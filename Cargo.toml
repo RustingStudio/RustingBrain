@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 rand = { version = "0.8", features = ["std"] }
+rayon = "1.11.0"
+
+[profile.release]
+opt-level = 3

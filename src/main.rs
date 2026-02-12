@@ -1,8 +1,7 @@
-mod network;
 mod matrix;
+mod network;
 mod xor;
 
-fn main() {
-    xor::xor_sigmoid();
-    xor::xor_relu();
+fn main(){
+    xor::xor();
 }
