@@ -21,7 +21,7 @@ pub fn xor() {
         vec![0.0],
     ];
 
-    for _ in 0..100_000_000 {
+    for _ in 0..1_000_000 {
         for i in 0..inputs.len() {
             net.train(&inputs[i], &targets[i]);
         }

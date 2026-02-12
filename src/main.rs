@@ -9,5 +9,5 @@ fn main() {
 
     complex::complex_example();
 
-    // tf_compare::tensorflow_like_example();
+    tf_compare::tensorflow_like_example();
 }

@@ -8,7 +8,7 @@ pub fn tensorflow_like_example() {
     let output_size = 10usize;
     let batch_size = 256usize;
     let samples = 20_000usize;
-    let iterations = 10usize;
+    let iterations = 1usize;
 
     let mut layers = Vec::new();
     layers.push(input_size);

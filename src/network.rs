@@ -1,5 +1,6 @@
 use crate::matrix::Matrix;
 use std::thread;
+use rayon::prelude::*; 
 
 pub struct Gradients {
     pub d_weights: Vec<Matrix>,
@@ -239,85 +240,48 @@ impl Network {
         self.apply_gradients(&grads, 1.0);
     }
 
-    pub fn train_batch_parallel(
+   pub fn train_batch_parallel(
         &mut self,
         inputs: &[Vec<f32>],
         targets: &[Vec<f32>],
-        num_threads: usize,
+        _num_threads: usize, 
     ) {
-        assert_eq!(inputs.len(), targets.len());
         let batch_size = inputs.len();
-        if batch_size == 0 {
-            return;
-        }
+        if batch_size == 0 { return; }
 
-        let threads = num_threads.max(1).min(batch_size);
-        let chunk_size = (batch_size + threads - 1) / threads;
+        let mut total_grads = inputs.par_iter().zip(targets.par_iter())
+            .map(|(input, target)| {
 
-        let layers = self.layers.clone();
-        let weights = self.weights.clone();
-        let biases = self.biases.clone();
-        let learning_rate = self.learning_rate;
-
-        let activations = self.activations.clone();
-        let weighted_sums = self.weighted_sums.clone();
-        let errors = self.errors.clone();
-        let gradients = self.gradients.clone();
-
-        let mut handles = Vec::new();
-
-        for t in 0..threads {
-            let start = t * chunk_size;
-            if start >= batch_size {
-                break;
-            }
-            let end = ((t + 1) * chunk_size).min(batch_size);
-
-            let inputs_slice = inputs[start..end].to_vec();
-            let targets_slice = targets[start..end].to_vec();
-
-            let layers_clone = layers.clone();
-            let weights_clone = weights.clone();
-            let biases_clone = biases.clone();
-            let activations_clone = activations.clone();
-            let weighted_sums_clone = weighted_sums.clone();
-            let errors_clone = errors.clone();
-            let gradients_clone = gradients.clone();
-
-            handles.push(thread::spawn(move || {
                 let mut local_net = Network {
-                    layers: layers_clone.clone(),
-                    weights: weights_clone,
-                    biases: biases_clone,
-                    learning_rate,
-                    activations: activations_clone,
-                    weighted_sums: weighted_sums_clone,
-                    errors: errors_clone,
-                    gradients: gradients_clone,
+                    layers: self.layers.clone(),
+                    weights: self.weights.clone(),
+                    biases: self.biases.clone(),
+                    learning_rate: self.learning_rate,
+                    activations: self.activations.iter().map(|m| Matrix::new(m.rows, m.cols)).collect(),
+                    weighted_sums: self.weighted_sums.iter().map(|m| Matrix::new(m.rows, m.cols)).collect(),
+                    errors: self.errors.iter().map(|m| Matrix::new(m.rows, m.cols)).collect(),
+                    gradients: self.gradients.iter().map(|m| Matrix::new(m.rows, m.cols)).collect(),
                 };
 
-                let mut local_grads = Gradients::new(&layers_clone);
+                let mut local_grads = Gradients::new(&self.layers);
                 local_grads.zero();
-
-                for (x, y) in inputs_slice.iter().zip(targets_slice.iter()) {
-                    local_net.compute_gradients_single(x, y, &mut local_grads);
-                }
-
+                local_net.compute_gradients_single(input, target, &mut local_grads);
                 local_grads
-            }));
-        }
-
-        let mut total_grads = Gradients::new(&self.layers);
-        total_grads.zero();
-
-        for h in handles {
-            let g = h.join().expect("thread panicked");
-            total_grads.add(&g);
-        }
+            })
+            .reduce(
+                || {
+                    let mut g = Gradients::new(&self.layers);
+                    g.zero();
+                    g
+                },
+                |mut a, b| {
+                    a.add(&b);
+                    a
+                }
+            );
 
         let scale = 1.0 / (batch_size as f32);
         total_grads.scale(scale);
-
         self.apply_gradients(&total_grads, 1.0);
-    }
+   }
 }
