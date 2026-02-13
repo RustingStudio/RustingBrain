@@ -8,7 +8,7 @@ pub fn tensorflow_like_example() {
     let output_size = 10usize;
     let batch_size = 256usize;
     let samples = 20_000usize;
-    let iterations = 1usize;
+    let iterations = 50usize;
 
     let mut layers = Vec::new();
     layers.push(input_size);
@@ -16,6 +16,9 @@ pub fn tensorflow_like_example() {
     layers.push(output_size);
 
     let mut net = Network::new(layers, 0.01);
+
+    let true_w = crate::matrix::Matrix::random(output_size, input_size);
+    let target_scale = 0.01f32;
 
     let mut inputs = Vec::with_capacity(samples);
     let mut targets = Vec::with_capacity(samples);
@@ -26,13 +29,18 @@ pub fn tensorflow_like_example() {
             x.push(rand::random::<f32>());
         }
 
-        let mut y = Vec::with_capacity(output_size);
-        for _ in 0..output_size {
-            y.push(rand::random::<f32>());
+        let mut x_matrix = crate::matrix::Matrix::new(input_size, 1);
+        x_matrix.copy_from_slice(&x);
+
+        let mut y_matrix = crate::matrix::Matrix::new(output_size, 1);
+        true_w.dot(&x_matrix, &mut y_matrix);
+
+        for v in &mut y_matrix.data {
+            *v *= target_scale;
         }
 
         inputs.push(x);
-        targets.push(y);
+        targets.push(y_matrix.data.clone());
     }
 
     let num_threads = available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -59,16 +67,29 @@ pub fn tensorflow_like_example() {
     for _ in 0..input_size {
         test_input.push(rand::random::<f32>());
     }
-    let mut expected = Vec::with_capacity(output_size);
-    for _ in 0..output_size {
-        expected.push(rand::random::<f32>());
+    let mut test_x_matrix = crate::matrix::Matrix::new(input_size, 1);
+    test_x_matrix.copy_from_slice(&test_input);
+    let mut test_y_matrix = crate::matrix::Matrix::new(output_size, 1);
+    true_w.dot(&test_x_matrix, &mut test_y_matrix);
+    for v in &mut test_y_matrix.data {
+        *v *= target_scale;
     }
+    let expected = test_y_matrix.data.clone();
     let output = net.forward(&test_input);
 
     println!("Large model test (Rust NN):");
     println!("Input len: {}", test_input.len());
     println!("Output len: {}", output.len());
     println!("Time taken (seconds): {:.6}", duration.as_secs_f64());
+    println!("Example test target (first 3):   {:?}", &expected[0..3]);
+    println!("Example test predicted (first 3): {:?}", &output[0..3]);
+
+    for i in 0..5 {
+        let out = net.forward(&inputs[i]);
+        println!("Target:  {:?}", &targets[i][0..3]);
+        println!("Predicted: {:?}", &out[0..3]);
+        println!();
+    }
 }
 
 pub fn learning_sanity_test() {

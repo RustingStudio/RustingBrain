@@ -6,7 +6,7 @@ pub fn xor() {
     let start = Instant::now();
 
     let layers = vec![2, 3, 1];
-    let mut net = Network::new(layers, 0.05); 
+    let mut net = Network::new(layers, 0.01); 
 
     let inputs = vec![
         vec![0.0, 0.0],
