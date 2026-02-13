@@ -10,4 +10,6 @@ fn main() {
     complex::complex_example();
 
     tf_compare::tensorflow_like_example();
+    tf_compare::learning_sanity_test();
+    tf_compare::large_model_learning_test();
 }

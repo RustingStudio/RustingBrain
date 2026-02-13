@@ -51,6 +51,56 @@ impl Matrix {
         }
     }
 
+    pub fn dot_rhs_transposed(&self, other: &Matrix, target: &mut Matrix) {
+        debug_assert_eq!(self.cols, other.cols);
+        debug_assert_eq!(target.rows, self.rows);
+        debug_assert_eq!(target.cols, other.rows);
+
+        unsafe {
+            matrixmultiply::sgemm(
+                self.rows,
+                self.cols,
+                other.rows,
+                1.0,
+                self.data.as_ptr(),
+                self.cols as isize,
+                1,
+                other.data.as_ptr(),
+                1,
+                other.cols as isize,
+                0.0,
+                target.data.as_mut_ptr(),
+                target.cols as isize,
+                1,
+            );
+        }
+    }
+
+    pub fn dot_self_transposed(&self, other: &Matrix, target: &mut Matrix) {
+        debug_assert_eq!(self.rows, other.rows);
+        debug_assert_eq!(target.rows, self.cols);
+        debug_assert_eq!(target.cols, other.cols);
+
+        unsafe {
+            matrixmultiply::sgemm(
+                self.cols,
+                self.rows,
+                other.cols,
+                1.0,
+                self.data.as_ptr(),
+                1,
+                self.cols as isize,
+                other.data.as_ptr(),
+                other.cols as isize,
+                1,
+                0.0,
+                target.data.as_mut_ptr(),
+                target.cols as isize,
+                1,
+            );
+        }
+    }
+
     pub fn outer_product(&self, input: &Matrix, target: &mut Matrix) {
         debug_assert_eq!(input.cols, 1);
         debug_assert_eq!(target.rows, self.rows);

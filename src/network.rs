@@ -1,6 +1,4 @@
 use crate::matrix::Matrix;
-use std::thread;
-use rayon::prelude::*; 
 
 pub struct Gradients {
     pub d_weights: Vec<Matrix>,
@@ -171,7 +169,6 @@ impl Network {
         }
 
         let last_idx = self.layers.len() - 1;
-        let output_z = &self.weighted_sums[last_idx];
         let output_a = &self.activations[last_idx];
         let error = &mut self.errors[last_idx];
 
@@ -240,48 +237,143 @@ impl Network {
         self.apply_gradients(&grads, 1.0);
     }
 
-   pub fn train_batch_parallel(
+    pub fn train_batch_parallel(
         &mut self,
         inputs: &[Vec<f32>],
         targets: &[Vec<f32>],
-        _num_threads: usize, 
+        _num_threads: usize,
     ) {
         let batch_size = inputs.len();
-        if batch_size == 0 { return; }
+        if batch_size == 0 {
+            return;
+        }
 
-        let mut total_grads = inputs.par_iter().zip(targets.par_iter())
-            .map(|(input, target)| {
+        let input_dim = self.layers[0];
+        let output_dim = *self.layers.last().unwrap();
 
-                let mut local_net = Network {
-                    layers: self.layers.clone(),
-                    weights: self.weights.clone(),
-                    biases: self.biases.clone(),
-                    learning_rate: self.learning_rate,
-                    activations: self.activations.iter().map(|m| Matrix::new(m.rows, m.cols)).collect(),
-                    weighted_sums: self.weighted_sums.iter().map(|m| Matrix::new(m.rows, m.cols)).collect(),
-                    errors: self.errors.iter().map(|m| Matrix::new(m.rows, m.cols)).collect(),
-                    gradients: self.gradients.iter().map(|m| Matrix::new(m.rows, m.cols)).collect(),
-                };
+        let mut input_batch = Matrix::new(input_dim, batch_size);
+        for (b, input) in inputs.iter().enumerate() {
+            assert_eq!(input.len(), input_dim);
+            for (i, &v) in input.iter().enumerate() {
+                input_batch.data[i * batch_size + b] = v;
+            }
+        }
 
-                let mut local_grads = Gradients::new(&self.layers);
-                local_grads.zero();
-                local_net.compute_gradients_single(input, target, &mut local_grads);
-                local_grads
-            })
-            .reduce(
-                || {
-                    let mut g = Gradients::new(&self.layers);
-                    g.zero();
-                    g
-                },
-                |mut a, b| {
-                    a.add(&b);
-                    a
+        let mut target_batch = Matrix::new(output_dim, batch_size);
+        for (b, target) in targets.iter().enumerate() {
+            assert_eq!(target.len(), output_dim);
+            for (i, &v) in target.iter().enumerate() {
+                target_batch.data[i * batch_size + b] = v;
+            }
+        }
+
+        let num_layers = self.layers.len() - 1;
+        let mut activations_batch: Vec<Matrix> = Vec::with_capacity(self.layers.len());
+        let mut weighted_sums_batch: Vec<Matrix> = Vec::with_capacity(self.layers.len());
+        let mut errors_batch: Vec<Matrix> = Vec::with_capacity(self.layers.len());
+
+        activations_batch.push(input_batch);
+        weighted_sums_batch.push(Matrix::new(self.layers[0], batch_size));
+        errors_batch.push(Matrix::new(self.layers[0], batch_size));
+
+        for l in 0..num_layers {
+            let rows = self.layers[l + 1];
+            let cols = self.layers[l];
+            let z = Matrix::new(rows, batch_size);
+            let a = Matrix::new(rows, batch_size);
+            let e = Matrix::new(rows, batch_size);
+
+            weighted_sums_batch.push(z);
+            activations_batch.push(a);
+            errors_batch.push(e);
+
+            debug_assert_eq!(self.weights[l].rows, rows);
+            debug_assert_eq!(self.weights[l].cols, cols);
+        }
+
+        for l in 0..num_layers {
+            let w = &self.weights[l];
+            let bias = &self.biases[l];
+
+            let (prev_slice, next_slice) = activations_batch.split_at_mut(l + 1);
+            let prev_a = &prev_slice[l];
+            let z = &mut weighted_sums_batch[l + 1];
+            let a = &mut next_slice[0];
+
+            w.dot(prev_a, z);
+
+            let is_last = l == num_layers - 1;
+            let rows = z.rows;
+            let cols = z.cols;
+
+            for r in 0..rows {
+                let b_val = bias.data[r];
+                let row_offset = r * cols;
+                for c in 0..cols {
+                    let idx = row_offset + c;
+                    let z_val = z.data[idx] + b_val;
+                    z.data[idx] = z_val;
+                    a.data[idx] = if is_last { z_val } else { Self::relu(z_val) };
                 }
-            );
+            }
+        }
+
+        let mut grads = Gradients::new(&self.layers);
+
+        {
+            let output_a = &activations_batch[num_layers];
+            let output_err = &mut errors_batch[num_layers];
+
+            let len = output_a.data.len();
+            for i in 0..len {
+                output_err.data[i] = target_batch.data[i] - output_a.data[i];
+            }
+        }
+
+        for l in (0..num_layers).rev() {
+            let curr_error = &errors_batch[l + 1]; 
+            let prev_activation = &activations_batch[l]; 
+
+            let rows = self.layers[l + 1];
+            let cols = self.layers[l];
+
+            let mut grad_w = Matrix::new(rows, cols);
+            curr_error.dot_rhs_transposed(prev_activation, &mut grad_w);
+
+            let mut grad_b = Matrix::new(rows, 1);
+            let batch_cols = curr_error.cols;
+            for r in 0..rows {
+                let mut sum = 0.0;
+                let row_offset = r * batch_cols;
+                for c in 0..batch_cols {
+                    sum += curr_error.data[row_offset + c];
+                }
+                grad_b.data[r] = sum;
+            }
+
+            grads.d_weights[l] = grad_w;
+            grads.d_biases[l] = grad_b;
+
+            if l > 0 {
+                let w = &self.weights[l]; 
+                let next_error = curr_error; 
+
+                let mut prev_error = Matrix::new(cols, batch_cols); 
+                w.dot_self_transposed(next_error, &mut prev_error);
+
+                let prev_z = &weighted_sums_batch[l];
+                let len = prev_error.data.len();
+                for i in 0..len {
+                    prev_error.data[i] *= Self::relu_derivative(prev_z.data[i]);
+                }
+
+                errors_batch[l] = prev_error;
+            }
+        }
 
         let scale = 1.0 / (batch_size as f32);
-        total_grads.scale(scale);
-        self.apply_gradients(&total_grads, 1.0);
-   }
+        grads.scale(scale);
+
+        self.apply_gradients(&grads, 1.0);
+    }
 }
