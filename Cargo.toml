@@ -5,8 +5,13 @@ edition = "2024"
 
 [dependencies]
 matrixmultiply = "0.3.10"
-rand = { version = "0.8", features = ["std"] }
 rayon = "1.11.0"
+
+# Revert to 0.8 to restore thread_rng() and gen_range()
+rand = { version = "0.8", features =["std", "std_rng"] }
+
+# Add the "std" feature to unlock CudaDevice in version 0.19+
+cudarc = { version = "0.19.3", features =["std", "cublas", "cuda-version-from-build-system"] }
 
 [profile.release]
 opt-level = 3

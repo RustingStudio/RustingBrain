@@ -1,22 +1,49 @@
-***
-
 # 🦀 RustingBrain
 
-**A lightweight, "from-scratch" Neural Network library written in pure Rust.**
+**A lightweight neural network library written from scratch in pure Rust.**
 
-RustingBrain is a foundational Deep Learning library designed to demystify the mathematics behind Artificial Intelligence. It implements Matrix operations, Feed Forward propagation, and Backpropagation (Gradient Descent) without relying on heavy external frameworks like TensorFlow or PyTorch.
+RustingBrain is a foundational deep learning project designed to **demystify the mathematics behind Artificial Intelligence**. It implements **matrix operations, feedforward propagation, and backpropagation** without relying on heavy frameworks such as TensorFlow or PyTorch.
 
-It serves as an educational tool for understanding how tensors and neurons actually learn.
+The project is meant primarily as an **educational deep learning engine**, helping developers understand how neural networks actually learn internally.
 
-## ⚡ Features
+---
 
-*   **Matrix Engine**: Custom implementation of linear algebra operations (Dot Product, Transpose, Hadamard Product).
-*   **Dynamic Architecture**: Create networks with any number of layers and neurons (e.g., `2 -> 3 -> 1`).
-*   **Backpropagation**: Implements Stochastic Gradient Descent to adjust weights and biases.
-*   **Custom Activation**: Support for injecting custom activation functions (Sigmoid, etc.) and their derivatives.
-*   **Pure Rust**: Minimal dependencies (only uses `rand` for initial weight generation).
+# ⚡ Features
 
-## 📦 Installation
+- **Custom Matrix Engine**  
+  High-performance linear algebra built on top of `matrixmultiply`.
+
+- **GPU Acceleration (CUDA)**  
+  Optional GPU backend using **cuBLAS via `cudarc`**.
+
+- **Dynamic Neural Architectures**  
+  Easily define networks such as:
+
+```
+
+2 → 8 → 4 → 1
+
+```
+
+- **Backpropagation Training**
+  Implements gradient descent with forward/backward passes.
+
+- **Tensor Backend Abstraction**
+  The same network code works with multiple backends:
+
+```
+
+Network<Matrix> // CPU
+Network<GpuMatrix> // CUDA GPU
+
+```
+
+- **Minimal Dependencies**
+  Only small libraries like `rand`, `rayon`, and `matrixmultiply`.
+
+---
+
+# 📦 Installation
 
 Clone the repository:
 
@@ -26,87 +53,202 @@ cd RustingBrain
 cargo run
 ```
 
-## 🚀 Usage Example
+To run benchmarks:
 
-Here is how to use the library to solve the classic **XOR** (Exclusive OR) problem. This demonstrates how to define activation functions, structure the network, and run the training loop.
+```bash
+cargo run --release
+```
+
+---
+
+# 🚀 Example
+
+A simple neural network:
 
 ```rust
-use crate::network::{Network, Activation};
+use crate::network::Network;
 use crate::matrix::Matrix;
 
 fn main() {
-    // 1. Define the Activation Function (Sigmoid)
-    // Squeezes numbers between 0.0 and 1.0
-    let sigmoid = Activation {
-        function: |x| 1.0 / (1.0 + (-x).exp()),
-        derivative: |x| x * (1.0 - x),
-    };
 
-    // 2. Initialize the Network
-    // 2 Input Neurons -> 3 Hidden Neurons -> 1 Output Neuron
+    // 2 inputs -> 3 hidden -> 1 output
     let layers = vec![2, 3, 1];
-    let learning_rate = 0.5;
-    let mut net = Network::new(layers, sigmoid, learning_rate);
 
-    // 3. Define Training Data (XOR Logic)
-    // Input: [0,0] -> Target: [0]
-    // Input: [0,1] -> Target: [1]
-    // ...
-    let inputs = vec![
-        vec![0.0, 0.0], vec![0.0, 1.0], 
-        vec![1.0, 0.0], vec![1.0, 1.0],
-    ];
-    let targets = vec![
-        vec![0.0], vec![1.0], 
-        vec![1.0], vec![0.0],
-    ];
+    let mut net = Network::<Matrix>::new(layers, 0.01);
 
-    // 4. Train the Network (10,000 Epochs)
-    println!("Training started...");
+    let input = vec![1.0, 0.0];
+    let target = vec![1.0];
+
     for _ in 0..10_000 {
-        for i in 0..inputs.len() {
-            let input_matrix = Matrix::from(vec![inputs[i].clone()]);
-            let target_matrix = Matrix::from(vec![targets[i].clone()]);
-            
-            // The library handles the math:
-            // FeedForward -> Calculate Error -> BackPropagate -> Update Weights
-            net.back_propagate(input_matrix, target_matrix);
-        }
+        net.train(&input, &target);
     }
 
-    // 5. Test Prediction
-    let test_input = Matrix::from(vec![vec![1.0, 0.0]]);
-    let prediction = net.feed_forward(test_input);
-    
-    println!("Training complete!");
-    println!("Input: [1, 0] -> Prediction: {:?}", prediction.data);
+    let prediction = net.forward(&input);
+
+    println!("Prediction: {:?}", prediction);
 }
 ```
 
-## 📂 Project Structure
+---
 
-*   **`src/matrix.rs`**: The math engine. Handles low-level data manipulation, including dot products, element-wise multiplication, and transposing.
-*   **`src/network.rs`**: The brain. Manages layers, weights, biases, and the orchestration of data flowing forward and errors flowing backward.
-*   **`src/main.rs`**: The implementation/entry point used for testing and training models.
+# 📊 Performance Benchmarks
 
-## 🛣️ Roadmap
+RustingBrain includes **CPU and GPU benchmarks** for matrix multiplication — the core operation behind neural networks.
 
-Future features planned for this library:
+The benchmark compares:
 
-- [ ] Save and Load trained models (serialize weights to JSON/Binary).
-- [ ] Implement additional activation functions (ReLU, Tanh, Softmax).
-- [ ] Add support for Batch Training (Learning from multiple inputs at once).
-- [ ] Implement Cost Functions (Mean Squared Error, Cross Entropy).
+- CPU (`matrixmultiply`)
+- GPU (`cuBLAS`)
 
-## 🤝 Contributing
+### Benchmark Results
 
-Contributions are welcome! If you want to add a new activation function or optimize the Matrix math:
+![Benchmark Results](benchmark.png)
 
-1.  Fork the project.
-2.  Create your feature branch (`git checkout -b feature/AmazingFeature`).
-3.  Commit your changes.
-4.  Open a Pull Request.
+---
 
-## 📄 License
+## CPU Matrix Multiplication
 
-Distributed under the MIT License.
+**CPU:** AMD Ryzen 7 5800H (8 cores)
+
+Peak observed performance:
+
+```
+109.42 GFLOPS
+```
+
+CPU performs best for **small matrices (<256×256)** where GPU overhead dominates.
+
+---
+
+## GPU Matrix Multiplication
+
+**GPU:** NVIDIA RTX 3050 Laptop GPU
+**CUDA:** 12.6
+
+Peak observed performance:
+
+```
+6132.53 GFLOPS
+```
+
+GPU performs best for **large matrices (≥1024×1024)**.
+
+---
+
+## Performance Comparison
+
+| Hardware | Peak Performance |
+| -------- | ---------------- |
+| CPU      | ~109 GFLOPS      |
+| GPU      | ~6132 GFLOPS     |
+
+**Speedup**
+
+```
+~56× faster on GPU for large matrices
+```
+
+---
+
+## Optimization Notes
+
+Best practices discovered from benchmarking:
+
+- Batch small matrices together
+- Keep tensors on GPU between operations
+- Use FP16 for ~2× speedup
+- For matrices smaller than **512×512**, CPU may be faster
+
+---
+
+# 🧠 Project Architecture
+
+```
+src/
+ ├── main.rs          # Benchmark runner / examples
+ ├── network.rs       # Neural network + backpropagation
+ ├── tensor.rs        # Tensor trait abstraction
+ ├── matrix.rs        # CPU tensor implementation
+ ├── gpu_matrix.rs    # CUDA tensor implementation
+ ├── xor.rs           # XOR example
+ ├── complex.rs       # Larger network examples
+ └── gpu_test.rs      # GPU benchmarks
+```
+
+---
+
+# ⚙️ Core Design
+
+RustingBrain uses a **backend abstraction layer**:
+
+```
+Tensor trait
+   │
+   ├── Matrix (CPU backend)
+   │
+   └── GpuMatrix (CUDA backend)
+```
+
+This allows the **same neural network code** to run on either **CPU or GPU**.
+
+---
+
+# 🛣️ Roadmap
+
+Future improvements planned:
+
+- [ ] FP16 / mixed precision training
+- [ ] Model serialization (save/load weights)
+- [ ] Additional activation functions
+- [ ] Convolution layers
+- [ ] Optimizers (Adam, RMSProp)
+- [ ] Transformer experiments
+- [ ] GPU backpropagation kernels
+
+---
+
+# 🤝 Contributing
+
+Contributions are welcome!
+
+1. Fork the project
+2. Create a feature branch
+
+```
+git checkout -b feature/AmazingFeature
+```
+
+3. Commit changes
+4. Open a Pull Request
+
+Ideas for contributions:
+
+- Faster CUDA kernels
+- Additional tensor operations
+- Optimized batching
+- Training examples
+
+---
+
+# 📄 License
+
+Distributed under the **MIT License**.
+
+---
+
+# ⭐ Why RustingBrain?
+
+Most ML libraries hide the math.
+
+RustingBrain shows it.
+
+You can read the code and directly see:
+
+```
+Forward Pass
+Weight Multiplication
+Error Propagation
+Gradient Updates
+```
+
+It’s a **neural network engine you can fully understand**.
