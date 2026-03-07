@@ -1,10 +1,61 @@
+//matrix.rs
 use rand::Rng;
+use crate::tensor::Tensor;
 
 #[derive(Clone, Debug)]
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
     pub data: Vec<f32>,
+}
+
+impl Tensor for Matrix {
+    fn rows(&self) -> usize { self.rows }
+    fn cols(&self) -> usize { self.cols }
+
+    fn new(rows: usize, cols: usize) -> Self {
+        Matrix::new(rows, cols)
+    }
+
+    fn random(rows: usize, cols: usize) -> Self {
+        Matrix::random(rows, cols)
+    }
+
+    fn zeros(&mut self) {
+        self.zeros()
+    }
+
+    fn dot(&self, other: &Self, target: &mut Self) {
+        self.dot(other, target)
+    }
+
+    fn dot_rhs_transposed(&self, other: &Self, target: &mut Self) {
+        self.dot_rhs_transposed(other, target)
+    }
+
+    fn dot_self_transposed(&self, other: &Self, target: &mut Self) {
+        self.dot_self_transposed(other, target)
+    }
+
+    fn outer_product(&self, input: &Self, target: &mut Self) {
+        self.outer_product(input, target)
+    }
+
+    fn dot_transpose_self(&self, error: &Self, target: &mut Self) {
+        self.dot_transpose_self(error, target)
+    }
+
+    fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    fn data_mut(&mut self) -> &mut [f32] {
+        &mut self.data
+    }
+
+    fn copy_from_slice(&mut self, source: &[f32]) {
+        self.copy_from_slice(source)
+    }
 }
 
 impl Matrix {
