@@ -137,3 +137,11 @@ See [INSTALL_CUDA.md](INSTALL_CUDA.md) for driver, toolkit, and cuBLAS setup.
 The current focus is dense neural networks and inference interop. Convolution
 layers, transformer experiments, mixed precision, and full GPU training are
 future work.
+
+## License
+
+RustingBrain is released under the RustingBrain License 1.0. You can use,
+modify, and distribute it, including in commercial projects, but redistributed
+copies must keep the license and credit Vasyl Trefilov as the original author.
+
+See [LICENSE.md](LICENSE.md) for the full terms.
