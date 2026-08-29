@@ -7,19 +7,39 @@ pub struct GpuMatrix {
     pub cols: usize,
     pub data: CudaSlice<f32>,
     pub stream: Arc<CudaStream>,
-    pub context: Arc<CudaContext>, 
+    pub context: Arc<CudaContext>,
 }
 
 impl GpuMatrix {
-    pub fn new(stream: Arc<CudaStream>, context: Arc<CudaContext>, rows: usize, cols: usize) -> Self {
+    pub fn new(
+        stream: Arc<CudaStream>,
+        context: Arc<CudaContext>,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
         let data = stream.alloc_zeros::<f32>(rows * cols).unwrap();
-        Self { rows, cols, data, stream, context }
+        Self {
+            rows,
+            cols,
+            data,
+            stream,
+            context,
+        }
     }
 
-    pub fn from_cpu(stream: Arc<CudaStream>, context: Arc<CudaContext>, cpu_matrix: &crate::matrix::Matrix) -> Self {
-        // Updated to use the new clone_htod method
+    pub fn from_cpu(
+        stream: Arc<CudaStream>,
+        context: Arc<CudaContext>,
+        cpu_matrix: &crate::matrix::Matrix,
+    ) -> Self {
         let data = stream.clone_htod(&cpu_matrix.data).unwrap();
-        Self { rows: cpu_matrix.rows, cols: cpu_matrix.cols, data, stream, context }
+        Self {
+            rows: cpu_matrix.rows,
+            cols: cpu_matrix.cols,
+            data,
+            stream,
+            context,
+        }
     }
 
     pub fn to_cpu(&self, target: &mut crate::matrix::Matrix) {

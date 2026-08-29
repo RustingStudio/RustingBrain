@@ -1,17 +1,38 @@
 [package]
-name = "RustingBrain"
+name = "rusting_brain"
 version = "0.1.0"
 edition = "2024"
+description = "A small Rust neural-network library for learning, training, and inference experiments."
+readme = "README.md"
+license = "MIT"
+rust-version = "1.85"
+documentation = "https://docs.rs/rusting_brain"
+homepage = "https://github.com/Vasyl-Trefilov/RustingBrain"
+repository = "https://github.com/Vasyl-Trefilov/RustingBrain.git"
+keywords = ["neural-network", "machine-learning", "onnx", "cuda", "education"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 matrixmultiply = "0.3.10"
 rayon = "1.11.0"
-
-# Revert to 0.8 to restore thread_rng() and gen_range()
 rand = { version = "0.8", features =["std", "std_rng"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+cudarc = { version = "0.19.3", optional = true, default-features = false, features = ["std", "cublas", "dynamic-loading"] }
+tract-onnx = { version = "0.21", optional = true }
 
-# Add the "std" feature to unlock CudaDevice in version 0.19+
-cudarc = { version = "0.19.3", features =["std", "cublas", "cuda-version-from-build-system"] }
+[features]
+default = []
+cuda = ["cuda-13-1"]
+cuda-11-8 = ["dep:cudarc", "cudarc/cuda-11080"]
+cuda-12-0 = ["dep:cudarc", "cudarc/cuda-12000"]
+cuda-12-4 = ["dep:cudarc", "cudarc/cuda-12040"]
+cuda-12-6 = ["dep:cudarc", "cudarc/cuda-12060"]
+cuda-12-8 = ["dep:cudarc", "cudarc/cuda-12080"]
+cuda-13-0 = ["dep:cudarc", "cudarc/cuda-13000"]
+cuda-13-1 = ["dep:cudarc", "cudarc/cuda-13010"]
+onnx = ["dep:tract-onnx"]
 
 [profile.release]
 opt-level = 3

@@ -1,422 +1,685 @@
+use crate::activations::Activation;
+use crate::dataset::Dataset;
+use crate::losses::Loss;
 use crate::matrix::Matrix;
-use rayon::prelude::*;
+use crate::optimizers::Optimizer;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use thiserror::Error;
 
-pub struct Gradients {
-    pub d_weights: Vec<Matrix>,
-    pub d_biases: Vec<Matrix>,
+#[derive(Debug, Error)]
+pub enum NetworkError {
+    #[error("network needs an input size and at least one dense layer")]
+    EmptyArchitecture,
+    #[error("input length {actual} does not match expected length {expected}")]
+    InvalidInput { expected: usize, actual: usize },
+    #[error("target length {actual} does not match expected length {expected}")]
+    InvalidTarget { expected: usize, actual: usize },
+    #[error("dataset is empty")]
+    EmptyDataset,
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
 }
 
-impl Gradients {
-    pub fn new(layers: &[usize]) -> Self {
-        let mut d_weights = Vec::new();
-        let mut d_biases = Vec::new();
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Dense {
+    pub units: usize,
+    pub activation: Activation,
+}
 
-        for i in 0..layers.len() - 1 {
-            let rows = layers[i + 1];
-            let cols = layers[i];
-            d_weights.push(Matrix::new(rows, cols));
-            d_biases.push(Matrix::new(rows, 1));
-        }
-
-        Gradients { d_weights, d_biases }
-    }
-
-    pub fn zero(&mut self) {
-        for m in &mut self.d_weights {
-            m.zeros();
-        }
-        for m in &mut self.d_biases {
-            m.zeros();
-        }
-    }
-
-    pub fn add(&mut self, other: &Gradients) {
-        for (a, b) in self.d_weights.iter_mut().zip(&other.d_weights) {
-            for (x, y) in a.data.iter_mut().zip(&b.data) {
-                *x += y;
-            }
-        }
-        for (a, b) in self.d_biases.iter_mut().zip(&other.d_biases) {
-            for (x, y) in a.data.iter_mut().zip(&b.data) {
-                *x += y;
-            }
-        }
-    }
-
-    pub fn scale(&mut self, factor: f32) {
-        for m in &mut self.d_weights {
-            for x in &mut m.data {
-                *x *= factor;
-            }
-        }
-        for m in &mut self.d_biases {
-            for x in &mut m.data {
-                *x *= factor;
-            }
-        }
+impl Dense {
+    pub fn new(units: usize, activation: Activation) -> Self {
+        assert!(units > 0);
+        Self { units, activation }
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DenseLayer {
+    pub weights: Matrix,
+    pub biases: Matrix,
+    pub activation: Activation,
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkBuilder {
+    input_size: Option<usize>,
+    layers: Vec<Dense>,
+    loss: Loss,
+    optimizer: Optimizer,
+}
+
+impl NetworkBuilder {
+    pub fn new() -> Self {
+        Self {
+            input_size: None,
+            layers: Vec::new(),
+            loss: Loss::Mse,
+            optimizer: Optimizer::sgd(0.01),
+        }
+    }
+
+    pub fn input_size(mut self, input_size: usize) -> Self {
+        assert!(input_size > 0);
+        self.input_size = Some(input_size);
+        self
+    }
+
+    pub fn dense(mut self, units: usize, activation: Activation) -> Self {
+        self.layers.push(Dense::new(units, activation));
+        self
+    }
+
+    pub fn loss(mut self, loss: Loss) -> Self {
+        self.loss = loss;
+        self
+    }
+
+    pub fn optimizer(mut self, optimizer: Optimizer) -> Self {
+        self.optimizer = optimizer;
+        self
+    }
+
+    pub fn build(self) -> Network {
+        Network::from_builder(self).expect("invalid network architecture")
+    }
+
+    pub fn try_build(self) -> Result<Network, NetworkError> {
+        Network::from_builder(self)
+    }
+}
+
+impl Default for NetworkBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrainConfig {
+    pub epochs: usize,
+    pub batch_size: usize,
+    pub shuffle: bool,
+    pub seed: Option<u64>,
+}
+
+impl Default for TrainConfig {
+    fn default() -> Self {
+        Self {
+            epochs: 100,
+            batch_size: 32,
+            shuffle: true,
+            seed: Some(42),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainingHistory {
+    pub losses: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct NetworkSnapshot {
+    version: u32,
+    input_size: usize,
+    layers: Vec<DenseLayer>,
+    loss: Loss,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Network {
-    layers: Vec<usize>,
+    input_size: usize,
+    layers: Vec<DenseLayer>,
+    loss: Loss,
+    optimizer: Optimizer,
+    adam_step: usize,
+    adam_m_weights: Vec<Matrix>,
+    adam_v_weights: Vec<Matrix>,
+    adam_m_biases: Vec<Matrix>,
+    adam_v_biases: Vec<Matrix>,
+}
+
+#[derive(Clone, Debug)]
+struct LayerCache {
+    input: Vec<f32>,
+    output: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct Gradients {
     weights: Vec<Matrix>,
     biases: Vec<Matrix>,
-    learning_rate: f32,
-    
-    activations: Vec<Matrix>,
-    weighted_sums: Vec<Matrix>,
-    errors: Vec<Matrix>,     
-    gradients: Vec<Matrix>,  
 }
 
 impl Network {
+    pub fn builder() -> NetworkBuilder {
+        NetworkBuilder::new()
+    }
+
     pub fn new(layers: Vec<usize>, learning_rate: f32) -> Self {
-        let mut weights = vec![];
-        let mut biases = vec![];
-        
-        let mut activations = vec![];
-        let mut weighted_sums = vec![];
-        let mut errors = vec![];
-        let mut gradients = vec![];
+        assert!(layers.len() >= 2);
 
-        activations.push(Matrix::new(layers[0], 1));
-        weighted_sums.push(Matrix::new(layers[0], 1)); 
-        errors.push(Matrix::new(layers[0], 1));
+        let last = layers.len() - 2;
+        let mut builder = NetworkBuilder::new()
+            .input_size(layers[0])
+            .loss(Loss::Mse)
+            .optimizer(Optimizer::sgd(learning_rate));
 
-        for i in 0..layers.len() - 1 {
-            let rows = layers[i + 1];
-            let cols = layers[i];
-            
-            weights.push(Matrix::random(rows, cols));
-            biases.push(Matrix::random(rows, 1));
-            
-            activations.push(Matrix::new(rows, 1));
-            weighted_sums.push(Matrix::new(rows, 1));
-            errors.push(Matrix::new(rows, 1));
-            gradients.push(Matrix::new(rows, cols));
+        for (i, &units) in layers.iter().enumerate().skip(1) {
+            let activation = if i - 1 == last {
+                Activation::Linear
+            } else {
+                Activation::Relu
+            };
+            builder = builder.dense(units, activation);
         }
 
-        Network {
+        builder.build()
+    }
+
+    fn from_builder(builder: NetworkBuilder) -> Result<Self, NetworkError> {
+        let input_size = builder.input_size.ok_or(NetworkError::EmptyArchitecture)?;
+        if builder.layers.is_empty() {
+            return Err(NetworkError::EmptyArchitecture);
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut previous = input_size;
+        let mut layers = Vec::with_capacity(builder.layers.len());
+
+        for dense in builder.layers {
+            let scale = (2.0 / previous as f32).sqrt();
+            let weights = (0..dense.units * previous)
+                .map(|_| rng.gen_range(-scale..scale))
+                .collect();
+
+            layers.push(DenseLayer {
+                weights: Matrix::from_vec(dense.units, previous, weights),
+                biases: Matrix::new(dense.units, 1),
+                activation: dense.activation,
+            });
+            previous = dense.units;
+        }
+
+        Ok(Self::with_layers(
+            input_size,
             layers,
-            weights,
-            biases,
-            learning_rate,
-            activations,
-            weighted_sums,
-            errors,
-            gradients,
+            builder.loss,
+            builder.optimizer,
+        ))
+    }
+
+    fn with_layers(
+        input_size: usize,
+        layers: Vec<DenseLayer>,
+        loss: Loss,
+        optimizer: Optimizer,
+    ) -> Self {
+        let adam_m_weights = layers
+            .iter()
+            .map(|layer| Matrix::new(layer.weights.rows, layer.weights.cols))
+            .collect();
+        let adam_v_weights = layers
+            .iter()
+            .map(|layer| Matrix::new(layer.weights.rows, layer.weights.cols))
+            .collect();
+        let adam_m_biases = layers
+            .iter()
+            .map(|layer| Matrix::new(layer.biases.rows, layer.biases.cols))
+            .collect();
+        let adam_v_biases = layers
+            .iter()
+            .map(|layer| Matrix::new(layer.biases.rows, layer.biases.cols))
+            .collect();
+
+        Self {
+            input_size,
+            layers,
+            loss,
+            optimizer,
+            adam_step: 0,
+            adam_m_weights,
+            adam_v_weights,
+            adam_m_biases,
+            adam_v_biases,
         }
     }
 
-    #[inline(always)]
-    fn relu(x: f32) -> f32 {
-        if x > 0.0 { x } else { 0.0 }
+    pub fn input_size(&self) -> usize {
+        self.input_size
     }
 
-    #[inline(always)]
-    fn relu_derivative(x: f32) -> f32 {
-        if x > 0.0 { 1.0 } else { 0.0 }
+    pub fn output_size(&self) -> usize {
+        self.layers.last().unwrap().biases.rows
     }
 
-    pub fn forward(&mut self, input: &[f32]) -> Vec<f32> {
-        self.activations[0].copy_from_slice(input);
-
-        for i in 0..self.weights.len() {
-            let (prev_a_slice, _current_z_slice) = self.activations.split_at(i + 1);
-            let (_prev_w_sum_slice, current_w_sum_slice) = self.weighted_sums.split_at_mut(i + 1);
-            
-            let prev_a = &prev_a_slice[i];
-            let current_z = &mut current_w_sum_slice[0];
-            
-            self.weights[i].dot(prev_a, current_z);
-            
-            let current_a = &mut self.activations[i+1];
-            let is_last = i == self.weights.len() - 1;
-
-            for j in 0..current_z.data.len() {
-                let z = current_z.data[j] + self.biases[i].data[j];
-                current_z.data[j] = z;
-                current_a.data[j] = if is_last { z } else { Self::relu(z) };
-            }
-        }
-
-        self.activations.last().unwrap().data.clone()
+    pub fn layers(&self) -> &[DenseLayer] {
+        &self.layers
     }
 
-    pub fn compute_gradients_single(
+    pub fn loss(&self) -> Loss {
+        self.loss
+    }
+
+    pub fn predict(&self, input: &[f32]) -> Result<Vec<f32>, NetworkError> {
+        self.validate_input(input)?;
+        Ok(self.forward_internal(input).0)
+    }
+
+    pub fn forward(&self, input: &[f32]) -> Vec<f32> {
+        self.predict(input).expect("invalid input shape")
+    }
+
+    pub fn predict_batch(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, NetworkError> {
+        inputs.iter().map(|input| self.predict(input)).collect()
+    }
+
+    pub fn train(&mut self, input: &[f32], target: &[f32]) -> Result<f32, NetworkError> {
+        self.train_batch(&[input.to_vec()], &[target.to_vec()])
+    }
+
+    pub fn train_batch(
         &mut self,
-        input: &[f32],
-        target: &[f32],
-        grads: &mut Gradients,
-    ) {
-        self.activations[0].copy_from_slice(input);
-
-        for i in 0..self.weights.len() {
-            let prev_a = &self.activations[i];
-            let current_z = &mut self.weighted_sums[i + 1];
-
-            self.weights[i].dot(prev_a, current_z);
-
-            let current_a = &mut self.activations[i + 1];
-            let bias = &self.biases[i];
-
-            let is_last = i == self.weights.len() - 1;
-
-            for j in 0..current_z.data.len() {
-                let z = current_z.data[j] + bias.data[j];
-                current_z.data[j] = z;
-                current_a.data[j] = if is_last { z } else { Self::relu(z) };
-            }
-        }
-
-        let last_idx = self.layers.len() - 1;
-        let output_a = &self.activations[last_idx];
-        let error = &mut self.errors[last_idx];
-
-        for j in 0..error.data.len() {
-            let e = target[j] - output_a.data[j];
-            error.data[j] = e;
-        }
-
-        for i in (0..self.weights.len()).rev() {
-            let curr_error = &self.errors[i + 1];
-            let prev_activation = &self.activations[i];
-            let gradient = &mut self.gradients[i];
-
-            curr_error.outer_product(prev_activation, gradient);
-
-            if i > 0 {
-                let weight = &self.weights[i];
-                let prev_z = &self.weighted_sums[i];
-
-                let (prev_errs, curr_errs) = self.errors.split_at_mut(i + 1);
-                let target_prev_error = &mut prev_errs[i];
-                let source_curr_error = &curr_errs[0];
-
-                weight.dot_transpose_self(source_curr_error, target_prev_error);
-
-                for j in 0..target_prev_error.data.len() {
-                    target_prev_error.data[j] *= Self::relu_derivative(prev_z.data[j]);
-                }
-            }
-
-            let grad_matrix = &self.gradients[i];
-            let err_vector = &self.errors[i + 1];
-
-            let grad_w = &mut grads.d_weights[i];
-            for j in 0..grad_w.data.len() {
-                grad_w.data[j] += grad_matrix.data[j];
-            }
-
-            let grad_b = &mut grads.d_biases[i];
-            for j in 0..grad_b.data.len() {
-                grad_b.data[j] += err_vector.data[j];
-            }
-        }
-    }
-
-    pub fn apply_gradients(&mut self, grads: &Gradients, scale: f32) {
-        let lr = self.learning_rate * scale;
-
-        for (weight_matrix, grad_matrix) in self.weights.iter_mut().zip(&grads.d_weights) {
-            for (w, g) in weight_matrix.data.iter_mut().zip(&grad_matrix.data) {
-                *w += g * lr;
-            }
-        }
-
-        for (bias_matrix, grad_b) in self.biases.iter_mut().zip(&grads.d_biases) {
-            for (b, g) in bias_matrix.data.iter_mut().zip(&grad_b.data) {
-                *b += g * lr;
-            }
-        }
-    }
-
-    pub fn train(&mut self, input: &[f32], target: &[f32]) {
-        let mut grads = Gradients::new(&self.layers);
-        grads.zero();
-        self.compute_gradients_single(input, target, &mut grads);
-        self.apply_gradients(&grads, 1.0);
-    }
-
-    fn compute_batch_gradients_chunk(
-        layers: &[usize],
-        weights: &[Matrix],
-        biases: &[Matrix],
         inputs: &[Vec<f32>],
         targets: &[Vec<f32>],
-    ) -> Gradients {
-        let batch_size = inputs.len();
-        let input_dim = layers[0];
-        let output_dim = *layers.last().unwrap();
+    ) -> Result<f32, NetworkError> {
+        if inputs.is_empty() {
+            return Err(NetworkError::EmptyDataset);
+        }
+        assert_eq!(inputs.len(), targets.len());
 
-        let mut input_batch = Matrix::new(input_dim, batch_size);
-        for (b, input) in inputs.iter().enumerate() {
-            debug_assert_eq!(input.len(), input_dim);
-            for (i, &v) in input.iter().enumerate() {
-                input_batch.data[i * batch_size + b] = v;
-            }
+        let mut gradients = Gradients::zeros(&self.layers);
+        let mut loss = 0.0;
+
+        for (input, target) in inputs.iter().zip(targets) {
+            self.validate_input(input)?;
+            self.validate_target(target)?;
+
+            let (prediction, caches) = self.forward_internal(input);
+            loss += self.loss.value(&prediction, target);
+            let sample_grads = self.backward(&prediction, target, &caches);
+            gradients.add_assign(&sample_grads);
         }
 
-        let mut target_batch = Matrix::new(output_dim, batch_size);
-        for (b, target) in targets.iter().enumerate() {
-            debug_assert_eq!(target.len(), output_dim);
-            for (i, &v) in target.iter().enumerate() {
-                target_batch.data[i * batch_size + b] = v;
-            }
-        }
+        let scale = 1.0 / inputs.len() as f32;
+        gradients.scale(scale);
+        self.apply_gradients(&gradients);
 
-        let num_layers = layers.len() - 1;
-        let mut activations_batch: Vec<Matrix> = Vec::with_capacity(layers.len());
-        let mut weighted_sums_batch: Vec<Matrix> = Vec::with_capacity(layers.len());
-        let mut errors_batch: Vec<Matrix> = Vec::with_capacity(layers.len());
-
-        activations_batch.push(input_batch);
-        weighted_sums_batch.push(Matrix::new(layers[0], batch_size));
-        errors_batch.push(Matrix::new(layers[0], batch_size));
-
-        for l in 0..num_layers {
-            let rows = layers[l + 1];
-            let cols = layers[l];
-            let z = Matrix::new(rows, batch_size);
-            let a = Matrix::new(rows, batch_size);
-            let e = Matrix::new(rows, batch_size);
-
-            weighted_sums_batch.push(z);
-            activations_batch.push(a);
-            errors_batch.push(e);
-
-            debug_assert_eq!(weights[l].rows, rows);
-            debug_assert_eq!(weights[l].cols, cols);
-        }
-
-        for l in 0..num_layers {
-            let w = &weights[l];
-            let bias = &biases[l];
-
-            let (prev_slice, next_slice) = activations_batch.split_at_mut(l + 1);
-            let prev_a = &prev_slice[l];
-            let z = &mut weighted_sums_batch[l + 1];
-            let a = &mut next_slice[0];
-
-            w.dot(prev_a, z);
-
-            let is_last = l == num_layers - 1;
-            let rows = z.rows;
-            let cols = z.cols;
-
-            for r in 0..rows {
-                let b_val = bias.data[r];
-                let row_offset = r * cols;
-                for c in 0..cols {
-                    let idx = row_offset + c;
-                    let z_val = z.data[idx] + b_val;
-                    z.data[idx] = z_val;
-                    a.data[idx] = if is_last { z_val } else { Self::relu(z_val) };
-                }
-            }
-        }
-
-        let mut grads = Gradients::new(layers);
-
-        {
-            let output_a = &activations_batch[num_layers];
-            let output_err = &mut errors_batch[num_layers];
-
-            let len = output_a.data.len();
-            for i in 0..len {
-                output_err.data[i] = target_batch.data[i] - output_a.data[i];
-            }
-        }
-
-        for l in (0..num_layers).rev() {
-            let curr_error = &errors_batch[l + 1];
-            let prev_activation = &activations_batch[l];
-
-            let rows = layers[l + 1];
-            let cols = layers[l];
-
-            let mut grad_w = Matrix::new(rows, cols);
-            curr_error.dot_rhs_transposed(prev_activation, &mut grad_w);
-
-            let mut grad_b = Matrix::new(rows, 1);
-            let batch_cols = curr_error.cols;
-            for r in 0..rows {
-                let mut sum = 0.0;
-                let row_offset = r * batch_cols;
-                for c in 0..batch_cols {
-                    sum += curr_error.data[row_offset + c];
-                }
-                grad_b.data[r] = sum;
-            }
-
-            grads.d_weights[l] = grad_w;
-            grads.d_biases[l] = grad_b;
-
-            if l > 0 {
-                let w = &weights[l];
-                let next_error = curr_error;
-
-                let mut prev_error = Matrix::new(cols, batch_cols);
-                w.dot_self_transposed(next_error, &mut prev_error);
-
-                let prev_z = &weighted_sums_batch[l];
-                let len = prev_error.data.len();
-                for i in 0..len {
-                    prev_error.data[i] *= Self::relu_derivative(prev_z.data[i]);
-                }
-
-                errors_batch[l] = prev_error;
-            }
-        }
-
-        grads
+        Ok(loss * scale)
     }
 
     pub fn train_batch_parallel(
         &mut self,
         inputs: &[Vec<f32>],
         targets: &[Vec<f32>],
-        num_threads: usize,
-    ) {
-        let batch_size = inputs.len();
-        if batch_size == 0 {
-            return;
+        _num_threads: usize,
+    ) -> Result<f32, NetworkError> {
+        self.train_batch(inputs, targets)
+    }
+
+    pub fn fit(
+        &mut self,
+        dataset: &Dataset,
+        config: TrainConfig,
+    ) -> Result<TrainingHistory, NetworkError> {
+        if dataset.is_empty() {
+            return Err(NetworkError::EmptyDataset);
         }
 
-        let layers = self.layers.clone();
-        let weights = &self.weights;
-        let biases = &self.biases;
+        let mut working = dataset.clone();
+        let mut losses = Vec::with_capacity(config.epochs);
 
-        let chunks = num_threads.max(1).min(batch_size);
-        let chunk_size = (batch_size + chunks - 1) / chunks;
+        for epoch in 0..config.epochs {
+            if config.shuffle {
+                let seed = config.seed.map(|seed| seed + epoch as u64);
+                working.shuffle(seed);
+            }
 
-        let total_grads = inputs
-            .par_chunks(chunk_size)
-            .zip(targets.par_chunks(chunk_size))
-            .map(|(in_chunk, tgt_chunk)| {
-                Self::compute_batch_gradients_chunk(
-                    &layers,
-                    weights,
-                    biases,
-                    in_chunk,
-                    tgt_chunk,
-                )
-            })
-            .reduce(
-                || {
-                    let mut g = Gradients::new(&layers);
-                    g.zero();
-                    g
+            let mut epoch_loss = 0.0;
+            let mut batches = 0;
+            for batch in working.batches(config.batch_size.max(1)) {
+                epoch_loss += self.train_batch(batch.inputs, batch.targets)?;
+                batches += 1;
+            }
+
+            losses.push(epoch_loss / batches as f32);
+        }
+
+        Ok(TrainingHistory { losses })
+    }
+
+    pub fn evaluate_loss(&self, dataset: &Dataset) -> Result<f32, NetworkError> {
+        if dataset.is_empty() {
+            return Err(NetworkError::EmptyDataset);
+        }
+
+        let mut loss = 0.0;
+        for (input, target) in dataset.inputs.iter().zip(&dataset.targets) {
+            self.validate_input(input)?;
+            self.validate_target(target)?;
+            loss += self.loss.value(&self.predict(input)?, target);
+        }
+
+        Ok(loss / dataset.len() as f32)
+    }
+
+    pub fn save_json<P: AsRef<Path>>(&self, path: P) -> Result<(), NetworkError> {
+        let snapshot = NetworkSnapshot {
+            version: 1,
+            input_size: self.input_size,
+            layers: self.layers.clone(),
+            loss: self.loss,
+        };
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    pub fn load_json<P: AsRef<Path>>(path: P) -> Result<Self, NetworkError> {
+        let json = std::fs::read_to_string(path)?;
+        let snapshot: NetworkSnapshot = serde_json::from_str(&json)?;
+        Ok(Self::with_layers(
+            snapshot.input_size,
+            snapshot.layers,
+            snapshot.loss,
+            Optimizer::sgd(0.01),
+        ))
+    }
+
+    fn forward_internal(&self, input: &[f32]) -> (Vec<f32>, Vec<LayerCache>) {
+        let mut current = input.to_vec();
+        let mut caches = Vec::with_capacity(self.layers.len());
+
+        for layer in &self.layers {
+            let layer_input = current;
+            let mut output = vec![0.0; layer.biases.rows];
+
+            for (row, out) in output.iter_mut().enumerate() {
+                let mut value = layer.biases.data[row];
+                let row_offset = row * layer.weights.cols;
+                for (col, input_value) in layer_input.iter().enumerate() {
+                    value += layer.weights.data[row_offset + col] * input_value;
+                }
+                *out = value;
+            }
+
+            layer.activation.apply_to_slice(&mut output);
+            caches.push(LayerCache {
+                input: layer_input,
+                output: output.clone(),
+            });
+            current = output;
+        }
+
+        (current, caches)
+    }
+
+    fn backward(&self, prediction: &[f32], target: &[f32], caches: &[LayerCache]) -> Gradients {
+        let mut gradients = Gradients::zeros(&self.layers);
+        let last_idx = self.layers.len() - 1;
+        let mut delta =
+            self.loss
+                .output_delta(prediction, target, self.layers[last_idx].activation);
+
+        for layer_idx in (0..self.layers.len()).rev() {
+            let layer = &self.layers[layer_idx];
+            let cache = &caches[layer_idx];
+
+            for (row, delta_value) in delta.iter().enumerate() {
+                gradients.biases[layer_idx].data[row] += *delta_value;
+                let row_offset = row * layer.weights.cols;
+                for (col, input_value) in cache.input.iter().enumerate() {
+                    gradients.weights[layer_idx].data[row_offset + col] +=
+                        delta_value * input_value;
+                }
+            }
+
+            if layer_idx > 0 {
+                let previous_output = &caches[layer_idx - 1].output;
+                let mut previous_delta = vec![0.0; layer.weights.cols];
+
+                for (col, previous_delta_value) in previous_delta.iter_mut().enumerate() {
+                    let mut sum = 0.0;
+                    for (row, delta_value) in delta.iter().enumerate() {
+                        sum += layer.weights.data[row * layer.weights.cols + col] * delta_value;
+                    }
+                    *previous_delta_value = sum
+                        * self.layers[layer_idx - 1]
+                            .activation
+                            .derivative(previous_output[col]);
+                }
+
+                delta = previous_delta;
+            }
+        }
+
+        gradients
+    }
+
+    fn apply_gradients(&mut self, gradients: &Gradients) {
+        match self.optimizer.clone() {
+            Optimizer::Sgd { learning_rate } => {
+                for (layer, (weight_grad, bias_grad)) in self
+                    .layers
+                    .iter_mut()
+                    .zip(gradients.weights.iter().zip(&gradients.biases))
+                {
+                    for (weight, grad) in layer.weights.data.iter_mut().zip(&weight_grad.data) {
+                        *weight += learning_rate * grad;
+                    }
+                    for (bias, grad) in layer.biases.data.iter_mut().zip(&bias_grad.data) {
+                        *bias += learning_rate * grad;
+                    }
+                }
+            }
+            Optimizer::Adam {
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+            } => {
+                self.adam_step += 1;
+                let bias_correction1 = 1.0 - beta1.powi(self.adam_step as i32);
+                let bias_correction2 = 1.0 - beta2.powi(self.adam_step as i32);
+
+                for layer_idx in 0..self.layers.len() {
+                    apply_adam(
+                        &mut self.layers[layer_idx].weights.data,
+                        &gradients.weights[layer_idx].data,
+                        &mut self.adam_m_weights[layer_idx].data,
+                        &mut self.adam_v_weights[layer_idx].data,
+                        AdamHyperparams {
+                            learning_rate,
+                            beta1,
+                            beta2,
+                            epsilon,
+                            bias_correction1,
+                            bias_correction2,
+                        },
+                    );
+                    apply_adam(
+                        &mut self.layers[layer_idx].biases.data,
+                        &gradients.biases[layer_idx].data,
+                        &mut self.adam_m_biases[layer_idx].data,
+                        &mut self.adam_v_biases[layer_idx].data,
+                        AdamHyperparams {
+                            learning_rate,
+                            beta1,
+                            beta2,
+                            epsilon,
+                            bias_correction1,
+                            bias_correction2,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn validate_input(&self, input: &[f32]) -> Result<(), NetworkError> {
+        if input.len() != self.input_size {
+            return Err(NetworkError::InvalidInput {
+                expected: self.input_size,
+                actual: input.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_target(&self, target: &[f32]) -> Result<(), NetworkError> {
+        let output_size = self.output_size();
+        if target.len() != output_size {
+            return Err(NetworkError::InvalidTarget {
+                expected: output_size,
+                actual: target.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AdamHyperparams {
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    bias_correction1: f32,
+    bias_correction2: f32,
+}
+
+fn apply_adam(
+    values: &mut [f32],
+    gradients: &[f32],
+    moment1: &mut [f32],
+    moment2: &mut [f32],
+    params: AdamHyperparams,
+) {
+    for (((value, gradient), m), v) in values.iter_mut().zip(gradients).zip(moment1).zip(moment2) {
+        *m = params.beta1 * *m + (1.0 - params.beta1) * *gradient;
+        *v = params.beta2 * *v + (1.0 - params.beta2) * gradient * gradient;
+
+        let m_hat = *m / params.bias_correction1;
+        let v_hat = *v / params.bias_correction2;
+        *value += params.learning_rate * m_hat / (v_hat.sqrt() + params.epsilon);
+    }
+}
+
+impl Gradients {
+    fn zeros(layers: &[DenseLayer]) -> Self {
+        Self {
+            weights: layers
+                .iter()
+                .map(|layer| Matrix::new(layer.weights.rows, layer.weights.cols))
+                .collect(),
+            biases: layers
+                .iter()
+                .map(|layer| Matrix::new(layer.biases.rows, layer.biases.cols))
+                .collect(),
+        }
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        for (left, right) in self.weights.iter_mut().zip(&other.weights) {
+            for (l, r) in left.data.iter_mut().zip(&right.data) {
+                *l += r;
+            }
+        }
+
+        for (left, right) in self.biases.iter_mut().zip(&other.biases) {
+            for (l, r) in left.data.iter_mut().zip(&right.data) {
+                *l += r;
+            }
+        }
+    }
+
+    fn scale(&mut self, scale: f32) {
+        for matrix in self.weights.iter_mut().chain(&mut self.biases) {
+            for value in &mut matrix.data {
+                *value *= scale;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xor_learns_with_adam() {
+        let dataset = Dataset::new(
+            vec![
+                vec![0.0, 0.0],
+                vec![0.0, 1.0],
+                vec![1.0, 0.0],
+                vec![1.0, 1.0],
+            ],
+            vec![vec![0.0], vec![1.0], vec![1.0], vec![0.0]],
+        );
+        let mut model = Network::builder()
+            .input_size(2)
+            .dense(8, Activation::Tanh)
+            .dense(1, Activation::Sigmoid)
+            .loss(Loss::BinaryCrossEntropy)
+            .optimizer(Optimizer::adam(0.05))
+            .build();
+
+        let initial = model.evaluate_loss(&dataset).unwrap();
+        model
+            .fit(
+                &dataset,
+                TrainConfig {
+                    epochs: 2_000,
+                    batch_size: 4,
+                    shuffle: true,
+                    seed: Some(7),
                 },
-                |mut a, b| {
-                    a.add(&b);
-                    a
-                },
-            );
+            )
+            .unwrap();
+        let final_loss = model.evaluate_loss(&dataset).unwrap();
 
-        let scale = 1.0 / (batch_size as f32);
-        let mut total_grads = total_grads;
-        total_grads.scale(scale);
-        self.apply_gradients(&total_grads, 1.0);
+        assert!(final_loss < initial);
+        assert!(final_loss < 0.2, "final loss was {final_loss}");
+    }
+
+    #[test]
+    fn save_load_preserves_predictions() {
+        let model = Network::builder()
+            .input_size(2)
+            .dense(3, Activation::Relu)
+            .dense(1, Activation::Linear)
+            .build();
+        let expected = model.predict(&[0.2, 0.4]).unwrap();
+        let path = std::env::temp_dir().join("rusting_brain_model_test.json");
+
+        model.save_json(&path).unwrap();
+        let loaded = Network::load_json(&path).unwrap();
+        let actual = loaded.predict(&[0.2, 0.4]).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn predict_rejects_wrong_input_size() {
+        let model = Network::builder()
+            .input_size(2)
+            .dense(1, Activation::Linear)
+            .build();
+
+        let error = model.predict(&[1.0]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            NetworkError::InvalidInput {
+                expected: 2,
+                actual: 1
+            }
+        ));
     }
 }

@@ -1,21 +1,39 @@
-//main.rs
-mod matrix;
-mod network;
-mod xor;
-mod complex;
-mod tf_compare;
-mod gpu_matrix; 
-mod gpu_test; 
-mod tensor;
+use rusting_brain::{Activation, Dataset, Loss, Network, Optimizer, TrainConfig};
 
 fn main() {
-    // xor::xor();
+    let dataset = Dataset::new(
+        vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+        ],
+        vec![vec![0.0], vec![1.0], vec![1.0], vec![0.0]],
+    );
 
-    // complex::complex_example();
+    let mut model = Network::builder()
+        .input_size(2)
+        .dense(8, Activation::Tanh)
+        .dense(1, Activation::Sigmoid)
+        .loss(Loss::BinaryCrossEntropy)
+        .optimizer(Optimizer::adam(0.05))
+        .build();
 
-    // tf_compare::tensorflow_like_example();
-    // tf_compare::learning_sanity_test();
-    // tf_compare::large_model_learning_test();
+    let history = model
+        .fit(
+            &dataset,
+            TrainConfig {
+                epochs: 2_000,
+                batch_size: 4,
+                shuffle: true,
+                seed: Some(42),
+            },
+        )
+        .expect("training failed");
 
-    gpu_test::run_benchmarks();
+    println!("Final loss: {:.6}", history.losses.last().unwrap());
+    for input in &dataset.inputs {
+        let prediction = model.predict(input).expect("prediction failed");
+        println!("{input:?} -> {:.4}", prediction[0]);
+    }
 }

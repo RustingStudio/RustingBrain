@@ -1,254 +1,139 @@
-# 🦀 RustingBrain
+# RustingBrain
 
-**A lightweight neural network library written from scratch in pure Rust.**
+RustingBrain is a small neural-network library for learning how inference and
+training work under the hood.
 
-RustingBrain is a foundational deep learning project designed to **demystify the mathematics behind Artificial Intelligence**. It implements **matrix operations, feedforward propagation, and backpropagation** without relying on heavy frameworks such as TensorFlow or PyTorch.
+The crate keeps the core pieces visible: matrices, dense layers, activations,
+loss functions, optimizers, batches, and model weights. It is not trying to
+replace PyTorch or TensorFlow. It is for experiments, study, and small models
+where readable Rust code matters more than having every deep-learning feature.
 
-The project is meant primarily as an **educational deep learning engine**, helping developers understand how neural networks actually learn internally.
+## Features
 
----
+- Dense feedforward networks
+- Regression, binary classification, multiclass classification, and XOR examples
+- ReLU, sigmoid, tanh, softmax, and linear activations
+- Mean squared error, binary cross entropy, and cross entropy losses
+- SGD and Adam optimizers
+- Mini-batch training with reproducible shuffling
+- JSON save/load for RustingBrain models
+- ONNX inference for models trained elsewhere
+- Optional CUDA/cuBLAS matrix benchmark
 
-# ⚡ Features
+## Install
 
-- **Custom Matrix Engine**  
-  High-performance linear algebra built on top of `matrixmultiply`.
-
-- **GPU Acceleration (CUDA)**  
-  Optional GPU backend using **cuBLAS via `cudarc`**.
-
-- **Dynamic Neural Architectures**  
-  Easily define networks such as:
-
-```
-
-2 → 8 → 4 → 1
-
-```
-
-- **Backpropagation Training**
-  Implements gradient descent with forward/backward passes.
-
-- **Tensor Backend Abstraction**
-  The same network code works with multiple backends:
-
-```
-
-Network<Matrix> // CPU
-Network<GpuMatrix> // CUDA GPU
-
-```
-
-- **Minimal Dependencies**
-  Only small libraries like `rand`, `rayon`, and `matrixmultiply`.
-
----
-
-# 📦 Installation
-
-Clone the repository:
+Add the crate from crates.io:
 
 ```bash
-git clone https://github.com/your-username/RustingBrain.git
+cargo add rusting_brain
+```
+
+Or clone and run the examples:
+
+```bash
+git clone https://github.com/Vasyl-Trefilov/RustingBrain.git
 cd RustingBrain
-cargo run
+cargo test
+cargo run --example xor
 ```
 
-To run benchmarks:
-
-```bash
-cargo run --release
-```
-
----
-
-# 🚀 Example
-
-A simple neural network:
+## Quick Example
 
 ```rust
-use crate::network::Network;
-use crate::matrix::Matrix;
+use rusting_brain::{Activation, Dataset, Loss, Network, Optimizer, TrainConfig};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let data = Dataset::new(
+        vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+        ],
+        vec![vec![0.0], vec![1.0], vec![1.0], vec![0.0]],
+    );
 
-    // 2 inputs -> 3 hidden -> 1 output
-    let layers = vec![2, 3, 1];
+    let mut model = Network::builder()
+        .input_size(2)
+        .dense(8, Activation::Tanh)
+        .dense(1, Activation::Sigmoid)
+        .loss(Loss::BinaryCrossEntropy)
+        .optimizer(Optimizer::adam(0.05))
+        .build();
 
-    let mut net = Network::<Matrix>::new(layers, 0.01);
+    model.fit(
+        &data,
+        TrainConfig {
+            epochs: 2_000,
+            batch_size: 4,
+            shuffle: true,
+            seed: Some(42),
+        },
+    )?;
 
-    let input = vec![1.0, 0.0];
-    let target = vec![1.0];
-
-    for _ in 0..10_000 {
-        net.train(&input, &target);
-    }
-
-    let prediction = net.forward(&input);
-
-    println!("Prediction: {:?}", prediction);
+    println!("{:?}", model.predict(&[1.0, 0.0])?);
+    Ok(())
 }
 ```
 
----
+## Examples
 
-# 📊 Performance Benchmarks
-
-RustingBrain includes **CPU and GPU benchmarks** for matrix multiplication — the core operation behind neural networks.
-
-The benchmark compares:
-
-- CPU (`matrixmultiply`)
-- GPU (`cuBLAS`)
-
-### Benchmark Results
-
-![Benchmark Results](benchmark.png)
-
----
-
-## CPU Matrix Multiplication
-
-**CPU:** AMD Ryzen 7 5800H (8 cores)
-
-Peak observed performance:
-
-```
-109.42 GFLOPS
+```bash
+cargo run --example xor
+cargo run --example regression
+cargo run --example classification
+cargo run --example save_load
 ```
 
-CPU performs best for **small matrices (<256×256)** where GPU overhead dominates.
+## Save And Load
 
----
-
-## GPU Matrix Multiplication
-
-**GPU:** NVIDIA RTX 3050 Laptop GPU
-**CUDA:** 12.6
-
-Peak observed performance:
-
-```
-6132.53 GFLOPS
+```rust
+model.save_json("model.json")?;
+let loaded = rusting_brain::Network::load_json("model.json")?;
 ```
 
-GPU performs best for **large matrices (≥1024×1024)**.
+The saved JSON contains the network shape, activations, loss, weights, biases,
+and file format version. Optimizer state is not stored yet, so saved models are
+mainly for inference and reproducible examples.
 
----
+## Import Models
 
-## Performance Comparison
+RustingBrain can run ONNX models for inference:
 
-| Hardware | Peak Performance |
-| -------- | ---------------- |
-| CPU      | ~109 GFLOPS      |
-| GPU      | ~6132 GFLOPS     |
-
-**Speedup**
-
-```
-~56× faster on GPU for large matrices
+```bash
+cargo run --example onnx_inference --features onnx -- model.onnx
 ```
 
----
+Some TensorFlow exports leave the input shape dynamic. In that case, pass the
+shape and input values explicitly:
 
-## Optimization Notes
-
-Best practices discovered from benchmarking:
-
-- Batch small matrices together
-- Keep tensors on GPU between operations
-- Use FP16 for ~2× speedup
-- For matrices smaller than **512×512**, CPU may be faster
-
----
-
-# 🧠 Project Architecture
-
-```
-src/
- ├── main.rs          # Benchmark runner / examples
- ├── network.rs       # Neural network + backpropagation
- ├── tensor.rs        # Tensor trait abstraction
- ├── matrix.rs        # CPU tensor implementation
- ├── gpu_matrix.rs    # CUDA tensor implementation
- ├── xor.rs           # XOR example
- ├── complex.rs       # Larger network examples
- └── gpu_test.rs      # GPU benchmarks
+```bash
+cargo run --example onnx_inference --features onnx -- xor.onnx 1,2 0,1
 ```
 
----
+See [IMPORT_MODELS.md](IMPORT_MODELS.md) for the TensorFlow/Keras to ONNX flow.
 
-# ⚙️ Core Design
+## CUDA Benchmark
 
-RustingBrain uses a **backend abstraction layer**:
+CUDA is optional. The normal crate build does not require CUDA, `nvcc`, or an
+NVIDIA GPU.
 
-```
-Tensor trait
-   │
-   ├── Matrix (CPU backend)
-   │
-   └── GpuMatrix (CUDA backend)
-```
+To compile the CUDA benchmark support:
 
-This allows the **same neural network code** to run on either **CPU or GPU**.
-
----
-
-# 🛣️ Roadmap
-
-Future improvements planned:
-
-- [ ] FP16 / mixed precision training
-- [ ] Model serialization (save/load weights)
-- [ ] Additional activation functions
-- [ ] Convolution layers
-- [ ] Optimizers (Adam, RMSProp)
-- [ ] Transformer experiments
-- [ ] GPU backpropagation kernels
-
----
-
-# 🤝 Contributing
-
-Contributions are welcome!
-
-1. Fork the project
-2. Create a feature branch
-
-```
-git checkout -b feature/AmazingFeature
+```bash
+cargo check --features cuda
 ```
 
-3. Commit changes
-4. Open a Pull Request
+To run the benchmark on a CUDA machine:
 
-Ideas for contributions:
-
-- Faster CUDA kernels
-- Additional tensor operations
-- Optimized batching
-- Training examples
-
----
-
-# 📄 License
-
-Distributed under the **MIT License**.
-
----
-
-# ⭐ Why RustingBrain?
-
-Most ML libraries hide the math.
-
-RustingBrain shows it.
-
-You can read the code and directly see:
-
-```
-Forward Pass
-Weight Multiplication
-Error Propagation
-Gradient Updates
+```bash
+cargo run --release --example cuda_benchmark --features cuda
 ```
 
-It’s a **neural network engine you can fully understand**.
+See [INSTALL_CUDA.md](INSTALL_CUDA.md) for driver, toolkit, and cuBLAS setup.
+
+## Scope
+
+The current focus is dense neural networks and inference interop. Convolution
+layers, transformer experiments, mixed precision, and full GPU training are
+future work.

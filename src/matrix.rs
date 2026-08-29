@@ -1,8 +1,8 @@
-//matrix.rs
-use rand::Rng;
 use crate::tensor::Tensor;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
@@ -10,8 +10,12 @@ pub struct Matrix {
 }
 
 impl Tensor for Matrix {
-    fn rows(&self) -> usize { self.rows }
-    fn cols(&self) -> usize { self.cols }
+    fn rows(&self) -> usize {
+        self.rows
+    }
+    fn cols(&self) -> usize {
+        self.cols
+    }
 
     fn new(rows: usize, cols: usize) -> Self {
         Matrix::new(rows, cols)
@@ -70,6 +74,11 @@ impl Matrix {
     pub fn random(rows: usize, cols: usize) -> Self {
         let mut rng = rand::thread_rng();
         let data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(0.0..1.0)).collect();
+        Self { rows, cols, data }
+    }
+
+    pub fn from_vec(rows: usize, cols: usize, data: Vec<f32>) -> Self {
+        assert_eq!(data.len(), rows * cols);
         Self { rows, cols, data }
     }
 
@@ -205,4 +214,20 @@ impl Matrix {
     pub fn copy_from_slice(&mut self, source: &[f32]) {
         self.data.copy_from_slice(source);
     }
-}   
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_multiplies_row_major_matrices() {
+        let left = Matrix::from_vec(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let right = Matrix::from_vec(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let mut output = Matrix::new(2, 2);
+
+        left.dot(&right, &mut output);
+
+        assert_eq!(output.data, vec![58.0, 64.0, 139.0, 154.0]);
+    }
+}

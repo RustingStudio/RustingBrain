@@ -1,4 +1,3 @@
-//tensor.rs
 pub trait Tensor: Clone {
     fn rows(&self) -> usize;
     fn cols(&self) -> usize;

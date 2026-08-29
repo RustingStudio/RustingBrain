@@ -1,4 +1,10 @@
 /target
+.idea/
+.vscode/
+.DS_Store
+*.onnx
+!examples/fixtures/*.onnx
+*.profraw
 perf.data
 perf.data.old
 flamegraph.svg
