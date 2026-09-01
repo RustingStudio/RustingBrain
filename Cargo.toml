@@ -19,19 +19,22 @@ rand = { version = "0.8", features =["std", "std_rng"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-cudarc = { version = "0.19.3", optional = true, default-features = false, features = ["std", "cublas", "dynamic-loading"] }
+cudarc = { version = "0.19.3", optional = true, default-features = false, features = ["std", "cublas", "dynamic-loading", "cuda-13010"] }
 tract-onnx = { version = "0.21", optional = true }
 
 [features]
 default = []
-cuda = ["cuda-13-1"]
-cuda-11-8 = ["dep:cudarc", "cudarc/cuda-11080"]
-cuda-12-0 = ["dep:cudarc", "cudarc/cuda-12000"]
-cuda-12-4 = ["dep:cudarc", "cudarc/cuda-12040"]
-cuda-12-6 = ["dep:cudarc", "cudarc/cuda-12060"]
-cuda-12-8 = ["dep:cudarc", "cudarc/cuda-12080"]
-cuda-13-0 = ["dep:cudarc", "cudarc/cuda-13000"]
-cuda-13-1 = ["dep:cudarc", "cudarc/cuda-13010"]
+cuda = ["dep:cudarc"]
+# Compatibility aliases. Cargo features are additive, so selecting a concrete
+# ABI in each alias makes `--all-features` invalid. The crate now has one
+# supported backend ABI and keeps the historic names as source-compatible aliases.
+cuda-11-8 = ["cuda"]
+cuda-12-0 = ["cuda"]
+cuda-12-4 = ["cuda"]
+cuda-12-6 = ["cuda"]
+cuda-12-8 = ["cuda"]
+cuda-13-0 = ["cuda"]
+cuda-13-1 = ["cuda"]
 onnx = ["dep:tract-onnx"]
 
 [profile.release]

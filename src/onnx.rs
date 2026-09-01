@@ -47,8 +47,11 @@ mod enabled {
     use tract_onnx::prelude::*;
     use tract_onnx::tract_hir::internal::DimLike;
 
+    type TractRunnable =
+        RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+
     pub struct OnnxModel {
-        model: RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
+        model: TractRunnable,
         input_shape: Vec<usize>,
     }
 

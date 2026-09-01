@@ -3,7 +3,7 @@ use crate::dataset::Dataset;
 use crate::losses::Loss;
 use crate::matrix::Matrix;
 use crate::optimizers::Optimizer;
-use rand::Rng;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
@@ -18,6 +18,8 @@ pub enum NetworkError {
     InvalidTarget { expected: usize, actual: usize },
     #[error("dataset is empty")]
     EmptyDataset,
+    #[error("invalid network snapshot: {0}")]
+    InvalidSnapshot(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
@@ -50,6 +52,7 @@ pub struct NetworkBuilder {
     layers: Vec<Dense>,
     loss: Loss,
     optimizer: Optimizer,
+    seed: Option<u64>,
 }
 
 impl NetworkBuilder {
@@ -59,6 +62,7 @@ impl NetworkBuilder {
             layers: Vec::new(),
             loss: Loss::Mse,
             optimizer: Optimizer::sgd(0.01),
+            seed: None,
         }
     }
 
@@ -80,6 +84,12 @@ impl NetworkBuilder {
 
     pub fn optimizer(mut self, optimizer: Optimizer) -> Self {
         self.optimizer = optimizer;
+        self
+    }
+
+    /// Uses a deterministic random stream for weight initialization.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
         self
     }
 
@@ -187,7 +197,9 @@ impl Network {
             return Err(NetworkError::EmptyArchitecture);
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = builder
+            .seed
+            .map_or_else(StdRng::from_entropy, StdRng::seed_from_u64);
         let mut previous = input_size;
         let mut layers = Vec::with_capacity(builder.layers.len());
 
@@ -254,7 +266,7 @@ impl Network {
     }
 
     pub fn output_size(&self) -> usize {
-        self.layers.last().unwrap().biases.rows
+        self.layers.last().map_or(0, |layer| layer.biases.rows)
     }
 
     pub fn layers(&self) -> &[DenseLayer] {
@@ -382,6 +394,7 @@ impl Network {
     pub fn load_json<P: AsRef<Path>>(path: P) -> Result<Self, NetworkError> {
         let json = std::fs::read_to_string(path)?;
         let snapshot: NetworkSnapshot = serde_json::from_str(&json)?;
+        validate_snapshot(&snapshot)?;
         Ok(Self::with_layers(
             snapshot.input_size,
             snapshot.layers,
@@ -542,6 +555,38 @@ impl Network {
     }
 }
 
+fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<(), NetworkError> {
+    if snapshot.version != 1 {
+        return Err(NetworkError::InvalidSnapshot(format!(
+            "unsupported version {}",
+            snapshot.version
+        )));
+    }
+    if snapshot.input_size == 0 || snapshot.layers.is_empty() {
+        return Err(NetworkError::InvalidSnapshot(
+            "input size and layers must be non-empty".to_owned(),
+        ));
+    }
+    let mut expected_inputs = snapshot.input_size;
+    for (index, layer) in snapshot.layers.iter().enumerate() {
+        if layer.weights.rows == 0
+            || layer.weights.cols != expected_inputs
+            || layer.weights.data.len() != layer.weights.rows * layer.weights.cols
+            || layer.biases.rows != layer.weights.rows
+            || layer.biases.cols != 1
+            || layer.biases.data.len() != layer.biases.rows
+            || layer.weights.data.iter().any(|value| !value.is_finite())
+            || layer.biases.data.iter().any(|value| !value.is_finite())
+        {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "layer {index} has inconsistent dimensions or non-finite values"
+            )));
+        }
+        expected_inputs = layer.weights.rows;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct AdamHyperparams {
     learning_rate: f32,
@@ -681,5 +726,21 @@ mod tests {
                 actual: 1
             }
         ));
+    }
+
+    #[test]
+    fn identical_builder_seeds_produce_identical_predictions() {
+        let build = || {
+            Network::builder()
+                .input_size(2)
+                .dense(3, Activation::Relu)
+                .dense(1, Activation::Linear)
+                .seed(17)
+                .build()
+        };
+        assert_eq!(
+            build().predict(&[0.25, -0.5]).unwrap(),
+            build().predict(&[0.25, -0.5]).unwrap()
+        );
     }
 }
