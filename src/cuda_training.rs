@@ -562,13 +562,17 @@ fn gemm(
     units: usize,
 ) -> Result<(), NetworkError> {
     let c = GemmConfig {
-        transa: cublasOperation_t::CUBLAS_OP_N,
+        // `w` is stored row-major as [units, input]. cuBLAS reads the same
+        // bytes as column-major [input, units] (W^T), so OP_T is required to
+        // compute Z^T = W * X^T. The old OP_N path was only shape-compatible;
+        // it multiplied a scrambled interpretation of W for non-square layers.
+        transa: cublasOperation_t::CUBLAS_OP_T,
         transb: cublasOperation_t::CUBLAS_OP_N,
         m: units as i32,
         n: batch as i32,
         k: input as i32,
         alpha: 1.,
-        lda: units as i32,
+        lda: input as i32,
         ldb: input as i32,
         beta: 0.,
         ldc: units as i32,
@@ -676,5 +680,85 @@ mod tests {
     #[test]
     fn cuda_adam_one_batch_update_matches_cpu_or_skips_without_device() {
         assert_update_parity(Optimizer::adam(0.01), 2e-5);
+    }
+
+    /// This deliberately exercises the failure mode that a one-layer/one-batch
+    /// test misses: rectangular dense layers, a short final batch, shuffling,
+    /// and a complete optimizer epoch. Keep this fixture aligned with the
+    /// production universe feature width when RustingTrade changes it.
+    fn assert_full_epoch_parity(optimizer: Optimizer, tolerance: f32) {
+        if !cuda_or_skip() {
+            return;
+        }
+        let inputs: Vec<Vec<f32>> = (0..19)
+            .map(|row| {
+                (0..8)
+                    .map(|col| ((row * 13 + col * 7) as f32 - 80.0) / 37.0)
+                    .collect()
+            })
+            .collect();
+        let targets: Vec<Vec<f32>> = inputs
+            .iter()
+            .map(|x| vec![0.3 * x[0] - 0.2 * x[3] + 0.1 * x[6] + 0.05])
+            .collect();
+        let data = Dataset::new(inputs, targets);
+        let base = Network::builder()
+            .input_size(8)
+            .dense(13, Activation::Relu)
+            .dense(7, Activation::Tanh)
+            .dense(1, Activation::Linear)
+            .loss(Loss::Mse)
+            .optimizer(optimizer)
+            .seed(0x5eed)
+            .build();
+        let config = TrainConfig {
+            epochs: 1,
+            batch_size: 6,
+            shuffle: true,
+            seed: Some(0x1234),
+        };
+        let mut cpu = base.clone();
+        let mut gpu = base;
+        let cpu_history = cpu.fit(&data, config).unwrap();
+        let gpu_history = gpu
+            .fit_with_backend(
+                &data,
+                config,
+                crate::TrainingBackend::Cuda {
+                    device: 0,
+                    memory_budget_mib: 8192,
+                },
+            )
+            .unwrap();
+        assert!(
+            (cpu_history.losses[0] - gpu_history.losses[0]).abs() <= tolerance,
+            "full-epoch loss differs: CPU={} GPU={}",
+            cpu_history.losses[0],
+            gpu_history.losses[0]
+        );
+        for (cpu_layer, gpu_layer) in cpu.layers.iter().zip(&gpu.layers) {
+            for (left, right) in cpu_layer
+                .weights
+                .data
+                .iter()
+                .chain(&cpu_layer.biases.data)
+                .zip(gpu_layer.weights.data.iter().chain(&gpu_layer.biases.data))
+            {
+                assert!(
+                    (left - right).abs() <= tolerance,
+                    "full-epoch parameter mismatch: CPU={left} GPU={right}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_full_network_sgd_epoch_matches_cpu_or_skips_without_device() {
+        assert_full_epoch_parity(Optimizer::sgd(0.01), 1e-5);
+    }
+
+    #[test]
+    fn cuda_full_network_adam_epoch_matches_cpu_or_skips_without_device() {
+        assert_full_epoch_parity(Optimizer::adam(0.005), 2e-5);
     }
 }
