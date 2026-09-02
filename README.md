@@ -18,7 +18,7 @@ where readable Rust code matters more than having every deep-learning feature.
 - Mini-batch training with reproducible shuffling
 - JSON save/load for RustingBrain models
 - ONNX inference for models trained elsewhere
-- Optional CUDA/cuBLAS matrix benchmark
+- Optional fail-closed FP32 CUDA training (MSE; linear/ReLU/tanh/sigmoid; SGD/Adam)
 
 ## Install
 
@@ -117,6 +117,21 @@ See [IMPORT_MODELS.md](IMPORT_MODELS.md) for the TensorFlow/Keras to ONNX flow.
 
 CUDA is optional. The normal crate build does not require CUDA, `nvcc`, or an
 NVIDIA GPU.
+
+## CUDA Training
+
+CUDA fitting is explicit and fail-closed: `TrainingBackend::Cuda` returns an
+error if the driver, cuBLAS, kernels, allocation, or numerical checks fail. It
+never switches to CPU training. JSON model artifacts remain unchanged, so a
+model trained on CUDA can be saved and loaded for ordinary CPU inference.
+
+```bash
+cargo test --features cuda
+cargo run --example cuda_training_smoke --features cuda
+```
+
+For a 12 GiB RTX 3060, RustingTrade should request an application budget of
+`8192` MiB, leaving capacity for the desktop, driver, and other processes.
 
 To compile the CUDA benchmark support:
 

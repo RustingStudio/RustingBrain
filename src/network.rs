@@ -24,6 +24,32 @@ pub enum NetworkError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("CUDA backend is unavailable: this crate was built without the `cuda` feature")]
+    CudaFeatureDisabled,
+    #[error("CUDA backend error: {0}")]
+    Cuda(String),
+    #[error("CUDA backend does not support {0}")]
+    UnsupportedCuda(String),
+    #[error(
+        "CUDA memory budget exceeded: estimated {estimated_mib} MiB exceeds budget {budget_mib} MiB"
+    )]
+    CudaMemoryBudget {
+        estimated_mib: usize,
+        budget_mib: usize,
+    },
+    #[error("invalid CUDA checkpoint: {0}")]
+    InvalidCudaCheckpoint(String),
+}
+
+/// Selects where fitting is performed. CUDA is deliberately fail-closed: a CUDA
+/// request never falls back to CPU training.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingBackend {
+    Cpu,
+    Cuda {
+        device: usize,
+        memory_budget_mib: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,6 +158,49 @@ pub struct TrainingHistory {
     pub losses: Vec<f32>,
 }
 
+/// Device-independent optimizer state for resuming CUDA fitting. It contains no
+/// CUDA handles or pointers and is safe to serialize as JSON.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CudaTrainingCheckpoint {
+    pub version: u32,
+    pub epoch: usize,
+    pub optimizer_step: usize,
+    pub shuffle_seed: Option<u64>,
+    pub input_size: usize,
+    pub layers: Vec<DenseLayer>,
+    pub loss: Loss,
+    pub optimizer: Optimizer,
+    pub adam_m_weights: Vec<Matrix>,
+    pub adam_v_weights: Vec<Matrix>,
+    pub adam_m_biases: Vec<Matrix>,
+    pub adam_v_biases: Vec<Matrix>,
+}
+
+impl CudaTrainingCheckpoint {
+    pub fn save_json<P: AsRef<Path>>(&self, path: P) -> Result<(), NetworkError> {
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    pub fn load_json<P: AsRef<Path>>(path: P) -> Result<Self, NetworkError> {
+        let checkpoint: Self = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        if checkpoint.version != 1 {
+            return Err(NetworkError::InvalidCudaCheckpoint(
+                "unsupported version".into(),
+            ));
+        }
+        let snapshot = NetworkSnapshot {
+            version: 1,
+            input_size: checkpoint.input_size,
+            layers: checkpoint.layers.clone(),
+            loss: checkpoint.loss,
+        };
+        validate_snapshot(&snapshot)
+            .map_err(|e| NetworkError::InvalidCudaCheckpoint(e.to_string()))?;
+        Ok(checkpoint)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct NetworkSnapshot {
     version: u32,
@@ -142,15 +211,15 @@ struct NetworkSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Network {
-    input_size: usize,
-    layers: Vec<DenseLayer>,
-    loss: Loss,
-    optimizer: Optimizer,
-    adam_step: usize,
-    adam_m_weights: Vec<Matrix>,
-    adam_v_weights: Vec<Matrix>,
-    adam_m_biases: Vec<Matrix>,
-    adam_v_biases: Vec<Matrix>,
+    pub(crate) input_size: usize,
+    pub(crate) layers: Vec<DenseLayer>,
+    pub(crate) loss: Loss,
+    pub(crate) optimizer: Optimizer,
+    pub(crate) adam_step: usize,
+    pub(crate) adam_m_weights: Vec<Matrix>,
+    pub(crate) adam_v_weights: Vec<Matrix>,
+    pub(crate) adam_m_biases: Vec<Matrix>,
+    pub(crate) adam_v_biases: Vec<Matrix>,
 }
 
 #[derive(Clone, Debug)]
@@ -364,6 +433,111 @@ impl Network {
         Ok(TrainingHistory { losses })
     }
 
+    /// Fits using the requested backend. CPU behavior is unchanged; CUDA never
+    /// silently delegates to CPU on an initialization or execution failure.
+    pub fn fit_with_backend(
+        &mut self,
+        dataset: &Dataset,
+        config: TrainConfig,
+        backend: TrainingBackend,
+    ) -> Result<TrainingHistory, NetworkError> {
+        match backend {
+            TrainingBackend::Cpu => self.fit(dataset, config),
+            TrainingBackend::Cuda {
+                device,
+                memory_budget_mib,
+            } => {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda_training::fit_cuda(self, dataset, config, device, memory_budget_mib)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = (dataset, config, device, memory_budget_mib);
+                    Err(NetworkError::CudaFeatureDisabled)
+                }
+            }
+        }
+    }
+
+    pub fn cuda_checkpoint(
+        &self,
+        epoch: usize,
+        shuffle_seed: Option<u64>,
+    ) -> CudaTrainingCheckpoint {
+        CudaTrainingCheckpoint {
+            version: 1,
+            epoch,
+            optimizer_step: self.adam_step,
+            shuffle_seed,
+            input_size: self.input_size,
+            layers: self.layers.clone(),
+            loss: self.loss,
+            optimizer: self.optimizer.clone(),
+            adam_m_weights: self.adam_m_weights.clone(),
+            adam_v_weights: self.adam_v_weights.clone(),
+            adam_m_biases: self.adam_m_biases.clone(),
+            adam_v_biases: self.adam_v_biases.clone(),
+        }
+    }
+
+    pub fn restore_cuda_checkpoint(
+        &mut self,
+        checkpoint: CudaTrainingCheckpoint,
+    ) -> Result<(), NetworkError> {
+        if checkpoint.version != 1 {
+            return Err(NetworkError::InvalidCudaCheckpoint(
+                "unsupported version".into(),
+            ));
+        }
+        let snapshot = NetworkSnapshot {
+            version: 1,
+            input_size: checkpoint.input_size,
+            layers: checkpoint.layers.clone(),
+            loss: checkpoint.loss,
+        };
+        validate_snapshot(&snapshot)?;
+        let n = checkpoint.layers.len();
+        if checkpoint.adam_m_weights.len() != n
+            || checkpoint.adam_v_weights.len() != n
+            || checkpoint.adam_m_biases.len() != n
+            || checkpoint.adam_v_biases.len() != n
+        {
+            return Err(NetworkError::InvalidCudaCheckpoint(
+                "moment tensor count does not match layers".into(),
+            ));
+        }
+        for i in 0..n {
+            if checkpoint.adam_m_weights[i].data.len() != checkpoint.layers[i].weights.data.len()
+                || checkpoint.adam_v_weights[i].data.len()
+                    != checkpoint.layers[i].weights.data.len()
+                || checkpoint.adam_m_biases[i].data.len() != checkpoint.layers[i].biases.data.len()
+                || checkpoint.adam_v_biases[i].data.len() != checkpoint.layers[i].biases.data.len()
+                || checkpoint.adam_m_weights[i]
+                    .data
+                    .iter()
+                    .chain(&checkpoint.adam_v_weights[i].data)
+                    .chain(&checkpoint.adam_m_biases[i].data)
+                    .chain(&checkpoint.adam_v_biases[i].data)
+                    .any(|v| !v.is_finite())
+            {
+                return Err(NetworkError::InvalidCudaCheckpoint(format!(
+                    "invalid moments for layer {i}"
+                )));
+            }
+        }
+        self.input_size = checkpoint.input_size;
+        self.layers = checkpoint.layers;
+        self.loss = checkpoint.loss;
+        self.optimizer = checkpoint.optimizer;
+        self.adam_step = checkpoint.optimizer_step;
+        self.adam_m_weights = checkpoint.adam_m_weights;
+        self.adam_v_weights = checkpoint.adam_v_weights;
+        self.adam_m_biases = checkpoint.adam_m_biases;
+        self.adam_v_biases = checkpoint.adam_v_biases;
+        Ok(())
+    }
+
     pub fn evaluate_loss(&self, dataset: &Dataset) -> Result<f32, NetworkError> {
         if dataset.is_empty() {
             return Err(NetworkError::EmptyDataset);
@@ -533,7 +707,7 @@ impl Network {
         }
     }
 
-    fn validate_input(&self, input: &[f32]) -> Result<(), NetworkError> {
+    pub(crate) fn validate_input(&self, input: &[f32]) -> Result<(), NetworkError> {
         if input.len() != self.input_size {
             return Err(NetworkError::InvalidInput {
                 expected: self.input_size,
@@ -543,7 +717,7 @@ impl Network {
         Ok(())
     }
 
-    fn validate_target(&self, target: &[f32]) -> Result<(), NetworkError> {
+    pub(crate) fn validate_target(&self, target: &[f32]) -> Result<(), NetworkError> {
         let output_size = self.output_size();
         if target.len() != output_size {
             return Err(NetworkError::InvalidTarget {

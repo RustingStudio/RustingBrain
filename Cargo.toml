@@ -19,7 +19,7 @@ rand = { version = "0.8", features =["std", "std_rng"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-cudarc = { version = "0.19.3", optional = true, default-features = false, features = ["std", "cublas", "dynamic-loading", "cuda-13010"] }
+cudarc = { version = "0.19.3", optional = true, default-features = false, features = ["std", "cublas", "nvrtc", "runtime", "dynamic-loading", "cuda-13010"] }
 tract-onnx = { version = "0.21", optional = true }
 
 [features]
@@ -36,6 +36,10 @@ cuda-12-8 = ["cuda"]
 cuda-13-0 = ["cuda"]
 cuda-13-1 = ["cuda"]
 onnx = ["dep:tract-onnx"]
+
+[[example]]
+name = "cuda_training_smoke"
+required-features = ["cuda"]
 
 [profile.release]
 opt-level = 3

@@ -1,7 +1,8 @@
 # CUDA Setup
 
-RustingBrain builds and trains on CPU by default. CUDA is only needed for the
-GPU matrix benchmark and later GPU backend work.
+RustingBrain builds and trains on CPU by default. CUDA is needed only when you
+select `TrainingBackend::Cuda`; that backend is fail-closed and will return an
+error rather than silently train on CPU.
 
 The CUDA feature uses dynamic loading, so Rust can compile the feature without
 calling `nvcc` during the build. Running the benchmark still requires an NVIDIA
@@ -13,13 +14,19 @@ Compile CUDA support:
 
 ```bash
 cargo check --features cuda
+cargo test --features cuda
 ```
 
 Run the benchmark:
 
 ```bash
 cargo run --release --example cuda_benchmark --features cuda
+cargo run --example cuda_training_smoke --features cuda
 ```
+
+The training smoke example runs the CUDA doctor (driver, cuBLAS, kernels,
+memory, allocation) and then trains a small MSE regression model. On a 12 GiB
+RTX 3060, configure RustingTrade with `memory_budget_mib: 8192`.
 
 The `cuda` feature currently points to CUDA 13.1 bindings. Other binding
 versions are available:

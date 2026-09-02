@@ -9,6 +9,8 @@ pub mod serialization;
 pub mod tensor;
 
 #[cfg(feature = "cuda")]
+pub mod cuda_training;
+#[cfg(feature = "cuda")]
 pub mod gpu_matrix;
 #[cfg(feature = "cuda")]
 pub mod gpu_test;
@@ -16,10 +18,13 @@ pub mod gpu_test;
 pub mod onnx;
 
 pub use activations::Activation;
+#[cfg(feature = "cuda")]
+pub use cuda_training::{CudaDoctorReport, cuda_doctor};
 pub use dataset::{Dataset, DatasetBatch};
 pub use losses::Loss;
 pub use matrix::Matrix;
 pub use network::{
-    Dense, DenseLayer, Network, NetworkBuilder, NetworkError, TrainConfig, TrainingHistory,
+    CudaTrainingCheckpoint, Dense, DenseLayer, Network, NetworkBuilder, NetworkError, TrainConfig,
+    TrainingBackend, TrainingHistory,
 };
 pub use optimizers::Optimizer;
