@@ -13,10 +13,16 @@ use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
-const MIB: usize = 1024 * 1024;
+pub(crate) use crate::accelerator::MIB;
+/// Backwards-compatible name for the shared session measurements.
+pub use crate::accelerator::AcceleratorStats as CudaTrainingStats;
+/// Re-exported so `cuda_training::estimate_tensor_memory_mib` keeps resolving;
+/// the estimate itself is backend-independent and lives in `accelerator`.
+pub use crate::accelerator::estimate_tensor_memory_mib;
+
 const KERNELS: &str = r#"
 extern "C" __global__ void bias_act(float *x,const float*b,int rows,int cols,int act){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*cols){float v=x[i]+b[i%cols];if(act==1)v=v>0?v:0;else if(act==2)v=1.f/(1.f+expf(-v));else if(act==3)v=tanhf(v);x[i]=v;}}
 extern "C" __global__ void output_delta(float*d,const float*y,const float*t,int n,int act){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=t[i]-y[i];float a=y[i];if(act==1)v*=a>0;else if(act==2)v*=a*(1-a);else if(act==3)v*=1-a*a;d[i]=v;}}
@@ -28,68 +34,6 @@ extern "C" __global__ void mse_sum(float *out,const float*y,const float*t,int n)
 extern "C" __global__ void mse_epoch_sum(float *out,const float*y,const float*t,int n,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=y[i]-t[i];atomicAdd(out,z*z*scale);}}
 extern "C" __global__ void gather_rows(float*out,const float*all,const unsigned int*order,int start,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*width){int r=i/width,c=i%width;out[i]=all[order[start+r]*width+c];}}
 "#;
-
-/// Measurements for the lifetime of a persistent CUDA training session.
-#[derive(Clone, Debug, Default)]
-pub struct CudaTrainingStats {
-    /// Bytes owned by CUDA allocations at the high-water mark (driver overhead excluded).
-    pub peak_allocated_bytes: usize,
-    pub setup_time: Duration,
-    pub training_time: Duration,
-    pub checkpoint_time: Duration,
-    pub epochs: usize,
-    pub batches: usize,
-    pub host_to_device_bytes: usize,
-    pub device_to_host_bytes: usize,
-    pub dataset_resident: bool,
-}
-
-/// Conservative tensor allocation estimate (MiB, rounded up). This is public
-/// so applications can reject an unsuitable configuration before touching CUDA.
-pub fn estimate_tensor_memory_mib(
-    network: &Network,
-    batch_size: usize,
-) -> Result<usize, NetworkError> {
-    if batch_size == 0 {
-        return Err(NetworkError::Cuda("batch size must be non-zero".into()));
-    }
-    let mut floats = 0usize;
-    let input = network.input_size;
-    floats = floats
-        .checked_add(
-            batch_size
-                .checked_mul(input)
-                .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?,
-        )
-        .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?;
-    for l in &network.layers {
-        let p = l.weights.data.len() + l.biases.data.len();
-        // parameter, gradient, and both Adam moments (also allocate for SGD for a stable upper bound)
-        floats = floats
-            .checked_add(
-                p.checked_mul(4)
-                    .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?,
-            )
-            .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?;
-        let a = batch_size
-            .checked_mul(l.weights.rows)
-            .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?;
-        // activation and delta
-        floats = floats
-            .checked_add(
-                a.checked_mul(2)
-                    .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?,
-            )
-            .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?;
-    }
-    floats = floats
-        .checked_add(1)
-        .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?;
-    Ok(floats
-        .checked_mul(4)
-        .ok_or_else(|| NetworkError::Cuda("tensor size overflow".into()))?
-        .div_ceil(MIB))
-}
 
 #[derive(Clone, Debug)]
 pub struct CudaDoctorReport {

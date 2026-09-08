@@ -40,10 +40,30 @@ pub enum NetworkError {
     },
     #[error("invalid CUDA checkpoint: {0}")]
     InvalidCudaCheckpoint(String),
+    #[error(
+        "Metal backend is unavailable: this crate was built without the `metal` feature, \
+         or for a platform that has no Metal"
+    )]
+    MetalFeatureDisabled,
+    #[error("Metal backend error: {0}")]
+    Metal(String),
+    #[error("Metal backend does not support {0}")]
+    UnsupportedMetal(String),
+    #[error(
+        "Metal memory budget exceeded: estimated {estimated_mib} MiB exceeds budget {budget_mib} MiB"
+    )]
+    MetalMemoryBudget {
+        estimated_mib: usize,
+        budget_mib: usize,
+    },
+    #[error("accelerator backend error: {0}")]
+    Accelerator(String),
 }
 
-/// Selects where fitting is performed. CUDA is deliberately fail-closed: a CUDA
-/// request never falls back to CPU training.
+/// Selects where fitting is performed. The accelerator backends are
+/// deliberately fail-closed: a CUDA or Metal request never falls back to CPU
+/// training, because silently turning a GPU study into a CPU one changes how
+/// long it runs by more than an order of magnitude.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrainingBackend {
     Cpu,
@@ -51,6 +71,27 @@ pub enum TrainingBackend {
         device: usize,
         memory_budget_mib: usize,
     },
+    /// Apple Silicon (and any other Metal device). `device` indexes
+    /// `metal::Device::all()`; 0 is the system default.
+    Metal {
+        device: usize,
+        memory_budget_mib: usize,
+    },
+}
+
+impl TrainingBackend {
+    /// Lowercase backend name, for messages and report files.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda { .. } => "cuda",
+            Self::Metal { .. } => "metal",
+        }
+    }
+
+    pub fn is_accelerated(self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,8 +219,16 @@ pub struct CudaTrainingCheckpoint {
 }
 
 impl CudaTrainingCheckpoint {
+    /// Writes the checkpoint as compact JSON straight into a buffered file.
+    /// `to_string_pretty` on a multi-megabyte optimizer state spends most of
+    /// its time emitting indentation that nothing reads back, and it has to
+    /// materialize the whole document in memory first; streaming the compact
+    /// form is the same data in roughly a third of the bytes.
     pub fn save_json<P: AsRef<Path>>(&self, path: P) -> Result<(), NetworkError> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, self)?;
+        std::io::Write::flush(&mut writer)?;
         Ok(())
     }
 
@@ -237,16 +286,66 @@ struct InferenceScratch {
 
 impl InferenceScratch {
     fn for_network(network: &Network) -> Self {
-        let widest = network
-            .layers
-            .iter()
-            .map(|layer| layer.weights.rows)
-            .chain(std::iter::once(network.input_size))
-            .max()
-            .unwrap_or(0);
+        let widest = widest_layer(network);
         Self {
             current: vec![0.0; widest],
             next: vec![0.0; widest],
+        }
+    }
+}
+
+fn widest_layer(network: &Network) -> usize {
+    network
+        .layers
+        .iter()
+        .map(|layer| layer.weights.rows)
+        .chain(std::iter::once(network.input_size))
+        .max()
+        .unwrap_or(0)
+}
+
+/// How many samples `forward_inference_tile` evaluates side by side.
+///
+/// A single-sample forward pass is a chain of `value += weight * input`, and
+/// because f32 addition is not associative the compiler may not reorder it into
+/// independent partial sums. The chain therefore runs at the latency of one
+/// dependent add per weight -- measured at 0.9 GFLOP/s per core on a 908-input
+/// network, a small fraction of what the core can issue.
+///
+/// Evaluating a tile of samples together fixes that without touching the
+/// arithmetic: each sample still accumulates over its inputs in exactly the
+/// same order, so every result is bit-for-bit what the scalar path produced,
+/// but the tile's accumulators are independent of each other and the inner loop
+/// vectorises across them. Eight is one AVX2 f32 vector.
+const INFERENCE_TILE: usize = 8;
+
+/// Samples handed to one rayon task. A multiple of [`INFERENCE_TILE`], and big
+/// enough that scheduling one task costs nothing next to running it.
+const INFERENCE_CHUNK: usize = 512;
+
+/// Samples per rayon task in [`Network::train_batch_parallel`]. Backward is
+/// roughly three times the work of forward per sample, so a smaller chunk than
+/// [`INFERENCE_CHUNK`] still hides the task overhead while giving a typical
+/// 1024-sample batch enough pieces to fill every core of an M-series or
+/// desktop CPU.
+pub const GRADIENT_CHUNK: usize = 64;
+
+/// Ping-ponged activations for a tile of samples, laid out unit-major with the
+/// tile contiguous (`value[unit * INFERENCE_TILE + sample]`) so the inner loop
+/// reads one vector per unit.
+struct TiledInferenceScratch {
+    current: Vec<f32>,
+    next: Vec<f32>,
+    single: InferenceScratch,
+}
+
+impl TiledInferenceScratch {
+    fn for_network(network: &Network) -> Self {
+        let widest = widest_layer(network);
+        Self {
+            current: vec![0.0; widest * INFERENCE_TILE],
+            next: vec![0.0; widest * INFERENCE_TILE],
+            single: InferenceScratch::for_network(network),
         }
     }
 }
@@ -382,12 +481,16 @@ impl Network {
         for input in inputs {
             self.validate_input(input)?;
         }
+        // Chunks are large enough that rayon's per-task overhead disappears
+        // next to the work, and a multiple of the tile so only the dataset's
+        // own remainder takes the single-sample path.
         Ok(inputs
-            .par_iter()
+            .par_chunks(INFERENCE_CHUNK)
             .map_init(
-                || InferenceScratch::for_network(self),
-                |scratch, input| self.forward_inference(input, scratch).to_vec(),
+                || TiledInferenceScratch::for_network(self),
+                |scratch, chunk| self.forward_inference_chunk(chunk, scratch),
             )
+            .flatten()
             .collect())
     }
 
@@ -425,13 +528,62 @@ impl Network {
         Ok(loss * scale)
     }
 
+    /// Same gradient step as [`Network::train_batch`], spread over rayon.
+    ///
+    /// Samples are reduced in fixed-size chunks taken in index order and the
+    /// chunk gradients are then summed in that same order, so the result
+    /// depends only on the batch contents -- not on the thread count, the pool
+    /// size, or how rayon happened to split the work. It is *not* bit-for-bit
+    /// equal to `train_batch`, because a chunked sum associates the additions
+    /// differently; it is equal to `train_batch` for batches of at most
+    /// [`GRADIENT_CHUNK`] samples, which take that path directly.
     pub fn train_batch_parallel(
         &mut self,
         inputs: &[Vec<f32>],
         targets: &[Vec<f32>],
         _num_threads: usize,
     ) -> Result<f32, NetworkError> {
-        self.train_batch(inputs, targets)
+        if inputs.is_empty() {
+            return Err(NetworkError::EmptyDataset);
+        }
+        assert_eq!(inputs.len(), targets.len());
+        if inputs.len() <= GRADIENT_CHUNK {
+            return self.train_batch(inputs, targets);
+        }
+        for (input, target) in inputs.iter().zip(targets) {
+            self.validate_input(input)?;
+            self.validate_target(target)?;
+        }
+        // `map` + an ordered `collect` rather than `reduce`: rayon's reduction
+        // order is a function of the thread count, and two machines must not
+        // disagree about a trained model.
+        let partials: Vec<(Gradients, f32)> = inputs
+            .par_chunks(GRADIENT_CHUNK)
+            .zip(targets.par_chunks(GRADIENT_CHUNK))
+            .map(|(inputs, targets)| {
+                let mut gradients = Gradients::zeros(&self.layers);
+                let mut loss = 0.0;
+                for (input, target) in inputs.iter().zip(targets) {
+                    let (prediction, caches) = self.forward_internal(input);
+                    loss += self.loss.value(&prediction, target);
+                    let sample_grads = self.backward(&prediction, target, &caches);
+                    gradients.add_assign(&sample_grads);
+                }
+                (gradients, loss)
+            })
+            .collect();
+
+        let mut gradients = Gradients::zeros(&self.layers);
+        let mut loss = 0.0;
+        for (chunk_gradients, chunk_loss) in &partials {
+            gradients.add_assign(chunk_gradients);
+            loss += chunk_loss;
+        }
+        let scale = 1.0 / inputs.len() as f32;
+        gradients.scale(scale);
+        self.apply_gradients(&gradients);
+
+        Ok(loss * scale)
     }
 
     pub fn fit(
@@ -455,7 +607,8 @@ impl Network {
             let mut epoch_loss = 0.0;
             let mut batches = 0;
             for batch in working.batches(config.batch_size.max(1)) {
-                epoch_loss += self.train_batch(batch.inputs, batch.targets)?;
+                epoch_loss +=
+                    self.train_batch_parallel(batch.inputs, batch.targets, 0)?;
                 batches += 1;
             }
 
@@ -487,6 +640,26 @@ impl Network {
                 {
                     let _ = (dataset, config, device, memory_budget_mib);
                     Err(NetworkError::CudaFeatureDisabled)
+                }
+            }
+            TrainingBackend::Metal {
+                device,
+                memory_budget_mib,
+            } => {
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                {
+                    crate::metal_training::fit_metal(
+                        self,
+                        dataset,
+                        config,
+                        device,
+                        memory_budget_mib,
+                    )
+                }
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                {
+                    let _ = (dataset, config, device, memory_budget_mib);
+                    Err(NetworkError::MetalFeatureDisabled)
                 }
             }
         }
@@ -584,15 +757,21 @@ impl Network {
         // so the total does not depend on how rayon splits the work.
         let losses: Vec<f32> = dataset
             .inputs
-            .par_iter()
-            .zip(&dataset.targets)
+            .par_chunks(INFERENCE_CHUNK)
+            .zip(dataset.targets.par_chunks(INFERENCE_CHUNK))
             .map_init(
-                || InferenceScratch::for_network(self),
-                |scratch, (input, target)| {
-                    self.loss
-                        .value(self.forward_inference(input, scratch), target)
+                || TiledInferenceScratch::for_network(self),
+                |scratch, (inputs, targets)| {
+                    self.forward_inference_chunk(inputs, scratch)
+                        .into_iter()
+                        .zip(targets)
+                        .map(|(prediction, target)| {
+                            self.loss.value(&prediction, target)
+                        })
+                        .collect::<Vec<f32>>()
                 },
             )
+            .flatten()
             .collect();
 
         Ok(losses.iter().sum::<f32>() / dataset.len() as f32)
@@ -605,8 +784,10 @@ impl Network {
             layers: self.layers.clone(),
             loss: self.loss,
         };
-        let json = serde_json::to_string_pretty(&snapshot)?;
-        std::fs::write(path, json)?;
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &snapshot)?;
+        std::io::Write::flush(&mut writer)?;
         Ok(())
     }
 
@@ -655,6 +836,98 @@ impl Network {
         }
 
         &current[..width]
+    }
+
+    /// Forward exactly `INFERENCE_TILE` samples, writing each one's output row
+    /// into `outputs`.
+    ///
+    /// The column loop, and therefore each sample's accumulation order, is the
+    /// same one `forward_inference` walks; only the number of samples in flight
+    /// changes. See [`INFERENCE_TILE`].
+    fn forward_inference_tile(
+        &self,
+        inputs: &[Vec<f32>],
+        scratch: &mut TiledInferenceScratch,
+        outputs: &mut Vec<Vec<f32>>,
+    ) {
+        debug_assert_eq!(inputs.len(), INFERENCE_TILE);
+        let mut width = self.input_size;
+        for (column, value) in scratch.current[..width * INFERENCE_TILE]
+            .chunks_exact_mut(INFERENCE_TILE)
+            .enumerate()
+        {
+            for (sample, slot) in value.iter_mut().enumerate() {
+                *slot = inputs[sample][column];
+            }
+        }
+
+        for layer in &self.layers {
+            let units = layer.weights.rows;
+            let source = &scratch.current[..width * INFERENCE_TILE];
+            let destination = &mut scratch.next[..units * INFERENCE_TILE];
+
+            for (row, out) in
+                destination.chunks_exact_mut(INFERENCE_TILE).enumerate()
+            {
+                let mut accumulator = [layer.biases.data[row]; INFERENCE_TILE];
+                let weights = &layer.weights.data
+                    [row * layer.weights.cols..][..width];
+                for (weight, values) in
+                    weights.iter().zip(source.chunks_exact(INFERENCE_TILE))
+                {
+                    for (slot, value) in accumulator.iter_mut().zip(values) {
+                        *slot += weight * value;
+                    }
+                }
+                out.copy_from_slice(&accumulator);
+            }
+
+            if layer.activation == Activation::Softmax {
+                // Softmax normalises across a sample's units, not elementwise,
+                // so it cannot see the interleaved tile.
+                let mut column = vec![0.0; units];
+                for sample in 0..INFERENCE_TILE {
+                    for unit in 0..units {
+                        column[unit] = destination[unit * INFERENCE_TILE + sample];
+                    }
+                    layer.activation.apply_to_slice(&mut column);
+                    for unit in 0..units {
+                        destination[unit * INFERENCE_TILE + sample] = column[unit];
+                    }
+                }
+            } else {
+                layer.activation.apply_to_slice(destination);
+            }
+            std::mem::swap(&mut scratch.current, &mut scratch.next);
+            width = units;
+        }
+
+        for sample in 0..INFERENCE_TILE {
+            outputs.push(
+                (0..width)
+                    .map(|unit| scratch.current[unit * INFERENCE_TILE + sample])
+                    .collect(),
+            );
+        }
+    }
+
+    /// Forward a slice of samples, tile by tile, with any remainder falling
+    /// back to the single-sample path.
+    fn forward_inference_chunk(
+        &self,
+        inputs: &[Vec<f32>],
+        scratch: &mut TiledInferenceScratch,
+    ) -> Vec<Vec<f32>> {
+        let mut outputs = Vec::with_capacity(inputs.len());
+        let mut tiles = inputs.chunks_exact(INFERENCE_TILE);
+        for tile in &mut tiles {
+            self.forward_inference_tile(tile, scratch, &mut outputs);
+        }
+        for input in tiles.remainder() {
+            outputs
+                .push(self.forward_inference(input, &mut scratch.single).to_vec());
+        }
+        outputs
     }
 
     fn forward_internal(&self, input: &[f32]) -> (Vec<f32>, Vec<LayerCache>) {
