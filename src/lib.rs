@@ -19,7 +19,7 @@ pub mod onnx;
 
 pub use activations::Activation;
 #[cfg(feature = "cuda")]
-pub use cuda_training::{CudaDoctorReport, cuda_doctor};
+pub use cuda_training::{CudaDoctorReport, CudaTrainingSession, CudaTrainingStats, cuda_doctor};
 pub use dataset::{Dataset, DatasetBatch};
 pub use losses::Loss;
 pub use matrix::Matrix;

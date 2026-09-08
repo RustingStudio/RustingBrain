@@ -1,6 +1,6 @@
 [package]
 name = "rusting_brain"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A small Rust neural-network library for learning, training, and inference experiments."
 readme = "README.md"
@@ -39,6 +39,10 @@ onnx = ["dep:tract-onnx"]
 
 [[example]]
 name = "cuda_training_smoke"
+required-features = ["cuda"]
+
+[[example]]
+name = "cuda_persistent_training"
 required-features = ["cuda"]
 
 [profile.release]

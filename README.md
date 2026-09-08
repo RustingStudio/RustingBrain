@@ -125,9 +125,17 @@ error if the driver, cuBLAS, kernels, allocation, or numerical checks fail. It
 never switches to CPU training. JSON model artifacts remain unchanged, so a
 model trained on CUDA can be saved and loaded for ordinary CPU inference.
 
+For epoch-level checkpointing, keep the CUDA resources alive with
+`CudaTrainingSession`: call `train_epoch()` repeatedly and call `checkpoint()`
+only when a host snapshot is needed. `stats()` reports allocated tensor bytes,
+transfer counts, and setup/training/checkpoint timing. The complete dataset is
+kept on the device when it fits the configured memory budget; otherwise the
+session reuses staged batch buffers.
+
 ```bash
 cargo test --features cuda
 cargo run --example cuda_training_smoke --features cuda
+cargo run --release --example cuda_persistent_training --features cuda
 ```
 
 For a 12 GiB RTX 3060, RustingTrade should request an application budget of

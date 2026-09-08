@@ -4,6 +4,7 @@ use crate::losses::Loss;
 use crate::matrix::Matrix;
 use crate::optimizers::Optimizer;
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
@@ -228,6 +229,28 @@ struct LayerCache {
     output: Vec<f32>,
 }
 
+/// Two buffers wide enough for any layer, ping-ponged by `forward_inference`.
+struct InferenceScratch {
+    current: Vec<f32>,
+    next: Vec<f32>,
+}
+
+impl InferenceScratch {
+    fn for_network(network: &Network) -> Self {
+        let widest = network
+            .layers
+            .iter()
+            .map(|layer| layer.weights.rows)
+            .chain(std::iter::once(network.input_size))
+            .max()
+            .unwrap_or(0);
+        Self {
+            current: vec![0.0; widest],
+            next: vec![0.0; widest],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Gradients {
     weights: Vec<Matrix>,
@@ -356,7 +379,16 @@ impl Network {
     }
 
     pub fn predict_batch(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, NetworkError> {
-        inputs.iter().map(|input| self.predict(input)).collect()
+        for input in inputs {
+            self.validate_input(input)?;
+        }
+        Ok(inputs
+            .par_iter()
+            .map_init(
+                || InferenceScratch::for_network(self),
+                |scratch, input| self.forward_inference(input, scratch).to_vec(),
+            )
+            .collect())
     }
 
     pub fn train(&mut self, input: &[f32], target: &[f32]) -> Result<f32, NetworkError> {
@@ -543,14 +575,27 @@ impl Network {
             return Err(NetworkError::EmptyDataset);
         }
 
-        let mut loss = 0.0;
         for (input, target) in dataset.inputs.iter().zip(&dataset.targets) {
             self.validate_input(input)?;
             self.validate_target(target)?;
-            loss += self.loss.value(&self.predict(input)?, target);
         }
 
-        Ok(loss / dataset.len() as f32)
+        // Per-sample losses are collected in dataset order and only then summed,
+        // so the total does not depend on how rayon splits the work.
+        let losses: Vec<f32> = dataset
+            .inputs
+            .par_iter()
+            .zip(&dataset.targets)
+            .map_init(
+                || InferenceScratch::for_network(self),
+                |scratch, (input, target)| {
+                    self.loss
+                        .value(self.forward_inference(input, scratch), target)
+                },
+            )
+            .collect();
+
+        Ok(losses.iter().sum::<f32>() / dataset.len() as f32)
     }
 
     pub fn save_json<P: AsRef<Path>>(&self, path: P) -> Result<(), NetworkError> {
@@ -575,6 +620,41 @@ impl Network {
             snapshot.loss,
             Optimizer::sgd(0.01),
         ))
+    }
+
+    /// Inference-only forward pass that reuses two scratch buffers instead of
+    /// allocating a `Vec` and a discarded `LayerCache` per layer per sample.
+    /// The arithmetic and its order are identical to `forward_internal`, so
+    /// predictions stay bit-for-bit the same.
+    fn forward_inference<'s>(
+        &self,
+        input: &[f32],
+        scratch: &'s mut InferenceScratch,
+    ) -> &'s [f32] {
+        let InferenceScratch { current, next } = scratch;
+        let mut width = input.len();
+        current[..width].copy_from_slice(input);
+
+        for layer in &self.layers {
+            let units = layer.weights.rows;
+            let source = &current[..width];
+            let destination = &mut next[..units];
+
+            for (row, out) in destination.iter_mut().enumerate() {
+                let mut value = layer.biases.data[row];
+                let row_offset = row * layer.weights.cols;
+                for (col, input_value) in source.iter().enumerate() {
+                    value += layer.weights.data[row_offset + col] * input_value;
+                }
+                *out = value;
+            }
+
+            layer.activation.apply_to_slice(destination);
+            std::mem::swap(current, next);
+            width = units;
+        }
+
+        &current[..width]
     }
 
     fn forward_internal(&self, input: &[f32]) -> (Vec<f32>, Vec<LayerCache>) {
@@ -668,6 +748,7 @@ impl Network {
                 beta1,
                 beta2,
                 epsilon,
+                weight_decay,
             } => {
                 self.adam_step += 1;
                 let bias_correction1 = 1.0 - beta1.powi(self.adam_step as i32);
@@ -686,6 +767,7 @@ impl Network {
                             epsilon,
                             bias_correction1,
                             bias_correction2,
+                            weight_decay,
                         },
                     );
                     apply_adam(
@@ -700,6 +782,7 @@ impl Network {
                             epsilon,
                             bias_correction1,
                             bias_correction2,
+                            weight_decay: 0.0,
                         },
                     );
                 }
@@ -769,6 +852,7 @@ struct AdamHyperparams {
     epsilon: f32,
     bias_correction1: f32,
     bias_correction2: f32,
+    weight_decay: f32,
 }
 
 fn apply_adam(
@@ -784,6 +868,9 @@ fn apply_adam(
 
         let m_hat = *m / params.bias_correction1;
         let v_hat = *v / params.bias_correction2;
+        // Decoupled (AdamW-style) weight decay: shrink the parameter toward
+        // zero independently of the adaptive gradient step.
+        *value -= params.learning_rate * params.weight_decay * *value;
         *value += params.learning_rate * m_hat / (v_hat.sqrt() + params.epsilon);
     }
 }
@@ -915,6 +1002,48 @@ mod tests {
         assert_eq!(
             build().predict(&[0.25, -0.5]).unwrap(),
             build().predict(&[0.25, -0.5]).unwrap()
+        );
+    }
+
+    /// `predict_batch` and `evaluate_loss` run a parallel, scratch-buffer
+    /// forward pass. Research artifacts are compared across runs, so the fast
+    /// path must stay bit-for-bit identical to the per-sample scalar path
+    /// rather than merely close.
+    #[test]
+    fn batched_inference_is_bit_identical_to_scalar_inference() {
+        let model = Network::builder()
+            .input_size(9)
+            .dense(13, Activation::Relu)
+            .dense(7, Activation::Tanh)
+            .dense(3, Activation::Sigmoid)
+            .loss(Loss::Mse)
+            .seed(0x5eed)
+            .build();
+        let inputs: Vec<Vec<f32>> = (0..257)
+            .map(|row| {
+                (0..9)
+                    .map(|col| ((row * 31 + col * 17) as f32 - 400.0) / 91.0)
+                    .collect()
+            })
+            .collect();
+        let targets: Vec<Vec<f32>> = inputs
+            .iter()
+            .map(|x| vec![x[0].abs().min(1.0), 0.5, x[2].abs().min(1.0)])
+            .collect();
+
+        let batched = model.predict_batch(&inputs).unwrap();
+        for (input, actual) in inputs.iter().zip(&batched) {
+            assert_eq!(&model.predict(input).unwrap(), actual);
+        }
+
+        let mut expected = 0.0f32;
+        for (input, target) in inputs.iter().zip(&targets) {
+            expected += model.loss.value(&model.predict(input).unwrap(), target);
+        }
+        let dataset = Dataset::new(inputs, targets);
+        assert_eq!(
+            model.evaluate_loss(&dataset).unwrap(),
+            expected / dataset.len() as f32
         );
     }
 }
