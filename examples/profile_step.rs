@@ -24,14 +24,25 @@ fn moe() -> rusting_brain::TransformerBuilder {
 
 fn main() {
     let preset = std::env::args().nth(1).unwrap_or_else(|| "dense".into());
-    let batch_size: usize = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(256);
-    let seq_len: usize = std::env::args().nth(3).and_then(|a| a.parse().ok()).unwrap_or(128);
+    let batch_size: usize = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(256);
+    let seq_len: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(128);
     let cuda = std::env::args().nth(4).map(|a| a != "cpu").unwrap_or(true);
-    let mixed = std::env::args().any(|a| a == "mp");
+    // Reduced precision is the library default; `nomp` is the opt-out, so the
+    // plain invocation measures what an ordinary caller gets.
+    let mixed = !std::env::args().any(|a| a == "nomp");
 
     let builder = match preset.as_str() {
         "dense" => dense(),
         "moe" => moe(),
+        // Same size and shape with every layer dense, so the MoE machinery's
+        // own cost is the difference between the two runs.
+        "nomoe" => TransformerLm::builder().moe_layers([]),
         other => panic!("unknown preset {other}, expected dense or moe"),
     };
     let mut model = builder
@@ -51,7 +62,11 @@ fn main() {
     }
 
     let ids: Vec<Vec<u32>> = (0..batch_size)
-        .map(|s| (0..seq_len).map(|t| ((s * 131 + t * 17) % 32_000) as u32).collect())
+        .map(|s| {
+            (0..seq_len)
+                .map(|t| ((s * 131 + t * 17) % 32_000) as u32)
+                .collect()
+        })
         .collect();
     let batch = TokenBatch::new(&ids).unwrap();
 
@@ -86,7 +101,14 @@ fn main() {
     }
 
     let mut totals = [0f64; 6];
-    let labels = ["forward", "loss(host)", "zero_grad", "backward", "step", "total"];
+    let labels = [
+        "forward",
+        "loss(host)",
+        "zero_grad",
+        "backward",
+        "step",
+        "total",
+    ];
 
     for _ in 0..steps {
         let t0 = Instant::now();
@@ -105,14 +127,11 @@ fn main() {
         model.synchronize().unwrap();
         let t5 = Instant::now();
 
-        for (slot, dt) in totals.iter_mut().zip([
-            t1 - t0,
-            t2 - t1,
-            t3 - t2,
-            t4 - t3,
-            t5 - t4,
-            t5 - t0,
-        ]) {
+        for (slot, dt) in
+            totals
+                .iter_mut()
+                .zip([t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0])
+        {
             *slot += dt.as_secs_f64();
         }
     }
@@ -120,7 +139,11 @@ fn main() {
     let total = totals[5] / steps as f64;
     for (label, sum) in labels.iter().zip(totals) {
         let seconds = sum / steps as f64;
-        println!("{label:<12} {:>8.3} s  {:>5.1}%", seconds, 100.0 * seconds / total);
+        println!(
+            "{label:<12} {:>8.3} s  {:>5.1}%",
+            seconds,
+            100.0 * seconds / total
+        );
     }
     println!(
         "batch {batch_size} x seq {seq_len}: {total:.3} s/step, {:.0} tokens/s",

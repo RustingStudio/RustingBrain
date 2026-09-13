@@ -6,8 +6,14 @@ use rusting_brain::TransformerLm;
 use std::time::Instant;
 
 fn main() {
-    let prompt: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(512);
-    let new_tokens: usize = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(128);
+    let prompt: usize = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(512);
+    let new_tokens: usize = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(128);
 
     let model = TransformerLm::builder()
         .vocab_size(32_000)
@@ -27,7 +33,9 @@ fn main() {
 
     let start = Instant::now();
     for t in 0..new_tokens {
-        model.forward_cached(&[(t * 31 % 32_000) as u32], &mut caches).unwrap();
+        model
+            .forward_cached(&[(t * 31 % 32_000) as u32], &mut caches)
+            .unwrap();
     }
     let elapsed = start.elapsed().as_secs_f64();
     println!(
