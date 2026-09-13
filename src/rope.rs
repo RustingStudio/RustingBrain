@@ -6,6 +6,7 @@
 
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Precomputed `cos`/`sin` tables, laid out `[position, head_dim / 2]`.
@@ -199,22 +200,27 @@ impl Rope {
         }
 
         let half = self.head_dim / 2;
-        for row in 0..tensor.rows {
-            let table = (position_offset + row % seq_len) * half;
-            let values = tensor.row_mut(row);
+        // Each row rotates on its own, and this runs four times per block per
+        // step over the query and key projections.
+        tensor
+            .data
+            .par_chunks_mut(tensor.cols)
+            .enumerate()
+            .for_each(|(row, values)| {
+                let table = (position_offset + row % seq_len) * half;
 
-            for head in 0..heads {
-                let base = head * self.head_dim;
-                for channel in 0..half {
-                    let cos = self.cos[table + channel];
-                    let sin = direction * self.sin[table + channel];
-                    let low = values[base + channel];
-                    let high = values[base + half + channel];
-                    values[base + channel] = low * cos - high * sin;
-                    values[base + half + channel] = high * cos + low * sin;
+                for head in 0..heads {
+                    let base = head * self.head_dim;
+                    for channel in 0..half {
+                        let cos = self.cos[table + channel];
+                        let sin = direction * self.sin[table + channel];
+                        let low = values[base + channel];
+                        let high = values[base + half + channel];
+                        values[base + channel] = low * cos - high * sin;
+                        values[base + half + channel] = high * cos + low * sin;
+                    }
                 }
-            }
-        }
+            });
 
         Ok(())
     }

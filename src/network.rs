@@ -613,8 +613,7 @@ impl Network {
             let mut epoch_loss = 0.0;
             let mut batches = 0;
             for batch in working.batches(config.batch_size.max(1)) {
-                epoch_loss +=
-                    self.train_batch_parallel(batch.inputs, batch.targets, 0)?;
+                epoch_loss += self.train_batch_parallel(batch.inputs, batch.targets, 0)?;
                 batches += 1;
             }
 
@@ -771,9 +770,7 @@ impl Network {
                     self.forward_inference_chunk(inputs, scratch)
                         .into_iter()
                         .zip(targets)
-                        .map(|(prediction, target)| {
-                            self.loss.value(&prediction, target)
-                        })
+                        .map(|(prediction, target)| self.loss.value(&prediction, target))
                         .collect::<Vec<f32>>()
                 },
             )
@@ -813,11 +810,7 @@ impl Network {
     /// allocating a `Vec` and a discarded `LayerCache` per layer per sample.
     /// The arithmetic and its order are identical to `forward_internal`, so
     /// predictions stay bit-for-bit the same.
-    fn forward_inference<'s>(
-        &self,
-        input: &[f32],
-        scratch: &'s mut InferenceScratch,
-    ) -> &'s [f32] {
+    fn forward_inference<'s>(&self, input: &[f32], scratch: &'s mut InferenceScratch) -> &'s [f32] {
         let InferenceScratch { current, next } = scratch;
         let mut width = input.len();
         current[..width].copy_from_slice(input);
@@ -872,15 +865,10 @@ impl Network {
             let source = &scratch.current[..width * INFERENCE_TILE];
             let destination = &mut scratch.next[..units * INFERENCE_TILE];
 
-            for (row, out) in
-                destination.chunks_exact_mut(INFERENCE_TILE).enumerate()
-            {
+            for (row, out) in destination.chunks_exact_mut(INFERENCE_TILE).enumerate() {
                 let mut accumulator = [layer.biases.data[row]; INFERENCE_TILE];
-                let weights = &layer.weights.data
-                    [row * layer.weights.cols..][..width];
-                for (weight, values) in
-                    weights.iter().zip(source.chunks_exact(INFERENCE_TILE))
-                {
+                let weights = &layer.weights.data[row * layer.weights.cols..][..width];
+                for (weight, values) in weights.iter().zip(source.chunks_exact(INFERENCE_TILE)) {
                     for (slot, value) in accumulator.iter_mut().zip(values) {
                         *slot += weight * value;
                     }
@@ -930,8 +918,7 @@ impl Network {
             self.forward_inference_tile(tile, scratch, &mut outputs);
         }
         for input in tiles.remainder() {
-            outputs
-                .push(self.forward_inference(input, &mut scratch.single).to_vec());
+            outputs.push(self.forward_inference(input, &mut scratch.single).to_vec());
         }
         outputs
     }

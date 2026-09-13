@@ -2,7 +2,16 @@
 
 use crate::matrix::Matrix;
 use crate::param::Param;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Rows per parallel tile in [`RmsNorm::backward`].
+///
+/// The scale gradient is a sum over every row, so the rows are grouped into
+/// fixed tiles and the per-tile partials are added up in order afterwards. The
+/// result is then independent of how rayon split the work, which is the same
+/// convention `network.rs` and `causal_lm_loss.rs` follow.
+const ROWS_PER_TILE: usize = 32;
 
 /// Root-mean-square normalization: `x / sqrt(mean(x^2) + eps) * weight`.
 ///
@@ -34,15 +43,19 @@ impl RmsNorm {
         let scale = &self.weight.value.data;
         let mut output = Matrix::new(input.rows, input.cols);
 
-        for row in 0..input.rows {
-            let source = input.row(row);
-            let inverse_rms = self.inverse_rms(source);
-            for ((slot, &value), &weight) in
-                output.row_mut(row).iter_mut().zip(source).zip(scale)
-            {
-                *slot = value * inverse_rms * weight;
-            }
-        }
+        // Rows are independent. Normalization is a large share of the
+        // non-GEMM work in a step, and left serial it is the one place a
+        // twelve-core host runs on one core.
+        output
+            .data
+            .par_chunks_mut(input.cols)
+            .zip(input.data.par_chunks(input.cols))
+            .for_each(|(destination, source)| {
+                let inverse_rms = self.inverse_rms(source);
+                for ((slot, &value), &weight) in destination.iter_mut().zip(source).zip(scale) {
+                    *slot = value * inverse_rms * weight;
+                }
+            });
 
         output
     }
@@ -60,32 +73,46 @@ impl RmsNorm {
         let scale = &self.weight.value.data;
         let mut grad_input = Matrix::new(input.rows, width);
 
-        for row in 0..input.rows {
-            let source = input.row(row);
-            let upstream = grad_output.row(row);
-            let inverse_rms = self.inverse_rms(source);
+        let partials: Vec<Vec<f32>> = grad_input
+            .data
+            .par_chunks_mut(ROWS_PER_TILE * width)
+            .enumerate()
+            .map(|(tile, destination)| {
+                let mut partial = vec![0.0f32; width];
 
-            // d(inverse_rms)/dx_j pulls in every element of the row, so the
-            // shared term is summed first and then spread back over the row.
-            let mut projection = 0.0;
-            for ((&value, &upstream), &weight) in source.iter().zip(upstream).zip(scale) {
-                projection += upstream * weight * value;
-            }
-            let shared = projection * inverse_rms.powi(3) / width as f32;
+                for (offset, target) in destination.chunks_mut(width).enumerate() {
+                    let row = tile * ROWS_PER_TILE + offset;
+                    let source = input.row(row);
+                    let upstream = grad_output.row(row);
+                    let inverse_rms = self.inverse_rms(source);
 
-            for (index, slot) in grad_input.row_mut(row).iter_mut().enumerate() {
-                *slot = upstream[index] * scale[index] * inverse_rms - source[index] * shared;
-            }
+                    // d(inverse_rms)/dx_j pulls in every element of the row, so
+                    // the shared term is summed first and then spread back over
+                    // the row.
+                    let mut projection = 0.0;
+                    for ((&value, &upstream), &weight) in source.iter().zip(upstream).zip(scale) {
+                        projection += upstream * weight * value;
+                    }
+                    let shared = projection * inverse_rms.powi(3) / width as f32;
 
-            for ((slot, &value), &upstream) in self
-                .weight
-                .grad
-                .data
-                .iter_mut()
-                .zip(source)
-                .zip(upstream)
-            {
-                *slot += upstream * value * inverse_rms;
+                    for (index, slot) in target.iter_mut().enumerate() {
+                        *slot =
+                            upstream[index] * scale[index] * inverse_rms - source[index] * shared;
+                    }
+
+                    for ((slot, &value), &upstream) in partial.iter_mut().zip(source).zip(upstream)
+                    {
+                        *slot += upstream * value * inverse_rms;
+                    }
+                }
+
+                partial
+            })
+            .collect();
+
+        for partial in &partials {
+            for (slot, value) in self.weight.grad.data.iter_mut().zip(partial) {
+                *slot += value;
             }
         }
 

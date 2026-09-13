@@ -16,9 +16,9 @@ use std::{
     time::Instant,
 };
 
-pub(crate) use crate::accelerator::MIB;
 /// Backwards-compatible name for the shared session measurements.
 pub use crate::accelerator::AcceleratorStats as CudaTrainingStats;
+pub(crate) use crate::accelerator::MIB;
 /// Re-exported so `cuda_training::estimate_tensor_memory_mib` keeps resolving;
 /// the estimate itself is backend-independent and lives in `accelerator`.
 pub use crate::accelerator::estimate_tensor_memory_mib;
@@ -85,7 +85,10 @@ extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const flo
   }
   if(use_smem){__syncthreads();for(int c=tid;c<cols;c+=ROW_THREADS)atomicAdd(&gw[c],acc[c]);}
 }
-extern "C" __global__ void rope_rotate(float*x,const float*cs,const float*sn,int rows,int heads,int head_dim,int seq_len,float dir){int half=head_dim/2;int total=rows*heads*half;int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;int ch=i%half;int h=(i/half)%heads;int r=i/(half*heads);int t=(r%seq_len)*half+ch;float c=cs[t];float s=dir*sn[t];size_t base=(size_t)r*(heads*head_dim)+(size_t)h*head_dim+ch;float lo=x[base];float hi=x[base+half];x[base]=lo*c-hi*s;x[base+half]=hi*c+lo*s;}
+// `width` and `off` locate the rotated block inside a wider row: queries and
+// keys are two slices of one fused projection output, so they share a row
+// stride and differ only in where they start.
+extern "C" __global__ void rope_rotate(float*x,const float*cs,const float*sn,int rows,int heads,int head_dim,int seq_len,float dir,int width,int off){int half=head_dim/2;int total=rows*heads*half;int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;int ch=i%half;int h=(i/half)%heads;int r=i/(half*heads);int t=(r%seq_len)*half+ch;float c=cs[t];float s=dir*sn[t];size_t base=(size_t)r*width+off+(size_t)h*head_dim+ch;float lo=x[base];float hi=x[base+half];x[base]=lo*c-hi*s;x[base+half]=hi*c+lo*s;}
 // Attention rows are short (one per query position, and only the positions up
 // to it are visible), so a whole block per row would leave most of its threads
 // idle. One warp per row instead, reducing through shuffles with no shared
@@ -99,15 +102,20 @@ __device__ __forceinline__ float warp_sum(float v){
   for(int o=16;o>0;o>>=1)v+=__shfl_down_sync(0xffffffff,v,o);
   return __shfl_sync(0xffffffff,v,0);
 }
-extern "C" __global__ void causal_softmax(float*s,int rows,int seq_len){
+// Causal softmax in place, plus the one log-sum-exp per query the backward
+// pass needs to rebuild these same probabilities. Writing that number here is
+// what lets the forward cache hold a few kilobytes per layer instead of the
+// whole probability matrix.
+extern "C" __global__ void causal_softmax_lse(float*s,float*lse,int rows,int seq_len){
   int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
   int stride=gridDim.x*warps;
   for(int i=blockIdx.x*warps+threadIdx.x/WARP;i<rows;i+=stride){
     int vis=i%seq_len+1;float*row=s+(size_t)i*seq_len;
     float m=-3.0e38f;for(int j=lane;j<vis;j+=WARP)m=fmaxf(m,row[j]);
     m=warp_max(m);
-    float part=0.f;for(int j=lane;j<vis;j+=WARP){float e=expf(row[j]-m);row[j]=e;part+=e;}
+    float part=0.f;for(int j=lane;j<vis;j+=WARP){float e=__expf(row[j]-m);row[j]=e;part+=e;}
     float sum=warp_sum(part);
+    if(lane==0)lse[i]=m+__logf(sum);
     if(sum>0.f){float inv=1.f/sum;for(int j=lane;j<vis;j+=WARP)row[j]*=inv;}
     for(int j=vis+lane;j<seq_len;j+=WARP)row[j]=0.f;
   }
@@ -123,8 +131,33 @@ extern "C" __global__ void causal_softmax_bwd(float*g,const float*p,int rows,int
     for(int j=vis+lane;j<seq_len;j+=WARP)gr[j]=0.f;
   }
 }
-extern "C" __global__ void swiglu_fwd(float*h,const float*g,const float*u,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=g[i];float s=1.f/(1.f+expf(-x));h[i]=x*s*u[i];}
-extern "C" __global__ void swiglu_bwd(float*gg,float*gu,const float*g,const float*u,const float*gh,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=g[i];float s=1.f/(1.f+expf(-x));float up=gh[i];gg[i]=up*u[i]*s*(1.f+x*(1.f-s));gu[i]=up*x*s;}
+// Rebuild the attention probabilities from the scaled scores and the stored
+// log-sum-exp. The forward pass kept only that one number per query, so the
+// backward pass pays an exponential per element instead of a second reduction,
+// and the probability matrix lives only for the length of one block's backward.
+extern "C" __global__ void causal_probs_from_lse(
+    float*s,const float*lse,int rows,int seq_len){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=rows*seq_len)return;
+  int r=i/seq_len,c=i-r*seq_len;
+  s[i]=c<=r%seq_len?__expf(s[i]-lse[r]):0.f;
+}
+
+// Gate and up share an input and a shape, so they are one GEMM at twice the
+// width: `gu` holds both halves of every row, gate first. cuBLAS is close to
+// twice as fast on the wider shape, which is why the two projections are not
+// kept apart here.
+__device__ inline float silu_mul(float x,float u){return x*u/(1.f+expf(-x));}
+__device__ inline void silu_mul_grad(float x,float u,float p,float&dg,float&du){float s=1.f/(1.f+expf(-x));dg=p*u*s*(1.f+x*(1.f-s));du=p*x*s;}
+// These two are memory bound, so an even width is read and written four floats
+// at a time. The host picks the thread count to match; the scalar tail below
+// serves an odd width, which no preset uses but a caller may configure.
+extern "C" __global__ void swiglu_fwd(float*h,const float*gu,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;
+ if((width&3)==0){int q=width>>2;if(i>=rows*q)return;int r=i/q;size_t b=(size_t)r*2*q+(i-r*q);const float4*s=(const float4*)gu;float4 g=s[b],u=s[b+q];float4 o;o.x=silu_mul(g.x,u.x);o.y=silu_mul(g.y,u.y);o.z=silu_mul(g.z,u.z);o.w=silu_mul(g.w,u.w);((float4*)h)[i]=o;return;}
+ if(i>=rows*width)return;int r=i/width;size_t b=(size_t)r*2*width+(i-r*width);h[i]=silu_mul(gu[b],gu[b+width]);}
+extern "C" __global__ void swiglu_bwd(float*ggu,const float*gu,const float*gh,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;
+ if((width&3)==0){int q=width>>2;if(i>=rows*q)return;int r=i/q;size_t b=(size_t)r*2*q+(i-r*q);const float4*s=(const float4*)gu;float4 g=s[b],u=s[b+q],p=((const float4*)gh)[i];float4 dg,du;silu_mul_grad(g.x,u.x,p.x,dg.x,du.x);silu_mul_grad(g.y,u.y,p.y,dg.y,du.y);silu_mul_grad(g.z,u.z,p.z,dg.z,du.z);silu_mul_grad(g.w,u.w,p.w,dg.w,du.w);float4*d=(float4*)ggu;d[b]=dg;d[b+q]=du;return;}
+ if(i>=rows*width)return;int r=i/width;size_t b=(size_t)r*2*width+(i-r*width);silu_mul_grad(gu[b],gu[b+width],gh[i],ggu[b],ggu[b+width]);}
 extern "C" __global__ void softmax_lse(float*p,float*lse,const float*x,int rows,int cols){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;const float*src=x+(size_t)r*cols;float*dst=p+(size_t)r*cols;float m=-3.0e38f;for(int c=0;c<cols;c++)m=fmaxf(m,src[c]);float sum=0;for(int c=0;c<cols;c++){float e=expf(src[c]-m);dst[c]=e;sum+=e;}lse[r]=m+logf(sum);if(sum>0)for(int c=0;c<cols;c++)dst[c]/=sum;}
 extern "C" __global__ void topk_gate(int*expert_of,float*gate_of,const float*p,const int*valid,int rows,int experts,int top_k){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;int base=r*top_k;if(valid!=0&&valid[r]==0){for(int k=0;k<top_k;k++){expert_of[base+k]=-1;gate_of[base+k]=0;}return;}const float*row=p+(size_t)r*experts;float total=0;for(int k=0;k<top_k;k++){int best=-1;for(int e=0;e<experts;e++){int taken=0;for(int j=0;j<k;j++)if(expert_of[base+j]==e)taken=1;if(taken)continue;if(best<0||row[e]>row[best])best=e;}expert_of[base+k]=best;gate_of[base+k]=row[best];total+=row[best];}if(total>0)for(int k=0;k<top_k;k++)gate_of[base+k]/=total;}
 extern "C" __global__ void gather_scale_rows(float*out,const float*src,const unsigned int*rows_of,const float*scale,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*width)return;int r=i/width;int c=i%width;out[i]=scale[r]*src[(size_t)rows_of[r]*width+c];}
@@ -151,7 +184,9 @@ extern "C" __global__ void moe_stats(float*sums,const float*p,const float*lse,co
 extern "C" __global__ void moe_grad_probs(float*gp,const float*gg,const float*p,const int*expert_of,int rows,int experts,int top_k){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;int base=r*top_k;if(expert_of[base]<0)return;const float*row=p+(size_t)r*experts;float total=0;float weighted=0;for(int k=0;k<top_k;k++){int e=expert_of[base+k];total+=row[e];weighted+=gg[base+k]*row[e];}if(total<=0)return;float*dst=gp+(size_t)r*experts;for(int k=0;k<top_k;k++){int e=expert_of[base+k];dst[e]+=gg[base+k]/total-weighted/(total*total);}}
 extern "C" __global__ void moe_aux_grad(float*gp,const float*loads,const int*expert_of,int rows,int experts,int top_k,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*experts)return;int r=i/experts;int e=i%experts;if(expert_of[r*top_k]<0)return;gp[i]+=scale*loads[e];}
 extern "C" __global__ void router_grad_logits(float*gl,const float*gp,const float*p,const float*lse,const int*expert_of,int rows,int experts,int top_k,float zfactor){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;float*dst=gl+(size_t)r*experts;if(expert_of[r*top_k]<0){for(int e=0;e<experts;e++)dst[e]=0;return;}const float*prob=p+(size_t)r*experts;const float*up=gp+(size_t)r*experts;float dot=0;for(int e=0;e<experts;e++)dot+=prob[e]*up[e];float f=zfactor*lse[r];for(int e=0;e<experts;e++)dst[e]=prob[e]*(up[e]-dot)+f*prob[e];}
-extern "C" __global__ void add_inplace(float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)a[i]+=b[i];}
+extern "C" __global__ void add_inplace(float*a,const float*b,int off,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
+ if(((n|off)&3)==0){int q=n>>2;if(i>=q)return;float4*d=(float4*)a;float4 x=d[i],y=((const float4*)(b+off))[i];x.x+=y.x;x.y+=y.y;x.z+=y.z;x.w+=y.w;d[i]=x;return;}
+ if(i<n)a[i]+=b[off+i];}
 
 // Cross-entropy over one chunk of logit rows, in place: the row comes in as
 // logits and leaves as dL/dlogits, so the largest tensor in a training step is
@@ -193,12 +228,14 @@ extern "C" __global__ void ce_loss_grad(float*x,float*loss,const int*target,int 
   // The running (max, sum) pair of the online softmax: one read pass over the
   // row instead of a max pass followed by a sum pass. At this vocabulary the
   // row is far too big for any cache, so the second pass cost a full trip to
-  // memory.
+  // memory. Rescaling the accumulator only when a new maximum arrives keeps the
+  // common element down to a single exponential, and the fast intrinsic is
+  // ample for a result that is stored as bfloat16.
   __shared__ float redm[CE_THREADS];
   __shared__ float reds[CE_THREADS];
   __shared__ float tgt;
   float m=-3.0e38f,acc=0.f;
-  for(int c=tid;c<vocab;c+=CE_THREADS){float v=row[c];float nm=fmaxf(m,v);acc=acc*expf(m-nm)+expf(v-nm);m=nm;}
+  for(int c=tid;c<vocab;c+=CE_THREADS){float v=row[c];if(v>m){acc=acc*__expf(m-v)+1.f;m=v;}else acc+=__expf(v-m);}
   redm[tid]=m;reds[tid]=acc;__syncthreads();
   for(int s=CE_THREADS/2;s>0;s>>=1){
     if(tid<s){float a=redm[tid],b=redm[tid+s];float nm=fmaxf(a,b);
@@ -211,7 +248,7 @@ extern "C" __global__ void ce_loss_grad(float*x,float*loss,const int*target,int 
   __syncthreads();
   float scale=inv_predicted/sum;
   if(tid==0)atomicAdd(loss,(m+logf(sum))-tgt);
-  for(int c=tid;c<vocab;c+=CE_THREADS)row[c]=expf(row[c]-m)*scale;
+  for(int c=tid;c<vocab;c+=CE_THREADS)row[c]=__expf(row[c]-m)*scale;
   __syncthreads();
   if(tid==0)row[t]-=inv_predicted;
 }
@@ -228,12 +265,30 @@ extern "C" __global__ void ce_loss_grad_bf16(bf16_t*x,float*loss,const int*targe
   // The running (max, sum) pair of the online softmax: one read pass over the
   // row instead of a max pass followed by a sum pass. At this vocabulary the
   // row is far too big for any cache, so the second pass cost a full trip to
-  // memory.
+  // memory. Rescaling the accumulator only when a new maximum arrives keeps the
+  // common element down to a single exponential, and the fast intrinsic is
+  // ample for a result that is stored as bfloat16.
   __shared__ float redm[CE_THREADS];
   __shared__ float reds[CE_THREADS];
   __shared__ float tgt;
+  // Both passes over the row move two values per access, because a warp of
+  // single bfloat16 loads only asks for 64 bytes at a time and this row is the
+  // largest tensor in the step. An odd vocabulary has no pairs and falls to the
+  // scalar tail, which is also where an even vocabulary's last value never
+  // lands.
+  int half=(vocab&1)==0?vocab>>1:0;
   float m=-3.0e38f,acc=0.f;
-  for(int c=tid;c<vocab;c+=CE_THREADS){float v=bf16_to_f32(row[c]);float nm=fmaxf(m,v);acc=acc*expf(m-nm)+expf(v-nm);m=nm;}
+  {
+    const unsigned int*pairs=(const unsigned int*)row;
+    for(int c=tid;c<half;c+=CE_THREADS){
+      unsigned int p=pairs[c];
+      float v=bf16_to_f32((bf16_t)(p&0xffffu));
+      if(v>m){acc=acc*__expf(m-v)+1.f;m=v;}else acc+=__expf(v-m);
+      v=bf16_to_f32((bf16_t)(p>>16));
+      if(v>m){acc=acc*__expf(m-v)+1.f;m=v;}else acc+=__expf(v-m);
+    }
+  }
+  for(int c=half*2+tid;c<vocab;c+=CE_THREADS){float v=bf16_to_f32(row[c]);if(v>m){acc=acc*__expf(m-v)+1.f;m=v;}else acc+=__expf(v-m);}
   redm[tid]=m;reds[tid]=acc;__syncthreads();
   for(int s=CE_THREADS/2;s>0;s>>=1){
     if(tid<s){float a=redm[tid],b=redm[tid+s];float nm=fmaxf(a,b);
@@ -246,7 +301,16 @@ extern "C" __global__ void ce_loss_grad_bf16(bf16_t*x,float*loss,const int*targe
   __syncthreads();
   float scale=inv_predicted/sum;
   if(tid==0)atomicAdd(loss,(m+logf(sum))-tgt);
-  for(int c=tid;c<vocab;c+=CE_THREADS)row[c]=f32_to_bf16(expf(bf16_to_f32(row[c])-m)*scale);
+  {
+    unsigned int*pairs=(unsigned int*)row;
+    for(int c=tid;c<half;c+=CE_THREADS){
+      unsigned int p=pairs[c];
+      unsigned int lo=f32_to_bf16(__expf(bf16_to_f32((bf16_t)(p&0xffffu))-m)*scale);
+      unsigned int hi=f32_to_bf16(__expf(bf16_to_f32((bf16_t)(p>>16))-m)*scale);
+      pairs[c]=(hi<<16)|lo;
+    }
+  }
+  for(int c=half*2+tid;c<vocab;c+=CE_THREADS)row[c]=f32_to_bf16(__expf(bf16_to_f32(row[c])-m)*scale);
   __syncthreads();
   if(tid==0)row[t]=f32_to_bf16(bf16_to_f32(row[t])-inv_predicted);
 }
@@ -308,7 +372,9 @@ pub fn cuda_doctor(
     })
 }
 
-pub(crate) fn cuda_err<E: std::fmt::Display>(stage: &'static str) -> impl FnOnce(E) -> NetworkError {
+pub(crate) fn cuda_err<E: std::fmt::Display>(
+    stage: &'static str,
+) -> impl FnOnce(E) -> NetworkError {
     move |e| NetworkError::Cuda(format!("{stage} failed: {e}"))
 }
 
@@ -326,7 +392,9 @@ fn kernel_ptx() -> Result<&'static Ptx, NetworkError> {
 /// when it drops; only the context and the compiled module are shared.
 type LoadedDevice = (Arc<CudaContext>, Arc<CudaModule>);
 
-pub(crate) fn device_context(device: usize) -> Result<(Arc<CudaContext>, Arc<CudaModule>), NetworkError> {
+pub(crate) fn device_context(
+    device: usize,
+) -> Result<(Arc<CudaContext>, Arc<CudaModule>), NetworkError> {
     static CONTEXTS: OnceLock<Mutex<HashMap<usize, LoadedDevice>>> = OnceLock::new();
     let mut contexts = CONTEXTS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -335,8 +403,7 @@ pub(crate) fn device_context(device: usize) -> Result<(Arc<CudaContext>, Arc<Cud
     if let Some(entry) = contexts.get(&device) {
         return Ok(entry.clone());
     }
-    let ctx =
-        CudaContext::new(device).map_err(cuda_err("CUDA driver/device initialization"))?;
+    let ctx = CudaContext::new(device).map_err(cuda_err("CUDA driver/device initialization"))?;
     let module = ctx
         .load_module(kernel_ptx()?.clone())
         .map_err(cuda_err("CUDA module loading"))?;
@@ -1609,13 +1676,17 @@ mod tests {
             (0..23)
                 .map(|i| vec![(i as f32 - 11.0) / 9.0, ((i * 3) % 7) as f32 / 7.0])
                 .collect(),
-            (0..23).map(|i| vec![((i * 5) % 11) as f32 / 11.0 - 0.5]).collect(),
+            (0..23)
+                .map(|i| vec![((i * 5) % 11) as f32 / 11.0 - 0.5])
+                .collect(),
         );
         let validation = Dataset::new(
             (0..13)
                 .map(|i| vec![(i as f32 - 6.0) / 5.0, ((i * 2) % 5) as f32 / 5.0])
                 .collect(),
-            (0..13).map(|i| vec![((i * 3) % 7) as f32 / 7.0 - 0.3]).collect(),
+            (0..13)
+                .map(|i| vec![((i * 3) % 7) as f32 / 7.0 - 0.3])
+                .collect(),
         );
         let base = Network::builder()
             .input_size(2)

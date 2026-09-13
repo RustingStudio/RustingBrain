@@ -79,7 +79,9 @@ impl Param {
     /// a transformer built with a given seed is as reproducible as a `Network`.
     pub fn he_uniform(rows: usize, cols: usize, fan_in: usize, rng: &mut StdRng) -> Self {
         let scale = (2.0 / fan_in as f32).sqrt();
-        let data = (0..rows * cols).map(|_| rng.gen_range(-scale..scale)).collect();
+        let data = (0..rows * cols)
+            .map(|_| rng.gen_range(-scale..scale))
+            .collect();
         Self::new(Matrix::from_vec(rows, cols, data))
     }
 
@@ -131,6 +133,36 @@ impl Param {
         if let Some(device) = &self.device {
             device.download_value(&mut self.value)?;
             device.download_grad(&mut self.grad)?;
+        }
+        Ok(())
+    }
+
+    /// The Adam moments, refreshed from the device first when the parameter is
+    /// resident there.
+    ///
+    /// A snapshot carries weights only, so a run that stops and resumes has to
+    /// carry the moments separately; see
+    /// [`TransformerLm::save_optimizer_state`](crate::transformer::TransformerLm::save_optimizer_state).
+    pub fn moments(&mut self) -> Result<(&Matrix, &Matrix), crate::network::NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            device.download_moments(&mut self.moment1, &mut self.moment2)?;
+        }
+        Ok((&self.moment1, &self.moment2))
+    }
+
+    /// Restores moments saved by an earlier run, uploading them when the
+    /// parameter is already resident on a device.
+    pub fn set_moments(
+        &mut self,
+        first: Matrix,
+        second: Matrix,
+    ) -> Result<(), crate::network::NetworkError> {
+        self.moment1 = first;
+        self.moment2 = second;
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &mut self.device {
+            device.upload_moments(&self.moment1, &self.moment2)?;
         }
         Ok(())
     }
