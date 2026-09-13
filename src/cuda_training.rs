@@ -33,6 +33,223 @@ extern "C" __global__ void adam(float*x,const float*g,float*m,float*v,int n,floa
 extern "C" __global__ void mse_sum(float *out,const float*y,const float*t,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=y[i]-t[i];atomicAdd(out,z*z/(float)n);}}
 extern "C" __global__ void mse_epoch_sum(float *out,const float*y,const float*t,int n,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=y[i]-t[i];atomicAdd(out,z*z*scale);}}
 extern "C" __global__ void gather_rows(float*out,const float*all,const unsigned int*order,int start,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*width){int r=i/width,c=i%width;out[i]=all[order[start+r]*width+c];}}
+extern "C" __global__ void scale_inplace(float*g,int n,float s){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)g[i]*=s;}
+extern "C" __global__ void scatter_rows_neg(float*grad,const float*upstream,const unsigned int*rows_of,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*width){int r=i/width,c=i%width;atomicAdd(&grad[rows_of[r]*width+c],-upstream[i]);}}
+
+// The transformer path's fused kernels. Everything a decoder layer does
+// between two matmuls lives here, so a layer runs device-side end to end: see
+// `gpu_model` for how they are sequenced.
+// One block of ROW_THREADS threads cooperates on one row, striding over the
+// columns so neighbouring threads touch neighbouring addresses. The previous
+// one-thread-per-row shape read a row serially, which made every access
+// uncoalesced: adjacent threads were `cols` floats apart. Rows outnumber
+// blocks, so each block walks a grid-stride slice of them.
+#define ROW_THREADS 256
+__device__ __forceinline__ float row_sum(float v,float*red){
+  int tid=threadIdx.x;red[tid]=v;__syncthreads();
+  for(int s=ROW_THREADS/2;s>0;s>>=1){if(tid<s)red[tid]+=red[tid+s];__syncthreads();}
+  float r=red[0];__syncthreads();return r;
+}
+extern "C" __global__ void rmsnorm_fwd(float*out,float*inv,const float*x,const float*w,int rows,int cols,float eps){
+  __shared__ float red[ROW_THREADS];int tid=threadIdx.x;
+  for(int r=blockIdx.x;r<rows;r+=gridDim.x){
+    const float*src=x+(size_t)r*cols;
+    float s=0.f;for(int c=tid;c<cols;c+=ROW_THREADS){float v=src[c];s+=v*v;}
+    s=row_sum(s,red);
+    float t=1.f/sqrtf(s/(float)cols+eps);
+    if(tid==0)inv[r]=t;
+    float*dst=out+(size_t)r*cols;
+    for(int c=tid;c<cols;c+=ROW_THREADS)dst[c]=src[c]*t*w[c];
+  }
+}
+// `use_smem` says the host sized the dynamic shared memory to hold `cols`
+// floats, so the scale gradient accumulates per block and lands in `gw` with
+// one atomic per column instead of one per element. A model wide enough to
+// overflow shared memory falls back to the direct atomic.
+extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const float*gy,const float*w,const float*inv,int rows,int cols,int use_smem){
+  extern __shared__ float acc[];
+  __shared__ float red[ROW_THREADS];int tid=threadIdx.x;
+  if(use_smem)for(int c=tid;c<cols;c+=ROW_THREADS)acc[c]=0.f;
+  __syncthreads();
+  for(int r=blockIdx.x;r<rows;r+=gridDim.x){
+    const float*src=x+(size_t)r*cols;const float*up=gy+(size_t)r*cols;float t=inv[r];
+    float proj=0.f;for(int c=tid;c<cols;c+=ROW_THREADS)proj+=up[c]*w[c]*src[c];
+    proj=row_sum(proj,red);
+    float shared=proj*t*t*t/(float)cols;
+    float*dst=gx+(size_t)r*cols;
+    for(int c=tid;c<cols;c+=ROW_THREADS){
+      dst[c]=up[c]*w[c]*t-src[c]*shared;
+      float g=up[c]*src[c]*t;
+      if(use_smem)acc[c]+=g;else atomicAdd(&gw[c],g);
+    }
+  }
+  if(use_smem){__syncthreads();for(int c=tid;c<cols;c+=ROW_THREADS)atomicAdd(&gw[c],acc[c]);}
+}
+extern "C" __global__ void rope_rotate(float*x,const float*cs,const float*sn,int rows,int heads,int head_dim,int seq_len,float dir){int half=head_dim/2;int total=rows*heads*half;int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;int ch=i%half;int h=(i/half)%heads;int r=i/(half*heads);int t=(r%seq_len)*half+ch;float c=cs[t];float s=dir*sn[t];size_t base=(size_t)r*(heads*head_dim)+(size_t)h*head_dim+ch;float lo=x[base];float hi=x[base+half];x[base]=lo*c-hi*s;x[base+half]=hi*c+lo*s;}
+// Attention rows are short (one per query position, and only the positions up
+// to it are visible), so a whole block per row would leave most of its threads
+// idle. One warp per row instead, reducing through shuffles with no shared
+// memory and no block-wide barrier.
+#define WARP 32
+__device__ __forceinline__ float warp_max(float v){
+  for(int o=16;o>0;o>>=1)v=fmaxf(v,__shfl_down_sync(0xffffffff,v,o));
+  return __shfl_sync(0xffffffff,v,0);
+}
+__device__ __forceinline__ float warp_sum(float v){
+  for(int o=16;o>0;o>>=1)v+=__shfl_down_sync(0xffffffff,v,o);
+  return __shfl_sync(0xffffffff,v,0);
+}
+extern "C" __global__ void causal_softmax(float*s,int rows,int seq_len){
+  int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
+  int stride=gridDim.x*warps;
+  for(int i=blockIdx.x*warps+threadIdx.x/WARP;i<rows;i+=stride){
+    int vis=i%seq_len+1;float*row=s+(size_t)i*seq_len;
+    float m=-3.0e38f;for(int j=lane;j<vis;j+=WARP)m=fmaxf(m,row[j]);
+    m=warp_max(m);
+    float part=0.f;for(int j=lane;j<vis;j+=WARP){float e=expf(row[j]-m);row[j]=e;part+=e;}
+    float sum=warp_sum(part);
+    if(sum>0.f){float inv=1.f/sum;for(int j=lane;j<vis;j+=WARP)row[j]*=inv;}
+    for(int j=vis+lane;j<seq_len;j+=WARP)row[j]=0.f;
+  }
+}
+extern "C" __global__ void causal_softmax_bwd(float*g,const float*p,int rows,int seq_len){
+  int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
+  int stride=gridDim.x*warps;
+  for(int i=blockIdx.x*warps+threadIdx.x/WARP;i<rows;i+=stride){
+    int vis=i%seq_len+1;float*gr=g+(size_t)i*seq_len;const float*pr=p+(size_t)i*seq_len;
+    float part=0.f;for(int j=lane;j<vis;j+=WARP)part+=pr[j]*gr[j];
+    float dot=warp_sum(part);
+    for(int j=lane;j<vis;j+=WARP)gr[j]=pr[j]*(gr[j]-dot);
+    for(int j=vis+lane;j<seq_len;j+=WARP)gr[j]=0.f;
+  }
+}
+extern "C" __global__ void swiglu_fwd(float*h,const float*g,const float*u,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=g[i];float s=1.f/(1.f+expf(-x));h[i]=x*s*u[i];}
+extern "C" __global__ void swiglu_bwd(float*gg,float*gu,const float*g,const float*u,const float*gh,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=g[i];float s=1.f/(1.f+expf(-x));float up=gh[i];gg[i]=up*u[i]*s*(1.f+x*(1.f-s));gu[i]=up*x*s;}
+extern "C" __global__ void softmax_lse(float*p,float*lse,const float*x,int rows,int cols){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;const float*src=x+(size_t)r*cols;float*dst=p+(size_t)r*cols;float m=-3.0e38f;for(int c=0;c<cols;c++)m=fmaxf(m,src[c]);float sum=0;for(int c=0;c<cols;c++){float e=expf(src[c]-m);dst[c]=e;sum+=e;}lse[r]=m+logf(sum);if(sum>0)for(int c=0;c<cols;c++)dst[c]/=sum;}
+extern "C" __global__ void topk_gate(int*expert_of,float*gate_of,const float*p,const int*valid,int rows,int experts,int top_k){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;int base=r*top_k;if(valid!=0&&valid[r]==0){for(int k=0;k<top_k;k++){expert_of[base+k]=-1;gate_of[base+k]=0;}return;}const float*row=p+(size_t)r*experts;float total=0;for(int k=0;k<top_k;k++){int best=-1;for(int e=0;e<experts;e++){int taken=0;for(int j=0;j<k;j++)if(expert_of[base+j]==e)taken=1;if(taken)continue;if(best<0||row[e]>row[best])best=e;}expert_of[base+k]=best;gate_of[base+k]=row[best];total+=row[best];}if(total>0)for(int k=0;k<top_k;k++)gate_of[base+k]/=total;}
+extern "C" __global__ void gather_scale_rows(float*out,const float*src,const unsigned int*rows_of,const float*scale,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*width)return;int r=i/width;int c=i%width;out[i]=scale[r]*src[(size_t)rows_of[r]*width+c];}
+extern "C" __global__ void scatter_add_scaled(float*out,const float*src,const unsigned int*rows_of,const float*scale,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*width)return;int r=i/width;int c=i%width;atomicAdd(&out[(size_t)rows_of[r]*width+c],scale[r]*src[i]);}
+extern "C" __global__ void scatter_add_rows(float*out,const float*src,const unsigned int*rows_of,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*width)return;int r=i/width;int c=i%width;atomicAdd(&out[(size_t)rows_of[r]*width+c],src[i]);}
+// One warp per routed row. A thread per row reads `width` consecutive floats
+// alone, which is the worst access pattern the memory system has; a warp
+// striding the row reads it in coalesced 128-byte lines instead and was about
+// nine times faster on the default MoE configuration.
+extern "C" __global__ void row_dot_scatter(float*out,const unsigned int*out_of,const float*a,const unsigned int*rows_of,const float*b,int rows,int width){
+  int lane=threadIdx.x&(WARP-1);
+  int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP;
+  int warps=(gridDim.x*blockDim.x)/WARP;
+  for(int r=warp;r<rows;r+=warps){
+    const float*x=a+(size_t)rows_of[r]*width;
+    const float*y=b+(size_t)r*width;
+    float s=0;
+    for(int c=lane;c<width;c+=WARP)s+=x[c]*y[c];
+    s=warp_sum(s);
+    if(lane==0)out[out_of[r]]=s;
+  }
+}
+extern "C" __global__ void moe_stats(float*sums,const float*p,const float*lse,const int*valid,int rows,int experts){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;if(valid!=0&&valid[r]==0)return;const float*row=p+(size_t)r*experts;for(int e=0;e<experts;e++)atomicAdd(&sums[e],row[e]);atomicAdd(&sums[experts],lse[r]*lse[r]);}
+extern "C" __global__ void moe_grad_probs(float*gp,const float*gg,const float*p,const int*expert_of,int rows,int experts,int top_k){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;int base=r*top_k;if(expert_of[base]<0)return;const float*row=p+(size_t)r*experts;float total=0;float weighted=0;for(int k=0;k<top_k;k++){int e=expert_of[base+k];total+=row[e];weighted+=gg[base+k]*row[e];}if(total<=0)return;float*dst=gp+(size_t)r*experts;for(int k=0;k<top_k;k++){int e=expert_of[base+k];dst[e]+=gg[base+k]/total-weighted/(total*total);}}
+extern "C" __global__ void moe_aux_grad(float*gp,const float*loads,const int*expert_of,int rows,int experts,int top_k,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*experts)return;int r=i/experts;int e=i%experts;if(expert_of[r*top_k]<0)return;gp[i]+=scale*loads[e];}
+extern "C" __global__ void router_grad_logits(float*gl,const float*gp,const float*p,const float*lse,const int*expert_of,int rows,int experts,int top_k,float zfactor){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;float*dst=gl+(size_t)r*experts;if(expert_of[r*top_k]<0){for(int e=0;e<experts;e++)dst[e]=0;return;}const float*prob=p+(size_t)r*experts;const float*up=gp+(size_t)r*experts;float dot=0;for(int e=0;e<experts;e++)dot+=prob[e]*up[e];float f=zfactor*lse[r];for(int e=0;e<experts;e++)dst[e]=prob[e]*(up[e]-dot)+f*prob[e];}
+extern "C" __global__ void add_inplace(float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)a[i]+=b[i];}
+
+// Cross-entropy over one chunk of logit rows, in place: the row comes in as
+// logits and leaves as dL/dlogits, so the largest tensor in a training step is
+// never held twice. `target` is the next token, or -1 for a row that predicts
+// nothing (padding, and the last position of every sequence), whose gradient
+// is zero. One block of CE_THREADS threads per row; `loss` accumulates the
+// unscaled negative log-likelihood, which the host divides by the predicted
+// count.
+// bfloat16 helpers, written against the raw bit pattern rather than
+// `cuda_bf16.h`: NVRTC compiles this string without a header search path, and
+// bf16 is just FP32 with the low 16 mantissa bits dropped. Rounding is
+// round-to-nearest-even, the same rule the tensor cores use, so a value that
+// makes a round trip through bf16 and back matches what cuBLAS saw.
+typedef unsigned short bf16_t;
+__device__ __forceinline__ float bf16_to_f32(bf16_t b){return __uint_as_float((unsigned int)b<<16);}
+__device__ __forceinline__ bf16_t f32_to_bf16(float v){
+  unsigned int u=__float_as_uint(v);
+  if((u&0x7f800000u)==0x7f800000u&&(u&0x007fffffu))return (bf16_t)0x7fc0u;
+  unsigned int r=((u>>16)&1u)+0x7fffu;
+  return (bf16_t)((u+r)>>16);
+}
+extern "C" __global__ void to_bf16(bf16_t*out,const float*in,int n){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=f32_to_bf16(in[i]);
+}
+extern "C" __global__ void from_bf16(float*out,const bf16_t*in,int n){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=bf16_to_f32(in[i]);
+}
+extern "C" __global__ void accumulate_bf16(float*acc,const bf16_t*in,int n){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)acc[i]+=bf16_to_f32(in[i]);
+}
+
+#define CE_THREADS 256
+extern "C" __global__ void ce_loss_grad(float*x,float*loss,const int*target,int rows,int vocab,float inv_predicted){
+  int r=blockIdx.x;if(r>=rows)return;
+  float*row=x+(size_t)r*vocab;
+  int tid=threadIdx.x;
+  int t=target[r];
+  if(t<0){for(int c=tid;c<vocab;c+=CE_THREADS)row[c]=0.f;return;}
+  // The running (max, sum) pair of the online softmax: one read pass over the
+  // row instead of a max pass followed by a sum pass. At this vocabulary the
+  // row is far too big for any cache, so the second pass cost a full trip to
+  // memory.
+  __shared__ float redm[CE_THREADS];
+  __shared__ float reds[CE_THREADS];
+  __shared__ float tgt;
+  float m=-3.0e38f,acc=0.f;
+  for(int c=tid;c<vocab;c+=CE_THREADS){float v=row[c];float nm=fmaxf(m,v);acc=acc*expf(m-nm)+expf(v-nm);m=nm;}
+  redm[tid]=m;reds[tid]=acc;__syncthreads();
+  for(int s=CE_THREADS/2;s>0;s>>=1){
+    if(tid<s){float a=redm[tid],b=redm[tid+s];float nm=fmaxf(a,b);
+      reds[tid]=reds[tid]*expf(a-nm)+reds[tid+s]*expf(b-nm);redm[tid]=nm;}
+    __syncthreads();
+  }
+  m=redm[0];
+  float sum=reds[0];
+  if(tid==0)tgt=row[t];
+  __syncthreads();
+  float scale=inv_predicted/sum;
+  if(tid==0)atomicAdd(loss,(m+logf(sum))-tgt);
+  for(int c=tid;c<vocab;c+=CE_THREADS)row[c]=expf(row[c]-m)*scale;
+  __syncthreads();
+  if(tid==0)row[t]-=inv_predicted;
+}
+
+// The bf16 mirror of `ce_loss_grad`. Identical arithmetic in FP32 registers;
+// only the row's storage is half as wide, which halves the traffic over the
+// largest tensor a training step touches.
+extern "C" __global__ void ce_loss_grad_bf16(bf16_t*x,float*loss,const int*target,int rows,int vocab,float inv_predicted){
+  int r=blockIdx.x;if(r>=rows)return;
+  bf16_t*row=x+(size_t)r*vocab;
+  int tid=threadIdx.x;
+  int t=target[r];
+  if(t<0){for(int c=tid;c<vocab;c+=CE_THREADS)row[c]=(bf16_t)0;return;}
+  // The running (max, sum) pair of the online softmax: one read pass over the
+  // row instead of a max pass followed by a sum pass. At this vocabulary the
+  // row is far too big for any cache, so the second pass cost a full trip to
+  // memory.
+  __shared__ float redm[CE_THREADS];
+  __shared__ float reds[CE_THREADS];
+  __shared__ float tgt;
+  float m=-3.0e38f,acc=0.f;
+  for(int c=tid;c<vocab;c+=CE_THREADS){float v=bf16_to_f32(row[c]);float nm=fmaxf(m,v);acc=acc*expf(m-nm)+expf(v-nm);m=nm;}
+  redm[tid]=m;reds[tid]=acc;__syncthreads();
+  for(int s=CE_THREADS/2;s>0;s>>=1){
+    if(tid<s){float a=redm[tid],b=redm[tid+s];float nm=fmaxf(a,b);
+      reds[tid]=reds[tid]*expf(a-nm)+reds[tid+s]*expf(b-nm);redm[tid]=nm;}
+    __syncthreads();
+  }
+  m=redm[0];
+  float sum=reds[0];
+  if(tid==0)tgt=bf16_to_f32(row[t]);
+  __syncthreads();
+  float scale=inv_predicted/sum;
+  if(tid==0)atomicAdd(loss,(m+logf(sum))-tgt);
+  for(int c=tid;c<vocab;c+=CE_THREADS)row[c]=f32_to_bf16(expf(bf16_to_f32(row[c])-m)*scale);
+  __syncthreads();
+  if(tid==0)row[t]=f32_to_bf16(bf16_to_f32(row[t])-inv_predicted);
+}
 "#;
 
 #[derive(Clone, Debug)]
@@ -91,7 +308,7 @@ pub fn cuda_doctor(
     })
 }
 
-fn cuda_err<E: std::fmt::Display>(stage: &'static str) -> impl FnOnce(E) -> NetworkError {
+pub(crate) fn cuda_err<E: std::fmt::Display>(stage: &'static str) -> impl FnOnce(E) -> NetworkError {
     move |e| NetworkError::Cuda(format!("{stage} failed: {e}"))
 }
 
@@ -107,9 +324,10 @@ fn kernel_ptx() -> Result<&'static Ptx, NetworkError> {
 /// Creating a `CudaContext` and loading a module are per-process costs, not
 /// per-session ones. Device buffers still belong to their session and are freed
 /// when it drops; only the context and the compiled module are shared.
-fn device_context(device: usize) -> Result<(Arc<CudaContext>, Arc<CudaModule>), NetworkError> {
-    static CONTEXTS: OnceLock<Mutex<HashMap<usize, (Arc<CudaContext>, Arc<CudaModule>)>>> =
-        OnceLock::new();
+type LoadedDevice = (Arc<CudaContext>, Arc<CudaModule>);
+
+pub(crate) fn device_context(device: usize) -> Result<(Arc<CudaContext>, Arc<CudaModule>), NetworkError> {
+    static CONTEXTS: OnceLock<Mutex<HashMap<usize, LoadedDevice>>> = OnceLock::new();
     let mut contexts = CONTEXTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -158,7 +376,7 @@ impl Kernels {
         })
     }
 }
-fn cfg(n: usize) -> LaunchConfig {
+pub(crate) fn cfg(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((n as u32).div_ceil(256), 1, 1),
         block_dim: (256, 1, 1),
@@ -199,6 +417,13 @@ struct State {
     all_input: Option<CudaSlice<f32>>,
     all_target: Option<CudaSlice<f32>>,
     order: Option<CudaSlice<u32>>,
+    /// Validation set, uploaded once by `prepare_validation` (P09: device-side
+    /// validation avoids a full model host round-trip every epoch). Identity
+    /// order, since validation never shuffles.
+    eval_input: Option<CudaSlice<f32>>,
+    eval_target: Option<CudaSlice<f32>>,
+    eval_order: Option<CudaSlice<u32>>,
+    eval_loss: Option<CudaSlice<f32>>,
 }
 
 pub(crate) fn fit_cuda(
@@ -235,6 +460,9 @@ pub struct CudaTrainingSession {
     stats: CudaTrainingStats,
     staged_input: Vec<f32>,
     staged_target: Vec<f32>,
+    /// Row count of the device-resident validation set, or 0 when
+    /// `prepare_validation` has not been called (or declined for budget).
+    eval_rows: usize,
 }
 
 struct HostDataset {
@@ -305,7 +533,7 @@ impl CudaTrainingSession {
         Ok(Self {
             state,
             model: net.clone(),
-            host: (!resident).then(|| HostDataset {
+            host: (!resident).then_some(HostDataset {
                 inputs: xs,
                 targets: ys,
             }),
@@ -318,6 +546,7 @@ impl CudaTrainingSession {
             epoch: 0,
             staged_input: Vec::with_capacity(batch * net.input_size),
             staged_target: Vec::with_capacity(batch * net.output_size()),
+            eval_rows: 0,
             stats: CudaTrainingStats {
                 peak_allocated_bytes: peak,
                 setup_time: started.elapsed(),
@@ -458,6 +687,151 @@ impl CudaTrainingSession {
     pub fn epoch(&self) -> usize {
         self.epoch
     }
+
+    /// Uploads `dataset` to the device once so `validate_epoch` can score it
+    /// without a host round-trip. Returns `Ok(false)` (not an error) when it
+    /// would not fit under `budget_mib` alongside what is already resident;
+    /// the caller should fall back to host-side validation in that case.
+    pub fn prepare_validation(
+        &mut self,
+        dataset: &Dataset,
+        budget_mib: usize,
+    ) -> Result<bool, NetworkError> {
+        if dataset.is_empty() {
+            return Err(NetworkError::EmptyDataset);
+        }
+        for (x, y) in dataset.inputs.iter().zip(&dataset.targets) {
+            self.model.validate_input(x)?;
+            self.model.validate_target(y)?;
+        }
+        let xs: Vec<f32> = dataset.inputs.iter().flatten().copied().collect();
+        let ys: Vec<f32> = dataset.targets.iter().flatten().copied().collect();
+        let rows = dataset.len();
+        let bytes = (xs.len() + ys.len()) * size_of::<f32>() + rows * size_of::<u32>();
+        if self.state.allocated_bytes() + bytes > budget_mib.saturating_mul(MIB) {
+            return Ok(false);
+        }
+        let stream = self.state.stream.clone();
+        let eval_input = stream
+            .clone_htod(&xs)
+            .map_err(cuda_err("validation dataset upload"))?;
+        let eval_target = stream
+            .clone_htod(&ys)
+            .map_err(cuda_err("validation dataset upload"))?;
+        // Identity order: validation is never shuffled, but `gather_rows`
+        // already does exactly the contiguous-batch copy this needs.
+        let identity: Vec<u32> = (0..rows as u32).collect();
+        let eval_order = stream
+            .clone_htod(&identity)
+            .map_err(cuda_err("validation order upload"))?;
+        let eval_loss = stream
+            .alloc_zeros::<f32>(1)
+            .map_err(cuda_err("device allocation"))?;
+        self.stats.host_to_device_bytes += bytes;
+        self.state.eval_input = Some(eval_input);
+        self.state.eval_target = Some(eval_target);
+        self.state.eval_order = Some(eval_order);
+        self.state.eval_loss = Some(eval_loss);
+        self.eval_rows = rows;
+        Ok(true)
+    }
+
+    /// Device-side validation loss over the set uploaded by
+    /// `prepare_validation`, using the weights currently resident on the
+    /// device (no `copy_back`/host round-trip of the full model). Forward
+    /// pass only: no gradients, no optimizer step, no mutation of training
+    /// state. Numerically the same computation as `Network::evaluate_loss`
+    /// (MSE averaged over every output element), just done on-device.
+    pub fn validate_epoch(&mut self) -> Result<f32, NetworkError> {
+        if self.eval_rows == 0 {
+            return Err(NetworkError::Accelerator(
+                "validate_epoch called before prepare_validation succeeded".into(),
+            ));
+        }
+        let rows = self.eval_rows;
+        let output_size = self.target_width;
+        {
+            let loss = self.state.eval_loss.as_mut().expect("prepared");
+            self.state
+                .stream
+                .memset_zeros(loss)
+                .map_err(cuda_err("validation loss reset"))?;
+        }
+        let scale = 1.0 / (rows * output_size) as f32;
+        for start in (0..rows).step_by(self.batch_size) {
+            let b = self.batch_size.min(rows - start);
+            let f = &self.state.kernels.gather_rows;
+            let all_input = self.state.eval_input.as_ref().expect("prepared");
+            let all_target = self.state.eval_target.as_ref().expect("prepared");
+            let order = self.state.eval_order.as_ref().expect("prepared");
+            unsafe {
+                self.state
+                    .stream
+                    .launch_builder(f)
+                    .arg(&mut self.state.input)
+                    .arg(all_input)
+                    .arg(order)
+                    .arg(&(start as i32))
+                    .arg(&(b as i32))
+                    .arg(&(self.input_width as i32))
+                    .launch(cfg(b * self.input_width))
+                    .map_err(cuda_err("validation input gather kernel"))?;
+                self.state
+                    .stream
+                    .launch_builder(f)
+                    .arg(&mut self.state.target)
+                    .arg(all_target)
+                    .arg(order)
+                    .arg(&(start as i32))
+                    .arg(&(b as i32))
+                    .arg(&(self.target_width as i32))
+                    .launch(cfg(b * self.target_width))
+                    .map_err(cuda_err("validation target gather kernel"))?;
+            }
+            forward_pass(
+                &self.state.stream,
+                &self.state.blas,
+                &self.state.kernels,
+                &mut self.state.layers,
+                &self.model,
+                &self.state.input,
+                b,
+            )?;
+            let last = self.state.layers.len() - 1;
+            let la = &self.state.layers[last].a;
+            let n = b * output_size;
+            let fl = &self.state.kernels.mse_epoch_sum;
+            let loss = self.state.eval_loss.as_mut().expect("prepared");
+            unsafe {
+                self.state
+                    .stream
+                    .launch_builder(fl)
+                    .arg(loss)
+                    .arg(la)
+                    .arg(&self.state.target)
+                    .arg(&(n as i32))
+                    .arg(&scale)
+                    .launch(cfg(n))
+                    .map_err(cuda_err("validation loss kernel"))?;
+            }
+        }
+        self.state
+            .stream
+            .synchronize()
+            .map_err(cuda_err("validation synchronization"))?;
+        let loss = self
+            .state
+            .stream
+            .clone_dtoh(self.state.eval_loss.as_ref().expect("prepared"))
+            .map_err(cuda_err("validation loss download"))?[0];
+        self.stats.device_to_host_bytes += size_of::<f32>();
+        if !loss.is_finite() {
+            return Err(NetworkError::Cuda(
+                "numerical preflight failed: non-finite validation loss".into(),
+            ));
+        }
+        Ok(loss)
+    }
 }
 
 impl State {
@@ -528,6 +902,10 @@ impl State {
             all_input,
             all_target,
             order,
+            eval_input: None,
+            eval_target: None,
+            eval_order: None,
+            eval_loss: None,
         })
     }
     fn gather_batch(
@@ -595,9 +973,14 @@ impl State {
                 + self.target.len()
                 + self.loss.len()
                 + self.all_input.as_ref().map_or(0, CudaSlice::len)
-                + self.all_target.as_ref().map_or(0, CudaSlice::len))
+                + self.all_target.as_ref().map_or(0, CudaSlice::len)
+                + self.eval_input.as_ref().map_or(0, CudaSlice::len)
+                + self.eval_target.as_ref().map_or(0, CudaSlice::len)
+                + self.eval_loss.as_ref().map_or(0, CudaSlice::len))
                 * size_of::<f32>()
-            + self.order.as_ref().map_or(0, CudaSlice::len) * size_of::<u32>()
+            + (self.order.as_ref().map_or(0, CudaSlice::len)
+                + self.eval_order.as_ref().map_or(0, CudaSlice::len))
+                * size_of::<u32>()
     }
     fn train_batch(
         &mut self,
@@ -832,6 +1215,53 @@ impl State {
         Ok(())
     }
 }
+/// Forward pass only: fills every `layers[i].a` from `input`, leaving
+/// `layers.last().a` holding the network's output. No gradients, no
+/// parameter update. Used by `CudaTrainingSession::validate_epoch`; kept
+/// separate from `State::train_batch`'s own (duplicated) forward section so
+/// this addition cannot change what the tested training path does.
+fn forward_pass(
+    stream: &Arc<CudaStream>,
+    blas: &CudaBlas,
+    kernels: &Kernels,
+    layers: &mut [DevLayer],
+    net: &Network,
+    input: &CudaSlice<f32>,
+    b: usize,
+) -> Result<(), NetworkError> {
+    for i in 0..layers.len() {
+        let units = if i == 0 {
+            net.input_size
+        } else {
+            net.layers[i - 1].weights.rows
+        };
+        let out_units = net.layers[i].weights.rows;
+        if i == 0 {
+            let l = &mut layers[0];
+            gemm(blas, input, &l.w, &mut l.a, b, units, out_units)?;
+        } else {
+            let (left, right) = layers.split_at_mut(i);
+            let previous = &left[i - 1].a;
+            let l = &mut right[0];
+            gemm(blas, previous, &l.w, &mut l.a, b, units, out_units)?;
+        }
+        let f = &kernels.bias_act;
+        let l = &mut layers[i];
+        unsafe {
+            stream
+                .launch_builder(f)
+                .arg(&mut l.a)
+                .arg(&l.b)
+                .arg(&(b as i32))
+                .arg(&(net.layers[i].weights.rows as i32))
+                .arg(&act(net.layers[i].activation)?)
+                .launch(cfg(b * net.layers[i].weights.rows))
+                .map_err(cuda_err("bias/activation kernel"))?;
+        }
+    }
+    Ok(())
+}
+
 fn gemm(
     blas: &CudaBlas,
     a: &CudaSlice<f32>,
@@ -1162,5 +1592,64 @@ mod tests {
         }
         assert!(resumed.stats().peak_allocated_bytes > 0);
         assert_eq!(resumed.stats().epochs, 1);
+    }
+
+    /// P09: `validate_epoch`'s device-side forward pass must agree with the
+    /// CPU `Network::evaluate_loss` path it replaces, or early stopping
+    /// would silently start deciding on wrong numbers. Trains a couple of
+    /// epochs first so weights are not at their (numerically forgiving)
+    /// random init, then checks both paths against the same, unsynced,
+    /// device-resident weights.
+    #[test]
+    fn cuda_validate_epoch_matches_cpu_evaluate_loss_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let train = Dataset::new(
+            (0..23)
+                .map(|i| vec![(i as f32 - 11.0) / 9.0, ((i * 3) % 7) as f32 / 7.0])
+                .collect(),
+            (0..23).map(|i| vec![((i * 5) % 11) as f32 / 11.0 - 0.5]).collect(),
+        );
+        let validation = Dataset::new(
+            (0..13)
+                .map(|i| vec![(i as f32 - 6.0) / 5.0, ((i * 2) % 5) as f32 / 5.0])
+                .collect(),
+            (0..13).map(|i| vec![((i * 3) % 7) as f32 / 7.0 - 0.3]).collect(),
+        );
+        let base = Network::builder()
+            .input_size(2)
+            .dense(6, Activation::Tanh)
+            .dense(1, Activation::Linear)
+            .loss(Loss::Mse)
+            .optimizer(Optimizer::adam(0.01))
+            .seed(0xC0FFEE)
+            .build();
+        let config = TrainConfig {
+            epochs: 1,
+            batch_size: 5,
+            shuffle: true,
+            seed: Some(42),
+        };
+        let mut session = CudaTrainingSession::new(&base, &train, config, 0, 8192).unwrap();
+        assert!(session.prepare_validation(&validation, 8192).unwrap());
+        session.train_epoch().unwrap();
+        session.train_epoch().unwrap();
+
+        let device_loss = session.validate_epoch().unwrap();
+
+        let mut host_network = base;
+        session.synchronize_network(&mut host_network).unwrap();
+        let cpu_loss = host_network.evaluate_loss(&validation).unwrap();
+
+        assert!(
+            (device_loss - cpu_loss).abs() <= 1e-5,
+            "device validation loss {device_loss} vs CPU {cpu_loss}"
+        );
+
+        // validate_epoch must not have perturbed training: another epoch and
+        // checkpoint should still look like ordinary continued training.
+        let loss_after = session.train_epoch().unwrap();
+        assert!(loss_after.is_finite());
     }
 }

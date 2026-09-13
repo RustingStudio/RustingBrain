@@ -322,6 +322,54 @@ impl TrainingSession {
             _ => 0,
         }
     }
+
+    /// True only for backends with a device-side validation path (CUDA
+    /// today). Callers should keep using the host `evaluate_loss`
+    /// round-trip on any backend this returns `false` for, Metal included:
+    /// it has no `prepare_validation`/`validate_epoch` implementation.
+    pub fn supports_device_validation(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
+    /// Uploads `dataset` once so `validate_epoch` can score it on-device.
+    /// Only call when `supports_device_validation()` is true. Returns
+    /// `Ok(false)` (not an error) when it would not fit the device budget
+    /// alongside what training already uses; the caller should fall back to
+    /// host-side validation for the whole session in that case.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    pub fn prepare_validation(
+        &mut self,
+        dataset: &Dataset,
+        budget_mib: usize,
+    ) -> Result<bool, NetworkError> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(session) => session.prepare_validation(dataset, budget_mib),
+            #[allow(unreachable_patterns)]
+            _ => Err(NetworkError::Accelerator(
+                "device-side validation is not implemented for this backend".into(),
+            )),
+        }
+    }
+
+    /// Device-side validation loss over the set uploaded by
+    /// `prepare_validation`, using the weights currently resident on the
+    /// device. No host copy of the model is needed to compute it.
+    pub fn validate_epoch(&mut self) -> Result<f32, NetworkError> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(session) => session.validate_epoch(),
+            #[allow(unreachable_patterns)]
+            _ => Err(NetworkError::Accelerator(
+                "device-side validation is not implemented for this backend".into(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
