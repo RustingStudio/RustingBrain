@@ -213,11 +213,7 @@ pub struct MoeLayer {
 }
 
 impl MoeLayer {
-    pub fn new(
-        d_model: usize,
-        config: MoeConfig,
-        rng: &mut StdRng,
-    ) -> Result<Self, NetworkError> {
+    pub fn new(d_model: usize, config: MoeConfig, rng: &mut StdRng) -> Result<Self, NetworkError> {
         config.validate()?;
 
         let experts = (0..config.num_experts)
@@ -468,11 +464,7 @@ impl MoeLayer {
             }
             let probabilities = cache.probabilities.row(token);
             let upstream = grad_probabilities.row(token);
-            let dot: f32 = probabilities
-                .iter()
-                .zip(upstream)
-                .map(|(p, g)| p * g)
-                .sum();
+            let dot: f32 = probabilities.iter().zip(upstream).map(|(p, g)| p * g).sum();
 
             let row = grad_logits.row_mut(token);
             for expert in 0..experts {
@@ -722,7 +714,9 @@ mod tests {
     fn gate_weights_sum_to_one_per_token() {
         for top_k in 1..=4 {
             let moe = layer(MoeConfig::new(4, top_k, 6), 8, 3);
-            let (_, cache) = moe.forward_train(&Matrix::random(7, 8), Layout::default()).unwrap();
+            let (_, cache) = moe
+                .forward_train(&Matrix::random(7, 8), Layout::default())
+                .unwrap();
 
             for token in 0..7 {
                 let total: f32 = cache.assignments[token * top_k..(token + 1) * top_k]
@@ -737,7 +731,9 @@ mod tests {
     #[test]
     fn top_one_routing_uses_a_single_expert_per_token() {
         let moe = layer(MoeConfig::new(4, 1, 6), 8, 4);
-        let (_, cache) = moe.forward_train(&Matrix::random(6, 8), Layout::default()).unwrap();
+        let (_, cache) = moe
+            .forward_train(&Matrix::random(6, 8), Layout::default())
+            .unwrap();
 
         assert_eq!(cache.assignments.len(), 6);
         for &(_, gate) in &cache.assignments {
@@ -748,7 +744,9 @@ mod tests {
     #[test]
     fn every_token_reaches_exactly_top_k_experts() {
         let moe = layer(MoeConfig::new(6, 3, 4), 8, 5);
-        let (_, cache) = moe.forward_train(&Matrix::random(9, 8), Layout::default()).unwrap();
+        let (_, cache) = moe
+            .forward_train(&Matrix::random(9, 8), Layout::default())
+            .unwrap();
 
         let routed: usize = cache.expert_tokens.iter().map(Vec::len).sum();
         assert_eq!(routed, 9 * 3);
@@ -799,8 +797,16 @@ mod tests {
         one_hot_router(&mut large, 20.0);
 
         let input = one_hot_rows(&[0, 1, 2, 3], 4);
-        let quiet = small.forward_train(&input, Layout::default()).unwrap().1.z_loss();
-        let loud = large.forward_train(&input, Layout::default()).unwrap().1.z_loss();
+        let quiet = small
+            .forward_train(&input, Layout::default())
+            .unwrap()
+            .1
+            .z_loss();
+        let loud = large
+            .forward_train(&input, Layout::default())
+            .unwrap()
+            .1
+            .z_loss();
 
         assert!(loud > quiet);
         assert!(quiet > 0.0);
@@ -809,7 +815,9 @@ mod tests {
     #[test]
     fn a_disabled_z_loss_is_zero() {
         let moe = layer(MoeConfig::new(4, 2, 6).with_router_z_loss_weight(0.0), 8, 8);
-        let (_, cache) = moe.forward_train(&Matrix::random(4, 8), Layout::default()).unwrap();
+        let (_, cache) = moe
+            .forward_train(&Matrix::random(4, 8), Layout::default())
+            .unwrap();
 
         assert_eq!(cache.z_loss(), 0.0);
         assert_eq!(cache.auxiliary_loss(), cache.aux_loss());
@@ -852,11 +860,18 @@ mod tests {
         // Every token routes to expert 0, so experts 1..4 must stay untouched.
         let input = one_hot_rows(&[0, 0, 0], 4);
         let (output, cache) = moe.forward_train(&input, Layout::default()).unwrap();
-        let grad_output =
-            Matrix::from_vec(output.rows, output.cols, vec![1.0; output.data.len()]);
+        let grad_output = Matrix::from_vec(output.rows, output.cols, vec![1.0; output.data.len()]);
         moe.backward(&cache, &grad_output);
 
-        assert!(moe.experts[0].gate.weight.grad.data.iter().any(|&g| g != 0.0));
+        assert!(
+            moe.experts[0]
+                .gate
+                .weight
+                .grad
+                .data
+                .iter()
+                .any(|&g| g != 0.0)
+        );
         for expert in &moe.experts[1..] {
             assert!(
                 expert.gate.weight.grad.data.iter().all(|&g| g == 0.0),
@@ -878,12 +893,13 @@ mod tests {
         let input = Matrix::from_vec(
             3,
             6,
-            (0..18).map(|i| ((i * 29) % 17) as f32 / 8.0 - 1.0).collect(),
+            (0..18)
+                .map(|i| ((i * 29) % 17) as f32 / 8.0 - 1.0)
+                .collect(),
         );
 
         let (output, cache) = moe.forward_train(&input, Layout::default()).unwrap();
-        let grad_output =
-            Matrix::from_vec(output.rows, output.cols, vec![1.0; output.data.len()]);
+        let grad_output = Matrix::from_vec(output.rows, output.cols, vec![1.0; output.data.len()]);
         let grad_input = moe.backward(&cache, &grad_output);
 
         let epsilon = 1e-3;
@@ -914,12 +930,13 @@ mod tests {
         let input = Matrix::from_vec(
             3,
             4,
-            (0..12).map(|i| ((i * 13) % 11) as f32 / 5.0 - 1.0).collect(),
+            (0..12)
+                .map(|i| ((i * 13) % 11) as f32 / 5.0 - 1.0)
+                .collect(),
         );
 
         let (output, cache) = moe.forward_train(&input, Layout::default()).unwrap();
-        let grad_output =
-            Matrix::from_vec(output.rows, output.cols, vec![1.0; output.data.len()]);
+        let grad_output = Matrix::from_vec(output.rows, output.cols, vec![1.0; output.data.len()]);
         moe.backward(&cache, &grad_output);
         let analytic = moe.router.projection.weight.grad.data.clone();
 
@@ -947,7 +964,9 @@ mod tests {
         let input = Matrix::from_vec(
             4,
             4,
-            (0..16).map(|i| ((i * 19) % 13) as f32 / 6.0 - 1.0).collect(),
+            (0..16)
+                .map(|i| ((i * 19) % 13) as f32 / 6.0 - 1.0)
+                .collect(),
         );
 
         // Zero upstream gradient isolates the auxiliary losses: the only thing
@@ -961,9 +980,17 @@ mod tests {
         for (index, &expected) in analytic.iter().enumerate() {
             let mut probe = moe.clone();
             probe.router.projection.weight.value.data[index] += epsilon;
-            let high = probe.forward_train(&input, Layout::default()).unwrap().1.auxiliary_loss();
+            let high = probe
+                .forward_train(&input, Layout::default())
+                .unwrap()
+                .1
+                .auxiliary_loss();
             probe.router.projection.weight.value.data[index] -= 2.0 * epsilon;
-            let low = probe.forward_train(&input, Layout::default()).unwrap().1.auxiliary_loss();
+            let low = probe
+                .forward_train(&input, Layout::default())
+                .unwrap()
+                .1
+                .auxiliary_loss();
             let numeric = (high - low) / (2.0 * epsilon);
             assert!(
                 (expected - numeric).abs() < 1e-3,

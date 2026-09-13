@@ -748,8 +748,13 @@ impl MetalTrainingSession {
                 let encoder = command.new_compute_command_encoder();
                 for start in (0..self.rows).step_by(self.batch_size) {
                     let rows = self.batch_size.min(self.rows - start);
-                    self.state
-                        .gather_batch(encoder, start, rows, self.input_width, self.target_width);
+                    self.state.gather_batch(
+                        encoder,
+                        start,
+                        rows,
+                        self.input_width,
+                        self.target_width,
+                    );
                     self.state
                         .train_batch(encoder, &mut self.model, rows, batches)?;
                     self.stats.batches += 1;

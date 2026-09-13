@@ -48,8 +48,9 @@ pub(crate) struct ModelKernels {
     rmsnorm_forward: CudaFunction,
     rmsnorm_backward: CudaFunction,
     rope: CudaFunction,
-    causal_softmax: CudaFunction,
     causal_softmax_backward: CudaFunction,
+    causal_probs_from_lse: CudaFunction,
+    causal_softmax_lse: CudaFunction,
     swiglu_forward: CudaFunction,
     swiglu_backward: CudaFunction,
     softmax_lse: CudaFunction,
@@ -83,8 +84,9 @@ impl ModelKernels {
             rmsnorm_forward: get("rmsnorm_fwd")?,
             rmsnorm_backward: get("rmsnorm_bwd")?,
             rope: get("rope_rotate")?,
-            causal_softmax: get("causal_softmax")?,
             causal_softmax_backward: get("causal_softmax_bwd")?,
+            causal_probs_from_lse: get("causal_probs_from_lse")?,
+            causal_softmax_lse: get("causal_softmax_lse")?,
             swiglu_forward: get("swiglu_fwd")?,
             swiglu_backward: get("swiglu_bwd")?,
             softmax_lse: get("softmax_lse")?,
@@ -155,10 +157,15 @@ struct BlockCache {
     attention_weight: CudaSlice<f32>,
     attention_inverse_rms: CudaSlice<f32>,
     attention_normed: CudaSlice<f32>,
-    queries: CudaSlice<f32>,
-    keys: CudaSlice<f32>,
-    values: CudaSlice<f32>,
-    probabilities: CudaSlice<f32>,
+    /// Query, key and value in one buffer, three slices of every row, because
+    /// they are produced by one GEMM against the three weights packed together.
+    qkv: CudaSlice<f32>,
+    /// Those three weights packed, which the input gradient reads again in the
+    /// backward pass.
+    qkv_weights: CudaSlice<f32>,
+    /// The per-query log-sum-exp of the attention scores, which is all the
+    /// backward pass needs of a probability matrix that never existed.
+    log_sum_exp: CudaSlice<f32>,
     merged: CudaSlice<f32>,
     residual: CudaSlice<f32>,
     feed_forward_weight: CudaSlice<f32>,
@@ -169,9 +176,13 @@ struct BlockCache {
 
 /// The three buffers a SwiGLU backward pass cannot recover from its output.
 struct SwiGluCache {
-    gate: CudaSlice<f32>,
-    up: CudaSlice<f32>,
+    /// Gate and up in one buffer, two halves of every row, because they are
+    /// produced by one GEMM at twice the width.
+    gate_up: CudaSlice<f32>,
     hidden: CudaSlice<f32>,
+    /// The gate and up weights concatenated, which the input gradient reads
+    /// again in the backward pass.
+    weights: CudaSlice<f32>,
 }
 
 enum FfnCache {
@@ -399,7 +410,7 @@ impl Gpu<'_> {
     ) -> Result<CudaSlice<f32>, NetworkError> {
         let mut out = self.uninit(rows * weight.rows())?;
         gemm_rhs_transposed(
-            &self.context.blas,
+            self.context,
             x,
             weight.cols(),
             weight.value(),
@@ -427,7 +438,7 @@ impl Gpu<'_> {
         beta: f32,
     ) -> Result<(), NetworkError> {
         gemm_rhs_transposed(
-            &self.context.blas,
+            self.context,
             x,
             weight.cols(),
             weight.value(),
@@ -453,7 +464,7 @@ impl Gpu<'_> {
         beta: f32,
     ) -> Result<(), NetworkError> {
         gemm_plain(
-            &self.context.blas,
+            self.context,
             grad_output,
             weight.rows(),
             weight.value(),
@@ -479,7 +490,7 @@ impl Gpu<'_> {
     ) -> Result<(), NetworkError> {
         let (units, cols) = (weight.rows(), weight.cols());
         gemm_lhs_transposed(
-            &self.context.blas,
+            self.context,
             grad_output,
             units,
             input,
@@ -566,6 +577,8 @@ impl Gpu<'_> {
         head_dim: usize,
         seq_len: usize,
         direction: f32,
+        width: usize,
+        offset: usize,
     ) -> Result<(), NetworkError> {
         let elements = rows * heads * head_dim / 2;
         unsafe {
@@ -580,27 +593,10 @@ impl Gpu<'_> {
                 .arg(&(head_dim as i32))
                 .arg(&(seq_len as i32))
                 .arg(&direction)
+                .arg(&(width as i32))
+                .arg(&(offset as i32))
                 .launch(cfg(elements))
                 .map_err(cuda_err("RoPE kernel"))?;
-        }
-        Ok(())
-    }
-
-    fn causal_softmax(
-        &self,
-        scores: &mut CudaSlice<f32>,
-        rows: usize,
-        seq_len: usize,
-    ) -> Result<(), NetworkError> {
-        unsafe {
-            self.context
-                .stream
-                .launch_builder(&self.context.model.causal_softmax)
-                .arg(scores)
-                .arg(&(rows as i32))
-                .arg(&(seq_len as i32))
-                .launch(warp_per_row_grid(rows))
-                .map_err(cuda_err("causal softmax kernel"))?;
         }
         Ok(())
     }
@@ -626,10 +622,59 @@ impl Gpu<'_> {
         Ok(())
     }
 
+    /// Causal softmax over the scores in place, writing the per-query
+    /// log-sum-exp the backward pass keeps instead of the probabilities.
+    fn causal_softmax_lse(
+        &self,
+        scores: &mut CudaSlice<f32>,
+        lse: &mut CudaSlice<f32>,
+        rows: usize,
+        seq_len: usize,
+    ) -> Result<(), NetworkError> {
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.causal_softmax_lse)
+                .arg(scores)
+                .arg(lse)
+                .arg(&(rows as i32))
+                .arg(&(seq_len as i32))
+                .launch(warp_per_row_grid(rows))
+                .map_err(cuda_err("causal softmax kernel"))?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the attention probabilities in place from scaled scores and the
+    /// stored log-sum-exp, which is what the backward GEMMs expect to read.
+    fn causal_probs_from_lse(
+        &self,
+        scores: &mut CudaSlice<f32>,
+        lse: &CudaSlice<f32>,
+        rows: usize,
+        seq_len: usize,
+    ) -> Result<(), NetworkError> {
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.causal_probs_from_lse)
+                .arg(scores)
+                .arg(lse)
+                .arg(&(rows as i32))
+                .arg(&(seq_len as i32))
+                .launch(cfg(rows * seq_len))
+                .map_err(cuda_err("attention probability kernel"))?;
+        }
+        Ok(())
+    }
+
+    /// `target += source[offset..offset + len]`, the offset being what lets one
+    /// fused weight-gradient buffer be split back into two parameters.
     fn add(
         &self,
         target: &mut CudaSlice<f32>,
         source: &CudaSlice<f32>,
+        offset: usize,
         len: usize,
     ) -> Result<(), NetworkError> {
         unsafe {
@@ -638,8 +683,13 @@ impl Gpu<'_> {
                 .launch_builder(&self.context.model.add)
                 .arg(target)
                 .arg(source)
+                .arg(&(offset as i32))
                 .arg(&(len as i32))
-                .launch(cfg(len))
+                .launch(cfg(if (len | offset) % 4 == 0 {
+                    len / 4
+                } else {
+                    len
+                }))
                 .map_err(cuda_err("addition kernel"))?;
         }
         Ok(())
@@ -771,47 +821,183 @@ impl Gpu<'_> {
 
     fn swiglu(
         &self,
-        gate: &CudaSlice<f32>,
-        up: &CudaSlice<f32>,
-        len: usize,
+        gate_up: &CudaSlice<f32>,
+        rows: usize,
+        width: usize,
     ) -> Result<CudaSlice<f32>, NetworkError> {
-        let mut hidden = self.uninit(len)?;
+        let mut hidden = self.uninit(rows * width)?;
         unsafe {
             self.context
                 .stream
                 .launch_builder(&self.context.model.swiglu_forward)
                 .arg(&mut hidden)
-                .arg(gate)
-                .arg(up)
-                .arg(&(len as i32))
-                .launch(cfg(len))
+                .arg(gate_up)
+                .arg(&(rows as i32))
+                .arg(&(width as i32))
+                .launch(cfg(if width % 4 == 0 {
+                    rows * width / 4
+                } else {
+                    rows * width
+                }))
                 .map_err(cuda_err("SwiGLU kernel"))?;
         }
         Ok(hidden)
     }
 
+    /// The gate and up gradients, in the same two-halves-per-row layout the
+    /// forward activations use, so the weight gradient is one wide GEMM too.
     fn swiglu_backward(
         &self,
-        cache: &SwiGluCache,
+        gate_up: &CudaSlice<f32>,
         grad_hidden: &CudaSlice<f32>,
-        len: usize,
-    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), NetworkError> {
-        let mut grad_gate = self.uninit(len)?;
-        let mut grad_up = self.uninit(len)?;
+        rows: usize,
+        width: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut grad_gate_up = self.uninit(rows * 2 * width)?;
         unsafe {
             self.context
                 .stream
                 .launch_builder(&self.context.model.swiglu_backward)
-                .arg(&mut grad_gate)
-                .arg(&mut grad_up)
-                .arg(&cache.gate)
-                .arg(&cache.up)
+                .arg(&mut grad_gate_up)
+                .arg(gate_up)
                 .arg(grad_hidden)
-                .arg(&(len as i32))
-                .launch(cfg(len))
+                .arg(&(rows as i32))
+                .arg(&(width as i32))
+                .launch(cfg(if width % 4 == 0 {
+                    rows * width / 4
+                } else {
+                    rows * width
+                }))
                 .map_err(cuda_err("SwiGLU backward kernel"))?;
         }
-        Ok((grad_gate, grad_up))
+        Ok(grad_gate_up)
+    }
+
+    /// Several weight matrices end to end in one buffer, which is the weight
+    /// of the single wide projection that replaces them. cuBLAS is close to
+    /// twice as fast on one wide shape as on two narrow ones, and the packing
+    /// itself is a device-to-device copy of weight-sized buffers.
+    fn pack(&self, parts: &[&DeviceParam]) -> Result<CudaSlice<f32>, NetworkError> {
+        let total: usize = parts.iter().map(|part| part.rows() * part.cols()).sum();
+        let mut packed = self.uninit(total)?;
+        let mut base = 0;
+        for part in parts {
+            let len = part.rows() * part.cols();
+            self.context
+                .stream
+                .memcpy_dtod(part.value(), &mut packed.slice_mut(base..base + len))
+                .map_err(cuda_err("device to device copy"))?;
+            base += len;
+        }
+        Ok(packed)
+    }
+
+    /// The gate and up weights of every given feed-forward, one after another,
+    /// so a routed layer pays a single allocation for all of its experts.
+    fn pack_gate_up<'a>(
+        &self,
+        ffns: impl Iterator<Item = &'a SwiGlu>,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut parts = Vec::new();
+        for ffn in ffns {
+            parts.push(device_of(&ffn.gate)?);
+            parts.push(device_of(&ffn.up)?);
+        }
+        self.pack(&parts)
+    }
+
+    /// `out = x . weight^T + beta * out` for a weight that is a plain buffer
+    /// rather than a parameter, which is what the packed gate-and-up is.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_packed<W: DevicePtr<f32>, X: DevicePtr<f32>, O: DevicePtrMut<f32>>(
+        &self,
+        weights: &W,
+        units: usize,
+        inner: usize,
+        x: &X,
+        out: &mut O,
+        rows: usize,
+        beta: f32,
+    ) -> Result<(), NetworkError> {
+        gemm_rhs_transposed(
+            self.context,
+            x,
+            inner,
+            weights,
+            inner,
+            out,
+            units,
+            rows,
+            units,
+            inner,
+            1.0,
+            beta,
+        )
+    }
+
+    /// The input-gradient half of [`Gpu::linear_packed`].
+    #[allow(clippy::too_many_arguments)]
+    fn linear_packed_backward_input<W: DevicePtr<f32>, G: DevicePtr<f32>, O: DevicePtrMut<f32>>(
+        &self,
+        weights: &W,
+        units: usize,
+        inner: usize,
+        grad_output: &G,
+        out: &mut O,
+        rows: usize,
+        beta: f32,
+    ) -> Result<(), NetworkError> {
+        gemm_plain(
+            self.context,
+            grad_output,
+            units,
+            weights,
+            inner,
+            out,
+            inner,
+            rows,
+            inner,
+            units,
+            1.0,
+            beta,
+        )
+    }
+
+    /// One wide weight-gradient GEMM for a packed projection, split back into
+    /// the separate parameters afterwards. The split is one add per parameter
+    /// over a weight-sized buffer, which is nothing next to halving the GEMM
+    /// time.
+    fn accumulate_packed_grad<G: DevicePtr<f32>, X: DevicePtr<f32>>(
+        &self,
+        parts: &mut [&mut DeviceParam],
+        grad: &G,
+        input: &X,
+        rows: usize,
+    ) -> Result<(), NetworkError> {
+        let inner = parts[0].cols();
+        let units: usize = parts.iter().map(|part| part.rows()).sum();
+        let mut scratch = self.uninit(units * inner)?;
+        gemm_lhs_transposed(
+            self.context,
+            grad,
+            units,
+            input,
+            inner,
+            &mut scratch,
+            inner,
+            rows,
+            units,
+            inner,
+            -1.0,
+            0.0,
+        )?;
+        let mut base = 0;
+        for part in parts {
+            let len = part.rows() * inner;
+            self.add(part.negated_grad_mut(), &scratch, base, len)?;
+            base += len;
+        }
+        Ok(())
     }
 }
 
@@ -838,15 +1024,19 @@ fn head_of_mut(model: &mut TransformerLm) -> Result<&mut DeviceParam, NetworkErr
 }
 
 fn device_of(linear: &Linear) -> Result<&DeviceParam, NetworkError> {
-    linear.weight.device.as_ref().ok_or_else(|| {
-        NetworkError::Cuda("a projection is not resident on the device".into())
-    })
+    linear
+        .weight
+        .device
+        .as_ref()
+        .ok_or_else(|| NetworkError::Cuda("a projection is not resident on the device".into()))
 }
 
 fn device_of_mut(linear: &mut Linear) -> Result<&mut DeviceParam, NetworkError> {
-    linear.weight.device.as_mut().ok_or_else(|| {
-        NetworkError::Cuda("a projection is not resident on the device".into())
-    })
+    linear
+        .weight
+        .device
+        .as_mut()
+        .ok_or_else(|| NetworkError::Cuda("a projection is not resident on the device".into()))
 }
 
 /// The device path implements the SwiGLU shape only, which is what
@@ -900,7 +1090,9 @@ fn forward_hidden(
     }
 
     let layout = batch.layout();
-    let flags: Vec<i32> = (0..rows).map(|row| i32::from(layout.is_valid(row))).collect();
+    let flags: Vec<i32> = (0..rows)
+        .map(|row| i32::from(layout.is_valid(row)))
+        .collect();
     let valid_tokens = flags.iter().filter(|&&flag| flag != 0).count();
     let valid = gpu.upload_flags(&flags)?;
     let ids = gpu.upload_indices(batch.ids())?;
@@ -931,13 +1123,8 @@ fn forward_hidden(
     }
 
     let final_weight = gpu.upload(&model.final_norm.weight.value.data)?;
-    let (final_output, final_inverse_rms) = gpu.rmsnorm(
-        &hidden,
-        &final_weight,
-        rows,
-        d_model,
-        model.final_norm.eps,
-    )?;
+    let (final_output, final_inverse_rms) =
+        gpu.rmsnorm(&hidden, &final_weight, rows, d_model, model.final_norm.eps)?;
 
     Ok(GpuCache {
         rows,
@@ -974,10 +1161,8 @@ fn forward_block(
     let heads = attention.num_heads();
     let kv_heads = attention.num_kv_heads();
     let head_dim = attention.head_dim();
-    let group = heads / kv_heads;
     let scale = (head_dim as f32).sqrt().recip();
     let query_width = heads * head_dim;
-    let kv_width = kv_heads * head_dim;
 
     let attention_weight = gpu.upload(&block.attention_norm.weight.value.data)?;
     let (attention_normed, attention_inverse_rms) = gpu.rmsnorm(
@@ -988,9 +1173,30 @@ fn forward_block(
         block.attention_norm.eps,
     )?;
 
-    let mut queries = gpu.linear(device_of(&attention.query)?, &attention_normed, rows)?;
-    let mut keys = gpu.linear(device_of(&attention.key)?, &attention_normed, rows)?;
-    let values = gpu.linear(device_of(&attention.value)?, &attention_normed, rows)?;
+    // Query, key and value read the same input and differ only in width, so
+    // they are one GEMM against their three weight matrices packed end to end.
+    // Every later reader takes a slice of the fused row instead of a buffer of
+    // its own, which is why the strides below are `qkv_width` rather than the
+    // width of the projection being read.
+    let kv_width = kv_heads * head_dim;
+    let qkv_width = query_width + 2 * kv_width;
+    let qkv_weights = gpu.pack(&[
+        device_of(&attention.query)?,
+        device_of(&attention.key)?,
+        device_of(&attention.value)?,
+    ])?;
+    let mut qkv = gpu.uninit(rows * qkv_width)?;
+    gpu.linear_packed(
+        &qkv_weights,
+        qkv_width,
+        d_model,
+        &attention_normed,
+        &mut qkv,
+        rows,
+        0.0,
+    )?;
+    let key_base = query_width;
+    let value_base = query_width + kv_width;
 
     let tables = gpu.rope_tables(&attention.rope)?;
     if seq_len > tables.max_seq_len {
@@ -999,23 +1205,33 @@ fn forward_block(
             max_seq_len: tables.max_seq_len,
         });
     }
-    gpu.rope(&mut queries, &tables, rows, heads, head_dim, seq_len, 1.0)?;
-    gpu.rope(&mut keys, &tables, rows, kv_heads, head_dim, seq_len, 1.0)?;
+    gpu.rope(
+        &mut qkv, &tables, rows, heads, head_dim, seq_len, 1.0, qkv_width, 0,
+    )?;
+    gpu.rope(
+        &mut qkv, &tables, rows, kv_heads, head_dim, seq_len, 1.0, qkv_width, key_base,
+    )?;
 
-    // Scores are `[head][sequence][query, key]`. Every head is one batched GEMM
-    // over the sequences, and the 1/sqrt(head_dim) scale rides along in alpha.
-    let mut probabilities = gpu.uninit(heads * sequences * seq_len * seq_len)?;
+    // Attention as three steps: a batched GEMM per head for the scores, a
+    // causal softmax in place, and a second batched GEMM against the values.
+    // The GEMMs run on the tensor cores, which no hand-written SIMT kernel on
+    // this card can match. The probability matrix is scratch that dies with
+    // this call: only the log-sum-exp is cached, and the backward pass rebuilds
+    // the probabilities from it.
+    let group = heads / kv_heads;
+    let block_size = seq_len * seq_len;
+    let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
     for head in 0..heads {
         let kv_base = (head / group) * head_dim;
-        let query = queries.slice(head * head_dim..);
-        let key = keys.slice(kv_base..);
-        let mut scores = probabilities.slice_mut(head * sequences * seq_len * seq_len..);
+        let query = qkv.slice(head * head_dim..);
+        let key = qkv.slice(key_base + kv_base..);
+        let mut scores = probabilities.slice_mut(head * sequences * block_size..);
         gemm_rhs_transposed_batched(
-            &gpu.context.blas,
+            gpu.context,
             &query,
-            query_width,
+            qkv_width,
             &key,
-            kv_width,
+            qkv_width,
             &mut scores,
             seq_len,
             seq_len,
@@ -1024,26 +1240,31 @@ fn forward_block(
             scale,
             0.0,
             sequences,
-            seq_len * query_width,
-            seq_len * kv_width,
-            seq_len * seq_len,
+            seq_len * qkv_width,
+            seq_len * qkv_width,
+            block_size,
         )?;
     }
-    gpu.causal_softmax(&mut probabilities, heads * sequences * seq_len, seq_len)?;
-
+        let mut log_sum_exp = gpu.uninit(heads * rows)?;
+    gpu.causal_softmax_lse(
+        &mut probabilities,
+        &mut log_sum_exp,
+        heads * sequences * seq_len,
+        seq_len,
+    )?;
     let mut merged = gpu.uninit(rows * query_width)?;
     for head in 0..heads {
         let kv_base = (head / group) * head_dim;
-        let scores = probabilities.slice(head * sequences * seq_len * seq_len..);
-        let value = values.slice(kv_base..);
-        let mut out = merged.slice_mut(head * head_dim..);
+        let head_probabilities = probabilities.slice(head * sequences * block_size..);
+        let value = qkv.slice(value_base + kv_base..);
+        let mut head_merged = merged.slice_mut(head * head_dim..);
         gemm_plain_batched(
-            &gpu.context.blas,
-            &scores,
+            gpu.context,
+            &head_probabilities,
             seq_len,
             &value,
-            kv_width,
-            &mut out,
+            qkv_width,
+            &mut head_merged,
             query_width,
             seq_len,
             head_dim,
@@ -1051,8 +1272,8 @@ fn forward_block(
             1.0,
             0.0,
             sequences,
-            seq_len * seq_len,
-            seq_len * kv_width,
+            block_size,
+            seq_len * qkv_width,
             seq_len * query_width,
         )?;
     }
@@ -1109,10 +1330,9 @@ fn forward_block(
             attention_weight,
             attention_inverse_rms,
             attention_normed,
-            queries,
-            keys,
-            values,
-            probabilities,
+            qkv,
+            qkv_weights,
+            log_sum_exp,
             merged,
             residual,
             feed_forward_weight,
@@ -1132,11 +1352,17 @@ fn forward_swiglu(
     rows: usize,
 ) -> Result<SwiGluCache, NetworkError> {
     let width = ffn.d_ff();
-    let gate = gpu.linear(device_of(&ffn.gate)?, input, rows)?;
-    let up = gpu.linear(device_of(&ffn.up)?, input, rows)?;
-    let hidden = gpu.swiglu(&gate, &up, rows * width)?;
+    let inner = ffn.d_model();
+    let weights = gpu.pack_gate_up(std::iter::once(ffn))?;
+    let mut gate_up = gpu.uninit(rows * 2 * width)?;
+    gpu.linear_packed(&weights, 2 * width, inner, input, &mut gate_up, rows, 0.0)?;
+    let hidden = gpu.swiglu(&gate_up, rows, width)?;
     gpu.linear_into(device_of(&ffn.down)?, &hidden, out, rows, 1.0)?;
-    Ok(SwiGluCache { gate, up, hidden })
+    Ok(SwiGluCache {
+        gate_up,
+        hidden,
+        weights,
+    })
 }
 
 /// The routed feed-forward.
@@ -1244,20 +1470,20 @@ fn forward_moe(
         gpu.gather(&mut gathered, input, &token_of, routed, d_model)?;
     }
 
-    let mut gate_activations = gpu.uninit(routed * width)?;
-    let mut up_activations = gpu.uninit(routed * width)?;
-    for (expert, module) in moe.experts.iter().enumerate() {
+    let expert_weights = gpu.pack_gate_up(moe.experts.iter())?;
+    let packed_stride = 2 * width * d_model;
+    let mut gate_up = gpu.uninit(routed * 2 * width)?;
+    for (expert, _) in moe.experts.iter().enumerate() {
         let count = counts[expert];
         if count == 0 {
             continue;
         }
         let rows_in = gathered.slice(offsets[expert] * d_model..);
-        let mut gate = gate_activations.slice_mut(offsets[expert] * width..);
-        gpu.linear_into(device_of(&module.gate)?, &rows_in, &mut gate, count, 0.0)?;
-        let mut up = up_activations.slice_mut(offsets[expert] * width..);
-        gpu.linear_into(device_of(&module.up)?, &rows_in, &mut up, count, 0.0)?;
+        let weights = expert_weights.slice(expert * packed_stride..);
+        let mut out = gate_up.slice_mut(offsets[expert] * 2 * width..);
+        gpu.linear_packed(&weights, 2 * width, d_model, &rows_in, &mut out, count, 0.0)?;
     }
-    let hidden = gpu.swiglu(&gate_activations, &up_activations, routed * width)?;
+    let hidden = gpu.swiglu(&gate_up, routed, width)?;
 
     let mut expert_output = gpu.uninit(routed * d_model)?;
     for (expert, module) in moe.experts.iter().enumerate() {
@@ -1267,7 +1493,13 @@ fn forward_moe(
         }
         let rows_in = hidden.slice(offsets[expert] * width..);
         let mut rows_out = expert_output.slice_mut(offsets[expert] * d_model..);
-        gpu.linear_into(device_of(&module.down)?, &rows_in, &mut rows_out, count, 0.0)?;
+        gpu.linear_into(
+            device_of(&module.down)?,
+            &rows_in,
+            &mut rows_out,
+            count,
+            0.0,
+        )?;
     }
     if routed > 0 {
         gpu.scatter_scaled(out, &expert_output, &token_of, &gates, routed, d_model)?;
@@ -1300,9 +1532,7 @@ fn forward_moe(
     if valid_tokens > 0 {
         let slots = (valid_tokens * top_k) as f32;
         let balance: f32 = (0..experts)
-            .map(|expert| {
-                (counts[expert] as f32 / slots) * (sums[expert] / valid_tokens as f32)
-            })
+            .map(|expert| (counts[expert] as f32 / slots) * (sums[expert] / valid_tokens as f32))
             .sum();
         auxiliary += experts as f32 * moe.config.aux_loss_weight * balance;
         auxiliary += moe.config.router_z_loss_weight * sums[experts] / valid_tokens as f32;
@@ -1321,9 +1551,9 @@ fn forward_moe(
             routed,
             input: gathered,
             expert: SwiGluCache {
-                gate: gate_activations,
-                up: up_activations,
+                gate_up,
                 hidden,
+                weights: expert_weights,
             },
             output: expert_output,
             shared,
@@ -1429,7 +1659,9 @@ pub(crate) fn train_step(
         let mut start = 0;
         while start < rows {
             let count = chunk.min(rows - start);
-            let input = cache.final_output.slice(start * d_model..(start + count) * d_model);
+            let input = cache
+                .final_output
+                .slice(start * d_model..(start + count) * d_model);
             let targets = targets.slice(start..start + count);
             let mut out = grad_final.slice_mut(start * d_model..(start + count) * d_model);
             if let Some(reduced) = reduced.as_mut() {
@@ -1529,10 +1761,9 @@ impl HeadBf16 {
         inverse_predicted: f32,
     ) -> Result<(), NetworkError> {
         let (vocab, d_model) = (head.rows(), head.cols());
-        let blas = &gpu.context.blas;
         gpu.cast_to_bf16(&mut self.input, input, count * d_model)?;
         gemm_rhs_transposed(
-            blas,
+            gpu.context,
             &self.input,
             d_model,
             &self.weight,
@@ -1560,7 +1791,7 @@ impl HeadBf16 {
         }
         // `self.logits` now holds dL/dlogits for this chunk.
         gemm_plain(
-            blas,
+            gpu.context,
             &self.logits,
             vocab,
             &self.weight,
@@ -1575,7 +1806,7 @@ impl HeadBf16 {
         )?;
         gpu.cast_from_bf16(grad_input, &self.grad_input, count * d_model)?;
         gemm_lhs_transposed(
-            blas,
+            gpu.context,
             &self.logits,
             vocab,
             &self.input,
@@ -1820,7 +2051,7 @@ fn backward_block(
     )?;
     // The residual passes the upstream gradient through untouched alongside the
     // branch gradient.
-    gpu.add(&mut grad_residual, grad_output, rows * d_model)?;
+    gpu.add(&mut grad_residual, grad_output, 0, rows * d_model)?;
 
     let grad_attention_normed = backward_attention(gpu, block, cache, &grad_residual, batch)?;
 
@@ -1833,7 +2064,7 @@ fn backward_block(
         rows,
         d_model,
     )?;
-    gpu.add(&mut grad_input, &grad_residual, rows * d_model)?;
+    gpu.add(&mut grad_input, &grad_residual, 0, rows * d_model)?;
 
     Ok(grad_input)
 }
@@ -1862,6 +2093,9 @@ fn backward_attention(
     let scale = (head_dim as f32).sqrt().recip();
     let query_width = heads * head_dim;
     let kv_width = kv_heads * head_dim;
+    let qkv_width = query_width + 2 * kv_width;
+    let key_base = query_width;
+    let value_base = query_width + kv_width;
     let block_size = seq_len * seq_len;
 
     let mut grad_merged = gpu.uninit(rows * query_width)?;
@@ -1879,22 +2113,61 @@ fn backward_attention(
         rows,
     )?;
 
+    // The forward pass kept only the log-sum-exp, so the probabilities are
+    // rebuilt here: one batched GEMM per head for the scores, then one
+    // exponential per element. The matrix lives for this block's backward pass
+    // alone rather than for the whole depth of the model.
+    let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
+    for head in 0..heads {
+        let kv_base = (head / group) * head_dim;
+        let query = cache.qkv.slice(head * head_dim..);
+        let key = cache.qkv.slice(key_base + kv_base..);
+        let mut scores = probabilities.slice_mut(head * sequences * block_size..);
+        gemm_rhs_transposed_batched(
+            gpu.context,
+            &query,
+            qkv_width,
+            &key,
+            qkv_width,
+            &mut scores,
+            seq_len,
+            seq_len,
+            seq_len,
+            head_dim,
+            scale,
+            0.0,
+            sequences,
+            seq_len * qkv_width,
+            seq_len * qkv_width,
+            block_size,
+        )?;
+    }
+    gpu.causal_probs_from_lse(
+        &mut probabilities,
+        &cache.log_sum_exp,
+        heads * sequences * seq_len,
+        seq_len,
+    )?;
+
     // Every head overwrites its own slice of `grad_scores`, so the buffer does
     // not need clearing. `grad_values` does: query heads in a group accumulate
     // into the same key/value head.
     let mut grad_scores = gpu.uninit(heads * sequences * block_size)?;
-    let mut grad_values = gpu.zeros(rows * kv_width)?;
+    // The query slice is overwritten head by head, but the key and value
+    // slices accumulate over every query head in a group, so the whole fused
+    // buffer starts at zero.
+    let mut grad_qkv = gpu.zeros(rows * qkv_width)?;
     for head in 0..heads {
         let kv_base = (head / group) * head_dim;
         let upstream = grad_merged.slice(head * head_dim..);
-        let value = cache.values.slice(kv_base..);
+        let value = cache.qkv.slice(value_base + kv_base..);
         let mut scores = grad_scores.slice_mut(head * sequences * block_size..);
         gemm_rhs_transposed_batched(
-            &gpu.context.blas,
+            gpu.context,
             &upstream,
             query_width,
             &value,
-            kv_width,
+            qkv_width,
             &mut scores,
             seq_len,
             seq_len,
@@ -1904,22 +2177,20 @@ fn backward_attention(
             0.0,
             sequences,
             seq_len * query_width,
-            seq_len * kv_width,
+            seq_len * qkv_width,
             block_size,
         )?;
 
-        // Query heads in one group share a key/value head, so the value
-        // gradient accumulates across them.
-        let probabilities = cache.probabilities.slice(head * sequences * block_size..);
-        let mut grad_value = grad_values.slice_mut(kv_base..);
+        let head_probabilities = probabilities.slice(head * sequences * block_size..);
+        let mut grad_value = grad_qkv.slice_mut(value_base + kv_base..);
         gemm_lhs_transposed_batched(
-            &gpu.context.blas,
-            &probabilities,
+            gpu.context,
+            &head_probabilities,
             seq_len,
             &upstream,
             query_width,
             &mut grad_value,
-            kv_width,
+            qkv_width,
             seq_len,
             seq_len,
             head_dim,
@@ -1928,32 +2199,30 @@ fn backward_attention(
             sequences,
             block_size,
             seq_len * query_width,
-            seq_len * kv_width,
+            seq_len * qkv_width,
         )?;
     }
 
     gpu.causal_softmax_backward(
         &mut grad_scores,
-        &cache.probabilities,
+        &probabilities,
         heads * sequences * seq_len,
         seq_len,
     )?;
 
-    let mut grad_queries = gpu.uninit(rows * query_width)?;
-    let mut grad_keys = gpu.zeros(rows * kv_width)?;
     for head in 0..heads {
         let kv_base = (head / group) * head_dim;
         let scores = grad_scores.slice(head * sequences * block_size..);
-        let key = cache.keys.slice(kv_base..);
-        let mut grad_query = grad_queries.slice_mut(head * head_dim..);
+        let key = cache.qkv.slice(key_base + kv_base..);
+        let mut grad_query = grad_qkv.slice_mut(head * head_dim..);
         gemm_plain_batched(
-            &gpu.context.blas,
+            gpu.context,
             &scores,
             seq_len,
             &key,
-            kv_width,
+            qkv_width,
             &mut grad_query,
-            query_width,
+            qkv_width,
             seq_len,
             head_dim,
             seq_len,
@@ -1961,20 +2230,20 @@ fn backward_attention(
             0.0,
             sequences,
             block_size,
-            seq_len * kv_width,
-            seq_len * query_width,
+            seq_len * qkv_width,
+            seq_len * qkv_width,
         )?;
 
-        let query = cache.queries.slice(head * head_dim..);
-        let mut grad_key = grad_keys.slice_mut(kv_base..);
+        let query = cache.qkv.slice(head * head_dim..);
+        let mut grad_key = grad_qkv.slice_mut(key_base + kv_base..);
         gemm_lhs_transposed_batched(
-            &gpu.context.blas,
+            gpu.context,
             &scores,
             seq_len,
             &query,
-            query_width,
+            qkv_width,
             &mut grad_key,
-            kv_width,
+            qkv_width,
             seq_len,
             seq_len,
             head_dim,
@@ -1982,68 +2251,52 @@ fn backward_attention(
             1.0,
             sequences,
             block_size,
-            seq_len * query_width,
-            seq_len * kv_width,
+            seq_len * qkv_width,
+            seq_len * qkv_width,
         )?;
     }
 
     let tables = gpu.rope_tables(&attention.rope)?;
     gpu.rope(
-        &mut grad_queries,
+        &mut grad_qkv,
         &tables,
         rows,
         heads,
         head_dim,
         seq_len,
         -1.0,
+        qkv_width,
+        0,
     )?;
     gpu.rope(
-        &mut grad_keys,
+        &mut grad_qkv,
         &tables,
         rows,
         kv_heads,
         head_dim,
         seq_len,
         -1.0,
+        qkv_width,
+        key_base,
     )?;
 
     let mut grad_input = gpu.uninit(rows * d_model)?;
-    gpu.linear_backward_input(
-        device_of(&attention.query)?,
-        &grad_queries,
+    gpu.linear_packed_backward_input(
+        &cache.qkv_weights,
+        qkv_width,
+        d_model,
+        &grad_qkv,
         &mut grad_input,
         rows,
         0.0,
     )?;
-    gpu.linear_backward_input(
-        device_of(&attention.key)?,
-        &grad_keys,
-        &mut grad_input,
-        rows,
-        1.0,
-    )?;
-    gpu.linear_backward_input(
-        device_of(&attention.value)?,
-        &grad_values,
-        &mut grad_input,
-        rows,
-        1.0,
-    )?;
-    gpu.accumulate_weight_grad(
-        device_of_mut(&mut attention.query)?,
-        &grad_queries,
-        &cache.attention_normed,
-        rows,
-    )?;
-    gpu.accumulate_weight_grad(
-        device_of_mut(&mut attention.key)?,
-        &grad_keys,
-        &cache.attention_normed,
-        rows,
-    )?;
-    gpu.accumulate_weight_grad(
-        device_of_mut(&mut attention.value)?,
-        &grad_values,
+    gpu.accumulate_packed_grad(
+        &mut [
+            device_of_mut(&mut attention.query)?,
+            device_of_mut(&mut attention.key)?,
+            device_of_mut(&mut attention.value)?,
+        ],
+        &grad_qkv,
         &cache.attention_normed,
         rows,
     )?;
@@ -2078,15 +2331,27 @@ fn backward_swiglu(
         rows,
     )?;
 
-    let (grad_gate, grad_up) = gpu.swiglu_backward(cache, &grad_hidden, rows * width)?;
+    let grad_gate_up = gpu.swiglu_backward(&cache.gate_up, &grad_hidden, rows, width)?;
 
-    // The gate projection *writes* `grad_input`; it is the first of the two,
-    // and in the MoE layer the shared expert runs before anything scatters
-    // into the same buffer. That is what lets the caller leave it uninitialized.
-    gpu.linear_backward_input(device_of(&ffn.gate)?, &grad_gate, grad_input, rows, 0.0)?;
-    gpu.accumulate_weight_grad(device_of_mut(&mut ffn.gate)?, &grad_gate, input, rows)?;
-    gpu.linear_backward_input(device_of(&ffn.up)?, &grad_up, grad_input, rows, 1.0)?;
-    gpu.accumulate_weight_grad(device_of_mut(&mut ffn.up)?, &grad_up, input, rows)?;
+    // The fused projection *writes* `grad_input`, and in the MoE layer the
+    // shared expert runs before anything scatters into the same buffer. That is
+    // what lets the caller leave it uninitialized.
+    let inner = ffn.d_model();
+    gpu.linear_packed_backward_input(
+        &cache.weights,
+        2 * width,
+        inner,
+        &grad_gate_up,
+        grad_input,
+        rows,
+        0.0,
+    )?;
+    gpu.accumulate_packed_grad(
+        &mut [device_of_mut(&mut ffn.gate)?, device_of_mut(&mut ffn.up)?],
+        &grad_gate_up,
+        input,
+        rows,
+    )?;
     Ok(())
 }
 
@@ -2172,8 +2437,10 @@ fn backward_moe(
             )?;
         }
 
-        let (grad_gate, grad_up) = gpu.swiglu_backward(&cache.expert, &grad_hidden, routed * width)?;
+        let grad_gate_up =
+            gpu.swiglu_backward(&cache.expert.gate_up, &grad_hidden, routed, width)?;
 
+        let packed_stride = 2 * width * d_model;
         let mut grad_expert_input = gpu.uninit(routed * d_model)?;
         for (expert, module) in moe.experts.iter_mut().enumerate() {
             let count = cache.counts[expert];
@@ -2182,22 +2449,23 @@ fn backward_moe(
             }
             let offset = cache.offsets[expert];
             let rows_in = cache.input.slice(offset * d_model..);
-
-            let upstream = grad_gate.slice(offset * width..);
+            let upstream = grad_gate_up.slice(offset * 2 * width..);
+            let weights = cache.expert.weights.slice(expert * packed_stride..);
             let mut grad = grad_expert_input.slice_mut(offset * d_model..);
-            gpu.linear_backward_input(device_of(&module.gate)?, &upstream, &mut grad, count, 0.0)?;
-            gpu.accumulate_weight_grad(
-                device_of_mut(&mut module.gate)?,
+            gpu.linear_packed_backward_input(
+                &weights,
+                2 * width,
+                d_model,
                 &upstream,
-                &rows_in,
+                &mut grad,
                 count,
+                0.0,
             )?;
-
-            let upstream = grad_up.slice(offset * width..);
-            let mut grad = grad_expert_input.slice_mut(offset * d_model..);
-            gpu.linear_backward_input(device_of(&module.up)?, &upstream, &mut grad, count, 1.0)?;
-            gpu.accumulate_weight_grad(
-                device_of_mut(&mut module.up)?,
+            gpu.accumulate_packed_grad(
+                &mut [
+                    device_of_mut(&mut module.gate)?,
+                    device_of_mut(&mut module.up)?,
+                ],
                 &upstream,
                 &rows_in,
                 count,
@@ -2405,16 +2673,37 @@ mod tests {
         let mut device = gpu.upload(&host.data).unwrap();
         let tables = gpu.rope_tables(&rope).unwrap();
 
-        gpu.rope(&mut device, &tables, rows, heads, head_dim, seq_len, 1.0)
-            .unwrap();
+        gpu.rope(
+            &mut device,
+            &tables,
+            rows,
+            heads,
+            head_dim,
+            seq_len,
+            1.0,
+            heads * head_dim,
+            0,
+        )
+        .unwrap();
         rope.apply_batched(&mut host, heads, seq_len).unwrap();
         assert_close("rope", &gpu.download(&device).unwrap(), &host.data, 1e-5);
 
         // The inverse is the same kernel with the opposite sign, which is what
         // the backward pass uses.
-        gpu.rope(&mut device, &tables, rows, heads, head_dim, seq_len, -1.0)
+        gpu.rope(
+            &mut device,
+            &tables,
+            rows,
+            heads,
+            head_dim,
+            seq_len,
+            -1.0,
+            heads * head_dim,
+            0,
+        )
+        .unwrap();
+        rope.apply_inverse_batched(&mut host, heads, seq_len)
             .unwrap();
-        rope.apply_inverse_batched(&mut host, heads, seq_len).unwrap();
         assert_close(
             "rope inverse",
             &gpu.download(&device).unwrap(),
@@ -2424,7 +2713,7 @@ mod tests {
     }
 
     #[test]
-    fn the_causal_softmax_kernel_masks_and_normalizes_or_skips_without_device() {
+    fn the_causal_probability_kernels_mask_and_normalize_or_skip_without_device() {
         let Some(context) = cuda_or_skip() else {
             return;
         };
@@ -2433,8 +2722,18 @@ mod tests {
         let rows = sequences * seq_len;
 
         let scores = ramp(rows * seq_len);
+        // The fused forward pass leaves exactly this statistic behind.
+        let log_sum_exp: Vec<f32> = (0..rows)
+            .map(|row| {
+                let source = &scores[row * seq_len..row * seq_len + row % seq_len + 1];
+                let max = source.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                max + source.iter().map(|v| (v - max).exp()).sum::<f32>().ln()
+            })
+            .collect();
         let mut device = gpu.upload(&scores).unwrap();
-        gpu.causal_softmax(&mut device, rows, seq_len).unwrap();
+        let device_lse = gpu.upload(&log_sum_exp).unwrap();
+        gpu.causal_probs_from_lse(&mut device, &device_lse, rows, seq_len)
+            .unwrap();
         let probabilities = gpu.download(&device).unwrap();
 
         for row in 0..rows {
@@ -2449,7 +2748,12 @@ mod tests {
                 *slot = (value - max).exp() / total;
             }
 
-            assert_close(&format!("causal softmax row {row}"), slice, &expected, 1e-6);
+            assert_close(
+                &format!("causal probabilities row {row}"),
+                slice,
+                &expected,
+                1e-6,
+            );
             // Everything past the diagonal is masked, not merely small.
             assert!(slice[visible..].iter().all(|&p| p == 0.0));
         }
@@ -2473,23 +2777,37 @@ mod tests {
             return;
         };
         let gpu = Gpu { context: &context };
-        let len = 16;
+        let (rows, width) = (4, 4);
+        let len = rows * width;
 
         let gate = ramp(len);
         let up = ramp_from(len, 5);
-        let cache = SwiGluCache {
-            gate: gpu.upload(&gate).unwrap(),
-            up: gpu.upload(&up).unwrap(),
-            hidden: gpu.zeros(len).unwrap(),
-        };
-        let hidden = gpu.swiglu(&cache.gate, &cache.up, len).unwrap();
+        // Gate and up interleave by row, which is the layout the fused
+        // projection produces.
+        let mut fused = Vec::with_capacity(2 * len);
+        for row in 0..rows {
+            fused.extend_from_slice(&gate[row * width..(row + 1) * width]);
+            fused.extend_from_slice(&up[row * width..(row + 1) * width]);
+        }
+        let gate_up = gpu.upload(&fused).unwrap();
+        let hidden = gpu.swiglu(&gate_up, rows, width).unwrap();
 
         let silu = |x: f32| x / (1.0 + (-x).exp());
         let expected: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
         assert_close("swiglu", &gpu.download(&hidden).unwrap(), &expected, 1e-6);
 
         let grad_hidden = gpu.upload(&vec![1.0; len]).unwrap();
-        let (grad_gate, grad_up) = gpu.swiglu_backward(&cache, &grad_hidden, len).unwrap();
+        let grad_fused = gpu
+            .swiglu_backward(&gate_up, &grad_hidden, rows, width)
+            .unwrap();
+        let grad_fused = gpu.download(&grad_fused).unwrap();
+        let mut grad_gate = Vec::with_capacity(len);
+        let mut grad_up = Vec::with_capacity(len);
+        for row in 0..rows {
+            let base = row * 2 * width;
+            grad_gate.extend_from_slice(&grad_fused[base..base + width]);
+            grad_up.extend_from_slice(&grad_fused[base + width..base + 2 * width]);
+        }
 
         // Compared against a central difference of the same formula.
         let epsilon = 1e-3;
@@ -2498,15 +2816,10 @@ mod tests {
             .zip(&up)
             .map(|(&g, &u)| (silu(g + epsilon) * u - silu(g - epsilon) * u) / (2.0 * epsilon))
             .collect();
-        assert_close(
-            "swiglu grad_gate",
-            &gpu.download(&grad_gate).unwrap(),
-            &numeric,
-            2e-3,
-        );
+        assert_close("swiglu grad_gate", &grad_gate, &numeric, 2e-3);
         assert_close(
             "swiglu grad_up",
-            &gpu.download(&grad_up).unwrap(),
+            &grad_up,
             &gate.iter().map(|&g| silu(g)).collect::<Vec<_>>(),
             1e-6,
         );
@@ -2575,7 +2888,11 @@ mod tests {
             let selected = &assigned[row * top_k..(row + 1) * top_k];
             if row + 1 == rows {
                 assert!(selected.iter().all(|&expert| expert < 0), "padding routed");
-                assert!(gates[row * top_k..(row + 1) * top_k].iter().all(|&g| g == 0.0));
+                assert!(
+                    gates[row * top_k..(row + 1) * top_k]
+                        .iter()
+                        .all(|&g| g == 0.0)
+                );
                 continue;
             }
 
@@ -2593,5 +2910,199 @@ mod tests {
                 assert!((gates[row * top_k + rank] - expected).abs() < 1e-6);
             }
         }
+    }
+
+    /// The shape of one attention layer, so the host reference and the device
+    /// path under test are described once instead of by eleven loose arguments.
+    #[derive(Clone, Copy)]
+    struct AttentionShape {
+        sequences: usize,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    }
+
+    /// A plain quadratic reference for causal grouped-query attention. Returns
+    /// the merged output and the probability matrix laid out the way the
+    /// backward GEMMs read it, `[head][sequence][query, key]`.
+    fn host_attention(
+        queries: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        shape: AttentionShape,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let AttentionShape {
+            sequences,
+            seq_len,
+            heads,
+            kv_heads,
+            head_dim,
+            scale,
+        } = shape;
+        let (group, query_width, kv_width) =
+            (heads / kv_heads, heads * head_dim, kv_heads * head_dim);
+        let mut out = vec![0.0; queries.len()];
+        let mut probabilities = vec![0.0; heads * sequences * seq_len * seq_len];
+        for s in 0..sequences {
+            for h in 0..heads {
+                let kv = h / group;
+                for i in 0..seq_len {
+                    let q = ((s * seq_len + i) * query_width) + h * head_dim;
+                    let mut row = vec![0.0f32; i + 1];
+                    for (j, p) in row.iter_mut().enumerate() {
+                        let k = ((s * seq_len + j) * kv_width) + kv * head_dim;
+                        *p = (0..head_dim)
+                            .map(|d| queries[q + d] * keys[k + d])
+                            .sum::<f32>()
+                            * scale;
+                    }
+                    let top = row.iter().cloned().fold(f32::MIN, f32::max);
+                    let total: f32 = row.iter().map(|p| (p - top).exp()).sum();
+                    let base = ((h * sequences + s) * seq_len + i) * seq_len;
+                    for (j, p) in row.iter().enumerate() {
+                        let weight = (p - top).exp() / total;
+                        probabilities[base + j] = weight;
+                        let v = ((s * seq_len + j) * kv_width) + kv * head_dim;
+                        for d in 0..head_dim {
+                            out[q + d] += weight * values[v + d];
+                        }
+                    }
+                }
+            }
+        }
+        (out, probabilities)
+    }
+
+    #[test]
+    fn the_attention_forward_matches_the_host_or_skips_without_device() {
+        let Some(context) = cuda_or_skip() else {
+            return;
+        };
+        let gpu = Gpu { context: &context };
+        let shape = AttentionShape {
+            sequences: 2,
+            seq_len: 11,
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 8,
+            scale: 1.0 / 8.0f32.sqrt(),
+        };
+        let rows = shape.sequences * shape.seq_len;
+        let wiggle = |len: usize, offset: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i + offset) as f32 * 0.37).sin() * 0.8)
+                .collect()
+        };
+        let queries = wiggle(rows * shape.heads * shape.head_dim, 0);
+        let keys = wiggle(rows * shape.kv_heads * shape.head_dim, 5);
+        let values = wiggle(rows * shape.kv_heads * shape.head_dim, 11);
+        let (host_out, host_probabilities) = host_attention(&queries, &keys, &values, shape);
+
+        let device_queries = gpu.upload(&queries).unwrap();
+        let device_keys = gpu.upload(&keys).unwrap();
+        let device_values = gpu.upload(&values).unwrap();
+
+        let (group, block_size) = (shape.heads / shape.kv_heads, shape.seq_len * shape.seq_len);
+        let (query_width, kv_width) = (
+            shape.heads * shape.head_dim,
+            shape.kv_heads * shape.head_dim,
+        );
+        let scores_of = |probabilities: &mut CudaSlice<f32>| {
+            for head in 0..shape.heads {
+                let query = device_queries.slice(head * shape.head_dim..);
+                let key = device_keys.slice((head / group) * shape.head_dim..);
+                let mut scores = probabilities.slice_mut(head * shape.sequences * block_size..);
+                gemm_rhs_transposed_batched(
+                    gpu.context,
+                    &query,
+                    query_width,
+                    &key,
+                    kv_width,
+                    &mut scores,
+                    shape.seq_len,
+                    shape.seq_len,
+                    shape.seq_len,
+                    shape.head_dim,
+                    shape.scale,
+                    0.0,
+                    shape.sequences,
+                    shape.seq_len * query_width,
+                    shape.seq_len * kv_width,
+                    block_size,
+                )
+                .unwrap();
+            }
+        };
+
+        let mut probabilities = gpu
+            .zeros(shape.heads * shape.sequences * block_size)
+            .unwrap();
+        scores_of(&mut probabilities);
+        let mut lse = gpu.zeros(shape.heads * rows).unwrap();
+        gpu.causal_softmax_lse(
+            &mut probabilities,
+            &mut lse,
+            shape.heads * shape.sequences * shape.seq_len,
+            shape.seq_len,
+        )
+        .unwrap();
+        assert_close(
+            "causal softmax probabilities",
+            &gpu.download(&probabilities).unwrap(),
+            &host_probabilities,
+            2e-6,
+        );
+
+        let mut merged = gpu.zeros(queries.len()).unwrap();
+        for head in 0..shape.heads {
+            let head_probabilities = probabilities.slice(head * shape.sequences * block_size..);
+            let value = device_values.slice((head / group) * shape.head_dim..);
+            let mut head_merged = merged.slice_mut(head * shape.head_dim..);
+            gemm_plain_batched(
+                gpu.context,
+                &head_probabilities,
+                shape.seq_len,
+                &value,
+                kv_width,
+                &mut head_merged,
+                query_width,
+                shape.seq_len,
+                shape.head_dim,
+                shape.seq_len,
+                1.0,
+                0.0,
+                shape.sequences,
+                block_size,
+                shape.seq_len * kv_width,
+                shape.seq_len * query_width,
+            )
+            .unwrap();
+        }
+        assert_close(
+            "attention forward",
+            &gpu.download(&merged).unwrap(),
+            &host_out,
+            2e-5,
+        );
+
+        // The backward pass throws the probabilities away and rebuilds them
+        // from the scores and the log-sum-exp, so the rebuild has to reproduce
+        // the same softmax.
+        scores_of(&mut probabilities);
+        gpu.causal_probs_from_lse(
+            &mut probabilities,
+            &lse,
+            shape.heads * shape.sequences * shape.seq_len,
+            shape.seq_len,
+        )
+        .unwrap();
+        assert_close(
+            "probabilities rebuilt from the log-sum-exp",
+            &gpu.download(&probabilities).unwrap(),
+            &host_probabilities,
+            2e-6,
+        );
     }
 }

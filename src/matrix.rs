@@ -1,5 +1,6 @@
 use crate::tensor::Tensor;
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -60,6 +61,28 @@ impl Tensor for Matrix {
     fn copy_from_slice(&mut self, source: &[f32]) {
         self.copy_from_slice(source)
     }
+}
+
+/// Dot product with eight accumulators.
+///
+/// Floating-point addition is not associative, so a single running sum is a
+/// dependency chain the compiler is not allowed to break: it stalls on the
+/// four-cycle latency of each add where it could be issuing a vector's worth
+/// every cycle. Eight independent lanes give it something to pipeline.
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut lanes = [0.0f32; 8];
+    let tail = a.len() - a.len() % 8;
+    for (x, y) in a[..tail].chunks_exact(8).zip(b[..tail].chunks_exact(8)) {
+        for lane in 0..8 {
+            lanes[lane] += x[lane] * y[lane];
+        }
+    }
+    let mut rest = 0.0f32;
+    for (x, y) in a[tail..].iter().zip(&b[tail..]) {
+        rest += x * y;
+    }
+    lanes.iter().sum::<f32>() + rest
 }
 
 impl Matrix {
@@ -123,13 +146,24 @@ impl Matrix {
         // vectorizes it.
         if self.rows == 1 {
             let k = self.cols;
-            for (slot, weight) in target.data.iter_mut().zip(other.data.chunks_exact(k)) {
-                *slot = self
+            let input = &self.data;
+            let row = |weight: &[f32]| dot(input, weight);
+            // One decoded token against a 32000-row unembedding streams 16 MB of
+            // weights, which is several times what one core can pull from memory
+            // in the time the rest of the token takes. The projections inside a
+            // block are small enough that the fork costs more than the work, so
+            // they stay on this thread.
+            const PARALLEL_FLOATS: usize = 1 << 18;
+            if other.data.len() >= PARALLEL_FLOATS {
+                target
                     .data
-                    .iter()
-                    .zip(weight)
-                    .map(|(a, b)| a * b)
-                    .sum::<f32>();
+                    .par_iter_mut()
+                    .zip(other.data.par_chunks_exact(k))
+                    .for_each(|(slot, weight)| *slot = row(weight));
+            } else {
+                for (slot, weight) in target.data.iter_mut().zip(other.data.chunks_exact(k)) {
+                    *slot = row(weight);
+                }
             }
             return;
         }

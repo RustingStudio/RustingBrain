@@ -8,9 +8,7 @@
 //! training through [`TrainingSession`] and read [`AcceleratorDoctorReport`]
 //! rather than reaching for a vendor module directly.
 
-use crate::{
-    CudaTrainingCheckpoint, Dataset, Network, NetworkError, TrainConfig, TrainingBackend,
-};
+use crate::{CudaTrainingCheckpoint, Dataset, Network, NetworkError, TrainConfig, TrainingBackend};
 use std::time::Duration;
 
 pub(crate) const MIB: usize = 1024 * 1024;
@@ -135,10 +133,7 @@ pub fn estimate_tensor_memory_mib(
     }
     // the epoch loss accumulator
     floats = floats.checked_add(1).ok_or_else(overflow)?;
-    Ok(floats
-        .checked_mul(4)
-        .ok_or_else(overflow)?
-        .div_ceil(MIB))
+    Ok(floats.checked_mul(4).ok_or_else(overflow)?.div_ceil(MIB))
 }
 
 /// A persistent device session, whichever backend is behind it.

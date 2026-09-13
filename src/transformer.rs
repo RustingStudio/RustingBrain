@@ -15,6 +15,7 @@ use crate::transformer_block::{FeedForward, TransformerBlock, TransformerBlockCa
 use rand::{SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Everything needed to lay out a decoder-only model.
@@ -86,7 +87,9 @@ impl TransformerConfig {
             ("max_seq_len", self.max_seq_len),
         ] {
             if value == 0 {
-                return Err(NetworkError::InvalidConfig(format!("{name} must be non-zero")));
+                return Err(NetworkError::InvalidConfig(format!(
+                    "{name} must be non-zero"
+                )));
             }
         }
 
@@ -222,7 +225,7 @@ impl TransformerBuilder {
             config: TransformerConfig::default(),
             optimizer: Optimizer::adam(3e-4),
             seed: None,
-            mixed_precision: false,
+            mixed_precision: true,
         }
     }
 
@@ -320,8 +323,9 @@ impl TransformerBuilder {
         self
     }
 
-    /// Lets the device path compute in reduced precision. Off by default, and
-    /// ignored by the CPU path, which is always FP32.
+    /// Lets the device path compute in reduced precision. **On by default**,
+    /// and ignored by the CPU path, which is always FP32. Pass `false` to get
+    /// a bit-comparable FP32 device run.
     ///
     /// Two things turn on together, and neither touches the parameters, the
     /// optimizer state or the gradients the optimizer consumes, all of which
@@ -351,8 +355,9 @@ impl TransformerBuilder {
     ///
     /// The head is worth the casts because it is the only part of the step
     /// whose GEMMs are `vocab`-wide; it is about three quarters of all GEMM
-    /// time. Measured on an RTX 3060 at batch 256, sequence 128, the flag is
-    /// worth about 1.7x end to end.
+    /// time. Measured on an RTX 3060 at batch 128, sequence 128, the flag is
+    /// worth about 1.7x end to end (61k vs 104k tokens/s), which is why it is
+    /// the default.
     pub fn mixed_precision(mut self, mixed_precision: bool) -> Self {
         self.mixed_precision = mixed_precision;
         self
@@ -403,6 +408,40 @@ impl TransformerCache {
     pub fn batch(&self) -> &TokenBatch {
         &self.batch
     }
+}
+
+/// Magic and version for the optimizer-state sidecar, so an unrelated or
+/// outdated file is rejected instead of being read as moments.
+const OPTIMIZER_STATE_MAGIC: &[u8; 8] = b"RBOPT001";
+const WEIGHTS_MAGIC: &[u8; 8] = b"RBWTS001";
+
+/// How [`TransformerLm::save_bin`] stores each weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Precision {
+    /// Raw `f32`, 4 bytes per weight. Lossless, and the only choice that a
+    /// training run can resume from without a visible jump in loss.
+    F32,
+    /// Symmetric int8 with one `f32` scale per row: 1 byte per weight plus 4
+    /// bytes per row. Lossy, for inference and for shipping a model.
+    Q8,
+}
+
+/// The JSON preamble of a binary snapshot. Small: it holds no weights.
+#[derive(Serialize, Deserialize)]
+struct BinHeader {
+    config: TransformerConfig,
+    optimizer: Optimizer,
+    optimizer_step: u64,
+    precision: Precision,
+}
+
+/// Rounds to the 255 levels int8 has, leaving -128 unused so the range stays
+/// symmetric around zero.
+fn quantize(value: f32, scale: f32) -> i8 {
+    if scale == 0.0 {
+        return 0;
+    }
+    (value / scale).round().clamp(-127.0, 127.0) as i8
 }
 
 /// A decoder-only language model.
@@ -660,9 +699,7 @@ impl TransformerLm {
                 .unembed_backward(&cache.final_output, grad_logits),
         };
 
-        grad_hidden = self
-            .final_norm
-            .backward(&cache.final_input, &grad_hidden);
+        grad_hidden = self.final_norm.backward(&cache.final_input, &grad_hidden);
 
         for (block, block_cache) in self.blocks.iter_mut().zip(&cache.blocks).rev() {
             grad_hidden = block.backward(block_cache, &grad_hidden)?;
@@ -798,8 +835,7 @@ impl TransformerLm {
         if let Some(context) = self.device.clone() {
             self.check_length(batch.seq_len(), 0)?;
             self.zero_grad();
-            let (lm_loss, auxiliary_loss) =
-                crate::gpu_model::train_step(self, &context, batch)?;
+            let (lm_loss, auxiliary_loss) = crate::gpu_model::train_step(self, &context, batch)?;
             self.step(1.0);
             self.check_device()?;
 
@@ -816,6 +852,54 @@ impl TransformerLm {
         self.backward(&cache, &loss.grad_logits)?;
         self.step(1.0);
         self.check_device()?;
+
+        Ok(TotalLoss {
+            lm_loss: loss.loss,
+            auxiliary_loss: cache.auxiliary_loss(),
+        })
+    }
+
+    /// Forward and backward over one batch, adding into whatever gradients are
+    /// already there.
+    ///
+    /// Unlike [`TransformerLm::train_step_batch`] this neither zeroes the
+    /// gradients first nor steps the optimizer after, which is what lets a
+    /// caller build an effective batch larger than the device holds:
+    ///
+    /// ```ignore
+    /// model.zero_grad();
+    /// for part in parts {
+    ///     model.accumulate_step(part)?;
+    /// }
+    /// model.step(1.0 / parts.len() as f32);
+    /// ```
+    ///
+    /// The averaging belongs on the step rather than on each backward pass:
+    /// Adam normalizes by the gradient's own second moment, so scaling every
+    /// accumulation identically would cancel out and change nothing.
+    ///
+    /// For a dense model this reproduces the gradient of the whole batch
+    /// exactly. A mixture-of-experts model's load-balancing loss does not: it
+    /// is computed from routing fractions over whatever batch it sees, so four
+    /// sequences in two accumulations balance the experts against two
+    /// different halves rather than against the whole. The language-modelling
+    /// gradient is unaffected; only the auxiliary term shifts.
+    pub fn accumulate_step(&mut self, batch: &TokenBatch) -> Result<TotalLoss, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(context) = self.device.clone() {
+            self.check_length(batch.seq_len(), 0)?;
+            let (lm_loss, auxiliary_loss) = crate::gpu_model::train_step(self, &context, batch)?;
+            self.check_device()?;
+
+            return Ok(TotalLoss {
+                lm_loss,
+                auxiliary_loss,
+            });
+        }
+
+        let (logits, cache) = self.forward_batch(batch)?;
+        let loss = causal_lm_loss_batch(&logits, batch)?;
+        self.backward(&cache, &loss.grad_logits)?;
 
         Ok(TotalLoss {
             lm_loss: loss.loss,
@@ -863,6 +947,14 @@ impl TransformerLm {
         self.optimizer_step
     }
 
+    /// Sets the Adam step counter, for a resume that has weights but no saved
+    /// moments: bias correction only matches moments that were accumulated
+    /// over the same number of steps, and correcting zero moments as if they
+    /// were warmed up makes the first updates several times too large.
+    pub fn set_optimizer_step(&mut self, step: usize) {
+        self.optimizer_step = step;
+    }
+
     pub fn params_mut(&mut self) -> Vec<&mut Param> {
         let mut params = self.embedding.params_mut();
         for block in &mut self.blocks {
@@ -890,6 +982,241 @@ impl TransformerLm {
         Ok(model)
     }
 
+    /// Overrides the precision chosen at build time.
+    ///
+    /// A snapshot records what a model is, not how to run it, so a model
+    /// restored by [`TransformerLm::load_json`] always comes back in full
+    /// precision. A resumed training run that wants reduced precision has to
+    /// say so again, before [`TransformerLm::to_cuda`].
+    pub fn set_mixed_precision(&mut self, mixed_precision: bool) {
+        self.mixed_precision = mixed_precision;
+    }
+
+    /// Writes the Adam moments to `path`, in the order
+    /// [`TransformerLm::params_mut`] yields them.
+    ///
+    /// The JSON snapshot holds weights alone: the moments triple its size and
+    /// nothing that only runs the model ever reads them. A run that stops and
+    /// resumes does need them. Without them Adam restarts from zero while the
+    /// step counter carries on, so bias correction no longer compensates and
+    /// the first updates after the resume are several times larger than the
+    /// ones the run was taking before it stopped.
+    ///
+    /// Call this after [`TransformerLm::to_cuda`] on a device-resident model:
+    /// the device owns the moments, and they are read back here.
+    pub fn save_optimizer_state<P: AsRef<Path>>(&mut self, path: P) -> Result<(), NetworkError> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let step = self.optimizer_step as u64;
+        let params = self.params_mut();
+        writer.write_all(OPTIMIZER_STATE_MAGIC)?;
+        writer.write_all(&(params.len() as u64).to_le_bytes())?;
+        writer.write_all(&step.to_le_bytes())?;
+        for param in params {
+            let (first, second) = param.moments()?;
+            writer.write_all(&(first.rows as u64).to_le_bytes())?;
+            writer.write_all(&(first.cols as u64).to_le_bytes())?;
+            for matrix in [first, second] {
+                let bytes: Vec<u8> = matrix.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                writer.write_all(&bytes)?;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Restores the moments and step counter written by
+    /// [`TransformerLm::save_optimizer_state`].
+    ///
+    /// Order matters on a device-resident model: uploading a parameter zeroes
+    /// its moments, so call this after [`TransformerLm::to_cuda`], not before.
+    pub fn load_optimizer_state<P: AsRef<Path>>(&mut self, path: P) -> Result<(), NetworkError> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != OPTIMIZER_STATE_MAGIC {
+            return Err(NetworkError::InvalidSnapshot(
+                "not a RustingBrain optimizer state file".into(),
+            ));
+        }
+        let mut word = [0u8; 8];
+        reader.read_exact(&mut word)?;
+        let count = u64::from_le_bytes(word) as usize;
+        reader.read_exact(&mut word)?;
+        let step = u64::from_le_bytes(word) as usize;
+        let params = self.params_mut();
+        if count != params.len() {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "optimizer state holds {count} parameters, this model has {}",
+                params.len()
+            )));
+        }
+        for param in params {
+            reader.read_exact(&mut word)?;
+            let rows = u64::from_le_bytes(word) as usize;
+            reader.read_exact(&mut word)?;
+            let cols = u64::from_le_bytes(word) as usize;
+            if rows != param.value.rows || cols != param.value.cols {
+                return Err(NetworkError::InvalidSnapshot(format!(
+                    "optimizer state has a {rows}x{cols} parameter where the model has {}x{}",
+                    param.value.rows, param.value.cols
+                )));
+            }
+            let mut bytes = vec![0u8; rows * cols * 4];
+            let mut moments = [Matrix::new(rows, cols), Matrix::new(rows, cols)];
+            for matrix in &mut moments {
+                reader.read_exact(&mut bytes)?;
+                for (slot, chunk) in matrix.data.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+            }
+            let [first, second] = moments;
+            param.set_moments(first, second)?;
+        }
+        self.optimizer_step = step;
+        Ok(())
+    }
+
+    /// Writes weights in a binary snapshot: raw f32, or int8 with a per-row
+    /// scale.
+    ///
+    /// JSON spends about 13 bytes on every weight, because a shortest
+    /// round-trip `f32` prints as roughly a dozen characters plus a comma, so a
+    /// 50M-parameter model lands near 670 MB. The same weights are 4 bytes each
+    /// as raw `f32` and 1 byte each as [`Precision::Q8`], which is 200 MB and
+    /// 50 MB for that model.
+    ///
+    /// The header holds the configuration and optimizer as JSON, so
+    /// [`TransformerLm::load_bin`] rebuilds the module tree before it reads any
+    /// weights and does not need a matching model to load into.
+    pub fn save_bin<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        precision: Precision,
+    ) -> Result<(), NetworkError> {
+        let header = serde_json::to_vec(&BinHeader {
+            config: self.config.clone(),
+            optimizer: self.optimizer.clone(),
+            optimizer_step: self.optimizer_step as u64,
+            precision,
+        })?;
+
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(WEIGHTS_MAGIC)?;
+        writer.write_all(&(header.len() as u64).to_le_bytes())?;
+        writer.write_all(&header)?;
+
+        let params = self.params_mut();
+        writer.write_all(&(params.len() as u64).to_le_bytes())?;
+        for param in params {
+            let value = &param.value;
+            writer.write_all(&(value.rows as u64).to_le_bytes())?;
+            writer.write_all(&(value.cols as u64).to_le_bytes())?;
+            match precision {
+                Precision::F32 => {
+                    let bytes: Vec<u8> =
+                        value.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    writer.write_all(&bytes)?;
+                }
+                Precision::Q8 => {
+                    for row in value.data.chunks(value.cols.max(1)) {
+                        let absmax = row.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+                        let scale = absmax / 127.0;
+                        writer.write_all(&scale.to_le_bytes())?;
+                        let quantized: Vec<u8> = row
+                            .iter()
+                            .map(|v| quantize(*v, scale) as u8)
+                            .collect();
+                        writer.write_all(&quantized)?;
+                    }
+                }
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Rebuilds the model written by [`TransformerLm::save_bin`].
+    ///
+    /// A [`Precision::Q8`] file restores dequantized `f32` weights: the model
+    /// runs in full precision, it is only the file that is small. Rounding to
+    /// 255 levels per row costs about 0.4% relative error on each weight, which
+    /// inference absorbs and a resumed training run does not, so keep
+    /// [`Precision::F32`] for checkpoints you intend to train from.
+    pub fn load_bin<P: AsRef<Path>>(path: P) -> Result<Self, NetworkError> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != WEIGHTS_MAGIC {
+            return Err(NetworkError::InvalidSnapshot(
+                "not a RustingBrain weight file".into(),
+            ));
+        }
+        let mut word = [0u8; 8];
+        reader.read_exact(&mut word)?;
+        let mut header = vec![0u8; u64::from_le_bytes(word) as usize];
+        reader.read_exact(&mut header)?;
+        let header: BinHeader = serde_json::from_slice(&header)?;
+        header.config.validate()?;
+
+        let mut model = Self::from_builder(TransformerBuilder {
+            config: header.config,
+            optimizer: header.optimizer,
+            seed: Some(0),
+            mixed_precision: TransformerBuilder::new().mixed_precision,
+        })?;
+        model.optimizer_step = header.optimizer_step as usize;
+
+        reader.read_exact(&mut word)?;
+        let count = u64::from_le_bytes(word) as usize;
+        let params = model.params_mut();
+        if count != params.len() {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "weight file holds {count} parameters, this configuration builds {}",
+                params.len()
+            )));
+        }
+
+        for param in params {
+            reader.read_exact(&mut word)?;
+            let rows = u64::from_le_bytes(word) as usize;
+            reader.read_exact(&mut word)?;
+            let cols = u64::from_le_bytes(word) as usize;
+            if rows != param.value.rows || cols != param.value.cols {
+                return Err(NetworkError::InvalidSnapshot(format!(
+                    "weight file has a {rows}x{cols} parameter where the model has {}x{}",
+                    param.value.rows, param.value.cols
+                )));
+            }
+            match header.precision {
+                Precision::F32 => {
+                    let mut bytes = vec![0u8; rows * cols * 4];
+                    reader.read_exact(&mut bytes)?;
+                    for (slot, chunk) in param.value.data.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    }
+                }
+                Precision::Q8 => {
+                    let mut scale_bytes = [0u8; 4];
+                    let mut row_bytes = vec![0u8; cols];
+                    for row in param.value.data.chunks_mut(cols.max(1)) {
+                        reader.read_exact(&mut scale_bytes)?;
+                        let scale = f32::from_le_bytes(scale_bytes);
+                        reader.read_exact(&mut row_bytes)?;
+                        for (slot, byte) in row.iter_mut().zip(&row_bytes) {
+                            *slot = *byte as i8 as f32 * scale;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(model)
+    }
+
     fn check_length(&self, new_tokens: usize, already_cached: usize) -> Result<(), NetworkError> {
         let length = new_tokens + already_cached;
         if length > self.config.max_seq_len {
@@ -909,6 +1236,84 @@ impl TransformerLm {
 mod tests {
     use super::*;
     use crate::causal_lm_loss::causal_lm_loss;
+
+    #[test]
+    fn accumulating_two_half_batches_sums_the_half_gradients() {
+        let ids: [&[u32]; 4] = [
+            &[1, 2, 3, 4],
+            &[5, 6, 7, 8],
+            &[9, 10, 11, 12],
+            &[13, 14, 15, 16],
+        ];
+
+        // Dense: a mixture-of-experts model's load-balancing loss is computed
+        // from routing fractions over whatever batch it sees, so it is not
+        // linear in the batch and splitting one changes it. See
+        // `accumulate_step`'s note.
+        let dense = || tiny().moe_layers(0..0).seed(3);
+
+        // One backward over all four sequences: a mean over four.
+        let mut whole = dense().build().unwrap();
+        whole.zero_grad();
+        whole.accumulate_step(&TokenBatch::new(&ids).unwrap()).unwrap();
+        let whole_grads: Vec<Vec<f32>> = whole
+            .params_mut()
+            .iter()
+            .map(|param| param.grad.data.clone())
+            .collect();
+
+        // Two backwards over two sequences each, nothing cleared between them.
+        // Each contributes a mean over two, so the sum is twice the mean over
+        // four -- which is exactly what `step(1.0 / parts)` divides back out.
+        let mut split = dense().build().unwrap();
+        split.zero_grad();
+        split
+            .accumulate_step(&TokenBatch::new(&ids[..2]).unwrap())
+            .unwrap();
+        split
+            .accumulate_step(&TokenBatch::new(&ids[2..]).unwrap())
+            .unwrap();
+        let split_grads: Vec<Vec<f32>> = split
+            .params_mut()
+            .iter()
+            .map(|param| param.grad.data.clone())
+            .collect();
+
+        assert_eq!(whole_grads.len(), split_grads.len());
+        let mut compared = 0usize;
+        for (whole_param, split_param) in whole_grads.iter().zip(&split_grads) {
+            for (whole_grad, split_grad) in whole_param.iter().zip(split_param) {
+                let tolerance = 1e-5 + 1e-3 * whole_grad.abs();
+                assert!(
+                    (split_grad - 2.0 * whole_grad).abs() < tolerance,
+                    "accumulated {split_grad} against twice the whole-batch {whole_grad}"
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 1000, "only {compared} gradients compared");
+    }
+
+    #[test]
+    fn accumulating_without_zeroing_keeps_adding() {
+        let ids: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
+        let batch = TokenBatch::new(&ids).unwrap();
+
+        let mut model = tiny().seed(3).build().unwrap();
+        model.zero_grad();
+        model.accumulate_step(&batch).unwrap();
+        let once = model.params_mut()[0].grad.data.clone();
+
+        model.accumulate_step(&batch).unwrap();
+        let twice = model.params_mut()[0].grad.data.clone();
+
+        for (single, double) in once.iter().zip(&twice) {
+            assert!(
+                (double - 2.0 * single).abs() < 1e-5 + 1e-3 * single.abs(),
+                "second accumulation gave {double}, not twice {single}"
+            );
+        }
+    }
 
     fn tiny() -> TransformerBuilder {
         TransformerLm::builder()
@@ -1077,7 +1482,15 @@ mod tests {
 
         // Row 23 is never gathered, and an untied head is what writes the rest
         // of the matrix, so this row must be untouched.
-        assert!(model.embedding.weight.grad.row(23).iter().all(|&g| g == 0.0));
+        assert!(
+            model
+                .embedding
+                .weight
+                .grad
+                .row(23)
+                .iter()
+                .all(|&g| g == 0.0)
+        );
         assert!(model.embedding.weight.grad.row(2).iter().any(|&g| g != 0.0));
     }
 
@@ -1093,7 +1506,15 @@ mod tests {
 
         // With tying, the unembedding touches every vocabulary row, including
         // ones the input never used.
-        assert!(model.embedding.weight.grad.row(23).iter().any(|&g| g != 0.0));
+        assert!(
+            model
+                .embedding
+                .weight
+                .grad
+                .row(23)
+                .iter()
+                .any(|&g| g != 0.0)
+        );
     }
 
     #[test]
@@ -1210,6 +1631,53 @@ mod tests {
     }
 
     #[test]
+    fn a_binary_snapshot_round_trips_and_is_far_smaller_than_json() {
+        let mut model = tiny().seed(5).build().unwrap();
+        let dir = std::env::temp_dir();
+        let json = dir.join("rusting_brain_size_check.json");
+        let f32_path = dir.join("rusting_brain_size_check.f32.rbw");
+        let q8_path = dir.join("rusting_brain_size_check.q8.rbw");
+
+        model.save_json(&json).unwrap();
+        model.save_bin(&f32_path, Precision::F32).unwrap();
+        model.save_bin(&q8_path, Precision::Q8).unwrap();
+
+        let size = |path: &std::path::Path| std::fs::metadata(path).unwrap().len() as f64;
+        let (json_size, f32_size, q8_size) = (size(&json), size(&f32_path), size(&q8_path));
+
+        let restored = TransformerLm::load_bin(&f32_path).unwrap();
+        assert_eq!(restored, model, "f32 is lossless");
+        assert_eq!(
+            restored.forward_train(&[[4, 11, 2]]).unwrap().0,
+            model.forward_train(&[[4, 11, 2]]).unwrap().0
+        );
+
+        let quantized = TransformerLm::load_bin(&q8_path).unwrap();
+        assert_eq!(quantized.config, model.config);
+        let (left, right) = (&quantized.embedding.weight.value, &model.embedding.weight.value);
+        let scale = right.data.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        for (a, b) in left.data.iter().zip(&right.data) {
+            assert!(
+                (a - b).abs() <= scale / 127.0,
+                "q8 weight {a} is further than one quantization step from {b}"
+            );
+        }
+
+        for path in [&json, &f32_path, &q8_path] {
+            std::fs::remove_file(path).ok();
+        }
+
+        assert!(
+            f32_size < json_size / 2.5,
+            "f32 {f32_size} should be far under json {json_size}"
+        );
+        assert!(
+            q8_size < json_size / 8.0,
+            "q8 {q8_size} should be far under json {json_size}"
+        );
+    }
+
+    #[test]
     fn a_snapshot_round_trips_and_predicts_identically() {
         let model = tiny().build().unwrap();
         let path = std::env::temp_dir().join("rusting_brain_transformer_round_trip.json");
@@ -1224,6 +1692,35 @@ mod tests {
             restored.forward_train(&[[4, 11, 2]]).unwrap().0,
             model.forward_train(&[[4, 11, 2]]).unwrap().0
         );
+    }
+
+    #[test]
+    fn optimizer_state_round_trips_through_a_file() {
+        let mut model = tiny().build().unwrap();
+        model.train_step(&[[1, 2, 3, 4]]).unwrap();
+        let path = std::env::temp_dir().join("rusting_brain_optimizer_state.bin");
+        model.save_optimizer_state(&path).unwrap();
+
+        // A fresh model has the same shapes and zero moments, so anything that
+        // comes back non-zero came out of the file.
+        let mut restored = tiny().build().unwrap();
+        restored.load_optimizer_state(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(restored.optimizer_step(), model.optimizer_step());
+        let mut saved = model.params_mut();
+        let mut loaded = restored.params_mut();
+        assert_eq!(saved.len(), loaded.len());
+        let mut moved = 0.0f32;
+        for (from, to) in saved.iter_mut().zip(loaded.iter_mut()) {
+            let (first, second) = from.moments().unwrap();
+            let (first, second) = (first.clone(), second.clone());
+            let (restored_first, restored_second) = to.moments().unwrap();
+            assert_eq!(&first, restored_first);
+            assert_eq!(&second, restored_second);
+            moved += first.data.iter().map(|v| v.abs()).sum::<f32>();
+        }
+        assert!(moved > 0.0, "a training step should leave non-zero moments");
     }
 
     #[test]

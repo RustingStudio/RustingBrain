@@ -14,6 +14,7 @@ use crate::param::Linear;
 use crate::param::Param;
 use crate::rope::Rope;
 use rand::rngs::StdRng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::norm::RmsNorm;
@@ -48,11 +49,7 @@ impl FeedForward {
         Self::Gelu(GeluMlp::new(d_model, d_ff, rng))
     }
 
-    pub fn moe(
-        d_model: usize,
-        config: MoeConfig,
-        rng: &mut StdRng,
-    ) -> Result<Self, NetworkError> {
+    pub fn moe(d_model: usize, config: MoeConfig, rng: &mut StdRng) -> Result<Self, NetworkError> {
         Ok(Self::Moe(Box::new(MoeLayer::new(d_model, config, rng)?)))
     }
 
@@ -205,16 +202,15 @@ impl TransformerBlock {
         layout: Layout<'_>,
     ) -> Result<(Matrix, TransformerBlockCache), NetworkError> {
         let attention_normed = self.attention_norm.forward(input);
-        let (attended, attention) = self
-            .attention
-            .forward_train(&attention_normed, layout)?;
+        let (attended, attention) = self.attention.forward_train(&attention_normed, layout)?;
 
         let mut residual = attended;
         add_in_place(&mut residual, input);
 
         let feed_forward_normed = self.feed_forward_norm.forward(&residual);
-        let (projected, feed_forward) =
-            self.feed_forward.forward_train(&feed_forward_normed, layout)?;
+        let (projected, feed_forward) = self
+            .feed_forward
+            .forward_train(&feed_forward_normed, layout)?;
 
         let mut output = projected;
         add_in_place(&mut output, &residual);
@@ -252,9 +248,7 @@ impl TransformerBlock {
         cache: &TransformerBlockCache,
         grad_output: &Matrix,
     ) -> Result<Matrix, NetworkError> {
-        let grad_projected = self
-            .feed_forward
-            .backward(&cache.feed_forward, grad_output);
+        let grad_projected = self.feed_forward.backward(&cache.feed_forward, grad_output);
         let mut grad_residual = self
             .feed_forward_norm
             .backward(&cache.residual, &grad_projected);
@@ -263,9 +257,7 @@ impl TransformerBlock {
         add_in_place(&mut grad_residual, grad_output);
 
         let grad_attended = self.attention.backward(&cache.attention, &grad_residual)?;
-        let mut grad_input = self
-            .attention_norm
-            .backward(&cache.input, &grad_attended);
+        let mut grad_input = self.attention_norm.backward(&cache.input, &grad_attended);
         add_in_place(&mut grad_input, &grad_residual);
 
         Ok(grad_input)
@@ -304,9 +296,17 @@ impl TransformerBlock {
 
 fn add_in_place(target: &mut Matrix, source: &Matrix) {
     debug_assert_eq!(target.data.len(), source.data.len());
-    for (slot, value) in target.data.iter_mut().zip(&source.data) {
-        *slot += value;
-    }
+    // Two residual adds per block per pass over `[rows, d_model]`. Pure
+    // streaming work, so it is worth spreading over the cores' memory ports.
+    target
+        .data
+        .par_chunks_mut(8192)
+        .zip(source.data.par_chunks(8192))
+        .for_each(|(destination, source)| {
+            for (slot, value) in destination.iter_mut().zip(source) {
+                *slot += value;
+            }
+        });
 }
 
 #[cfg(test)]
@@ -386,9 +386,21 @@ mod tests {
         for index in 0..input.data.len() {
             let mut bumped = input.clone();
             bumped.data[index] += epsilon;
-            let high: f32 = layer.forward_train(&bumped, Layout::default()).unwrap().0.data.iter().sum();
+            let high: f32 = layer
+                .forward_train(&bumped, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
             bumped.data[index] -= 2.0 * epsilon;
-            let low: f32 = layer.forward_train(&bumped, Layout::default()).unwrap().0.data.iter().sum();
+            let low: f32 = layer
+                .forward_train(&bumped, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
             let numeric = (high - low) / (2.0 * epsilon);
             assert!(
                 (grad_input.data[index] - numeric).abs() < 3e-2,
@@ -420,9 +432,21 @@ mod tests {
         for index in 0..input.data.len() {
             let mut bumped = input.clone();
             bumped.data[index] += epsilon;
-            let high: f32 = layer.forward_train(&bumped, Layout::default()).unwrap().0.data.iter().sum();
+            let high: f32 = layer
+                .forward_train(&bumped, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
             bumped.data[index] -= 2.0 * epsilon;
-            let low: f32 = layer.forward_train(&bumped, Layout::default()).unwrap().0.data.iter().sum();
+            let low: f32 = layer
+                .forward_train(&bumped, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
             let numeric = (high - low) / (2.0 * epsilon);
             assert!(
                 (grad_input.data[index] - numeric).abs() < 3e-2,

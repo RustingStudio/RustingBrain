@@ -6,7 +6,13 @@
 use crate::matrix::Matrix;
 use crate::param::{Linear, Param};
 use rand::rngs::StdRng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Elements per rayon task in the point-wise activation passes. Big enough
+/// that the scheduling overhead disappears against the work, small enough that
+/// a `[2048, 308]` hidden layer still splits across every core.
+const CHUNK: usize = 8192;
 
 /// `SiLU(x * Wg^T) * (x * Wu^T) * Wd^T`, all three projections bias-free.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -51,10 +57,20 @@ impl SwiGlu {
         let gate = self.gate.forward(input);
         let up = self.up.forward(input);
 
+        // `silu` is an `exp` per element over a `[rows, d_ff]` matrix, which
+        // is the largest point-wise pass in a step. It is embarrassingly
+        // parallel, so it runs on every core rather than one.
         let mut hidden = Matrix::new(gate.rows, gate.cols);
-        for ((slot, &g), &u) in hidden.data.iter_mut().zip(&gate.data).zip(&up.data) {
-            *slot = silu(g) * u;
-        }
+        hidden
+            .data
+            .par_chunks_mut(CHUNK)
+            .zip(gate.data.par_chunks(CHUNK))
+            .zip(up.data.par_chunks(CHUNK))
+            .for_each(|((destination, gate), up)| {
+                for ((slot, &g), &u) in destination.iter_mut().zip(gate).zip(up) {
+                    *slot = silu(g) * u;
+                }
+            });
 
         let output = self.down.forward(&hidden);
         (
@@ -73,18 +89,32 @@ impl SwiGlu {
 
         let mut grad_gate = Matrix::new(cache.gate.rows, cache.gate.cols);
         let mut grad_up = Matrix::new(cache.up.rows, cache.up.cols);
-        for (index, &upstream) in grad_hidden.data.iter().enumerate() {
-            let g = cache.gate.data[index];
-            let u = cache.up.data[index];
-            grad_gate.data[index] = upstream * u * silu_derivative(g);
-            grad_up.data[index] = upstream * silu(g);
-        }
+        grad_gate
+            .data
+            .par_chunks_mut(CHUNK)
+            .zip(grad_up.data.par_chunks_mut(CHUNK))
+            .zip(grad_hidden.data.par_chunks(CHUNK))
+            .zip(cache.gate.data.par_chunks(CHUNK))
+            .zip(cache.up.data.par_chunks(CHUNK))
+            .for_each(|((((grad_gate, grad_up), upstream), gate), up)| {
+                for index in 0..upstream.len() {
+                    let g = gate[index];
+                    grad_gate[index] = upstream[index] * up[index] * silu_derivative(g);
+                    grad_up[index] = upstream[index] * silu(g);
+                }
+            });
 
         let mut grad_input = self.gate.backward(&cache.input, &grad_gate);
         let from_up = self.up.backward(&cache.input, &grad_up);
-        for (slot, value) in grad_input.data.iter_mut().zip(&from_up.data) {
-            *slot += value;
-        }
+        grad_input
+            .data
+            .par_chunks_mut(CHUNK)
+            .zip(from_up.data.par_chunks(CHUNK))
+            .for_each(|(destination, source)| {
+                for (slot, value) in destination.iter_mut().zip(source) {
+                    *slot += value;
+                }
+            });
 
         grad_input
     }
@@ -145,9 +175,15 @@ impl GeluMlp {
         let pre_activation = self.up.forward(input);
 
         let mut hidden = Matrix::new(pre_activation.rows, pre_activation.cols);
-        for (slot, &value) in hidden.data.iter_mut().zip(&pre_activation.data) {
-            *slot = gelu(value);
-        }
+        hidden
+            .data
+            .par_chunks_mut(CHUNK)
+            .zip(pre_activation.data.par_chunks(CHUNK))
+            .for_each(|(destination, source)| {
+                for (slot, &value) in destination.iter_mut().zip(source) {
+                    *slot = gelu(value);
+                }
+            });
 
         let output = self.down.forward(&hidden);
         (
@@ -162,9 +198,15 @@ impl GeluMlp {
 
     pub fn backward(&mut self, cache: &GeluMlpCache, grad_output: &Matrix) -> Matrix {
         let mut grad_hidden = self.down.backward(&cache.hidden, grad_output);
-        for (slot, &value) in grad_hidden.data.iter_mut().zip(&cache.pre_activation.data) {
-            *slot *= gelu_derivative(value);
-        }
+        grad_hidden
+            .data
+            .par_chunks_mut(CHUNK)
+            .zip(cache.pre_activation.data.par_chunks(CHUNK))
+            .for_each(|(destination, source)| {
+                for (slot, &value) in destination.iter_mut().zip(source) {
+                    *slot *= gelu_derivative(value);
+                }
+            });
         self.up.backward(&cache.input, &grad_hidden)
     }
 

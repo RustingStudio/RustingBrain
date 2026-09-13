@@ -32,10 +32,12 @@ use crate::cuda_training::{cfg, cuda_err, device_context};
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::optimizers::Optimizer;
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig, sys::cublasOperation_t};
-use cudarc::driver::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg,
+use cudarc::cublas::{
+    CudaBlas, Gemm, GemmConfig, StridedBatchedConfig, result as cublas, sys as cublas_sys,
+    sys::cublasOperation_t,
 };
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
+use std::any::TypeId;
 use std::sync::{Arc, Mutex};
 
 /// One device, its stream, cuBLAS handle and the kernels the transformer uses.
@@ -64,7 +66,9 @@ pub struct GpuContext {
 
 impl std::fmt::Debug for GpuContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuContext").field("device", &self.device).finish()
+        f.debug_struct("GpuContext")
+            .field("device", &self.device)
+            .finish()
     }
 }
 
@@ -164,7 +168,11 @@ impl GpuContext {
             .map_err(cuda_err("host to device copy"))
     }
 
-    pub(crate) fn download(&self, source: &CudaSlice<f32>, target: &mut Matrix) -> Result<(), NetworkError> {
+    pub(crate) fn download(
+        &self,
+        source: &CudaSlice<f32>,
+        target: &mut Matrix,
+    ) -> Result<(), NetworkError> {
         self.stream
             .memcpy_dtoh(source, &mut target.data)
             .map_err(cuda_err("device to host copy"))
@@ -215,7 +223,7 @@ impl GpuContext {
 
             // scores[tokens, history] = scale * Q_head . K_head^T
             gemm_rhs_transposed(
-                &self.blas,
+                self,
                 &device_queries.slice(query_base..),
                 queries.cols,
                 &device_keys.slice(kv_base..),
@@ -243,7 +251,7 @@ impl GpuContext {
 
             // merged[:, head] = probabilities . V_head
             gemm_plain(
-                &self.blas,
+                self,
                 &device_scores.slice(0..),
                 history,
                 &device_values.slice(kv_base..),
@@ -306,7 +314,12 @@ impl Clone for DeviceParam {
         };
         let fallback = |len: usize| self.context.stream.alloc_zeros::<f32>(len).ok();
         let mut slices = Vec::with_capacity(4);
-        for source in [&self.value, &self.negated_grad, &self.moment1, &self.moment2] {
+        for source in [
+            &self.value,
+            &self.negated_grad,
+            &self.moment1,
+            &self.moment2,
+        ] {
             match copy(source) {
                 Ok(slice) => slices.push(Some(slice)),
                 Err(error) => {
@@ -373,6 +386,28 @@ impl DeviceParam {
         self.context.download(&self.value, target)
     }
 
+    /// The Adam moments, for a training run that persists optimizer state so a
+    /// resumed run does not restart the optimizer from zero.
+    pub(crate) fn download_moments(
+        &self,
+        first: &mut Matrix,
+        second: &mut Matrix,
+    ) -> Result<(), NetworkError> {
+        self.context.download(&self.moment1, first)?;
+        self.context.download(&self.moment2, second)
+    }
+
+    /// Restores moments read back from such a file.
+    pub(crate) fn upload_moments(
+        &mut self,
+        first: &Matrix,
+        second: &Matrix,
+    ) -> Result<(), NetworkError> {
+        self.moment1 = self.context.upload(first)?;
+        self.moment2 = self.context.upload(second)?;
+        Ok(())
+    }
+
     /// The plain `dL/dw`, negating the device convention on the way out.
     pub(crate) fn download_grad(&self, target: &mut Matrix) -> Result<(), NetworkError> {
         self.context.download(&self.negated_grad, target)?;
@@ -398,7 +433,7 @@ impl DeviceParam {
             let device_input = self.context.upload(input)?;
             let mut device_output = self.context.zeros(output.data.len())?;
             gemm_rhs_transposed(
-                &self.context.blas,
+                &self.context,
                 &device_input,
                 self.cols,
                 &self.value,
@@ -424,7 +459,7 @@ impl DeviceParam {
             let device_input = self.context.upload(input)?;
             let mut device_output = self.context.zeros(output.data.len())?;
             gemm_plain(
-                &self.context.blas,
+                &self.context,
                 &device_input,
                 self.rows,
                 &self.value,
@@ -449,7 +484,7 @@ impl DeviceParam {
             let device_grad_output = self.context.upload(grad_output)?;
             let device_input = self.context.upload(input)?;
             gemm_lhs_transposed(
-                &self.context.blas,
+                &self.context,
                 &device_grad_output,
                 self.rows,
                 &device_input,
@@ -603,10 +638,7 @@ pub(crate) fn attention_heads(
     position_offset: usize,
     keep_probabilities: bool,
 ) -> (Vec<Matrix>, Matrix) {
-    let fallback = (
-        Vec::new(),
-        Matrix::new(queries.rows, num_heads * head_dim),
-    );
+    let fallback = (Vec::new(), Matrix::new(queries.rows, num_heads * head_dim));
     let result = context.attention(
         queries,
         keys,
@@ -628,10 +660,72 @@ pub(crate) fn attention_heads(
 // cuBLAS is column-major, so a row-major `[r, c]` buffer with row stride `ld`
 // is read as a column-major `[c, r]` with leading dimension `ld`.
 
+/// Runs one GEMM, in BF16 when the context asks for reduced precision.
+///
+/// With reduced precision off, or for a caller whose operands are already
+/// BF16 (the language-model head), this is exactly `blas.gemm`. Otherwise the
+/// same operands go to `cublasGemmEx` with a `32F_FAST_16BF` compute type: A,
+/// B and C stay FP32 in memory and cuBLAS still accumulates in FP32, and the
+/// only change is that the multiplier inputs are rounded to BF16 inside the
+/// tensor cores. Ampere runs BF16 tensor operations at twice the TF32 rate,
+/// and on the default mixture-of-experts preset the transformer-block GEMMs
+/// are more than half of all device time, so this is where the flag pays.
+///
+/// # Safety
+///
+/// Same contract as `Gemm::gemm`: the configuration must describe the three
+/// buffers correctly.
+unsafe fn gemm_dispatch<T: 'static, A: DevicePtr<T>, B: DevicePtr<T>, C: DevicePtrMut<T>>(
+    context: &GpuContext,
+    config: GemmConfig<T>,
+    a: &A,
+    b: &B,
+    c: &mut C,
+) -> Result<(), NetworkError>
+where
+    CudaBlas: Gemm<T>,
+{
+    if !context.mixed_precision || TypeId::of::<T>() != TypeId::of::<f32>() {
+        return unsafe { context.blas.gemm(config, a, b, c) }.map_err(cuda_err("cuBLAS GEMM"));
+    }
+    let (a_pointer, _a_guard) = a.device_ptr(&context.stream);
+    let (b_pointer, _b_guard) = b.device_ptr(&context.stream);
+    let (c_pointer, _c_guard) = c.device_ptr_mut(&context.stream);
+    unsafe {
+        cublas::gemm_ex(
+            *context.blas.handle(),
+            config.transa,
+            config.transb,
+            config.m,
+            config.n,
+            config.k,
+            &config.alpha as *const T as *const std::ffi::c_void,
+            a_pointer as *const std::ffi::c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            config.lda,
+            b_pointer as *const std::ffi::c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            config.ldb,
+            &config.beta as *const T as *const std::ffi::c_void,
+            c_pointer as *mut std::ffi::c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            config.ldc,
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
+            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+    .map_err(cuda_err("cuBLAS BF16 GEMM"))
+}
+
 /// `out[rows, units] = alpha * x[rows, inner] . w[units, inner]^T + beta * out`
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gemm_rhs_transposed<T, X: DevicePtr<T>, W: DevicePtr<T>, O: DevicePtrMut<T>>(
-    blas: &CudaBlas,
+pub(crate) fn gemm_rhs_transposed<
+    T: 'static,
+    X: DevicePtr<T>,
+    W: DevicePtr<T>,
+    O: DevicePtrMut<T>,
+>(
+    context: &GpuContext,
     x: &X,
     x_stride: usize,
     w: &W,
@@ -659,7 +753,57 @@ where
         beta,
         ldc: out_stride as i32,
     };
-    unsafe { blas.gemm(config, w, x, out).map_err(cuda_err("cuBLAS GEMM")) }
+    unsafe { gemm_dispatch(context, config, w, x, out) }
+}
+
+/// The batched twin of [`gemm_dispatch`]: the same reduced-precision compute
+/// type on the same tensor cores, which the plain strided-batched entry point
+/// cannot reach. Attention is the only batched caller and its matrices are the
+/// narrowest in the model, so this is where the TF32 path was costing the most.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_strided_batched_dispatch<A: DevicePtr<f32>, B: DevicePtr<f32>, C: DevicePtrMut<f32>>(
+    context: &GpuContext,
+    config: StridedBatchedConfig<f32>,
+    a: &A,
+    b: &B,
+    c: &mut C,
+) -> Result<(), NetworkError> {
+    if !context.mixed_precision {
+        return unsafe { context.blas.gemm_strided_batched(config, a, b, c) }
+            .map_err(cuda_err("cuBLAS batched GEMM"));
+    }
+    let (a_pointer, _a_guard) = a.device_ptr(&context.stream);
+    let (b_pointer, _b_guard) = b.device_ptr(&context.stream);
+    let (c_pointer, _c_guard) = c.device_ptr_mut(&context.stream);
+    let gemm = config.gemm;
+    unsafe {
+        cublas::gemm_strided_batched_ex(
+            *context.blas.handle(),
+            gemm.transa,
+            gemm.transb,
+            gemm.m,
+            gemm.n,
+            gemm.k,
+            &gemm.alpha as *const f32 as *const std::ffi::c_void,
+            a_pointer as *const std::ffi::c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            gemm.lda,
+            config.stride_a,
+            b_pointer as *const std::ffi::c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            gemm.ldb,
+            config.stride_b,
+            &gemm.beta as *const f32 as *const std::ffi::c_void,
+            c_pointer as *mut std::ffi::c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            gemm.ldc,
+            config.stride_c,
+            config.batch_size,
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
+            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+    .map_err(cuda_err("cuBLAS batched BF16 GEMM"))
 }
 
 /// [`gemm_rhs_transposed`] over `count` independent matrices, one per sequence.
@@ -667,8 +811,12 @@ where
 /// The strides are in elements and step from one sequence's block to the next,
 /// which is what lets a whole batch of per-head attention GEMMs be one launch.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gemm_rhs_transposed_batched<X: DevicePtr<f32>, W: DevicePtr<f32>, O: DevicePtrMut<f32>>(
-    blas: &CudaBlas,
+pub(crate) fn gemm_rhs_transposed_batched<
+    X: DevicePtr<f32>,
+    W: DevicePtr<f32>,
+    O: DevicePtrMut<f32>,
+>(
+    context: &GpuContext,
     x: &X,
     x_stride: usize,
     w: &W,
@@ -704,15 +852,14 @@ pub(crate) fn gemm_rhs_transposed_batched<X: DevicePtr<f32>, W: DevicePtr<f32>, 
         stride_c: out_batch_stride as i64,
     };
     unsafe {
-        blas.gemm_strided_batched(config, w, x, out)
-            .map_err(cuda_err("cuBLAS batched GEMM"))
+        gemm_strided_batched_dispatch(context, config, w, x, out)
     }
 }
 
 /// [`gemm_plain`] over `count` independent matrices, one per sequence.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_plain_batched<X: DevicePtr<f32>, W: DevicePtr<f32>, O: DevicePtrMut<f32>>(
-    blas: &CudaBlas,
+    context: &GpuContext,
     x: &X,
     x_stride: usize,
     w: &W,
@@ -748,15 +895,18 @@ pub(crate) fn gemm_plain_batched<X: DevicePtr<f32>, W: DevicePtr<f32>, O: Device
         stride_c: out_batch_stride as i64,
     };
     unsafe {
-        blas.gemm_strided_batched(config, w, x, out)
-            .map_err(cuda_err("cuBLAS batched GEMM"))
+        gemm_strided_batched_dispatch(context, config, w, x, out)
     }
 }
 
 /// [`gemm_lhs_transposed`] over `count` independent matrices, one per sequence.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gemm_lhs_transposed_batched<D: DevicePtr<f32>, X: DevicePtr<f32>, O: DevicePtrMut<f32>>(
-    blas: &CudaBlas,
+pub(crate) fn gemm_lhs_transposed_batched<
+    D: DevicePtr<f32>,
+    X: DevicePtr<f32>,
+    O: DevicePtrMut<f32>,
+>(
+    context: &GpuContext,
     d: &D,
     d_stride: usize,
     x: &X,
@@ -792,15 +942,14 @@ pub(crate) fn gemm_lhs_transposed_batched<D: DevicePtr<f32>, X: DevicePtr<f32>, 
         stride_c: out_batch_stride as i64,
     };
     unsafe {
-        blas.gemm_strided_batched(config, x, d, out)
-            .map_err(cuda_err("cuBLAS batched weight-gradient GEMM"))
+        gemm_strided_batched_dispatch(context, config, x, d, out)
     }
 }
 
 /// `out[rows, cols] = alpha * x[rows, inner] . w[inner, cols] + beta * out`
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gemm_plain<T, X: DevicePtr<T>, W: DevicePtr<T>, O: DevicePtrMut<T>>(
-    blas: &CudaBlas,
+pub(crate) fn gemm_plain<T: 'static, X: DevicePtr<T>, W: DevicePtr<T>, O: DevicePtrMut<T>>(
+    context: &GpuContext,
     x: &X,
     x_stride: usize,
     w: &W,
@@ -828,13 +977,18 @@ where
         beta,
         ldc: out_stride as i32,
     };
-    unsafe { blas.gemm(config, w, x, out).map_err(cuda_err("cuBLAS GEMM")) }
+    unsafe { gemm_dispatch(context, config, w, x, out) }
 }
 
 /// `out[units, cols] = alpha * d[rows, units]^T . x[rows, cols] + beta * out`
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gemm_lhs_transposed<T, D: DevicePtr<T>, X: DevicePtr<T>, O: DevicePtrMut<T>>(
-    blas: &CudaBlas,
+pub(crate) fn gemm_lhs_transposed<
+    T: 'static,
+    D: DevicePtr<T>,
+    X: DevicePtr<T>,
+    O: DevicePtrMut<T>,
+>(
+    context: &GpuContext,
     d: &D,
     d_stride: usize,
     x: &X,
@@ -862,10 +1016,7 @@ where
         beta,
         ldc: out_stride as i32,
     };
-    unsafe {
-        blas.gemm(config, x, d, out)
-            .map_err(cuda_err("cuBLAS weight-gradient GEMM"))
-    }
+    unsafe { gemm_dispatch(context, config, x, d, out) }
 }
 
 #[cfg(test)]
@@ -891,6 +1042,12 @@ mod tests {
 
     /// One dense block and one MoE block, so a parity run covers both feed
     /// forward shapes as well as grouped-query attention and tied embeddings.
+    ///
+    /// Reduced precision is switched off. It is the library default, but these
+    /// are FP32 device-against-host parity tests, and TF32 and BF16 rounding
+    /// would put them a full learning-rate step apart on any parameter whose
+    /// true gradient is near zero — see the note on
+    /// `mixed_precision_tracks_the_fp32_device_path_or_skips_without_device`.
     fn tiny() -> TransformerBuilder {
         TransformerLm::builder()
             .vocab_size(24)
@@ -905,6 +1062,7 @@ mod tests {
             .max_seq_len(32)
             .optimizer(Optimizer::adam(1e-2))
             .seed(1234)
+            .mixed_precision(false)
     }
 
     fn assert_close(label: &str, gpu: &[f32], cpu: &[f32], tolerance: f32) {
@@ -974,7 +1132,12 @@ mod tests {
         let (device_logits, _) = gpu.forward_train(&batch).unwrap();
 
         assert_eq!(device_logits.rows, 12);
-        assert_close("batched logits", &device_logits.data, &host_logits.data, 1e-3);
+        assert_close(
+            "batched logits",
+            &device_logits.data,
+            &host_logits.data,
+            1e-3,
+        );
     }
 
     /// Padding exercises the two places where a row is not independent: the
@@ -993,7 +1156,12 @@ mod tests {
         let (host_logits, host_cache) = cpu.forward_train(&batch).unwrap();
         let (device_logits, device_cache) = gpu.forward_train(&batch).unwrap();
 
-        assert_close("padded logits", &device_logits.data, &host_logits.data, 1e-3);
+        assert_close(
+            "padded logits",
+            &device_logits.data,
+            &host_logits.data,
+            1e-3,
+        );
         assert!(
             (device_cache.auxiliary_loss() - host_cache.auxiliary_loss()).abs() < 1e-4,
             "auxiliary loss {} on the device vs {} on the host",
@@ -1010,7 +1178,11 @@ mod tests {
         let mut cpu = tiny().build().unwrap();
         let mut gpu = cpu.clone();
         gpu.to_cuda(0, 8192).unwrap();
-        let batch = [vec![3u32, 8, 1, 5, 2, 7], vec![9, 4, 4, 0, 11, 6], vec![2, 6, 1]];
+        let batch = [
+            vec![3u32, 8, 1, 5, 2, 7],
+            vec![9, 4, 4, 0, 11, 6],
+            vec![2, 6, 1],
+        ];
 
         let host = cpu.train_step(&batch).unwrap();
         let device = gpu.train_step(&batch).unwrap();
@@ -1040,7 +1212,11 @@ mod tests {
         let mut cpu = tiny().build().unwrap();
         let mut gpu = cpu.clone();
         gpu.to_cuda(0, 8192).unwrap();
-        let batch = [vec![3u32, 8, 1, 5, 2, 7], vec![9, 4, 4, 0, 11, 6], vec![2, 6, 1]];
+        let batch = [
+            vec![3u32, 8, 1, 5, 2, 7],
+            vec![9, 4, 4, 0, 11, 6],
+            vec![2, 6, 1],
+        ];
 
         // 18 rows in 5-row chunks: four chunks, the last one short.
         crate::gpu_model::CHUNK_ROWS_OVERRIDE.store(5, std::sync::atomic::Ordering::Relaxed);
@@ -1099,10 +1275,17 @@ mod tests {
         }
         let mut baseline = tiny().build().unwrap();
         let mut reduced = tiny().mixed_precision(true).build().unwrap();
-        assert_eq!(baseline, reduced, "the two models start from the same weights");
+        assert_eq!(
+            baseline, reduced,
+            "the two models start from the same weights"
+        );
         baseline.to_cuda(0, 8192).unwrap();
         reduced.to_cuda(0, 8192).unwrap();
-        let batch = [vec![3u32, 8, 1, 5, 2, 7], vec![9, 4, 4, 0, 11, 6], vec![2, 6, 1]];
+        let batch = [
+            vec![3u32, 8, 1, 5, 2, 7],
+            vec![9, 4, 4, 0, 11, 6],
+            vec![2, 6, 1],
+        ];
 
         crate::gpu_model::CHUNK_ROWS_OVERRIDE.store(5, std::sync::atomic::Ordering::Relaxed);
         for step in 0..2 {
@@ -1117,7 +1300,6 @@ mod tests {
         }
         crate::gpu_model::CHUNK_ROWS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
     }
-
 
     /// Several steps in a row, which is where a stale cache or a gradient that
     /// is not cleared would show up.

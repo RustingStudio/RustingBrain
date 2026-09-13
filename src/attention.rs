@@ -7,6 +7,7 @@ use crate::network::NetworkError;
 use crate::param::{Linear, Param};
 use crate::rope::Rope;
 use rand::rngs::StdRng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Growable key/value history for one attention layer.
@@ -264,8 +265,14 @@ impl MultiHeadAttention {
         // which dominates once the history is a few hundred tokens long.
         let mut merged = Matrix::new(input.rows, self.num_heads * self.head_dim);
         for head in 0..self.num_heads {
-            let scores =
-                self.head_scores(&queries, cache.keys(), width, head, position_offset, history);
+            let scores = self.head_scores(
+                &queries,
+                cache.keys(),
+                width,
+                head,
+                position_offset,
+                history,
+            );
             self.accumulate_head_output(&scores, cache.values(), width, head, &mut merged);
         }
 
@@ -293,53 +300,116 @@ impl MultiHeadAttention {
         let mut grad_keys = Matrix::new(rows, self.num_kv_heads * head_dim);
         let mut grad_values = Matrix::new(rows, self.num_kv_heads * head_dim);
 
+        // One head of one sequence is a strided window of the packed
+        // `[rows, heads * head_dim]` projections, and `sgemm` takes a row and a
+        // column stride per operand, so each of the five products below reads
+        // its head where it lies instead of gathering it into a temporary.
+        // `dL/dscore` is the only scratch, and it is reused across heads.
+        let sequences = rows / seq_len;
+        let mut grad_scores = vec![0.0f32; seq_len * seq_len];
+
         for head in 0..self.num_heads {
             let probabilities = &cache.probabilities[head];
             let query_base = head * head_dim;
             let kv_base = (head / group_size) * head_dim;
 
-            for row in 0..rows {
-                let sequence = (row / seq_len) * seq_len;
-                let visible = row % seq_len + 1;
-                let upstream = &grad_merged.row(row)[query_base..query_base + head_dim];
-                let weights = probabilities.row(row);
+            for sequence in 0..sequences {
+                let probability_offset = sequence * seq_len * seq_len;
+                let query_offset = sequence * seq_len * cache.queries.cols + query_base;
+                let merged_offset = sequence * seq_len * grad_merged.cols + query_base;
+                let key_offset = sequence * seq_len * cache.keys.cols + kv_base;
+                let value_offset = sequence * seq_len * cache.values.cols + kv_base;
 
-                // dL/dprobability, and the value gradient it implies.
-                let mut grad_weights = vec![0.0f32; visible];
-                for key in 0..visible {
-                    let value_row =
-                        &cache.values.row(sequence + key)[kv_base..kv_base + head_dim];
-                    grad_weights[key] = upstream
-                        .iter()
-                        .zip(value_row)
-                        .map(|(g, v)| g * v)
-                        .sum::<f32>();
+                unsafe {
+                    // dL/dprobability = dL/dmerged_head * V_head^T.
+                    matrixmultiply::sgemm(
+                        seq_len,
+                        head_dim,
+                        seq_len,
+                        1.0,
+                        grad_merged.data.as_ptr().add(merged_offset),
+                        grad_merged.cols as isize,
+                        1,
+                        cache.values.data.as_ptr().add(value_offset),
+                        1,
+                        cache.values.cols as isize,
+                        0.0,
+                        grad_scores.as_mut_ptr(),
+                        seq_len as isize,
+                        1,
+                    );
 
-                    let weight = weights[key];
-                    let target =
-                        &mut grad_values.row_mut(sequence + key)[kv_base..kv_base + head_dim];
-                    for (slot, &g) in target.iter_mut().zip(upstream) {
-                        *slot += weight * g;
+                    // dL/dV_head += P^T * dL/dmerged_head. Accumulating rather
+                    // than assigning is what makes grouped-query attention
+                    // correct: `group_size` query heads share these columns.
+                    matrixmultiply::sgemm(
+                        seq_len,
+                        seq_len,
+                        head_dim,
+                        1.0,
+                        probabilities.data.as_ptr().add(probability_offset),
+                        1,
+                        seq_len as isize,
+                        grad_merged.data.as_ptr().add(merged_offset),
+                        grad_merged.cols as isize,
+                        1,
+                        1.0,
+                        grad_values.data.as_mut_ptr().add(value_offset),
+                        grad_values.cols as isize,
+                        1,
+                    );
+                }
+
+                // Softmax backward, in place over the whole square. A masked
+                // entry has probability zero, so it stays zero here and the
+                // causal mask needs no separate handling.
+                for position in 0..seq_len {
+                    let weights =
+                        &probabilities.data[probability_offset + position * seq_len..][..seq_len];
+                    let row = &mut grad_scores[position * seq_len..][..seq_len];
+                    let dot: f32 = weights.iter().zip(row.iter()).map(|(p, g)| p * g).sum();
+                    for (slot, &weight) in row.iter_mut().zip(weights) {
+                        *slot = weight * (*slot - dot) * scale;
                     }
                 }
 
-                // Softmax backward, restricted to the unmasked prefix: masked
-                // entries have probability zero and so contribute nothing.
-                let dot = (0..visible).map(|k| weights[k] * grad_weights[k]).sum::<f32>();
-                for key in 0..visible {
-                    let grad_score = weights[key] * (grad_weights[key] - dot) * scale;
-                    let key_row = &cache.keys.row(sequence + key)[kv_base..kv_base + head_dim];
-                    let query_row = &cache.queries.row(row)[query_base..query_base + head_dim];
+                unsafe {
+                    // dL/dQ_head += dL/dscore * K_head.
+                    matrixmultiply::sgemm(
+                        seq_len,
+                        seq_len,
+                        head_dim,
+                        1.0,
+                        grad_scores.as_ptr(),
+                        seq_len as isize,
+                        1,
+                        cache.keys.data.as_ptr().add(key_offset),
+                        cache.keys.cols as isize,
+                        1,
+                        1.0,
+                        grad_queries.data.as_mut_ptr().add(query_offset),
+                        grad_queries.cols as isize,
+                        1,
+                    );
 
-                    let target = &mut grad_queries.row_mut(row)[query_base..query_base + head_dim];
-                    for (slot, &k) in target.iter_mut().zip(key_row) {
-                        *slot += grad_score * k;
-                    }
-                    let target =
-                        &mut grad_keys.row_mut(sequence + key)[kv_base..kv_base + head_dim];
-                    for (slot, &q) in target.iter_mut().zip(query_row) {
-                        *slot += grad_score * q;
-                    }
+                    // dL/dK_head += dL/dscore^T * Q_head, accumulating for the
+                    // same grouped-query reason as the value gradient.
+                    matrixmultiply::sgemm(
+                        seq_len,
+                        seq_len,
+                        head_dim,
+                        1.0,
+                        grad_scores.as_ptr(),
+                        1,
+                        seq_len as isize,
+                        cache.queries.data.as_ptr().add(query_offset),
+                        cache.queries.cols as isize,
+                        1,
+                        1.0,
+                        grad_keys.data.as_mut_ptr().add(key_offset),
+                        grad_keys.cols as isize,
+                        1,
+                    );
                 }
             }
         }
@@ -413,8 +483,10 @@ impl MultiHeadAttention {
         let mut keys = self.key.forward(input);
         let values = self.value.forward(input);
 
-        self.rope.apply(&mut queries, self.num_heads, position_offset)?;
-        self.rope.apply(&mut keys, self.num_kv_heads, position_offset)?;
+        self.rope
+            .apply(&mut queries, self.num_heads, position_offset)?;
+        self.rope
+            .apply(&mut keys, self.num_kv_heads, position_offset)?;
 
         Ok((queries, keys, values))
     }
@@ -438,7 +510,8 @@ impl MultiHeadAttention {
 
         self.rope
             .apply_batched(&mut queries, self.num_heads, seq_len)?;
-        self.rope.apply_batched(&mut keys, self.num_kv_heads, seq_len)?;
+        self.rope
+            .apply_batched(&mut keys, self.num_kv_heads, seq_len)?;
 
         Ok((queries, keys, values))
     }
@@ -447,9 +520,9 @@ impl MultiHeadAttention {
     /// `[batch * seq_len, seq_len]`.
     ///
     /// Column `k` of row `r` is the weight the query at position `r % seq_len`
-    /// puts on key `k` *of its own sequence*. Masked entries are left at zero
-    /// rather than set to `-inf` and exponentiated, so the causal structure is
-    /// in the loop bounds and cannot be softened by a numerical accident.
+    /// puts on key `k` *of its own sequence*. Masked entries are exactly zero
+    /// rather than `-inf` exponentiated, so nothing downstream has to carry the
+    /// mask around and no numerical accident can soften it.
     fn head_scores_batched(
         &self,
         queries: &Matrix,
@@ -461,26 +534,52 @@ impl MultiHeadAttention {
         let query_base = head * head_dim;
         let kv_base = (head / self.group_size()) * head_dim;
         let scale = self.scale();
+        let sequences = queries.rows / seq_len;
 
         let mut scores = Matrix::new(queries.rows, seq_len);
-        for query in 0..queries.rows {
-            let query_row = &queries.row(query)[query_base..query_base + head_dim];
-            let sequence = (query / seq_len) * seq_len;
-            let visible = query % seq_len + 1;
+        for sequence in 0..sequences {
+            let query_offset = sequence * seq_len * queries.cols + query_base;
+            let key_offset = sequence * seq_len * keys.cols + kv_base;
+            let score_offset = sequence * seq_len * seq_len;
 
-            let row = scores.row_mut(query);
-            for (key, slot) in row.iter_mut().enumerate().take(visible) {
-                let base = (sequence + key) * keys.cols + kv_base;
-                let key_row = &keys.data[base..base + head_dim];
-                *slot = query_row
-                    .iter()
-                    .zip(key_row)
-                    .map(|(q, k)| q * k)
-                    .sum::<f32>()
-                    * scale;
+            // Q_head times K_head transposed, both read in place out of the
+            // packed projections through `sgemm`'s row and column strides. The
+            // masked upper triangle is computed and then discarded, which costs
+            // half the multiplies but buys a single blocked, threaded kernel in
+            // place of `seq_len` growing dot-product loops.
+            unsafe {
+                matrixmultiply::sgemm(
+                    seq_len,
+                    head_dim,
+                    seq_len,
+                    scale,
+                    queries.data.as_ptr().add(query_offset),
+                    queries.cols as isize,
+                    1,
+                    keys.data.as_ptr().add(key_offset),
+                    1,
+                    keys.cols as isize,
+                    0.0,
+                    scores.data.as_mut_ptr().add(score_offset),
+                    seq_len as isize,
+                    1,
+                );
             }
-            softmax(&mut row[..visible]);
         }
+
+        // Normalizing afterwards rather than inside the loop above puts every
+        // row of every sequence in one parallel pass. `softmax` is an `exp` per
+        // element, and the masked tail is cleared to an exact zero so that
+        // nothing downstream has to know where the causal boundary is.
+        scores
+            .data
+            .par_chunks_mut(seq_len)
+            .enumerate()
+            .for_each(|(row, weights)| {
+                let position = row % seq_len;
+                softmax(&mut weights[..position + 1]);
+                weights[position + 1..].fill(0.0);
+            });
 
         scores
     }
@@ -497,19 +596,38 @@ impl MultiHeadAttention {
         let head_dim = self.head_dim;
         let query_base = head * head_dim;
         let kv_base = (head / self.group_size()) * head_dim;
+        let sequences = probabilities.rows / seq_len;
 
-        for query in 0..probabilities.rows {
-            let sequence = (query / seq_len) * seq_len;
-            let visible = query % seq_len + 1;
-            let weights = probabilities.row(query);
-
-            for (key, &weight) in weights.iter().enumerate().take(visible) {
-                let base = (sequence + key) * values.cols + kv_base;
-                let value_row = &values.data[base..base + head_dim];
-                let target = &mut merged.row_mut(query)[query_base..query_base + head_dim];
-                for (slot, &value) in target.iter_mut().zip(value_row) {
-                    *slot += weight * value;
-                }
+        for sequence in 0..sequences {
+            // Masked weights are exactly zero, so the whole square takes part
+            // in the multiply and the causal mask costs nothing here. `beta` is
+            // one because the head writes its own column range of `merged`.
+            unsafe {
+                matrixmultiply::sgemm(
+                    seq_len,
+                    seq_len,
+                    head_dim,
+                    1.0,
+                    probabilities
+                        .data
+                        .as_ptr()
+                        .add(sequence * seq_len * seq_len),
+                    seq_len as isize,
+                    1,
+                    values
+                        .data
+                        .as_ptr()
+                        .add(sequence * seq_len * values.cols + kv_base),
+                    values.cols as isize,
+                    1,
+                    1.0,
+                    merged
+                        .data
+                        .as_mut_ptr()
+                        .add(sequence * seq_len * merged.cols + query_base),
+                    merged.cols as isize,
+                    1,
+                );
             }
         }
     }
@@ -545,12 +663,7 @@ impl MultiHeadAttention {
             for (key, slot) in row.iter_mut().enumerate().take(visible) {
                 let base = key * key_cols + kv_base;
                 let key_row = &keys[base..base + head_dim];
-                *slot = query_row
-                    .iter()
-                    .zip(key_row)
-                    .map(|(q, k)| q * k)
-                    .sum::<f32>()
-                    * scale;
+                *slot = crate::matrix::dot(query_row, key_row) * scale;
             }
             softmax(&mut row[..visible]);
         }
@@ -616,7 +729,9 @@ mod tests {
     #[test]
     fn output_keeps_the_model_dimension() {
         let layer = attention(2, 2);
-        let (output, _) = layer.forward_train(&inputs(5, 8), Layout::default()).unwrap();
+        let (output, _) = layer
+            .forward_train(&inputs(5, 8), Layout::default())
+            .unwrap();
 
         assert_eq!(output.rows, 5);
         assert_eq!(output.cols, 8);
@@ -634,7 +749,9 @@ mod tests {
     #[test]
     fn attention_weights_sum_to_one_over_the_visible_prefix() {
         let layer = attention(2, 1);
-        let (_, cache) = layer.forward_train(&inputs(4, 8), Layout::default()).unwrap();
+        let (_, cache) = layer
+            .forward_train(&inputs(4, 8), Layout::default())
+            .unwrap();
 
         for head in &cache.probabilities {
             for query in 0..head.rows {
@@ -647,7 +764,9 @@ mod tests {
     #[test]
     fn the_causal_mask_zeroes_every_future_key() {
         let layer = attention(2, 2);
-        let (_, cache) = layer.forward_train(&inputs(5, 8), Layout::default()).unwrap();
+        let (_, cache) = layer
+            .forward_train(&inputs(5, 8), Layout::default())
+            .unwrap();
 
         for head in &cache.probabilities {
             for query in 0..head.rows {
@@ -729,9 +848,21 @@ mod tests {
         for index in 0..input.data.len() {
             let mut bumped = input.clone();
             bumped.data[index] += epsilon;
-            let high: f32 = layer.forward_train(&bumped, Layout::default()).unwrap().0.data.iter().sum();
+            let high: f32 = layer
+                .forward_train(&bumped, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
             bumped.data[index] -= 2.0 * epsilon;
-            let low: f32 = layer.forward_train(&bumped, Layout::default()).unwrap().0.data.iter().sum();
+            let low: f32 = layer
+                .forward_train(&bumped, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
             let numeric = (high - low) / (2.0 * epsilon);
             assert!(
                 (grad_input.data[index] - numeric).abs() < 2e-2,
@@ -755,9 +886,21 @@ mod tests {
         for (index, &expected) in analytic.iter().enumerate() {
             let mut probe = layer.clone();
             probe.query.weight.value.data[index] += epsilon;
-            let high: f32 = probe.forward_train(&input, Layout::default()).unwrap().0.data.iter().sum();
+            let high: f32 = probe
+                .forward_train(&input, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
             probe.query.weight.value.data[index] -= 2.0 * epsilon;
-            let low: f32 = probe.forward_train(&input, Layout::default()).unwrap().0.data.iter().sum();
+            let low: f32 = probe
+                .forward_train(&input, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
             let numeric = (high - low) / (2.0 * epsilon);
             assert!(
                 (expected - numeric).abs() < 2e-2,
@@ -770,6 +913,10 @@ mod tests {
     #[test]
     fn a_cache_rejects_the_wrong_width() {
         let mut cache = KvCache::new(2, 4);
-        assert!(cache.append(&Matrix::new(1, 4), &Matrix::new(1, 4)).is_err());
+        assert!(
+            cache
+                .append(&Matrix::new(1, 4), &Matrix::new(1, 4))
+                .is_err()
+        );
     }
 }
