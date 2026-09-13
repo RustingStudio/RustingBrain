@@ -6,8 +6,14 @@ use rusting_brain::{Optimizer, TransformerLm};
 use std::time::Instant;
 
 fn main() {
-    let batch_size: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(4);
-    let seq_len: usize = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(128);
+    let batch_size: usize = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(4);
+    let seq_len: usize = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(128);
     let device: bool = std::env::args().nth(3).map(|a| a == "cuda").unwrap_or(true);
 
     let mut model = TransformerLm::builder()
@@ -24,7 +30,11 @@ fn main() {
     }
 
     let batch: Vec<Vec<u32>> = (0..batch_size)
-        .map(|s| (0..seq_len).map(|t| ((s * 131 + t * 17) % 32000) as u32).collect())
+        .map(|s| {
+            (0..seq_len)
+                .map(|t| ((s * 131 + t * 17) % 32000) as u32)
+                .collect()
+        })
         .collect();
 
     model.train_step(&batch).unwrap();

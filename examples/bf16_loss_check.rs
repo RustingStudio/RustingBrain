@@ -9,9 +9,16 @@
 use rusting_brain::{Optimizer, TokenBatch, TransformerLm};
 
 fn main() {
-    let steps: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(20);
+    let steps: usize = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(20);
     let ids: Vec<Vec<u32>> = (0..64)
-        .map(|s| (0..128).map(|t| ((s * 131 + t * 17) % 32_000) as u32).collect())
+        .map(|s| {
+            (0..128)
+                .map(|t| ((s * 131 + t * 17) % 32_000) as u32)
+                .collect()
+        })
         .collect();
     let batch = TokenBatch::new(&ids).unwrap();
 
@@ -40,7 +47,11 @@ fn main() {
             "{label}: first {:.5} last {:.5} | {}",
             losses[0],
             losses[steps - 1],
-            losses.iter().map(|l| format!("{l:.4}")).collect::<Vec<_>>().join(" ")
+            losses
+                .iter()
+                .map(|l| format!("{l:.4}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
     }
 }
