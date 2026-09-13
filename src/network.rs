@@ -58,6 +58,12 @@ pub enum NetworkError {
     },
     #[error("accelerator backend error: {0}")]
     Accelerator(String),
+    #[error("invalid transformer configuration: {0}")]
+    InvalidConfig(String),
+    #[error("token id {id} is outside the vocabulary of {vocab_size}")]
+    TokenOutOfRange { id: u32, vocab_size: usize },
+    #[error("sequence length {length} exceeds the configured maximum {max_seq_len}")]
+    SequenceTooLong { length: usize, max_seq_len: usize },
 }
 
 /// Selects where fitting is performed. The accelerator backends are

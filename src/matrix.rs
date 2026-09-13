@@ -116,6 +116,24 @@ impl Matrix {
         debug_assert_eq!(target.rows, self.rows);
         debug_assert_eq!(target.cols, other.rows);
 
+        // A cached decode step feeds one token at a time, and `sgemm` with
+        // `m == 1` spends all its time packing panels for a blocked kernel that
+        // never gets a second row. A plain row-times-row dot product over
+        // contiguous memory beats it by a wide margin, and the compiler
+        // vectorizes it.
+        if self.rows == 1 {
+            let k = self.cols;
+            for (slot, weight) in target.data.iter_mut().zip(other.data.chunks_exact(k)) {
+                *slot = self
+                    .data
+                    .iter()
+                    .zip(weight)
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>();
+            }
+            return;
+        }
+
         unsafe {
             matrixmultiply::sgemm(
                 self.rows,
@@ -213,6 +231,50 @@ impl Matrix {
 
     pub fn copy_from_slice(&mut self, source: &[f32]) {
         self.data.copy_from_slice(source);
+    }
+
+    /// Row `index` as a contiguous slice. The transformer layers keep one token
+    /// per row, so this is the natural unit of work for them.
+    pub fn row(&self, index: usize) -> &[f32] {
+        debug_assert!(index < self.rows);
+        &self.data[index * self.cols..(index + 1) * self.cols]
+    }
+
+    pub fn row_mut(&mut self, index: usize) -> &mut [f32] {
+        debug_assert!(index < self.rows);
+        &mut self.data[index * self.cols..(index + 1) * self.cols]
+    }
+
+    /// `target += self^T * other`, the accumulating form of
+    /// [`Matrix::dot_self_transposed`].
+    ///
+    /// Weight gradients are summed over a whole batch and often over several
+    /// call sites (a shared embedding matrix is written by both the gather and
+    /// the unembedding), so the accumulating form avoids a full-size scratch
+    /// matrix and an extra pass per call.
+    pub fn dot_self_transposed_accumulate(&self, other: &Matrix, target: &mut Matrix) {
+        debug_assert_eq!(self.rows, other.rows);
+        debug_assert_eq!(target.rows, self.cols);
+        debug_assert_eq!(target.cols, other.cols);
+
+        unsafe {
+            matrixmultiply::sgemm(
+                self.cols,
+                self.rows,
+                other.cols,
+                1.0,
+                self.data.as_ptr(),
+                1,
+                self.cols as isize,
+                other.data.as_ptr(),
+                other.cols as isize,
+                1,
+                1.0,
+                target.data.as_mut_ptr(),
+                target.cols as isize,
+                1,
+            );
+        }
     }
 }
 

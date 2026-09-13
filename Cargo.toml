@@ -1,8 +1,8 @@
 [package]
 name = "rusting_brain"
-version = "0.1.3"
+version = "1.0.0"
 edition = "2024"
-description = "A small Rust neural-network library for learning, training, and inference experiments."
+description = "A Rust neural-network library for learning, training, and inference from small models to small size LLM."
 readme = "README.md"
 license-file = "LICENSE.md"
 rust-version = "1.85"
@@ -13,14 +13,15 @@ keywords = ["neural-network", "machine-learning", "onnx", "cuda", "education"]
 categories = ["science", "algorithms"]
 
 [dependencies]
-matrixmultiply = "0.3.10"
+matrixmultiply = { version = "0.3.11", features = ["threading", "avx512"] }
 rayon = "1.11.0"
 rand = { version = "0.8", features =["std", "std_rng"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-cudarc = { version = "0.19.3", optional = true, default-features = false, features = ["std", "cublas", "nvrtc", "runtime", "dynamic-loading", "cuda-13010"] }
+cudarc = { version = "0.19.3", optional = true, default-features = false, features = ["std", "cublas", "nvrtc", "runtime", "dynamic-loading", "cuda-13010", "f16"] }
 tract-onnx = { version = "0.21", optional = true }
+half = { version = "2", optional = true }
 
 # Metal only exists on Apple platforms, so the dependency is target-scoped:
 # `--features metal` stays a valid (if inert) request on Linux and Windows,
@@ -31,7 +32,7 @@ metal = { version = "0.33", optional = true }
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:half"]
 # Compatibility aliases. Cargo features are additive, so selecting a concrete
 # ABI in each alias makes `--all-features` invalid. The crate now has one
 # supported backend ABI and keeps the historic names as source-compatible aliases.

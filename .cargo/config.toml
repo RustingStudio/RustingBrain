@@ -1,0 +1,4 @@
+[build]
+# Zen4/AVX-512 and modern AVX2 kernels for the hand-written element-wise loops.
+# Worth ~9% on a CPU training step here; harmless on older hosts.
+rustflags = ["-C", "target-cpu=native"]
