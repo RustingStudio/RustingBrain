@@ -706,6 +706,87 @@ impl Gpu<'_> {
         Ok(())
     }
 
+    /// The backward half of the same fusion: three kernels in place of two
+    /// `[seq_len, seq_len]` buffers, six passes over them and four batched
+    /// GEMMs.
+    ///
+    /// The query gradient is blocked over query tiles, the key and value
+    /// gradients over key tiles, because each of those is the blocking under
+    /// which a gradient is complete inside one block. The scores are rebuilt
+    /// from the log-sum-exp in both, which costs one extra matmul and saves
+    /// every byte of the round trip.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_backward(
+        &self,
+        flash: &crate::cuda_flash::FlashKernels,
+        qkv: &CudaSlice<f32>,
+        merged: &CudaSlice<f32>,
+        grad_merged: &CudaSlice<f32>,
+        log_sum_exp: &CudaSlice<f32>,
+        delta: &mut CudaSlice<f32>,
+        grad_qkv: &mut CudaSlice<f32>,
+        shape: FlashShape,
+        scale: f32,
+    ) -> Result<(), NetworkError> {
+        let tiles = shape.seq_len.div_ceil(crate::cuda_flash::TILE) as u32;
+        let warps = shape.heads * shape.rows;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&flash.delta)
+                .arg(merged)
+                .arg(grad_merged)
+                .arg(&mut *delta)
+                .arg(&(shape.rows as i32))
+                .arg(&(shape.heads as i32))
+                .arg(&(shape.query_width as i32))
+                .arg(&(shape.rows as i32))
+                .launch(warp_per_row_grid(warps))
+                .map_err(cuda_err("attention delta kernel"))?;
+        }
+
+        let delta = &*delta;
+        let grad_qkv = &*grad_qkv;
+        let launch = |function, grid_y, shared_mem_bytes| {
+            let config = cudarc::driver::LaunchConfig {
+                grid_dim: (tiles, grid_y, shape.sequences as u32),
+                block_dim: (crate::cuda_flash::THREADS, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe {
+                self.context
+                    .stream
+                    .launch_builder(function)
+                    .arg(qkv)
+                    .arg(grad_merged)
+                    .arg(log_sum_exp)
+                    .arg(&*delta)
+                    .arg(&*grad_qkv)
+                    .arg(&(shape.seq_len as i32))
+                    .arg(&(shape.qkv_width as i32))
+                    .arg(&(shape.query_width as i32))
+                    .arg(&(shape.key_base as i32))
+                    .arg(&(shape.value_base as i32))
+                    .arg(&(shape.group as i32))
+                    .arg(&(shape.rows as i32))
+                    .arg(&scale)
+                    .launch(config)
+                    .map_err(cuda_err("fused attention backward kernel"))
+            }
+        };
+        launch(
+            &flash.grad_query,
+            shape.heads as u32,
+            crate::cuda_flash::DQ_SHARED_BYTES,
+        )?;
+        launch(
+            &flash.grad_key_value,
+            (shape.heads / shape.group) as u32,
+            crate::cuda_flash::DKV_SHARED_BYTES,
+        )?;
+        Ok(())
+    }
+
     /// Rebuild the attention probabilities in place from scaled scores and the
     /// stored log-sum-exp, which is what the backward GEMMs expect to read.
     fn causal_probs_from_lse(
@@ -2195,148 +2276,189 @@ fn backward_attention(
         rows,
     )?;
 
-    // The forward pass kept only the log-sum-exp, so the probabilities are
-    // rebuilt here: one batched GEMM per head for the scores, then one
-    // exponential per element. The matrix lives for this block's backward pass
-    // alone rather than for the whole depth of the model.
-    let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
-    for head in 0..heads {
-        let kv_base = (head / group) * head_dim;
-        let query = cache.qkv.slice(head * head_dim..);
-        let key = cache.qkv.slice(key_base + kv_base..);
-        let mut scores = probabilities.slice_mut(head * sequences * block_size..);
-        gemm_rhs_transposed_batched(
-            gpu.context,
-            &query,
-            qkv_width,
-            &key,
-            qkv_width,
-            &mut scores,
+    // The fused path, where the device can take it: the same three kernels
+    // that replaced the forward softmax replace six passes over two
+    // `[seq_len, seq_len]` buffers and four batched GEMMs here.
+    let fused = gpu
+        .context
+        .flash
+        .as_ref()
+        .filter(|_| crate::cuda_flash::eligible(gpu.context.mixed_precision, head_dim));
+    let mut grad_qkv = if let Some(flash) = fused {
+        let shape = FlashShape {
+            rows,
             seq_len,
-            seq_len,
-            seq_len,
-            head_dim,
-            scale,
-            0.0,
             sequences,
-            seq_len * qkv_width,
-            seq_len * qkv_width,
-            block_size,
-        )?;
-    }
-    gpu.causal_probs_from_lse(
-        &mut probabilities,
-        &cache.log_sum_exp,
-        heads * sequences * seq_len,
-        seq_len,
-    )?;
-
-    // Every head overwrites its own slice of `grad_scores`, so the buffer does
-    // not need clearing. `grad_values` does: query heads in a group accumulate
-    // into the same key/value head.
-    let mut grad_scores = gpu.uninit(heads * sequences * block_size)?;
-    // The query slice is overwritten head by head, but the key and value
-    // slices accumulate over every query head in a group, so the whole fused
-    // buffer starts at zero.
-    let mut grad_qkv = gpu.zeros(rows * qkv_width)?;
-    for head in 0..heads {
-        let kv_base = (head / group) * head_dim;
-        let upstream = grad_merged.slice(head * head_dim..);
-        let value = cache.qkv.slice(value_base + kv_base..);
-        let mut scores = grad_scores.slice_mut(head * sequences * block_size..);
-        gemm_rhs_transposed_batched(
-            gpu.context,
-            &upstream,
+            heads,
+            group,
+            qkv_width,
             query_width,
-            &value,
-            qkv_width,
-            &mut scores,
-            seq_len,
-            seq_len,
-            seq_len,
-            head_dim,
-            1.0,
-            0.0,
-            sequences,
-            seq_len * query_width,
-            seq_len * qkv_width,
-            block_size,
-        )?;
-
-        let head_probabilities = probabilities.slice(head * sequences * block_size..);
-        let mut grad_value = grad_qkv.slice_mut(value_base + kv_base..);
-        gemm_lhs_transposed_batched(
-            gpu.context,
-            &head_probabilities,
-            seq_len,
-            &upstream,
-            query_width,
-            &mut grad_value,
-            qkv_width,
-            seq_len,
-            seq_len,
-            head_dim,
-            1.0,
-            1.0,
-            sequences,
-            block_size,
-            seq_len * query_width,
-            seq_len * qkv_width,
-        )?;
-    }
-
-    gpu.causal_softmax_backward(
-        &mut grad_scores,
-        &probabilities,
-        heads * sequences * seq_len,
-        seq_len,
-    )?;
-
-    for head in 0..heads {
-        let kv_base = (head / group) * head_dim;
-        let scores = grad_scores.slice(head * sequences * block_size..);
-        let key = cache.qkv.slice(key_base + kv_base..);
-        let mut grad_query = grad_qkv.slice_mut(head * head_dim..);
-        gemm_plain_batched(
-            gpu.context,
-            &scores,
-            seq_len,
-            &key,
-            qkv_width,
-            &mut grad_query,
-            qkv_width,
-            seq_len,
-            head_dim,
-            seq_len,
+            key_base,
+            value_base,
+        };
+        let mut delta = gpu.uninit(heads * rows)?;
+        // Every column of `grad_qkv` is written rather than accumulated: the
+        // query gradient by the query-tile kernel, the key and value gradients
+        // by the key-tile one, so there is nothing to clear first.
+        let mut grad_qkv = gpu.uninit(rows * qkv_width)?;
+        gpu.flash_attention_backward(
+            flash,
+            &cache.qkv,
+            &cache.merged,
+            &grad_merged,
+            &cache.log_sum_exp,
+            &mut delta,
+            &mut grad_qkv,
+            shape,
             scale,
-            0.0,
-            sequences,
-            block_size,
-            seq_len * qkv_width,
-            seq_len * qkv_width,
+        )?;
+        grad_qkv
+    } else {
+        // The forward pass kept only the log-sum-exp, so the probabilities are
+        // rebuilt here: one batched GEMM per head for the scores, then one
+        // exponential per element. The matrix lives for this block's backward pass
+        // alone rather than for the whole depth of the model.
+        let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
+        for head in 0..heads {
+            let kv_base = (head / group) * head_dim;
+            let query = cache.qkv.slice(head * head_dim..);
+            let key = cache.qkv.slice(key_base + kv_base..);
+            let mut scores = probabilities.slice_mut(head * sequences * block_size..);
+            gemm_rhs_transposed_batched(
+                gpu.context,
+                &query,
+                qkv_width,
+                &key,
+                qkv_width,
+                &mut scores,
+                seq_len,
+                seq_len,
+                seq_len,
+                head_dim,
+                scale,
+                0.0,
+                sequences,
+                seq_len * qkv_width,
+                seq_len * qkv_width,
+                block_size,
+            )?;
+        }
+        gpu.causal_probs_from_lse(
+            &mut probabilities,
+            &cache.log_sum_exp,
+            heads * sequences * seq_len,
+            seq_len,
         )?;
 
-        let query = cache.qkv.slice(head * head_dim..);
-        let mut grad_key = grad_qkv.slice_mut(key_base + kv_base..);
-        gemm_lhs_transposed_batched(
-            gpu.context,
-            &scores,
+        // Every head overwrites its own slice of `grad_scores`, so the buffer does
+        // not need clearing. `grad_values` does: query heads in a group accumulate
+        // into the same key/value head.
+        let mut grad_scores = gpu.uninit(heads * sequences * block_size)?;
+        // The query slice is overwritten head by head, but the key and value
+        // slices accumulate over every query head in a group, so the whole fused
+        // buffer starts at zero.
+        let mut grad_qkv = gpu.zeros(rows * qkv_width)?;
+        for head in 0..heads {
+            let kv_base = (head / group) * head_dim;
+            let upstream = grad_merged.slice(head * head_dim..);
+            let value = cache.qkv.slice(value_base + kv_base..);
+            let mut scores = grad_scores.slice_mut(head * sequences * block_size..);
+            gemm_rhs_transposed_batched(
+                gpu.context,
+                &upstream,
+                query_width,
+                &value,
+                qkv_width,
+                &mut scores,
+                seq_len,
+                seq_len,
+                seq_len,
+                head_dim,
+                1.0,
+                0.0,
+                sequences,
+                seq_len * query_width,
+                seq_len * qkv_width,
+                block_size,
+            )?;
+
+            let head_probabilities = probabilities.slice(head * sequences * block_size..);
+            let mut grad_value = grad_qkv.slice_mut(value_base + kv_base..);
+            gemm_lhs_transposed_batched(
+                gpu.context,
+                &head_probabilities,
+                seq_len,
+                &upstream,
+                query_width,
+                &mut grad_value,
+                qkv_width,
+                seq_len,
+                seq_len,
+                head_dim,
+                1.0,
+                1.0,
+                sequences,
+                block_size,
+                seq_len * query_width,
+                seq_len * qkv_width,
+            )?;
+        }
+
+        gpu.causal_softmax_backward(
+            &mut grad_scores,
+            &probabilities,
+            heads * sequences * seq_len,
             seq_len,
-            &query,
-            qkv_width,
-            &mut grad_key,
-            qkv_width,
-            seq_len,
-            seq_len,
-            head_dim,
-            scale,
-            1.0,
-            sequences,
-            block_size,
-            seq_len * qkv_width,
-            seq_len * qkv_width,
         )?;
-    }
+
+        for head in 0..heads {
+            let kv_base = (head / group) * head_dim;
+            let scores = grad_scores.slice(head * sequences * block_size..);
+            let key = cache.qkv.slice(key_base + kv_base..);
+            let mut grad_query = grad_qkv.slice_mut(head * head_dim..);
+            gemm_plain_batched(
+                gpu.context,
+                &scores,
+                seq_len,
+                &key,
+                qkv_width,
+                &mut grad_query,
+                qkv_width,
+                seq_len,
+                head_dim,
+                seq_len,
+                scale,
+                0.0,
+                sequences,
+                block_size,
+                seq_len * qkv_width,
+                seq_len * qkv_width,
+            )?;
+
+            let query = cache.qkv.slice(head * head_dim..);
+            let mut grad_key = grad_qkv.slice_mut(key_base + kv_base..);
+            gemm_lhs_transposed_batched(
+                gpu.context,
+                &scores,
+                seq_len,
+                &query,
+                qkv_width,
+                &mut grad_key,
+                qkv_width,
+                seq_len,
+                seq_len,
+                head_dim,
+                scale,
+                1.0,
+                sequences,
+                block_size,
+                seq_len * qkv_width,
+                seq_len * qkv_width,
+            )?;
+        }
+
+        grad_qkv
+    };
 
     let tables = gpu.rope_tables(&attention.rope)?;
     gpu.rope(

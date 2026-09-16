@@ -126,3 +126,78 @@ That leaves two ways forward, and they are not the same size:
 
 Option 1 is a precondition for neither and a fair fraction of the gain, so it
 is worth measuring before committing to option 2.
+
+---
+
+## Fused attention (Task 9, Steps 2-5)
+
+Five kernels became three, and the `[seq_len, seq_len]` matrix stopped being
+written at all.
+
+| Pass | Before | After |
+|---|---|---|
+| Forward | `causal_softmax_lse` plus two batched GEMMs per head | `flash_attention_fwd` |
+| Backward | `causal_probs_from_lse`, `causal_softmax_bwd` and four batched GEMMs per head | `flash_attention_delta`, `flash_attention_dq`, `flash_attention_dkv` |
+
+The forward kernel is blocked over query tiles. The backward pass needs two
+kernels because the query gradient is complete inside a query tile and the key
+and value gradients are complete inside a key tile; blocking the second one on
+the key/value head rather than the query head is what makes grouped-query
+attention exact without atomics. Both rebuild the scores from the stored
+log-sum-exp, which costs one extra matmul per tile pair and saves the whole
+round trip.
+
+### Throughput
+
+Same command as the profile above. **The card was not idle: a game was running
+on it throughout, so treat these as a paired comparison, not as absolute
+numbers.** `RUSTING_BRAIN_NO_FLASH=1` is what selects the old path.
+
+| Path | Run 1 | Run 2 |
+|---|---|---|
+| Fused | 12077 tok/s | 12064 tok/s |
+| Three-kernel | 7087 tok/s | 7187 tok/s |
+
+**1.70x**, and the final loss agrees to 0.006 across both paths (6.711-6.716
+fused, 6.717-6.718 split) after 20 steps. For reference the three-kernel path
+measured 11905 tok/s on an idle card, so the fused path on a contended one is
+already past the old idle figure; the idle figure for the fused path is still
+to be taken.
+
+Of that 1.70x, the forward fusion alone was 1.15x, measured the same way
+before the backward kernels existed. The backward half is the larger share, as
+the profile said it would be.
+
+### What the profile looks like now
+
+| Kernel | Share of GPU time |
+|---|---|
+| `cutlass ... 128x256_16x3_nt` | 17.3% |
+| `cutlass ... 256x128_16x3_nn` | 17.3% |
+| `cutlass ... 256x128_16x3_tn` | 16.5% |
+| `flash_attention_dkv` | 8.0% |
+| `flash_attention_dq` | 5.8% |
+| `flash_attention_fwd` | 4.0% |
+
+`causal_softmax_lse`, `causal_softmax_bwd` and `causal_probs_from_lse` are
+gone, and so are the 8064-instance per-head attention GEMMs that used to run
+beside them. Attention is now 17.8% of GPU time in three kernels, against
+21.3% in the softmax kernels alone plus 17% in the per-head GEMMs before.
+
+The three remaining `cutlass` entries are the model's own projections, and at
+51% of GPU time between them they are what stands between this and PyTorch.
+`flash_attention_dkv` is the slowest of the three fused kernels at a 1.04 ms
+median against `flash_attention_dq`'s 0.68 ms, which is what four matmuls per
+tile pair and a tile count that falls from 16 to 1 across the grid look like.
+
+### Accuracy
+
+Both device paths round their matmul operands to BF16, so neither is a
+reference for the other; the FP32 host path is. On a two-layer, four-head
+model at 100 tokens the fused forward lands 3.7e-3 from the host where the
+three-kernel path lands 2.5e-3, on logits of magnitude 0.475. After one full
+gradient-descent step the two land 1.0 to 1.4 times apart, the difference
+being that the fused backward takes the softmax row sum from the output
+gradient and the output rather than from probabilities it no longer keeps.
+`fused_attention_matches_the_three_kernel_path_or_skips_without_device` and
+its backward twin hold that ratio.

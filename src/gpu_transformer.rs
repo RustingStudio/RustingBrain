@@ -1458,4 +1458,84 @@ mod tests {
             "both device paths drifted: {fused_error}"
         );
     }
+
+    /// The same comparison for the backward half, which is a separate pair of
+    /// kernels: the query gradient is blocked over query tiles, the key and
+    /// value gradients over key tiles, and neither rebuilds the score matrix.
+    /// A full training step is what puts every gradient into one number.
+    #[test]
+    fn fused_attention_backward_matches_the_three_kernel_path_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let model = || {
+            TransformerLm::builder()
+                .vocab_size(32)
+                .d_model(256)
+                .n_layers(2)
+                .heads(4, 2, 64)
+                .d_ff(64)
+                .moe_layers([0usize; 0])
+                .max_seq_len(128)
+                .optimizer(Optimizer::sgd(1.0))
+                .seed(99)
+                .mixed_precision(true)
+                .build()
+                .unwrap()
+        };
+        let ids: Vec<u32> = (0..100).map(|index| (index * 7 % 32) as u32).collect();
+
+        let mut host = model();
+        host.train_step(&[&ids[..]]).unwrap();
+        let (host_logits, _) = host.forward_train(&[&ids[..]]).unwrap();
+
+        let mut fused = model();
+        fused.to_cuda(0, 8192).unwrap();
+        fused.train_step(&[&ids[..]]).unwrap();
+        let (fused_logits, _) = fused.forward_train(&[&ids[..]]).unwrap();
+
+        crate::cuda_flash::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut split = model();
+        split.to_cuda(0, 8192).unwrap();
+        let stepped = split
+            .train_step(&[&ids[..]])
+            .and_then(|_| split.forward_train(&[&ids[..]]));
+        crate::cuda_flash::DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let (split_logits, _) = stepped.unwrap();
+
+        // A wrong gradient moves a parameter the wrong way, and plain gradient
+        // descent at a rate of 1 makes that visible in the next forward pass
+        // in proportion to the error. Adam would not: it normalizes the step,
+        // so a parameter whose true gradient is near zero takes a full step in
+        // whichever direction the rounding noise pointed, and both device
+        // paths would land a learning rate apart from the host for reasons
+        // that have nothing to do with the fusion.
+        //
+        // The bar is the forward test's: no worse against the FP32 host than
+        // the path being replaced. Measured, the fused path runs 1.0 to 1.4
+        // times the three-kernel path's error here, the difference being that
+        // it takes the softmax row sum from the output gradient and the output
+        // rather than from the probabilities it no longer has.
+        let error = |logits: &crate::matrix::Matrix| {
+            logits
+                .data
+                .iter()
+                .zip(&host_logits.data)
+                .map(|(device, host)| (device - host).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let (fused_error, split_error) = (error(&fused_logits), error(&split_logits));
+        assert!(
+            fused_error <= 2.0 * split_error,
+            "the fused path is {fused_error} from the host where the three-kernel path is {split_error}"
+        );
+        // A second bound, in case both paths break the same way. A full
+        // gradient-descent step at a rate of 1 moves logits of this shape by
+        // 2.5 to 4.2, and BF16 rounding of the attention matmuls leaves both
+        // device paths about 0.04 from the host afterwards.
+        assert!(
+            fused_error < 0.1,
+            "both device paths drifted: {fused_error}"
+        );
+    }
 }
