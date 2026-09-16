@@ -652,6 +652,7 @@ impl Gpu<'_> {
         rows: usize,
     ) -> Result<(), NetworkError> {
         let (units, cols) = (weight.rows(), weight.cols());
+        let beta = weight.grad_beta();
         gemm_lhs_transposed(
             self.context,
             grad_output,
@@ -664,7 +665,7 @@ impl Gpu<'_> {
             units,
             cols,
             -1.0,
-            1.0,
+            beta,
         )
     }
 
@@ -999,12 +1000,15 @@ impl Gpu<'_> {
 
     /// `target += source[offset..offset + len]`, the offset being what lets one
     /// fused weight-gradient buffer be split back into two parameters.
+    /// `keep` adds into `target`; without it `target` is overwritten, which is
+    /// what a gradient buffer still holding the last step's value wants.
     fn add(
         &self,
         target: &mut CudaSlice<f32>,
         source: &CudaSlice<f32>,
         offset: usize,
         len: usize,
+        keep: bool,
     ) -> Result<(), NetworkError> {
         unsafe {
             self.context
@@ -1014,6 +1018,7 @@ impl Gpu<'_> {
                 .arg(source)
                 .arg(&(offset as i32))
                 .arg(&(len as i32))
+                .arg(&i32::from(keep))
                 .launch(cfg(if (len | offset) % 4 == 0 {
                     len / 4
                 } else {
@@ -1351,6 +1356,7 @@ impl Gpu<'_> {
         rows: usize,
     ) -> Result<(), NetworkError> {
         let (units, cols) = (weight.rows(), weight.cols());
+        let beta = weight.grad_beta();
         act_lhs_transposed(
             self.context,
             grad_output,
@@ -1364,7 +1370,7 @@ impl Gpu<'_> {
             units,
             cols,
             -1.0,
-            1.0,
+            beta,
         )
     }
 
@@ -1401,7 +1407,8 @@ impl Gpu<'_> {
         let mut base = 0;
         for part in parts {
             let len = part.rows() * inner;
-            self.add(part.negated_grad_mut(), &scratch, base, len)?;
+            let keep = part.grad_beta() != 0.0;
+            self.add(part.negated_grad_mut(), &scratch, base, len, keep)?;
             base += len;
         }
         Ok(())
@@ -2323,6 +2330,7 @@ impl HeadBf16 {
             bf16::NEG_ONE,
             bf16::ZERO,
         )?;
+        head.clear_grad()?;
         gpu.accumulate_bf16(head.negated_grad_mut(), &self.weight_grad, vocab * d_model)
     }
 }
@@ -2483,6 +2491,8 @@ fn backward_from_final(
         let embedding = model.embedding.weight.device.as_mut().ok_or_else(|| {
             NetworkError::Cuda("the embedding table is not resident on the device".into())
         })?;
+        // The scatter is a pile of atomic adds, so it needs real zeros under it.
+        embedding.clear_grad()?;
         gpu.scatter_negated(
             embedding.negated_grad_mut(),
             &grad_hidden,

@@ -231,9 +231,13 @@ extern "C" __global__ void moe_stats(float*sums,const float*p,const float*lse,co
 extern "C" __global__ void moe_grad_probs(float*gp,const float*gg,const float*p,const int*expert_of,int rows,int experts,int top_k){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;int base=r*top_k;if(expert_of[base]<0)return;const float*row=p+(size_t)r*experts;float total=0;float weighted=0;for(int k=0;k<top_k;k++){int e=expert_of[base+k];total+=row[e];weighted+=gg[base+k]*row[e];}if(total<=0)return;float*dst=gp+(size_t)r*experts;for(int k=0;k<top_k;k++){int e=expert_of[base+k];dst[e]+=gg[base+k]/total-weighted/(total*total);}}
 extern "C" __global__ void moe_aux_grad(float*gp,const float*loads,const int*expert_of,int rows,int experts,int top_k,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*experts)return;int r=i/experts;int e=i%experts;if(expert_of[r*top_k]<0)return;gp[i]+=scale*loads[e];}
 extern "C" __global__ void router_grad_logits(float*gl,const float*gp,const float*p,const float*lse,const int*expert_of,int rows,int experts,int top_k,float zfactor){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;float*dst=gl+(size_t)r*experts;if(expert_of[r*top_k]<0){for(int e=0;e<experts;e++)dst[e]=0;return;}const float*prob=p+(size_t)r*experts;const float*up=gp+(size_t)r*experts;float dot=0;for(int e=0;e<experts;e++)dot+=prob[e]*up[e];float f=zfactor*lse[r];for(int e=0;e<experts;e++)dst[e]=prob[e]*(up[e]-dot)+f*prob[e];}
-extern "C" __global__ void add_inplace(float*a,const float*b,int off,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
- if(((n|off)&3)==0){int q=n>>2;if(i>=q)return;float4*d=(float4*)a;float4 x=d[i],y=((const float4*)(b+off))[i];x.x+=y.x;x.y+=y.y;x.z+=y.z;x.w+=y.w;d[i]=x;return;}
- if(i<n)a[i]+=b[off+i];}
+// `keep` says `a` already holds a value worth adding to. A gradient buffer the
+// optimizer has not refilled since the last step holds a stale one instead, and
+// the first writer of the step overwrites it rather than paying for a zeroing
+// pass over every parameter.
+extern "C" __global__ void add_inplace(float*a,const float*b,int off,int n,int keep){int i=blockIdx.x*blockDim.x+threadIdx.x;
+ if(((n|off)&3)==0){int q=n>>2;if(i>=q)return;float4*d=(float4*)a;float4 y=((const float4*)(b+off))[i];if(keep){float4 x=d[i];y.x+=x.x;y.y+=x.y;y.z+=x.z;y.w+=x.w;}d[i]=y;return;}
+ if(i<n)a[i]=keep?a[i]+b[off+i]:b[off+i];}
 
 // Cross-entropy over one chunk of logit rows, in place: the row comes in as
 // logits and leaves as dL/dlogits, so the largest tensor in a training step is
