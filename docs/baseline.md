@@ -270,3 +270,91 @@ The three flash kernels move about 360 GFLOP per step at 36.2 ms, which is
 For reference: PyTorch 23121 tok/s, TensorFlow 20140 tok/s, this repository's
 pre-optimization idle baseline 11905 tok/s. At 21516 tok/s the step is 1.81x
 the baseline, past TensorFlow, and 7% short of PyTorch.
+
+## Step 12: the fused attention buffers in BF16 (`579b040`)
+
+The previous step narrowed the activations that feed cuBLAS. `qkv` was left
+FP32, even though its only readers were the three fused attention kernels and
+they rounded every tile to BF16 as they loaded it. This step makes `qkv` and
+`grad_qkv` narrow too, so the rounding happens once at the projection's store
+instead of on every tile load.
+
+`eligible(mixed_precision, head_dim) = mixed_precision && head_dim == TILE`, so
+whenever the fused kernels run at all, every buffer they touch is BF16. The
+runtime `narrow` flag is therefore gone from all four kernels in
+`cuda_flash.rs` - the type is known at compile time. cuBLAS writes the
+projection straight to BF16 (`Ctype = CUDA_R_16BF`, via `linear_packed_act`),
+which removes a `cast_act` launch as well as the FP32 round trip.
+
+### The first version was 2.6% slower
+
+20960 tok/s against 21524, all of it in `flash_attention_dkv`. It was not
+occupancy: `nvcc -arch=sm_86 -cubin -Xptxas -v` reports 198 registers for dkv
+both before and after, and deleting the `narrow` branch changed nothing.
+
+The cause is that these kernels are latency bound, not bandwidth bound. Halving
+the bytes buys nothing; issuing the same number of loads at 16 bits each,
+plus a shift and an `__uint_as_float` per element, costs.
+
+The fix is that **two adjacent BF16 elements are exactly the 32-bit register an
+`m16n8k16` mma operand takes**, so one 32-bit load fills a fragment with no
+conversion at all:
+
+```cuda
+__device__ __forceinline__ unsigned bf16_pair(const unsigned short* p, size_t i){
+  return *(const unsigned*)(p + i);   // i must be even
+}
+```
+
+dkv now loads K and V straight into `kf`/`vf`, and tiles Q and dO two elements
+a thread. dq tiles K and V the same way, and every `grad_qkv` and `out` store
+is a packed 32-bit write. The forward kernel's K/V tile was tried this way and
+measured worse - 8.0 ms to 10.9 ms - because its value tile is stored
+transposed and the wider load buys bank conflicts; it stays scalar, with a
+comment saying so.
+
+One incidental exactness note: the attention scale moved off the queries and
+onto the scores and the `dk` store. For head dim 64 the scale is 1/8, a power
+of two, so this is bit-exact and it saves 64 multiplies per query row.
+
+### Throughput
+
+Idle card, 20 steps of the 102M model, same command as above.
+
+| Path | Tokens/sec | Final loss |
+|---|---|---|
+| BF16 `qkv` (`579b040`) | 21863 | 6.715 |
+| FP32 `qkv` (`8c318ae`) | 21524 | 6.710 |
+
+**1.016x.** 144 library tests pass.
+
+### Where the step goes now
+
+| Kernel | Per step |
+|---|---|
+| `ampere_s1688gemm_bf16_128x128_ldg8_stages_32x1_nt` | 20.38 ms |
+| `cutlass_80_tensorop_s16816gemm_bf16_256x128` | 19.37 ms |
+| `flash_attention_dkv` | 17.16 ms |
+| `ampere_s1688gemm_bf16_128x128_ldg8_tn` | 13.09 ms |
+| `cutlass_80_tensorop_s16816gemm_bf16_128x256` | 12.79 ms |
+| `flash_attention_dq` | 10.96 ms |
+| `adam` | 9.04 ms |
+| `flash_attention_fwd` | 8.04 ms |
+| `add_inplace` | 5.76 ms |
+| `swiglu_bwd` | 4.68 ms |
+| `rmsnorm_bwd` | 4.28 ms |
+| `cast_act` | 4.04 ms |
+| `swiglu_fwd` | 3.41 ms |
+| `rmsnorm_fwd` | 2.80 ms |
+| `rope_rotate` | 2.66 ms |
+
+`rope_rotate` is 32% cheaper than it was and `cast_act` 31%, both because they
+now move half the bytes. The GEMMs are 59% of the step, the three flash kernels
+19%, everything else 21%.
+
+`examples/flash_probe.rs` runs the three kernels standalone on the benchmark
+shape - forward 0.449 ms, grad query 0.656 ms, grad key/value 1.014 ms per
+launch - which is the fast loop for working on them without a 20-step
+benchmark in between.
+
+PyTorch is 23121 tok/s. At 21863 the gap is 5.7%.
