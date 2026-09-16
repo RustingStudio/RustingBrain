@@ -898,7 +898,7 @@ impl Gpu<'_> {
         flash: &crate::cuda_flash::FlashKernels,
         qkv: &Act,
         merged: &Act,
-        grad_merged: &CudaSlice<f32>,
+        grad_merged: &Act,
         log_sum_exp: &CudaSlice<f32>,
         delta: &mut CudaSlice<f32>,
         grad_qkv: &mut Act,
@@ -912,7 +912,7 @@ impl Gpu<'_> {
                 .stream
                 .launch_builder(&flash.delta)
                 .arg(&merged.all())
-                .arg(grad_merged)
+                .arg(&grad_merged.all())
                 .arg(&mut *delta)
                 .arg(&(shape.rows as i32))
                 .arg(&(shape.heads as i32))
@@ -923,9 +923,10 @@ impl Gpu<'_> {
         }
 
         let delta = &*delta;
+        let grad_merged_view = grad_merged.all();
         // Both kernels write disjoint columns of `grad_qkv`, so they take it
         // as a shared view rather than one after the other.
-        debug_assert!(qkv.is_narrow() && grad_qkv.is_narrow());
+        debug_assert!(qkv.is_narrow() && grad_qkv.is_narrow() && grad_merged.is_narrow());
         let qkv = qkv.all();
         let grad_qkv = grad_qkv.all();
         let launch = |function, grid_y, shared_mem_bytes| {
@@ -939,7 +940,7 @@ impl Gpu<'_> {
                     .stream
                     .launch_builder(function)
                     .arg(&qkv)
-                    .arg(grad_merged)
+                    .arg(&grad_merged_view)
                     .arg(log_sum_exp)
                     .arg(&*delta)
                     .arg(&grad_qkv)
@@ -1304,13 +1305,14 @@ impl Gpu<'_> {
 
     /// The input-gradient half of [`Gpu::linear_packed`].
     #[allow(clippy::too_many_arguments)]
-    fn linear_packed_backward_input<O: DevicePtrMut<f32>>(
+    fn linear_packed_backward_input<T, O: DevicePtrMut<T>>(
         &self,
         weights: &CudaView<'_, u8>,
         units: usize,
         inner: usize,
         grad_output: &CudaView<'_, u8>,
         narrow: bool,
+        out_narrow: bool,
         out: &mut O,
         rows: usize,
         beta: f32,
@@ -1322,6 +1324,7 @@ impl Gpu<'_> {
             weights,
             inner,
             narrow,
+            out_narrow,
             out,
             inner,
             rows,
@@ -2621,14 +2624,17 @@ fn backward_attention(
     let merged_narrow = cache.merged.is_narrow();
     debug_assert_eq!(grad_output.is_narrow(), merged_narrow);
     let grad_output_act = grad_output;
-    let mut grad_merged = gpu.uninit(rows * query_width)?;
+    // The fused backward kernels are the only readers that take it narrow,
+    // and they run exactly when the forward pass wrote a narrow `merged`.
+    let mut grad_merged = gpu.act(rows * query_width, merged_narrow)?;
     gpu.linear_packed_backward_input(
         &cache.output_weight.all(),
         d_model,
         query_width,
         &grad_output_act.all(),
         merged_narrow,
-        &mut grad_merged,
+        merged_narrow,
+        grad_merged.destination(),
         rows,
         0.0,
     )?;
@@ -2683,6 +2689,7 @@ fn backward_attention(
         // exponential per element. The matrix lives for this block's backward pass
         // alone rather than for the whole depth of the model.
         let qkv = cache.qkv.wide();
+        let wide_grad_merged = grad_merged.wide();
         let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
@@ -2729,7 +2736,7 @@ fn backward_attention(
             .map_err(cuda_err("gradient clear"))?;
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
-            let upstream = grad_merged.slice(head * head_dim..);
+            let upstream = wide_grad_merged.slice(head * head_dim..);
             let value = qkv.slice(value_base + kv_base..);
             let mut scores = grad_scores.slice_mut(head * sequences * block_size..);
             gemm_rhs_transposed_batched(
@@ -2866,6 +2873,7 @@ fn backward_attention(
         d_model,
         &grad_qkv.all(),
         narrow,
+        false,
         &mut grad_input,
         rows,
         0.0,
@@ -2912,6 +2920,7 @@ fn backward_swiglu(
         width,
         &grad_output_act.all(),
         narrow,
+        false,
         &mut grad_hidden,
         rows,
         0.0,
@@ -2935,6 +2944,7 @@ fn backward_swiglu(
         inner,
         &grad_gate_up.all(),
         narrow,
+        false,
         grad_input,
         rows,
         0.0,
@@ -3054,6 +3064,7 @@ fn backward_moe(
                 2 * width,
                 d_model,
                 &upstream,
+                false,
                 false,
                 &mut grad,
                 count,
