@@ -100,7 +100,7 @@ extern "C" __global__ void rmsnorm_fwd(void*out,float*inv,const float*x,const fl
 // floats, so the scale gradient accumulates per block and lands in `gw` with
 // one atomic per column instead of one per element. A model wide enough to
 // overflow shared memory falls back to the direct atomic.
-extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const float*gy,const float*w,const float*inv,int rows,int cols,int use_smem,const float*res,int add_res){
+extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const float*gy,const float*w,const float*inv,int rows,int cols,int use_smem,const float*res,int add_res,void*copy,int copy_mode){
   extern __shared__ float acc[];
   __shared__ float red[ROW_THREADS];int tid=threadIdx.x;
   if(use_smem)for(int c=tid;c<cols;c+=ROW_THREADS)acc[c]=0.f;
@@ -118,6 +118,9 @@ extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const flo
       // one more addend here rather than a separate pass over the whole tensor.
       if(add_res)g_in+=res[base+c];
       dst[c]=g_in;
+      // The GEMMs downstream want this gradient as an operand, so the copy
+      // they read is written here instead of by a separate pass.
+      if(copy_mode)store_act(copy,base+c,g_in,copy_mode-1);
       float g=up[c]*src[c]*t;
       if(use_smem)acc[c]+=g;else atomicAdd(&gw[c],g);
     }
