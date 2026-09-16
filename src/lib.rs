@@ -21,6 +21,8 @@ pub mod transformer;
 pub mod transformer_block;
 
 #[cfg(feature = "cuda")]
+pub(crate) mod cuda_flash;
+#[cfg(feature = "cuda")]
 pub mod cuda_training;
 #[cfg(feature = "cuda")]
 pub mod gpu_matrix;
@@ -63,5 +65,7 @@ pub use norm::RmsNorm;
 pub use optimizers::Optimizer;
 pub use param::{Linear, Param};
 pub use rope::Rope;
-pub use transformer::{ParameterCounts, Precision, TransformerBuilder, TransformerConfig, TransformerLm};
+pub use transformer::{
+    ParameterCounts, Precision, TransformerBuilder, TransformerConfig, TransformerLm,
+};
 pub use transformer_block::{FeedForward, TransformerBlock};

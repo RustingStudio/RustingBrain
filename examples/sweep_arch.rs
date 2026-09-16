@@ -3,7 +3,7 @@
 //! experts router is data dependent, and a model left resident on the device
 //! skews the next one's memory headroom.
 //!
-//! `cargo run --release --features cuda --example sweep_arch -- <vocab> <d_model> <layers> <batch> <seq>`
+//! `cargo run --release --features cuda --example sweep_arch -- <vocab> <d_model> <layers> <batch> <seq> [moe] [experts] [top_k]`
 
 use rusting_brain::{Optimizer, TransformerLm};
 use std::time::Instant;
@@ -19,6 +19,7 @@ fn main() {
     let (vocab, d_model, layers) = (arg(1, 32_000), arg(2, 512usize), arg(3, 8usize));
     let (batch, seq) = (arg(4, 16usize), arg(5, 512usize));
     let moe: usize = arg(6, 1usize);
+    let (experts, top_k) = (arg(7, 8usize), arg(8, 2usize));
     let heads = d_model / 64;
 
     let builder = || {
@@ -29,6 +30,7 @@ fn main() {
             .heads(heads, (heads / 4).max(1), 64)
             .d_ff(d_model * 11 / 4)
             .moe_d_ff(d_model * 11 / 16)
+            .experts(experts, top_k)
             .moe_layers(if moe == 1 { 2..layers } else { 0..0 })
             .max_seq_len(seq.max(256))
             .optimizer(Optimizer::adam(1e-4))
@@ -37,7 +39,11 @@ fn main() {
     let counts = builder().parameter_counts();
     let label = format!(
         "v{vocab} d{d_model} L{layers} {batch}x{seq} {}",
-        if moe == 1 { "moe" } else { "dense" }
+        if moe == 1 {
+            format!("moe{experts}x{top_k}")
+        } else {
+            "dense".into()
+        }
     );
 
     let mut model = builder().build().unwrap();

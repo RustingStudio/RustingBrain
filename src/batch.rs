@@ -24,6 +24,7 @@ pub struct TokenBatch {
     lengths: Vec<usize>,
     seq_len: usize,
     valid: Vec<bool>,
+    supervised: Option<Vec<bool>>,
 }
 
 impl TokenBatch {
@@ -57,7 +58,56 @@ impl TokenBatch {
             lengths,
             seq_len,
             valid,
+            supervised: None,
         })
+    }
+
+    /// Restricts the loss to the token positions flagged `true`.
+    ///
+    /// `mask` holds one flag per row of [`TokenBatch::ids`] - `batch *
+    /// seq_len` flags, padding included - and a flag marks its token as a
+    /// *target*: when `mask[i]` is true the position that predicts token `i`
+    /// contributes to the loss and to the gradient, and when it is false that
+    /// position contributes exactly zero to both. This is the same convention
+    /// as a Hugging Face `labels` tensor, where masked entries are `-100`.
+    ///
+    /// The first token of a sequence is never a target - nothing precedes it -
+    /// so its flag is ignored, and padding stays excluded whatever the mask
+    /// says.
+    ///
+    /// Masking changes the loss alone. Masked rows still run through the
+    /// forward pass and still serve as context for the rows that do count,
+    /// which is what makes this usable for supervised fine-tuning: flag the
+    /// response span and the instruction span in front of it conditions the
+    /// model without being learned.
+    pub fn with_loss_mask(mut self, mask: &[bool]) -> Result<Self, NetworkError> {
+        if mask.len() != self.ids.len() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a loss mask covers {} token positions, not {}",
+                mask.len(),
+                self.ids.len()
+            )));
+        }
+        self.supervised = Some(mask.to_vec());
+        if self.predicted() == 0 {
+            return Err(NetworkError::InvalidConfig(
+                "a loss mask left no position to predict".into(),
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Whether row `row` predicts a token that counts toward the loss.
+    ///
+    /// False for padding, for the last position of a sequence, and for a
+    /// position whose target a loss mask excluded.
+    pub fn predicts(&self, row: usize) -> bool {
+        if row % self.seq_len + 1 >= self.lengths[row / self.seq_len] {
+            return false;
+        }
+        self.supervised
+            .as_ref()
+            .is_none_or(|supervised| supervised[row + 1])
     }
 
     /// Number of sequences.
@@ -91,7 +141,10 @@ impl TokenBatch {
 
     /// How many positions a next-token loss covers.
     pub fn predicted(&self) -> usize {
-        self.lengths.iter().map(|length| length - 1).sum()
+        match self.supervised {
+            None => self.lengths.iter().map(|length| length - 1).sum(),
+            Some(_) => (0..self.rows()).filter(|&row| self.predicts(row)).count(),
+        }
     }
 
     /// The row-to-sequence map every batched module needs.
@@ -179,6 +232,52 @@ mod tests {
         assert!(layout.is_valid(5));
         assert!(!layout.is_valid(6));
         assert_eq!(batch.predicted(), 3 + 1);
+    }
+
+    #[test]
+    fn a_loss_mask_counts_only_the_flagged_targets() {
+        let batch = TokenBatch::new(&[[1u32, 2, 3, 4]])
+            .unwrap()
+            // Flag the last two tokens: rows 1 and 2 predict them.
+            .with_loss_mask(&[false, false, true, true])
+            .unwrap();
+
+        assert_eq!(batch.predicted(), 2);
+        assert!(!batch.predicts(0));
+        assert!(batch.predicts(1));
+        assert!(batch.predicts(2));
+        // Nothing follows the last token, whatever the mask says.
+        assert!(!batch.predicts(3));
+    }
+
+    #[test]
+    fn a_loss_mask_never_resurrects_padding() {
+        let batch = TokenBatch::new(&[vec![1u32, 2, 3, 4], vec![5, 6]])
+            .unwrap()
+            .with_loss_mask(&[true; 8])
+            .unwrap();
+
+        // Same count as the unmasked batch: rows 5, 6 and 7 of the short
+        // sequence are padding or its final token.
+        assert_eq!(batch.predicted(), 4);
+        assert!(batch.predicts(4));
+        assert!(!batch.predicts(5));
+        assert!(!batch.predicts(6));
+    }
+
+    #[test]
+    fn a_loss_mask_of_the_wrong_length_or_all_false_is_rejected() {
+        let batch = || TokenBatch::new(&[[1u32, 2, 3, 4]]).unwrap();
+
+        assert!(batch().with_loss_mask(&[true; 3]).is_err());
+        assert!(batch().with_loss_mask(&[false; 4]).is_err());
+        // Flagging only the first token leaves nothing to predict: nothing
+        // precedes it.
+        assert!(
+            batch()
+                .with_loss_mask(&[true, false, false, false])
+                .is_err()
+        );
     }
 
     #[test]
