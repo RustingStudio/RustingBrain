@@ -720,11 +720,16 @@ impl Gpu<'_> {
         grad_weight: &mut CudaViewMut<'_, f32>,
         residual: &CudaSlice<f32>,
         add_residual: bool,
+        copy: Option<bool>,
         rows: usize,
         cols: usize,
-    ) -> Result<CudaSlice<f32>, NetworkError> {
+    ) -> Result<(CudaSlice<f32>, Option<Act>), NetworkError> {
         let mut grad_input = self.uninit(rows * cols)?;
         let add_residual = i32::from(add_residual);
+        let copy_mode = copy.map_or(0, |narrow| 1 + i32::from(narrow));
+        // A one-byte stand-in keeps the launch arguments uniform when no copy
+        // is asked for; `copy_mode` is what decides whether it is written.
+        let mut copy = self.act(copy.map_or(1, |_| rows * cols), copy.unwrap_or(false))?;
         let smem = rmsnorm_smem(cols);
         let mut config = row_grid(rows);
         config.shared_mem_bytes = smem.unwrap_or(0);
@@ -743,10 +748,12 @@ impl Gpu<'_> {
                 .arg(&(i32::from(smem.is_some())))
                 .arg(residual)
                 .arg(&add_residual)
+                .arg(&mut copy.bytes)
+                .arg(&copy_mode)
                 .launch(config)
                 .map_err(cuda_err("RMSNorm backward kernel"))?;
         }
-        Ok(grad_input)
+        Ok((grad_input, (copy_mode != 0).then_some(copy)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2422,7 +2429,17 @@ fn backward_from_final(
     // final norm, then two slots per block. See [`Gpu::accumulate_host_grad`]
     // for why they are not downloaded where they are produced.
     let mut grad_norms = gpu.zeros(norm_slots(model.blocks.len()) * d_model)?;
-    let mut grad_hidden = gpu.rmsnorm_backward(
+    // The gradient a norm hands down is a GEMM operand for the layer below it,
+    // so the norm writes that operand copy itself. Which precision it wants is
+    // the receiving feed forward's; a routed one takes FP32 and narrows the
+    // shared expert's operand on its own, so it asks for no copy at all.
+    let operand = |index: usize| {
+        cache.blocks.get(index).and_then(|block| match &block.feed_forward {
+            FfnCache::Dense(_) => Some(block.feed_forward_normed.is_narrow()),
+            FfnCache::Moe(_) => None,
+        })
+    };
+    let (mut grad_hidden, mut grad_hidden_act) = gpu.rmsnorm_backward(
         &cache.final_input,
         grad_final,
         &cache.final_weight,
@@ -2430,6 +2447,7 @@ fn backward_from_final(
         &mut grad_norms.slice_mut(0..d_model),
         grad_final,
         false,
+        model.blocks.len().checked_sub(1).and_then(operand),
         rows,
         d_model,
     )?;
@@ -2437,11 +2455,13 @@ fn backward_from_final(
     for (index, (block, block_cache)) in
         model.blocks.iter_mut().zip(&cache.blocks).enumerate().rev()
     {
-        grad_hidden = backward_block(
+        (grad_hidden, grad_hidden_act) = backward_block(
             &gpu,
             block,
             block_cache,
             &grad_hidden,
+            grad_hidden_act.as_ref(),
+            index.checked_sub(1).and_then(operand),
             cache,
             &mut grad_norms,
             index,
@@ -2490,10 +2510,12 @@ fn backward_block(
     block: &mut TransformerBlock,
     cache: &BlockCache,
     grad_output: &CudaSlice<f32>,
+    grad_output_act: Option<&Act>,
+    output_operand: Option<bool>,
     batch: &GpuCache,
     grad_norms: &mut CudaSlice<f32>,
     index: usize,
-) -> Result<CudaSlice<f32>, NetworkError> {
+) -> Result<(CudaSlice<f32>, Option<Act>), NetworkError> {
     let rows = batch.rows;
     let d_model = block.attention.d_model();
     let (attention_slot, feed_forward_slot) = norm_slot(index);
@@ -2508,7 +2530,7 @@ fn backward_block(
             ffn,
             ffn_cache,
             &cache.feed_forward_normed,
-            grad_output,
+            grad_output_act.expect("a dense feed forward was handed its operand"),
             &mut grad_normed,
             rows,
         )?,
@@ -2532,7 +2554,7 @@ fn backward_block(
 
     // The residual passes the upstream gradient through untouched alongside
     // the branch gradient, so it rides in the norm's backward kernel.
-    let grad_residual = gpu.rmsnorm_backward(
+    let (grad_residual, grad_residual_act) = gpu.rmsnorm_backward(
         &cache.residual,
         &grad_normed,
         &cache.feed_forward_weight,
@@ -2540,13 +2562,16 @@ fn backward_block(
         &mut grad_norms.slice_mut(feed_forward_slot * d_model..(feed_forward_slot + 1) * d_model),
         grad_output,
         true,
+        Some(cache.merged.is_narrow()),
         rows,
         d_model,
     )?;
+    let grad_residual_act = grad_residual_act.expect("a copy was asked for");
 
-    let grad_attention_normed = backward_attention(gpu, block, cache, &grad_residual, batch)?;
+    let grad_attention_normed =
+        backward_attention(gpu, block, cache, &grad_residual_act, batch)?;
 
-    let grad_input = gpu.rmsnorm_backward(
+    let (grad_input, grad_input_act) = gpu.rmsnorm_backward(
         &cache.input,
         &grad_attention_normed,
         &cache.attention_weight,
@@ -2554,11 +2579,12 @@ fn backward_block(
         &mut grad_norms.slice_mut(attention_slot * d_model..(attention_slot + 1) * d_model),
         &grad_residual,
         true,
+        output_operand,
         rows,
         d_model,
     )?;
 
-    Ok(grad_input)
+    Ok((grad_input, grad_input_act))
 }
 
 /// Attention backward, head by head, each head one batched GEMM per operand.
@@ -2570,7 +2596,7 @@ fn backward_attention(
     gpu: &Gpu<'_>,
     block: &mut TransformerBlock,
     cache: &BlockCache,
-    grad_output: &CudaSlice<f32>,
+    grad_output: &Act,
     batch: &GpuCache,
 ) -> Result<CudaSlice<f32>, NetworkError> {
     let rows = batch.rows;
@@ -2590,10 +2616,11 @@ fn backward_attention(
     let value_base = query_width + kv_width;
     let block_size = seq_len * seq_len;
 
-    // The output projection reads the upstream gradient twice, so it is
-    // narrowed once here rather than per GEMM.
+    // The output projection reads the upstream gradient twice; the norm that
+    // produced it already wrote the operand copy both GEMMs read.
     let merged_narrow = cache.merged.is_narrow();
-    let grad_output_act = gpu.narrowed(&grad_output.slice(..), rows * d_model, merged_narrow)?;
+    debug_assert_eq!(grad_output.is_narrow(), merged_narrow);
+    let grad_output_act = grad_output;
     let mut grad_merged = gpu.uninit(rows * query_width)?;
     gpu.linear_packed_backward_input(
         &cache.output_weight.all(),
@@ -2865,18 +2892,19 @@ fn backward_swiglu(
     ffn: &mut SwiGlu,
     cache: &SwiGluCache,
     input: &Act,
-    grad_output: &CudaSlice<f32>,
+    grad_output: &Act,
     grad_input: &mut CudaSlice<f32>,
     rows: usize,
 ) -> Result<(), NetworkError> {
     let width = ffn.d_ff();
     let inner = ffn.d_model();
     let narrow = input.is_narrow();
+    debug_assert_eq!(grad_output.is_narrow(), narrow);
+    let grad_output_act = grad_output;
     let down = cache
         .down
         .as_ref()
         .ok_or_else(|| NetworkError::Cuda("the SwiGLU cache has no down projection".into()))?;
-    let grad_output_act = gpu.narrowed(&grad_output.slice(..), rows * inner, narrow)?;
     let mut grad_hidden = gpu.uninit(rows * width)?;
     gpu.linear_packed_backward_input(
         &down.all(),
@@ -2946,12 +2974,15 @@ fn backward_moe(
     let routed = cache.routed;
 
     if let (Some(shared), Some(shared_cache)) = (moe.shared.as_mut(), &cache.shared) {
+        // The routed path is FP32 throughout, so the norm above did not leave
+        // an operand copy for the shared expert's GEMMs; it is made here.
+        let upstream = gpu.narrowed(&grad_output.slice(..), rows * d_model, input.is_narrow())?;
         backward_swiglu(
             gpu,
             shared,
             shared_cache,
             input,
-            grad_output,
+            &upstream,
             grad_input,
             rows,
         )?;
@@ -3209,10 +3240,12 @@ mod tests {
                 &mut grad_weight.slice_mut(..),
                 &device_grad,
                 false,
+                None,
                 rows,
                 cols,
             )
-            .unwrap();
+            .unwrap()
+            .0;
 
         let host_grad_input = norm.backward(&input, &grad_output);
         assert_close(
