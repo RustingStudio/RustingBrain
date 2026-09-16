@@ -58,6 +58,16 @@ __device__ __forceinline__ unsigned short bf16_bits(float f){
   u+=0x7fffu+((u>>16)&1u);
   return (unsigned short)(u>>16);
 }
+// The same narrow-or-wide store the fused kernels in `cuda_training` use: a
+// GEMM operand is held in BF16 whenever the block around it is. Written out
+// again here because this module is its own NVRTC translation unit.
+__device__ __forceinline__ void store_act(void*p,size_t i,float v,int narrow){
+  if(narrow)((unsigned short*)p)[i]=bf16_bits(v); else ((float*)p)[i]=v;
+}
+__device__ __forceinline__ float load_act(const void*p,size_t i,int narrow){
+  return narrow ? __uint_as_float((unsigned)((const unsigned short*)p)[i]<<16)
+                : ((const float*)p)[i];
+}
 __device__ __forceinline__ unsigned pack2(float lo,float hi){
   return (unsigned)bf16_bits(lo)|((unsigned)bf16_bits(hi)<<16);
 }
@@ -79,11 +89,11 @@ __device__ __forceinline__ unsigned pack2(float lo,float hi){
 // backward pass rebuilds the probabilities from it unchanged.
 extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
     const float* __restrict__ qkv,
-    float* __restrict__ out,
+    void* __restrict__ out,
     float* __restrict__ lse,
     int seq_len, int qkv_width, int query_width,
     int key_base, int value_base, int group,
-    int lse_head_stride, float scale)
+    int lse_head_stride, float scale, int narrow)
 {
   extern __shared__ unsigned short smem[];
   unsigned short* ks = smem;                      // [key][dim]
@@ -228,17 +238,19 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
 
   float inv_a = l_a>0.f ? 1.f/l_a : 0.f;
   float inv_b = l_b>0.f ? 1.f/l_b : 0.f;
-  float* obase = out + seq_base*(size_t)query_width + h*FA_D;
+  // `out` is read by the output projection and by its weight-gradient GEMM and
+  // by nothing else, so it is stored in whatever width those operands want.
+  const size_t obase = seq_base*(size_t)query_width + h*FA_D;
   #pragma unroll
   for (int n=0;n<8;++n) {
     int c = n*8 + t*2;
     if (row_a < seq_len) {
-      float* p = obase + (size_t)row_a*query_width;
-      p[c]=acc[n][0]*inv_a; p[c+1]=acc[n][1]*inv_a;
+      size_t p = obase + (size_t)row_a*query_width + c;
+      store_act(out,p,acc[n][0]*inv_a,narrow); store_act(out,p+1,acc[n][1]*inv_a,narrow);
     }
     if (row_b < seq_len) {
-      float* p = obase + (size_t)row_b*query_width;
-      p[c]=acc[n][2]*inv_b; p[c+1]=acc[n][3]*inv_b;
+      size_t p = obase + (size_t)row_b*query_width + c;
+      store_act(out,p,acc[n][2]*inv_b,narrow); store_act(out,p+1,acc[n][3]*inv_b,narrow);
     }
   }
   if (t == 0) {
@@ -251,19 +263,19 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
 // `delta` term the softmax backward needs. One warp per row, two dimensions a
 // lane, so both loads are contiguous.
 extern "C" __global__ void flash_attention_delta(
-    const float* __restrict__ out,
+    const void* __restrict__ out,
     const float* __restrict__ grad_out,
     float* __restrict__ delta,
-    int rows, int heads, int query_width, int delta_head_stride)
+    int rows, int heads, int query_width, int delta_head_stride, int narrow)
 {
   int lane = threadIdx.x & 31;
   int total = rows*heads;
   int stride = (gridDim.x*blockDim.x) >> 5;
   for (int warp = (blockIdx.x*blockDim.x + threadIdx.x) >> 5; warp < total; warp += stride) {
     int h = warp / rows, r = warp % rows;
-    const float* o = out + (size_t)r*query_width + h*FA_D;
+    size_t o = (size_t)r*query_width + h*FA_D;
     const float* g = grad_out + (size_t)r*query_width + h*FA_D;
-    float sum = o[lane]*g[lane] + o[lane+32]*g[lane+32];
+    float sum = load_act(out,o+lane,narrow)*g[lane] + load_act(out,o+lane+32,narrow)*g[lane+32];
     #pragma unroll
     for (int step=16; step; step>>=1) sum += __shfl_xor_sync(0xffffffff,sum,step);
     if (lane == 0) delta[(size_t)h*delta_head_stride + r] = sum;

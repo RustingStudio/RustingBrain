@@ -201,3 +201,72 @@ being that the fused backward takes the softmax row sum from the output
 gradient and the output rather than from probabilities it no longer keeps.
 `fused_attention_matches_the_three_kernel_path_or_skips_without_device` and
 its backward twin hold that ratio.
+
+---
+
+## BF16 activations (the GEMM operand pipeline)
+
+The fused-attention profile left the block's projection GEMMs at roughly half
+of GPU time, all of them on `cutlass_80_tensorop_s1688bf16gemm_*_align4`. That
+is the m16n8k8 tensor-core shape, which is what cuBLAS picks for FP32 operands
+with a `32F_FAST_16BF` compute type. The language-model head, whose operands
+are already BF16, lands on `s16816 ... align8` instead: twice the `k` per
+instruction.
+
+`examples/gemm_probe.rs` measured the three ways to close that gap on the four
+projection shapes at batch 4, sequence 1024:
+
+| Shape | units/inner | FP32 operands | BF16 operands | BF16 plus a per-call cast |
+|---|---|---|---|---|
+| qkv projection | 1280/768 | 12.82 TF | 13.07 TF | 9.22 TF |
+| attention output | 768/768 | 9.83 TF | 11.67 TF | 7.36 TF |
+| feed forward in | 2816/768 | 12.55 TF | 14.35 TF | 11.48 TF |
+| feed forward out | 768/1408 | 12.49 TF | 12.85 TF | 8.09 TF |
+
+**Casting the operands inside the GEMM wrapper is a net loss** - 0.65x to 0.91x
+- so the kernel that produces an activation has to write it narrow. That is
+what this change does: `rmsnorm_fwd`, `swiglu_fwd`, `swiglu_bwd` and
+`flash_attention_fwd` take a `narrow` flag and store through `store_act`, and
+`Act` in `gpu_model` holds an activation as untyped bytes plus that flag. One
+byte buffer serves both precisions because a kernel launch only ever passes a
+device pointer and cuBLAS takes the element type as a runtime argument.
+
+Weights and gradients, Adam moments and every accumulator stay FP32. The routed
+feed-forward stays FP32 end to end, because its gathers, scatters and row-wise
+reductions are FP32 kernels and it is not what these shapes exercise.
+
+### Throughput
+
+Idle card, same command as the profile above.
+
+| Path | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| BF16 activations | 21516 tok/s | 21529 tok/s | 21484 tok/s |
+| FP32 activations (commit `1f3ad13`) | 20152 tok/s | 20180 tok/s | |
+
+**1.067x.** Final loss 6.707 against 6.713, on logits the two paths compute
+with the same FP32 accumulators and different operand rounding.
+
+### Where the step goes now
+
+185.6 ms of kernel time per step against 190.4 ms of wall clock, so launch
+overhead is 2.5% and not worth attacking.
+
+| Group | Per step | Share |
+|---|---|---|
+| Projection and head GEMMs | 108.0 ms | 58.2% |
+| Fused attention (three kernels) | 36.2 ms | 19.5% |
+| Elementwise and the optimizer | 41.5 ms | 22.3% |
+
+The GEMMs move roughly 2498 GFLOP per step - 1894 in the blocks, 604 in the
+head - which at 108.0 ms is **23.1 TFLOPS against the card's 25.5 TFLOPS BF16
+peak, 91%.** There is nothing left in them. Half of them still land on
+`ampere_s1688gemm_bf16_128x128`, the k8 kernel, but at that fraction of peak
+the heuristic is not what bounds the step.
+
+The three flash kernels move about 360 GFLOP per step at 36.2 ms, which is
+10.0 TFLOPS, 39% of peak. That is where the remaining headroom is.
+
+For reference: PyTorch 23121 tok/s, TensorFlow 20140 tok/s, this repository's
+pre-optimization idle baseline 11905 tok/s. At 21516 tok/s the step is 1.81x
+the baseline, past TensorFlow, and 7% short of PyTorch.
