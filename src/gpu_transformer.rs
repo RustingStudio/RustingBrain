@@ -737,12 +737,13 @@ where
 ///
 /// Same contract as `Gemm::gemm`: the configuration must describe the three
 /// buffers correctly, and `narrow` must say how the operand bytes are laid out.
-unsafe fn act_dispatch<C: DevicePtrMut<f32>>(
+unsafe fn act_dispatch<T, C: DevicePtrMut<T>>(
     context: &GpuContext,
     config: GemmConfig<f32>,
     a: &CudaView<'_, u8>,
     b: &CudaView<'_, u8>,
     narrow: bool,
+    out_narrow: bool,
     c: &mut C,
 ) -> Result<(), NetworkError> {
     // Wide operands keep the `32F_FAST_16BF` compute type `gemm_dispatch`
@@ -785,7 +786,11 @@ unsafe fn act_dispatch<C: DevicePtrMut<f32>>(
             config.ldb,
             &config.beta as *const f32 as *const std::ffi::c_void,
             c_pointer as *mut std::ffi::c_void,
-            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            if out_narrow {
+                cublas_sys::cudaDataType_t::CUDA_R_16BF
+            } else {
+                cublas_sys::cudaDataType_t::CUDA_R_32F
+            },
             config.ldc,
             compute,
             cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
@@ -795,14 +800,18 @@ unsafe fn act_dispatch<C: DevicePtrMut<f32>>(
 }
 
 /// [`gemm_rhs_transposed`] over [`act_dispatch`] operands.
+///
+/// `out_narrow` narrows the result too, which saves the separate cast kernel
+/// when the only reader of the result is a kernel that takes narrow input.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn act_rhs_transposed<O: DevicePtrMut<f32>>(
+pub(crate) fn act_rhs_transposed<T, O: DevicePtrMut<T>>(
     context: &GpuContext,
     x: &CudaView<'_, u8>,
     x_stride: usize,
     w: &CudaView<'_, u8>,
     w_stride: usize,
     narrow: bool,
+    out_narrow: bool,
     out: &mut O,
     out_stride: usize,
     rows: usize,
@@ -823,7 +832,7 @@ pub(crate) fn act_rhs_transposed<O: DevicePtrMut<f32>>(
         beta,
         ldc: out_stride as i32,
     };
-    unsafe { act_dispatch(context, config, w, x, narrow, out) }
+    unsafe { act_dispatch(context, config, w, x, narrow, out_narrow, out) }
 }
 
 /// [`gemm_plain`] over [`act_dispatch`] operands.
@@ -855,7 +864,7 @@ pub(crate) fn act_plain<O: DevicePtrMut<f32>>(
         beta,
         ldc: out_stride as i32,
     };
-    unsafe { act_dispatch(context, config, w, x, narrow, out) }
+    unsafe { act_dispatch(context, config, w, x, narrow, false, out) }
 }
 
 /// [`gemm_lhs_transposed`] over [`act_dispatch`] operands.
@@ -887,7 +896,7 @@ pub(crate) fn act_lhs_transposed<O: DevicePtrMut<f32>>(
         beta,
         ldc: out_stride as i32,
     };
-    unsafe { act_dispatch(context, config, x, d, narrow, out) }
+    unsafe { act_dispatch(context, config, x, d, narrow, false, out) }
 }
 
 /// `out[rows, units] = alpha * x[rows, inner] . w[units, inner]^T + beta * out`
