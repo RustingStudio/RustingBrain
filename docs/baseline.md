@@ -358,3 +358,164 @@ launch - which is the fast loop for working on them without a 20-step
 benchmark in between.
 
 PyTorch is 23121 tok/s. At 21863 the gap is 5.7%.
+
+## Steps 13-16: the passes that were not carrying their weight
+
+Four changes, each of them a pass over a whole activation or a whole parameter
+set that some other kernel was already positioned to absorb. None of them makes
+a kernel faster; they delete work.
+
+### The residual add inside the RMSNorm backward (`12c1700`)
+
+A residual branch's backward pass produced two gradients for the same tensor and
+added them in a separate kernel. `rmsnorm_bwd` already writes that tensor, so it
+takes the other addend as an argument and folds it in:
+
+```cuda
+float g_in=up[c]*w[c]*t-src[c]*shared;
+if(add_res)g_in+=res[base+c];
+dst[c]=g_in;
+```
+
+**21863 -> 22240 tok/s, 1.017x.**
+
+### The operand copy inside the RMSNorm backward (`81c3e9e`)
+
+The gradient a norm hands down is a GEMM operand for the layer below it, and a
+mixed-precision GEMM wants it in BF16. That narrowing was its own pass. The same
+kernel writes it, because the value is in a register at that point:
+
+```cuda
+if(copy_mode)store_act(copy,base+c,g_in,copy_mode-1);
+```
+
+Which precision the copy wants is the *receiving* feed-forward's, not the
+context flag: a routed layer's GEMMs are FP32 and ask for no copy at all, and
+the fused attention path's `merged` is narrow only when flash attention runs.
+Deriving it from the consumer (`cache.merged.is_narrow()`, and
+`cache.blocks[i].feed_forward_normed.is_narrow()` for the norm above a block)
+is what makes the FP32 and flash-disabled tests pass.
+
+**22240 -> 22383 tok/s, 1.006x.**
+
+### A BF16 output gradient for the fused attention backward (`1f596d5`)
+
+The three flash backward kernels took `grad_out` in FP32 and converted on every
+tile load. They now take it in BF16, which is both half the traffic and, because
+two adjacent BF16 elements *are* the 32-bit register an `m16n8k16` operand takes,
+zero conversion:
+
+```cuda
+df[kk][0]=bf16_pair(grad_out,e+c);
+```
+
+**22383 -> 22692 tok/s, 1.014x.**
+
+### The residual duplicate inside the RMSNorm forward (`345c46b`)
+
+A residual branch's projection accumulates over the block input with `beta = 1`,
+so that input had to be duplicated into the destination first: two
+`clone_dtod` calls a block, 32 copies of 12.58 MB a step, 2.5 ms.
+
+The first attempt removed them the other way round -- projection writes its own
+buffer with `beta = 0`, and the next norm sums the two inputs -- and measured
+*neutral*: 22875, 22747, 22681 tok/s against a 22692 baseline. The profile said
+exactly why. The copies went from 2.52 ms a step to 0.08, and `rmsnorm_fwd` went
+from 2.17 ms to 4.63. The two are the same number because the scheme still
+materializes two tensors per branch; the `beta = 1` read it also removed was
+never costing anything, because it is hidden under a GEMM running at 22 TFLOPS.
+
+What does pay is leaving the accumulate alone and moving only the copy. The norm
+above a branch reads the row it would have copied, so it writes the duplicate
+itself, out of registers:
+
+```cuda
+for(int c=tid;c<cols;c+=ROW_THREADS){float v=src[c];if(do_copy)dup[c]=v;s+=v*v;}
+```
+
+That is a store where there was a read-modify-write pass: 12.58 MB less per
+site.
+
+**22758 -> 22944 tok/s, 1.008x** (mean of two 60-step runs each).
+
+### Stale gradients instead of zeroed ones (`0c5d951`)
+
+Every optimizer step ended by memsetting each parameter's gradient, and every
+weight-gradient GEMM then accumulated into those zeros with `beta = 1`. That is
+467 MB of zeroing a step.
+
+A gradient buffer holding the last step's value is as good as a zeroed one, so
+long as the first writer of the next step overwrites rather than accumulates.
+Each `DeviceParam` carries a `grad_dirty` flag; `grad_beta()` hands out `0.0`
+once and `1.0` after, and the optimizer step clears the flag instead of the
+memory. The callers that can only accumulate -- the embedding scatter's atomic
+adds, the tied head's BF16 accumulate, and the optimizer itself for a parameter
+that took no gradient -- call `clear_grad()`, which memsets only if nothing has
+claimed the buffer yet.
+
+The win is larger than the memsets alone, because `beta = 0` also spares each
+weight-gradient GEMM the read of its destination.
+
+**22944 -> 23411 tok/s, 1.020x** (23399 and 23423 over two 60-step runs).
+
+### Throughput
+
+Idle card, 60 steps of the 102M model, same command as above.
+
+| Path | Tokens/sec | Final loss |
+|---|---|---|
+| This branch (`0c5d951`) | 23411 | 1.188 / 1.201 |
+| Before these four (`579b040`) | 21863 | 6.715 (20 steps) |
+| PyTorch | 23121 | |
+| TensorFlow | 20140 | |
+| Idle-GPU baseline | 11905 | |
+
+**1.97x the baseline, and 1.013x PyTorch.** 144 library tests pass.
+
+### Where the step goes now
+
+174.9 ms of kernel time a step.
+
+| Kernel | Per step | Launches |
+|---|---|---|
+| `ampere_s1688gemm_bf16_128x128_ldg8_stages_32x1_nt` | 19.57 ms | 48 |
+| `cutlass_80_tensorop_s16816gemm_bf16_256x128_32x3_nn` | 18.51 ms | 32 |
+| `flash_attention_dkv` | 15.45 ms | 16 |
+| `ampere_s1688gemm_bf16_128x128_ldg8_tn` | 11.58 ms | 16 |
+| `cutlass_80_tensorop_s16816gemm_bf16_128x256_32x3_tn` | 11.40 ms | 32 |
+| `flash_attention_dq` | 10.45 ms | 16 |
+| `adam` | 8.96 ms | 113 |
+| LM head GEMMs (three kernels) | 22.72 ms | 3 |
+| `flash_attention_fwd` | 7.24 ms | 16 |
+| `rmsnorm_bwd` | 6.66 ms | 33 |
+| `swiglu_bwd` | 4.52 ms | 16 |
+| memsets | 0.75 ms | 113 |
+
+GEMMs are 60% of the step, the three flash kernels 19%, everything else 20%.
+
+### What is left
+
+The GEMMs have no headroom. Mapping each cuBLAS and cutlass kernel to its shape
+by grid dimensions gives 24.9 TFLOPS for the `gate_up` weight gradient, 24.0 for
+`qkv`, 23.5 for the `gate_up` forward, 22.1 for the `qkv` and `down` forwards,
+21.8 for the attention-output weight gradient and 19.9 for `down`'s, against a
+25.5 TFLOPS dense BF16 peak. 78% to 98% of the card.
+
+The flash kernels run at roughly half of peak, which makes `flash_attention_dkv`
+the largest single target left. Four ablations on it, each measured with
+`examples/flash_probe.rs` against a 0.995 ms baseline:
+
+| What was removed | Grad key/value |
+|---|---|
+| The two global tile loads | 1.023 ms |
+| The `__expf` epilogue | 1.027 ms |
+| The `dk`/`dv` mma pair | 0.556 ms |
+| The score/`dpt` mma pair | 0.825 ms |
+
+Global traffic and the softmax epilogue cost nothing measurable: only removing
+mma work moves the number, so the kernel is bound by the tensor-core and
+shared-operand pipeline, not by bandwidth. With `DKV_SHARED_BYTES` at 37376 and
+198 registers per thread the kernel is capped at two blocks per SM either way,
+so the fix is not occupancy. The asymmetry between the two mma loops -- 0.44 ms
+against 0.17 ms for identical mma and `LDS.32` counts -- points at the second
+loop's fragment packing, which is where to look next.
