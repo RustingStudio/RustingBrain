@@ -111,6 +111,21 @@ impl ModelKernels {
     }
 }
 
+/// Everything [`Gpu::flash_attention`] needs to locate one block's queries,
+/// keys and values inside the fused projection output.
+#[derive(Clone, Copy)]
+pub(crate) struct FlashShape {
+    pub(crate) rows: usize,
+    pub(crate) seq_len: usize,
+    pub(crate) sequences: usize,
+    pub(crate) heads: usize,
+    pub(crate) group: usize,
+    pub(crate) qkv_width: usize,
+    pub(crate) query_width: usize,
+    pub(crate) key_base: usize,
+    pub(crate) value_base: usize,
+}
+
 /// RoPE's `cos` and `sin` tables on the device.
 ///
 /// Every layer is built from the same [`Rope`] configuration, so one upload
@@ -641,6 +656,52 @@ impl Gpu<'_> {
                 .arg(&(seq_len as i32))
                 .launch(warp_per_row_grid(rows))
                 .map_err(cuda_err("causal softmax kernel"))?;
+        }
+        Ok(())
+    }
+
+    /// Attention for one block in a single kernel: scores, causal softmax and
+    /// the value matmul, with no `[seq_len, seq_len]` matrix ever written to
+    /// global memory.
+    ///
+    /// Produces exactly the `merged` and `log_sum_exp` the three-kernel path
+    /// produced, which is why the backward pass needs no change to go with it.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention(
+        &self,
+        flash: &crate::cuda_flash::FlashKernels,
+        qkv: &CudaSlice<f32>,
+        merged: &mut CudaSlice<f32>,
+        log_sum_exp: &mut CudaSlice<f32>,
+        shape: FlashShape,
+        scale: f32,
+    ) -> Result<(), NetworkError> {
+        let config = cudarc::driver::LaunchConfig {
+            grid_dim: (
+                shape.seq_len.div_ceil(crate::cuda_flash::TILE) as u32,
+                shape.heads as u32,
+                shape.sequences as u32,
+            ),
+            block_dim: (crate::cuda_flash::THREADS, 1, 1),
+            shared_mem_bytes: crate::cuda_flash::SHARED_BYTES,
+        };
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&flash.forward)
+                .arg(qkv)
+                .arg(merged)
+                .arg(log_sum_exp)
+                .arg(&(shape.seq_len as i32))
+                .arg(&(shape.qkv_width as i32))
+                .arg(&(shape.query_width as i32))
+                .arg(&(shape.key_base as i32))
+                .arg(&(shape.value_base as i32))
+                .arg(&(shape.group as i32))
+                .arg(&(shape.rows as i32))
+                .arg(&scale)
+                .launch(config)
+                .map_err(cuda_err("fused attention kernel"))?;
         }
         Ok(())
     }
@@ -1212,70 +1273,89 @@ fn forward_block(
         &mut qkv, &tables, rows, kv_heads, head_dim, seq_len, 1.0, qkv_width, key_base,
     )?;
 
-    // Attention as three steps: a batched GEMM per head for the scores, a
-    // causal softmax in place, and a second batched GEMM against the values.
-    // The GEMMs run on the tensor cores, which no hand-written SIMT kernel on
-    // this card can match. The probability matrix is scratch that dies with
-    // this call: only the log-sum-exp is cached, and the backward pass rebuilds
-    // the probabilities from it.
+    // Attention, one of two ways. The fused kernel keeps the scores in
+    // registers and never writes the `[seq_len, seq_len]` matrix at all; the
+    // three-kernel path below writes it, reads it back for the softmax and
+    // reads it a third time for the value matmul, which profiling put at 21.3%
+    // of GPU time. Both produce the same `merged` and `log_sum_exp`.
     let group = heads / kv_heads;
-    let block_size = seq_len * seq_len;
-    let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
-    for head in 0..heads {
-        let kv_base = (head / group) * head_dim;
-        let query = qkv.slice(head * head_dim..);
-        let key = qkv.slice(key_base + kv_base..);
-        let mut scores = probabilities.slice_mut(head * sequences * block_size..);
-        gemm_rhs_transposed_batched(
-            gpu.context,
-            &query,
-            qkv_width,
-            &key,
-            qkv_width,
-            &mut scores,
-            seq_len,
-            seq_len,
-            seq_len,
-            head_dim,
-            scale,
-            0.0,
-            sequences,
-            seq_len * qkv_width,
-            seq_len * qkv_width,
-            block_size,
-        )?;
-    }
-        let mut log_sum_exp = gpu.uninit(heads * rows)?;
-    gpu.causal_softmax_lse(
-        &mut probabilities,
-        &mut log_sum_exp,
-        heads * sequences * seq_len,
+    let shape = FlashShape {
+        rows,
         seq_len,
-    )?;
+        sequences,
+        heads,
+        group,
+        qkv_width,
+        query_width,
+        key_base,
+        value_base,
+    };
+    let fused = gpu
+        .context
+        .flash
+        .as_ref()
+        .filter(|_| crate::cuda_flash::eligible(gpu.context.mixed_precision, head_dim));
+    let mut log_sum_exp = gpu.uninit(heads * rows)?;
     let mut merged = gpu.uninit(rows * query_width)?;
-    for head in 0..heads {
-        let kv_base = (head / group) * head_dim;
-        let head_probabilities = probabilities.slice(head * sequences * block_size..);
-        let value = qkv.slice(value_base + kv_base..);
-        let mut head_merged = merged.slice_mut(head * head_dim..);
-        gemm_plain_batched(
-            gpu.context,
-            &head_probabilities,
+    if let Some(flash) = fused {
+        gpu.flash_attention(flash, &qkv, &mut merged, &mut log_sum_exp, shape, scale)?;
+    } else {
+        let block_size = seq_len * seq_len;
+        let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
+        for head in 0..heads {
+            let kv_base = (head / group) * head_dim;
+            let query = qkv.slice(head * head_dim..);
+            let key = qkv.slice(key_base + kv_base..);
+            let mut scores = probabilities.slice_mut(head * sequences * block_size..);
+            gemm_rhs_transposed_batched(
+                gpu.context,
+                &query,
+                qkv_width,
+                &key,
+                qkv_width,
+                &mut scores,
+                seq_len,
+                seq_len,
+                seq_len,
+                head_dim,
+                scale,
+                0.0,
+                sequences,
+                seq_len * qkv_width,
+                seq_len * qkv_width,
+                block_size,
+            )?;
+        }
+        gpu.causal_softmax_lse(
+            &mut probabilities,
+            &mut log_sum_exp,
+            heads * sequences * seq_len,
             seq_len,
-            &value,
-            qkv_width,
-            &mut head_merged,
-            query_width,
-            seq_len,
-            head_dim,
-            seq_len,
-            1.0,
-            0.0,
-            sequences,
-            block_size,
-            seq_len * qkv_width,
-            seq_len * query_width,
         )?;
+        for head in 0..heads {
+            let kv_base = (head / group) * head_dim;
+            let head_probabilities = probabilities.slice(head * sequences * block_size..);
+            let value = qkv.slice(value_base + kv_base..);
+            let mut head_merged = merged.slice_mut(head * head_dim..);
+            gemm_plain_batched(
+                gpu.context,
+                &head_probabilities,
+                seq_len,
+                &value,
+                qkv_width,
+                &mut head_merged,
+                query_width,
+                seq_len,
+                head_dim,
+                seq_len,
+                1.0,
+                0.0,
+                sequences,
+                block_size,
+                seq_len * qkv_width,
+                seq_len * query_width,
+            )?;
+        }
     }
 
     // The residual is the output projection's GEMM with beta = 1 over a copy of
@@ -1828,21 +1908,23 @@ impl HeadBf16 {
 /// Padding rows and the last position of every sequence predict nothing, which
 /// is the same rule [`crate::causal_lm_loss_batch`] applies on the host.
 fn causal_targets(batch: &TokenBatch, vocab: usize) -> Result<Vec<i32>, NetworkError> {
-    let seq_len = batch.seq_len();
     let ids = batch.ids();
     let mut targets = vec![-1i32; batch.rows()];
-    for (sequence, &length) in batch.lengths().iter().enumerate() {
-        for position in 0..length.saturating_sub(1) {
-            let row = sequence * seq_len + position;
-            let id = ids[row + 1];
-            if id as usize >= vocab {
-                return Err(NetworkError::TokenOutOfRange {
-                    id,
-                    vocab_size: vocab,
-                });
-            }
-            targets[row] = id as i32;
+    for row in 0..batch.rows() {
+        // -1 is what the kernel reads as "this row predicts nothing", so a
+        // masked position needs no separate machinery on the device: it is
+        // spelled the same way as padding.
+        if !batch.predicts(row) {
+            continue;
         }
+        let id = ids[row + 1];
+        if id as usize >= vocab {
+            return Err(NetworkError::TokenOutOfRange {
+                id,
+                vocab_size: vocab,
+            });
+        }
+        targets[row] = id as i32;
     }
     Ok(targets)
 }

@@ -58,6 +58,9 @@ pub struct GpuContext {
     scatter: CudaFunction,
     /// The fused kernels the device-resident training path uses.
     pub(crate) model: crate::gpu_model::ModelKernels,
+    /// The fused attention kernel, present only on Ampere and later. `None`
+    /// leaves attention on the three-kernel cuBLAS path.
+    pub(crate) flash: Option<crate::cuda_flash::FlashKernels>,
     /// RoPE tables, uploaded on first use and shared by every layer.
     pub(crate) rope: Mutex<Option<Arc<crate::gpu_model::DeviceRope>>>,
     /// First CUDA failure seen by an infallible operation.
@@ -120,6 +123,7 @@ impl GpuContext {
             gather: get("gather_rows")?,
             scatter: get("scatter_rows_neg")?,
             model: crate::gpu_model::ModelKernels::load(&module)?,
+            flash: crate::cuda_flash::flash_kernels(device, &context),
             rope: Mutex::new(None),
             poison: Mutex::new(None),
         }))
@@ -761,7 +765,11 @@ where
 /// cannot reach. Attention is the only batched caller and its matrices are the
 /// narrowest in the model, so this is where the TF32 path was costing the most.
 #[allow(clippy::too_many_arguments)]
-unsafe fn gemm_strided_batched_dispatch<A: DevicePtr<f32>, B: DevicePtr<f32>, C: DevicePtrMut<f32>>(
+unsafe fn gemm_strided_batched_dispatch<
+    A: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    C: DevicePtrMut<f32>,
+>(
     context: &GpuContext,
     config: StridedBatchedConfig<f32>,
     a: &A,
@@ -851,9 +859,7 @@ pub(crate) fn gemm_rhs_transposed_batched<
         stride_b: x_batch_stride as i64,
         stride_c: out_batch_stride as i64,
     };
-    unsafe {
-        gemm_strided_batched_dispatch(context, config, w, x, out)
-    }
+    unsafe { gemm_strided_batched_dispatch(context, config, w, x, out) }
 }
 
 /// [`gemm_plain`] over `count` independent matrices, one per sequence.
@@ -894,9 +900,7 @@ pub(crate) fn gemm_plain_batched<X: DevicePtr<f32>, W: DevicePtr<f32>, O: Device
         stride_b: x_batch_stride as i64,
         stride_c: out_batch_stride as i64,
     };
-    unsafe {
-        gemm_strided_batched_dispatch(context, config, w, x, out)
-    }
+    unsafe { gemm_strided_batched_dispatch(context, config, w, x, out) }
 }
 
 /// [`gemm_lhs_transposed`] over `count` independent matrices, one per sequence.
@@ -941,9 +945,7 @@ pub(crate) fn gemm_lhs_transposed_batched<
         stride_b: d_batch_stride as i64,
         stride_c: out_batch_stride as i64,
     };
-    unsafe {
-        gemm_strided_batched_dispatch(context, config, x, d, out)
-    }
+    unsafe { gemm_strided_batched_dispatch(context, config, x, d, out) }
 }
 
 /// `out[rows, cols] = alpha * x[rows, inner] . w[inner, cols] + beta * out`
@@ -1383,5 +1385,77 @@ mod tests {
             Err(NetworkError::CudaMemoryBudget { .. })
         ));
         assert!(!model.on_device());
+    }
+
+    /// The fused attention kernel against the three-kernel path it replaces.
+    ///
+    /// It only runs on a head dimension of 64 under reduced precision, which no
+    /// other test in this file uses, so without this one it is never executed.
+    /// The sequence is 100 tokens: longer than one 64-wide tile, and not a
+    /// multiple of it, so the run covers an off-diagonal tile, the masked
+    /// diagonal, and a ragged tail.
+    ///
+    /// `DISABLED` is process-wide. Nothing else here is eligible for the fused
+    /// path, so flipping it cannot disturb a test running alongside.
+    #[test]
+    fn fused_attention_matches_the_three_kernel_path_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let model = || {
+            TransformerLm::builder()
+                .vocab_size(32)
+                .d_model(128)
+                .n_layers(2)
+                .heads(2, 1, 64)
+                .d_ff(64)
+                .moe_layers([0usize; 0])
+                .max_seq_len(128)
+                .optimizer(Optimizer::adam(1e-2))
+                .seed(99)
+                .mixed_precision(true)
+                .build()
+                .unwrap()
+        };
+        let ids: Vec<u32> = (0..100).map(|index| (index * 7 % 32) as u32).collect();
+
+        let (host_logits, _) = model().forward_train(&[&ids[..]]).unwrap();
+
+        let mut fused = model();
+        fused.to_cuda(0, 8192).unwrap();
+        let (fused_logits, _) = fused.forward_train(&[&ids[..]]).unwrap();
+
+        crate::cuda_flash::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut split = model();
+        split.to_cuda(0, 8192).unwrap();
+        let split_forward = split.forward_train(&[&ids[..]]);
+        crate::cuda_flash::DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let (split_logits, _) = split_forward.unwrap();
+
+        // Both device paths round their matmul operands to BF16, so neither is
+        // the reference and a fixed band between them would only be a band
+        // around BF16 epsilon. The FP32 host run is the reference, and the
+        // question the fusion has to answer is whether it loses accuracy the
+        // path it replaces did not: measured here the split path lands 2.5e-3
+        // from the host and the fused path 3.7e-3, on logits whose magnitude is
+        // 0.475. A real fault in the tile loop, the mask or the running maximum
+        // is off by far more than the factor of two below.
+        let error = |logits: &crate::matrix::Matrix| {
+            logits
+                .data
+                .iter()
+                .zip(&host_logits.data)
+                .map(|(device, host)| (device - host).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let (fused_error, split_error) = (error(&fused_logits), error(&split_logits));
+        assert!(
+            fused_error <= 2.0 * split_error,
+            "the fused path is {fused_error} from the host where the three-kernel path is {split_error}"
+        );
+        assert!(
+            fused_error < 1e-2,
+            "both device paths drifted: {fused_error}"
+        );
     }
 }

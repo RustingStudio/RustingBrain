@@ -907,6 +907,35 @@ impl TransformerLm {
         })
     }
 
+    /// [`TransformerLm::accumulate_step`] with a per-token loss mask.
+    ///
+    /// `mask` holds one flag per token position of `batch`, in the same order
+    /// and of the same length as [`TokenBatch::ids`] - `batch.rows()` flags,
+    /// padding included. A flag marks its token as a *target*: `false` makes
+    /// the position that predicts that token contribute exactly zero to the
+    /// loss and zero to the gradient, and the mean is taken over the flagged
+    /// positions alone, so no scaling is needed on the caller's side. `None`
+    /// is [`TransformerLm::accumulate_step`] exactly.
+    ///
+    /// Masked tokens still run the forward pass and still condition the
+    /// positions that count, which is what supervised fine-tuning needs: for
+    /// `<|user|>{instruction}<|assistant|>{response}<|end|>`, flag the
+    /// `{response}<|end|>` span and leave the instruction span unflagged, and
+    /// the instruction is read as context without being learned.
+    ///
+    /// A sequence's first token is never a target - nothing precedes it - so
+    /// its flag is ignored.
+    pub fn accumulate_step_masked(
+        &mut self,
+        batch: &TokenBatch,
+        mask: Option<&[bool]>,
+    ) -> Result<TotalLoss, NetworkError> {
+        match mask {
+            None => self.accumulate_step(batch),
+            Some(mask) => self.accumulate_step(&batch.clone().with_loss_mask(mask)?),
+        }
+    }
+
     /// Applies the optimizer to every parameter and clears the gradients.
     ///
     /// `scale` divides the accumulated gradient, so a caller that ran several
@@ -1116,8 +1145,7 @@ impl TransformerLm {
             writer.write_all(&(value.cols as u64).to_le_bytes())?;
             match precision {
                 Precision::F32 => {
-                    let bytes: Vec<u8> =
-                        value.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let bytes: Vec<u8> = value.data.iter().flat_map(|v| v.to_le_bytes()).collect();
                     writer.write_all(&bytes)?;
                 }
                 Precision::Q8 => {
@@ -1125,10 +1153,8 @@ impl TransformerLm {
                         let absmax = row.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
                         let scale = absmax / 127.0;
                         writer.write_all(&scale.to_le_bytes())?;
-                        let quantized: Vec<u8> = row
-                            .iter()
-                            .map(|v| quantize(*v, scale) as u8)
-                            .collect();
+                        let quantized: Vec<u8> =
+                            row.iter().map(|v| quantize(*v, scale) as u8).collect();
                         writer.write_all(&quantized)?;
                     }
                 }
@@ -1255,7 +1281,9 @@ mod tests {
         // One backward over all four sequences: a mean over four.
         let mut whole = dense().build().unwrap();
         whole.zero_grad();
-        whole.accumulate_step(&TokenBatch::new(&ids).unwrap()).unwrap();
+        whole
+            .accumulate_step(&TokenBatch::new(&ids).unwrap())
+            .unwrap();
         let whole_grads: Vec<Vec<f32>> = whole
             .params_mut()
             .iter()
@@ -1292,6 +1320,56 @@ mod tests {
             }
         }
         assert!(compared > 1000, "only {compared} gradients compared");
+    }
+
+    #[test]
+    fn a_loss_mask_zeroes_the_masked_positions_gradient() {
+        let ids: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
+        let batch = TokenBatch::new(&ids).unwrap();
+        let grads = |model: &mut TransformerLm| -> Vec<Vec<f32>> {
+            model
+                .params_mut()
+                .iter()
+                .map(|param| param.grad.data.clone())
+                .collect()
+        };
+
+        // A mask that flags every token is the unmasked step exactly.
+        let mut plain = tiny().seed(3).build().unwrap();
+        plain.zero_grad();
+        plain.accumulate_step(&batch).unwrap();
+        let mut flagged = tiny().seed(3).build().unwrap();
+        flagged.zero_grad();
+        flagged
+            .accumulate_step_masked(&batch, Some(&[true; 8]))
+            .unwrap();
+        assert_eq!(grads(&mut plain), grads(&mut flagged));
+
+        // Masking the first half of every sequence leaves a different
+        // gradient, but one that is still finite and non-zero: the masked
+        // tokens went through the forward pass as context.
+        let mut masked = tiny().seed(3).build().unwrap();
+        masked.zero_grad();
+        let mask = [false, false, true, true, false, false, true, true];
+        masked.accumulate_step_masked(&batch, Some(&mask)).unwrap();
+        let masked_grads = grads(&mut masked);
+        let plain_grads = grads(&mut plain);
+
+        assert_ne!(masked_grads, plain_grads);
+        let total: f32 = masked_grads.iter().flatten().map(|g| g.abs()).sum();
+        assert!(total.is_finite() && total > 0.0, "gradient was {total}");
+    }
+
+    #[test]
+    fn a_loss_mask_that_covers_the_wrong_number_of_tokens_is_rejected() {
+        let batch = TokenBatch::new(&[[1u32, 2, 3, 4]]).unwrap();
+        let mut model = tiny().seed(3).build().unwrap();
+
+        assert!(
+            model
+                .accumulate_step_masked(&batch, Some(&[true; 3]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1654,7 +1732,10 @@ mod tests {
 
         let quantized = TransformerLm::load_bin(&q8_path).unwrap();
         assert_eq!(quantized.config, model.config);
-        let (left, right) = (&quantized.embedding.weight.value, &model.embedding.weight.value);
+        let (left, right) = (
+            &quantized.embedding.weight.value,
+            &model.embedding.weight.value,
+        );
         let scale = right.data.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
         for (a, b) in left.data.iter().zip(&right.data) {
             assert!(

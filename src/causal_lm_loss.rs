@@ -69,7 +69,6 @@ pub fn causal_lm_loss_batch(
     }
 
     let vocab_size = logits.cols;
-    let seq_len = batch.seq_len();
     let ids = batch.ids();
     let predicted = batch.predicted();
     if predicted == 0 {
@@ -79,7 +78,6 @@ pub fn causal_lm_loss_batch(
     }
 
     let mut grad_logits = Matrix::new(logits.rows, vocab_size);
-    let lengths = batch.lengths();
     let inverse_predicted = 1.0 / predicted as f32;
 
     // One softmax per row over a 32k-wide vocabulary is the single most
@@ -91,9 +89,9 @@ pub fn causal_lm_loss_batch(
         .par_chunks_mut(vocab_size)
         .enumerate()
         .map(|(row_index, row)| {
-            let position = row_index % seq_len;
-            // Padding rows and the last position of a sequence predict nothing.
-            if position + 1 >= lengths[row_index / seq_len] {
+            // Padding rows, the last position of a sequence, and any position
+            // a loss mask excluded predict nothing.
+            if !batch.predicts(row_index) {
                 return Ok(0.0);
             }
             let target = ids[row_index + 1] as usize;
@@ -165,6 +163,68 @@ mod tests {
             let numeric = (high - low) / (2.0 * epsilon);
             assert!((analytic.data[index] - numeric).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn a_loss_mask_drops_a_position_to_exactly_zero() {
+        let logits = Matrix::from_vec(3, 3, vec![0.2, -1.0, 0.5, 1.5, 0.3, -0.7, 0.1, 0.9, -0.2]);
+        let ids = [0u32, 1, 2];
+        let full = causal_lm_loss(&logits, &ids).unwrap();
+
+        // Flag the last token alone: row 0 (which predicts token 1) drops out,
+        // row 1 (which predicts token 2) is all that is left.
+        let masked = causal_lm_loss_batch(
+            &logits,
+            &TokenBatch::new(&[ids])
+                .unwrap()
+                .with_loss_mask(&[false, false, true])
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(masked.predicted, 1);
+        assert_eq!(masked.grad_logits.row(0), &[0.0, 0.0, 0.0]);
+        assert_eq!(masked.grad_logits.row(2), &[0.0, 0.0, 0.0]);
+
+        // The unmasked run averaged two positions, this one averages one, so
+        // the surviving row's loss and gradient both double.
+        let surviving = -softmax_probability(logits.row(1), 2).ln();
+        assert!((masked.loss - surviving).abs() < 1e-5);
+        // The unmasked mean over both positions minus the surviving one
+        // leaves exactly the position the mask dropped.
+        let dropped = -softmax_probability(logits.row(0), 1).ln();
+        assert!((full.loss * 2.0 - masked.loss - dropped).abs() < 1e-5);
+        for (full_grad, masked_grad) in full
+            .grad_logits
+            .row(1)
+            .iter()
+            .zip(masked.grad_logits.row(1))
+        {
+            assert!((masked_grad - 2.0 * full_grad).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_mask_that_flags_everything_changes_nothing() {
+        let logits = Matrix::from_vec(3, 3, vec![0.2, -1.0, 0.5, 1.5, 0.3, -0.7, 0.1, 0.9, -0.2]);
+        let ids = [2u32, 0, 1];
+        let plain = causal_lm_loss(&logits, &ids).unwrap();
+        let flagged = causal_lm_loss_batch(
+            &logits,
+            &TokenBatch::new(&[ids])
+                .unwrap()
+                .with_loss_mask(&[true; 3])
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(plain, flagged);
+    }
+
+    fn softmax_probability(row: &[f32], index: usize) -> f32 {
+        let mut row = row.to_vec();
+        softmax(&mut row);
+        row[index]
     }
 
     #[test]
