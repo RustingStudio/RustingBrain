@@ -269,7 +269,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
 // lane, so both loads are contiguous.
 extern "C" __global__ void flash_attention_delta(
     const unsigned short* __restrict__ out,
-    const float* __restrict__ grad_out,
+    const unsigned short* __restrict__ grad_out,
     float* __restrict__ delta,
     int rows, int heads, int query_width, int delta_head_stride)
 {
@@ -279,8 +279,9 @@ extern "C" __global__ void flash_attention_delta(
   for (int warp = (blockIdx.x*blockDim.x + threadIdx.x) >> 5; warp < total; warp += stride) {
     int h = warp / rows, r = warp % rows;
     size_t o = (size_t)r*query_width + h*FA_D;
-    const float* g = grad_out + (size_t)r*query_width + h*FA_D;
-    float sum = bf16_load(out,o+lane)*g[lane] + bf16_load(out,o+lane+32)*g[lane+32];
+    size_t g = (size_t)r*query_width + h*FA_D;
+    float sum = bf16_load(out,o+lane)*bf16_load(grad_out,g+lane)
+              + bf16_load(out,o+lane+32)*bf16_load(grad_out,g+lane+32);
     #pragma unroll
     for (int step=16; step; step>>=1) sum += __shfl_xor_sync(0xffffffff,sum,step);
     if (lane == 0) delta[(size_t)h*delta_head_stride + r] = sum;
@@ -294,7 +295,7 @@ extern "C" __global__ void flash_attention_delta(
 // wants them key-major and the query matmul wants them dimension-major.
 extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
     const unsigned short* __restrict__ qkv,
-    const float* __restrict__ grad_out,
+    const unsigned short* __restrict__ grad_out,
     const float* __restrict__ lse,
     const float* __restrict__ delta,
     unsigned short* __restrict__ grad_qkv,
@@ -319,30 +320,28 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
   float lse_a=0.f, lse_b=0.f, del_a=0.f, del_b=0.f;
   {
     const size_t qbase = seq_base*(size_t)qkv_width + h*FA_D;
-    const float* gbase = grad_out + seq_base*(size_t)query_width + h*FA_D;
+    const size_t gbase = seq_base*(size_t)query_width + h*FA_D;
     #pragma unroll
     for (int kk=0; kk<4; ++kk) {
       int c = kk*16 + t*2;
       float q0=0.f,q1=0.f,q2=0.f,q3=0.f,q4=0.f,q5=0.f,q6=0.f,q7=0.f;
-      float d0=0.f,d1=0.f,d2=0.f,d3=0.f,d4=0.f,d5=0.f,d6=0.f,d7=0.f;
+      df[kk][0]=0; df[kk][1]=0; df[kk][2]=0; df[kk][3]=0;
       if (row_a < seq_len) {
         size_t p = qbase + (size_t)row_a*qkv_width;
         q0=bf16_load(qkv,p+c)*scale;   q1=bf16_load(qkv,p+c+1)*scale;
         q4=bf16_load(qkv,p+c+8)*scale; q5=bf16_load(qkv,p+c+9)*scale;
-        const float* e = gbase + (size_t)row_a*query_width;
-        d0=e[c]; d1=e[c+1]; d4=e[c+8]; d5=e[c+9];
+        size_t e = gbase + (size_t)row_a*query_width;
+        df[kk][0]=bf16_pair(grad_out,e+c); df[kk][2]=bf16_pair(grad_out,e+c+8);
       }
       if (row_b < seq_len) {
         size_t p = qbase + (size_t)row_b*qkv_width;
         q2=bf16_load(qkv,p+c)*scale;   q3=bf16_load(qkv,p+c+1)*scale;
         q6=bf16_load(qkv,p+c+8)*scale; q7=bf16_load(qkv,p+c+9)*scale;
-        const float* e = gbase + (size_t)row_b*query_width;
-        d2=e[c]; d3=e[c+1]; d6=e[c+8]; d7=e[c+9];
+        size_t e = gbase + (size_t)row_b*query_width;
+        df[kk][1]=bf16_pair(grad_out,e+c); df[kk][3]=bf16_pair(grad_out,e+c+8);
       }
       qf[kk][0]=pack2(q0,q1); qf[kk][1]=pack2(q2,q3);
       qf[kk][2]=pack2(q4,q5); qf[kk][3]=pack2(q6,q7);
-      df[kk][0]=pack2(d0,d1); df[kk][1]=pack2(d2,d3);
-      df[kk][2]=pack2(d4,d5); df[kk][3]=pack2(d6,d7);
     }
     const float* row = lse + (size_t)h*lse_head_stride + seq_base;
     const float* dd  = delta + (size_t)h*lse_head_stride + seq_base;
@@ -454,7 +453,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
 // every query head that shares a key head is summed inside one block.
 extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
     const unsigned short* __restrict__ qkv,
-    const float* __restrict__ grad_out,
+    const unsigned short* __restrict__ grad_out,
     const float* __restrict__ lse,
     const float* __restrict__ delta,
     unsigned short* __restrict__ grad_qkv,
@@ -517,21 +516,19 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
       for (int i = threadIdx.x*2; i < 64*FA_D; i += 256) {
         int r = i >> 6, c = i & 63;
         int q = it*64 + r;
-        unsigned qw = 0;
-        float g0 = 0.f, g1 = 0.f;
+        unsigned qw = 0, gw = 0;
         if (q < seq_len) {
           qw = bf16_pair(qkv,(seq_base+q)*(size_t)qkv_width + hq*FA_D + c);
-          float2 gp = *(const float2*)(grad_out + (seq_base+q)*(size_t)query_width + hq*FA_D + c);
-          g0 = gp.x; g1 = gp.y;
+          gw = bf16_pair(grad_out,(seq_base+q)*(size_t)query_width + hq*FA_D + c);
         }
         // The queries are stored unscaled, so the scores carry the scale
         // instead: one multiply per score rather than one per element here.
         *(unsigned*)(qs + r*FA_ROW + c) = qw;
         qtr[c*FA_ROW + r] = (unsigned short)qw;
         qtr[(c+1)*FA_ROW + r] = (unsigned short)(qw >> 16);
-        unsigned short b0 = bf16_bits(g0), b1 = bf16_bits(g1);
-        gs[r*FA_ROW + c] = b0;  gs[r*FA_ROW + c + 1] = b1;
-        gtr[c*FA_ROW + r] = b0; gtr[(c+1)*FA_ROW + r] = b1;
+        *(unsigned*)(gs + r*FA_ROW + c) = gw;
+        gtr[c*FA_ROW + r] = (unsigned short)gw;
+        gtr[(c+1)*FA_ROW + r] = (unsigned short)(gw >> 16);
       }
       if (threadIdx.x < 64) {
         int q = it*64 + threadIdx.x;

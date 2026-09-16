@@ -837,13 +837,14 @@ pub(crate) fn act_rhs_transposed<T, O: DevicePtrMut<T>>(
 
 /// [`gemm_plain`] over [`act_dispatch`] operands.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn act_plain<O: DevicePtrMut<f32>>(
+pub(crate) fn act_plain<T, O: DevicePtrMut<T>>(
     context: &GpuContext,
     x: &CudaView<'_, u8>,
     x_stride: usize,
     w: &CudaView<'_, u8>,
     w_stride: usize,
     narrow: bool,
+    out_narrow: bool,
     out: &mut O,
     out_stride: usize,
     rows: usize,
@@ -864,7 +865,7 @@ pub(crate) fn act_plain<O: DevicePtrMut<f32>>(
         beta,
         ldc: out_stride as i32,
     };
-    unsafe { act_dispatch(context, config, w, x, narrow, false, out) }
+    unsafe { act_dispatch(context, config, w, x, narrow, out_narrow, out) }
 }
 
 /// [`gemm_lhs_transposed`] over [`act_dispatch`] operands.
