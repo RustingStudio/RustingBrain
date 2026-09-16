@@ -512,13 +512,6 @@ impl Gpu<'_> {
             .map_err(cuda_err("device to host copy"))
     }
 
-    fn duplicate(&self, source: &CudaSlice<f32>) -> Result<CudaSlice<f32>, NetworkError> {
-        self.context
-            .stream
-            .clone_dtod(source)
-            .map_err(cuda_err("device to device copy"))
-    }
-
     /// `[rows, width]` back into a host matrix.
     fn matrix(
         &self,
@@ -676,6 +669,11 @@ impl Gpu<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `copy` asks for an FP32 duplicate of `input` alongside the normed
+    /// output. The residual branch below a norm wants one, because its
+    /// projection accumulates over the block input with `beta = 1`; this kernel
+    /// has the row in registers already, so it is a store rather than a pass.
+    #[allow(clippy::too_many_arguments)]
     fn rmsnorm(
         &self,
         input: &CudaSlice<f32>,
@@ -684,9 +682,14 @@ impl Gpu<'_> {
         cols: usize,
         eps: f32,
         narrow: bool,
-    ) -> Result<(Act, CudaSlice<f32>), NetworkError> {
+        copy: bool,
+    ) -> Result<(Act, CudaSlice<f32>, Option<CudaSlice<f32>>), NetworkError> {
         let mut out = self.act(rows * cols, narrow)?;
         let mut inverse = self.uninit(rows)?;
+        // A one-element stand-in keeps the launch arguments uniform when no
+        // duplicate is asked for; `do_copy` is what decides whether it is written.
+        let mut duplicate = self.uninit(if copy { rows * cols } else { 1 })?;
+        let do_copy = i32::from(copy);
         unsafe {
             self.context
                 .stream
@@ -699,10 +702,12 @@ impl Gpu<'_> {
                 .arg(&(cols as i32))
                 .arg(&eps)
                 .arg(&i32::from(narrow))
+                .arg(&mut duplicate)
+                .arg(&do_copy)
                 .launch(row_grid(rows))
                 .map_err(cuda_err("RMSNorm kernel"))?;
         }
-        Ok((out, inverse))
+        Ok((out, inverse, copy.then_some(duplicate)))
     }
 
     /// Returns `dL/dinput` and accumulates the scale gradient on the device.
@@ -1532,12 +1537,13 @@ fn forward_hidden(
 
     let final_weight = gpu.upload(&model.final_norm.weight.value.data)?;
     // The head narrows its own operands, so the last norm stays FP32.
-    let (final_output, final_inverse_rms) = gpu.rmsnorm(
+    let (final_output, final_inverse_rms, _) = gpu.rmsnorm(
         &hidden,
         &final_weight,
         rows,
         d_model,
         model.final_norm.eps,
+        false,
         false,
     )?;
 
@@ -1589,14 +1595,17 @@ fn forward_block(
     let ffn_narrow = narrow && dense_ffn;
 
     let attention_weight = gpu.upload(&block.attention_norm.weight.value.data)?;
-    let (attention_normed, attention_inverse_rms) = gpu.rmsnorm(
+    // The residual this norm's branch lands on is the duplicate it writes.
+    let (attention_normed, attention_inverse_rms, residual) = gpu.rmsnorm(
         &input,
         &attention_weight,
         rows,
         d_model,
         block.attention_norm.eps,
         narrow,
+        true,
     )?;
+    let mut residual = residual.expect("a norm asked for a duplicate returns one");
 
     // Query, key and value read the same input and differ only in width, so
     // they are one GEMM against their three weight matrices packed end to end.
@@ -1732,9 +1741,8 @@ fn forward_block(
         }
     }
 
-    // The residual is the output projection's GEMM with beta = 1 over a copy of
-    // the block input, so the addition costs no extra kernel.
-    let mut residual = gpu.duplicate(&input)?;
+    // The residual add is the output projection's GEMM with beta = 1 over the
+    // duplicate the norm above left behind, so it costs no extra kernel.
     let output_weight = gpu.pack(&[device_of(&attention.output)?], merged.is_narrow())?;
     gpu.linear_packed(
         &output_weight.all(),
@@ -1748,16 +1756,16 @@ fn forward_block(
     )?;
 
     let feed_forward_weight = gpu.upload(&block.feed_forward_norm.weight.value.data)?;
-    let (feed_forward_normed, feed_forward_inverse_rms) = gpu.rmsnorm(
+    let (feed_forward_normed, feed_forward_inverse_rms, output) = gpu.rmsnorm(
         &residual,
         &feed_forward_weight,
         rows,
         d_model,
         block.feed_forward_norm.eps,
         ffn_narrow,
+        true,
     )?;
-
-    let mut output = gpu.duplicate(&residual)?;
+    let mut output = output.expect("a norm asked for a duplicate returns one");
     let feed_forward = match &block.feed_forward {
         FeedForward::SwiGlu(ffn) => FfnCache::Dense(forward_swiglu(
             gpu,
@@ -3230,8 +3238,8 @@ mod tests {
 
         let weight = gpu.upload(&norm.weight.value.data).unwrap();
         let device_input = gpu.upload(&input.data).unwrap();
-        let (output, inverse) = gpu
-            .rmsnorm(&device_input, &weight, rows, cols, norm.eps, false)
+        let (output, inverse, _) = gpu
+            .rmsnorm(&device_input, &weight, rows, cols, norm.eps, false, false)
             .unwrap();
         assert_close(
             "rmsnorm forward",

@@ -84,11 +84,16 @@ __device__ __forceinline__ float row_sum(float v,float*red){
   for(int s=ROW_THREADS/2;s>0;s>>=1){if(tid<s)red[tid]+=red[tid+s];__syncthreads();}
   float r=red[0];__syncthreads();return r;
 }
-extern "C" __global__ void rmsnorm_fwd(void*out,float*inv,const float*x,const float*w,int rows,int cols,float eps,int narrow){
+// `do_copy` asks for a plain duplicate of `x` in `copy`. A residual branch
+// needs one: the projection below it accumulates with `beta = 1` over the
+// block input. Writing it here is a store on a row this kernel has already
+// read, which is cheaper than the separate device-to-device copy it replaces.
+extern "C" __global__ void rmsnorm_fwd(void*out,float*inv,const float*x,const float*w,int rows,int cols,float eps,int narrow,float*copy,int do_copy){
   __shared__ float red[ROW_THREADS];int tid=threadIdx.x;
   for(int r=blockIdx.x;r<rows;r+=gridDim.x){
     const float*src=x+(size_t)r*cols;
-    float s=0.f;for(int c=tid;c<cols;c+=ROW_THREADS){float v=src[c];s+=v*v;}
+    float*dup=copy+(size_t)r*cols;
+    float s=0.f;for(int c=tid;c<cols;c+=ROW_THREADS){float v=src[c];if(do_copy)dup[c]=v;s+=v*v;}
     s=row_sum(s,red);
     float t=1.f/sqrtf(s/(float)cols+eps);
     if(tid==0)inv[r]=t;
