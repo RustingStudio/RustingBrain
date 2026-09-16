@@ -36,7 +36,9 @@ use cudarc::cublas::{
     CudaBlas, Gemm, GemmConfig, StridedBatchedConfig, result as cublas, sys as cublas_sys,
     sys::cublasOperation_t,
 };
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut, PushKernelArg,
+};
 use std::any::TypeId;
 use std::sync::{Arc, Mutex};
 
@@ -719,6 +721,173 @@ where
         )
     }
     .map_err(cuda_err("cuBLAS BF16 GEMM"))
+}
+
+/// One GEMM whose operands are untyped bytes, either BF16 or FP32.
+///
+/// [`Act`](crate::gpu_model::Act) stores the block activations narrow whenever
+/// reduced precision is on, because every one of them is read only by a GEMM
+/// that would have rounded it to BF16 inside the tensor cores anyway. Handing
+/// cuBLAS BF16 operands instead of FP32 ones with a `32F_FAST_16BF` compute
+/// type changes which kernel it picks: `s16816 ... align8`, twice the k per
+/// instruction, rather than `s1688 ... align4`. The accumulator stays FP32
+/// either way, so this is the same arithmetic on a better kernel.
+///
+/// # Safety
+///
+/// Same contract as `Gemm::gemm`: the configuration must describe the three
+/// buffers correctly, and `narrow` must say how the operand bytes are laid out.
+unsafe fn act_dispatch<C: DevicePtrMut<f32>>(
+    context: &GpuContext,
+    config: GemmConfig<f32>,
+    a: &CudaView<'_, u8>,
+    b: &CudaView<'_, u8>,
+    narrow: bool,
+    c: &mut C,
+) -> Result<(), NetworkError> {
+    // Wide operands keep the `32F_FAST_16BF` compute type `gemm_dispatch`
+    // uses, so a buffer that stayed FP32 (the routed feed-forward's, whose
+    // gathers and scatters are FP32 kernels) runs on exactly the kernel it ran
+    // on before.
+    let (operand, compute) = if narrow {
+        (
+            cublas_sys::cudaDataType_t::CUDA_R_16BF,
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        )
+    } else if context.mixed_precision {
+        (
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
+        )
+    } else {
+        (
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        )
+    };
+    let (a_pointer, _a_guard) = a.device_ptr(&context.stream);
+    let (b_pointer, _b_guard) = b.device_ptr(&context.stream);
+    let (c_pointer, _c_guard) = c.device_ptr_mut(&context.stream);
+    unsafe {
+        cublas::gemm_ex(
+            *context.blas.handle(),
+            config.transa,
+            config.transb,
+            config.m,
+            config.n,
+            config.k,
+            &config.alpha as *const f32 as *const std::ffi::c_void,
+            a_pointer as *const std::ffi::c_void,
+            operand,
+            config.lda,
+            b_pointer as *const std::ffi::c_void,
+            operand,
+            config.ldb,
+            &config.beta as *const f32 as *const std::ffi::c_void,
+            c_pointer as *mut std::ffi::c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            config.ldc,
+            compute,
+            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+    .map_err(cuda_err("cuBLAS narrow GEMM"))
+}
+
+/// [`gemm_rhs_transposed`] over [`act_dispatch`] operands.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn act_rhs_transposed<O: DevicePtrMut<f32>>(
+    context: &GpuContext,
+    x: &CudaView<'_, u8>,
+    x_stride: usize,
+    w: &CudaView<'_, u8>,
+    w_stride: usize,
+    narrow: bool,
+    out: &mut O,
+    out_stride: usize,
+    rows: usize,
+    units: usize,
+    inner: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), NetworkError> {
+    let config = GemmConfig {
+        transa: cublasOperation_t::CUBLAS_OP_T,
+        transb: cublasOperation_t::CUBLAS_OP_N,
+        m: units as i32,
+        n: rows as i32,
+        k: inner as i32,
+        alpha,
+        lda: w_stride as i32,
+        ldb: x_stride as i32,
+        beta,
+        ldc: out_stride as i32,
+    };
+    unsafe { act_dispatch(context, config, w, x, narrow, out) }
+}
+
+/// [`gemm_plain`] over [`act_dispatch`] operands.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn act_plain<O: DevicePtrMut<f32>>(
+    context: &GpuContext,
+    x: &CudaView<'_, u8>,
+    x_stride: usize,
+    w: &CudaView<'_, u8>,
+    w_stride: usize,
+    narrow: bool,
+    out: &mut O,
+    out_stride: usize,
+    rows: usize,
+    cols: usize,
+    inner: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), NetworkError> {
+    let config = GemmConfig {
+        transa: cublasOperation_t::CUBLAS_OP_N,
+        transb: cublasOperation_t::CUBLAS_OP_N,
+        m: cols as i32,
+        n: rows as i32,
+        k: inner as i32,
+        alpha,
+        lda: w_stride as i32,
+        ldb: x_stride as i32,
+        beta,
+        ldc: out_stride as i32,
+    };
+    unsafe { act_dispatch(context, config, w, x, narrow, out) }
+}
+
+/// [`gemm_lhs_transposed`] over [`act_dispatch`] operands.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn act_lhs_transposed<O: DevicePtrMut<f32>>(
+    context: &GpuContext,
+    d: &CudaView<'_, u8>,
+    d_stride: usize,
+    x: &CudaView<'_, u8>,
+    x_stride: usize,
+    narrow: bool,
+    out: &mut O,
+    out_stride: usize,
+    rows: usize,
+    units: usize,
+    cols: usize,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), NetworkError> {
+    let config = GemmConfig {
+        transa: cublasOperation_t::CUBLAS_OP_N,
+        transb: cublasOperation_t::CUBLAS_OP_T,
+        m: cols as i32,
+        n: units as i32,
+        k: rows as i32,
+        alpha,
+        lda: x_stride as i32,
+        ldb: d_stride as i32,
+        beta,
+        ldc: out_stride as i32,
+    };
+    unsafe { act_dispatch(context, config, x, d, narrow, out) }
 }
 
 /// `out[rows, units] = alpha * x[rows, inner] . w[units, inner]^T + beta * out`
