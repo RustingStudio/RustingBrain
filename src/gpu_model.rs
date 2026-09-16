@@ -707,6 +707,10 @@ impl Gpu<'_> {
 
     /// Returns `dL/dinput` and accumulates the scale gradient on the device.
     #[allow(clippy::too_many_arguments)]
+    /// `residual`, when `add_residual` is set, is added into the input
+    /// gradient: a residual branch's upstream gradient passes through here
+    /// instead of costing a separate pass over the whole activation.
+    #[allow(clippy::too_many_arguments)]
     fn rmsnorm_backward(
         &self,
         input: &CudaSlice<f32>,
@@ -714,10 +718,13 @@ impl Gpu<'_> {
         weight: &CudaSlice<f32>,
         inverse: &CudaSlice<f32>,
         grad_weight: &mut CudaViewMut<'_, f32>,
+        residual: &CudaSlice<f32>,
+        add_residual: bool,
         rows: usize,
         cols: usize,
     ) -> Result<CudaSlice<f32>, NetworkError> {
         let mut grad_input = self.uninit(rows * cols)?;
+        let add_residual = i32::from(add_residual);
         let smem = rmsnorm_smem(cols);
         let mut config = row_grid(rows);
         config.shared_mem_bytes = smem.unwrap_or(0);
@@ -734,6 +741,8 @@ impl Gpu<'_> {
                 .arg(&(rows as i32))
                 .arg(&(cols as i32))
                 .arg(&(i32::from(smem.is_some())))
+                .arg(residual)
+                .arg(&add_residual)
                 .launch(config)
                 .map_err(cuda_err("RMSNorm backward kernel"))?;
         }
@@ -2419,6 +2428,8 @@ fn backward_from_final(
         &cache.final_weight,
         &cache.final_inverse_rms,
         &mut grad_norms.slice_mut(0..d_model),
+        grad_final,
+        false,
         rows,
         d_model,
     )?;
@@ -2519,31 +2530,33 @@ fn backward_block(
         }
     }
 
-    let mut grad_residual = gpu.rmsnorm_backward(
+    // The residual passes the upstream gradient through untouched alongside
+    // the branch gradient, so it rides in the norm's backward kernel.
+    let grad_residual = gpu.rmsnorm_backward(
         &cache.residual,
         &grad_normed,
         &cache.feed_forward_weight,
         &cache.feed_forward_inverse_rms,
         &mut grad_norms.slice_mut(feed_forward_slot * d_model..(feed_forward_slot + 1) * d_model),
+        grad_output,
+        true,
         rows,
         d_model,
     )?;
-    // The residual passes the upstream gradient through untouched alongside the
-    // branch gradient.
-    gpu.add(&mut grad_residual, grad_output, 0, rows * d_model)?;
 
     let grad_attention_normed = backward_attention(gpu, block, cache, &grad_residual, batch)?;
 
-    let mut grad_input = gpu.rmsnorm_backward(
+    let grad_input = gpu.rmsnorm_backward(
         &cache.input,
         &grad_attention_normed,
         &cache.attention_weight,
         &cache.attention_inverse_rms,
         &mut grad_norms.slice_mut(attention_slot * d_model..(attention_slot + 1) * d_model),
+        &grad_residual,
+        true,
         rows,
         d_model,
     )?;
-    gpu.add(&mut grad_input, &grad_residual, 0, rows * d_model)?;
 
     Ok(grad_input)
 }
@@ -3194,6 +3207,8 @@ mod tests {
                 &weight,
                 &inverse,
                 &mut grad_weight.slice_mut(..),
+                &device_grad,
+                false,
                 rows,
                 cols,
             )
