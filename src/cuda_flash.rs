@@ -58,15 +58,15 @@ __device__ __forceinline__ unsigned short bf16_bits(float f){
   u+=0x7fffu+((u>>16)&1u);
   return (unsigned short)(u>>16);
 }
-// The same narrow-or-wide store the fused kernels in `cuda_training` use: a
-// GEMM operand is held in BF16 whenever the block around it is. Written out
-// again here because this module is its own NVRTC translation unit.
-__device__ __forceinline__ void store_act(void*p,size_t i,float v,int narrow){
-  if(narrow)((unsigned short*)p)[i]=bf16_bits(v); else ((float*)p)[i]=v;
+// Every activation these kernels touch is BF16: `eligible` runs them only in
+// mixed precision, so the type is known at compile time rather than passed in.
+__device__ __forceinline__ float bf16_load(const unsigned short*p,size_t i){
+  return __uint_as_float((unsigned)p[i]<<16);
 }
-__device__ __forceinline__ float load_act(const void*p,size_t i,int narrow){
-  return narrow ? __uint_as_float((unsigned)((const unsigned short*)p)[i]<<16)
-                : ((const float*)p)[i];
+// Two adjacent BF16 elements as the 32-bit register an mma operand already is,
+// in one load and no conversion at all. `i` must be even.
+__device__ __forceinline__ unsigned bf16_pair(const unsigned short*p,size_t i){
+  return *(const unsigned*)(p+i);
 }
 __device__ __forceinline__ unsigned pack2(float lo,float hi){
   return (unsigned)bf16_bits(lo)|((unsigned)bf16_bits(hi)<<16);
@@ -88,12 +88,12 @@ __device__ __forceinline__ unsigned pack2(float lo,float hi){
 // time. `lse` is written in the same layout the three-kernel path used, so the
 // backward pass rebuilds the probabilities from it unchanged.
 extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
-    const float* __restrict__ qkv,
-    void* __restrict__ out,
+    const unsigned short* __restrict__ qkv,
+    unsigned short* __restrict__ out,
     float* __restrict__ lse,
     int seq_len, int qkv_width, int query_width,
     int key_base, int value_base, int group,
-    int lse_head_stride, float scale, int narrow)
+    int lse_head_stride, float scale)
 {
   extern __shared__ unsigned short smem[];
   unsigned short* ks = smem;                      // [key][dim]
@@ -111,18 +111,20 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
   // path did, and rounded to BF16 exactly as that path's tensor cores did.
   unsigned qf[4][4];
   {
-    const float* base = qkv + seq_base*(size_t)qkv_width + h*FA_D;
+    const size_t base = seq_base*(size_t)qkv_width + h*FA_D;
     #pragma unroll
     for (int kk=0; kk<4; ++kk) {
       int c = kk*16 + t*2;
       float a0=0.f,a1=0.f,a2=0.f,a3=0.f,a4=0.f,a5=0.f,a6=0.f,a7=0.f;
       if (row_a < seq_len) {
-        const float* p = base + (size_t)row_a*qkv_width;
-        a0=p[c]*scale; a1=p[c+1]*scale; a4=p[c+8]*scale; a5=p[c+9]*scale;
+        size_t p = base + (size_t)row_a*qkv_width;
+        a0=bf16_load(qkv,p+c)*scale;   a1=bf16_load(qkv,p+c+1)*scale;
+        a4=bf16_load(qkv,p+c+8)*scale; a5=bf16_load(qkv,p+c+9)*scale;
       }
       if (row_b < seq_len) {
-        const float* p = base + (size_t)row_b*qkv_width;
-        a2=p[c]*scale; a3=p[c+1]*scale; a6=p[c+8]*scale; a7=p[c+9]*scale;
+        size_t p = base + (size_t)row_b*qkv_width;
+        a2=bf16_load(qkv,p+c)*scale;   a3=bf16_load(qkv,p+c+1)*scale;
+        a6=bf16_load(qkv,p+c+8)*scale; a7=bf16_load(qkv,p+c+9)*scale;
       }
       qf[kk][0]=pack2(a0,a1); qf[kk][1]=pack2(a2,a3);
       qf[kk][2]=pack2(a4,a5); qf[kk][3]=pack2(a6,a7);
@@ -140,17 +142,20 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
   // Causal: query tile `qt` sees key tiles 0..qt and nothing beyond.
   for (int kt=0; kt<=qt; ++kt) {
     __syncthreads();
+    // One element a thread, not two: the value tile is stored transposed, and
+    // measured, the wider load does not pay for the extra shared-memory bank
+    // conflicts that come with it.
     for (int i = threadIdx.x; i < 64*FA_D; i += 128) {
       int r = i >> 6, c = i & 63;
       int key = kt*64 + r;
-      float kval = 0.f, vval = 0.f;
+      unsigned short kb = 0, vb = 0;
       if (key < seq_len) {
-        const float* p = qkv + (seq_base + key)*(size_t)qkv_width;
-        kval = p[key_base + kv + c];
-        vval = p[value_base + kv + c];
+        size_t p = (seq_base + key)*(size_t)qkv_width;
+        kb = qkv[p + key_base + kv + c];
+        vb = qkv[p + value_base + kv + c];
       }
-      ks[r*FA_ROW + c] = bf16_bits(kval);
-      vt[c*FA_ROW + r] = bf16_bits(vval);
+      ks[r*FA_ROW + c] = kb;
+      vt[c*FA_ROW + r] = vb;
     }
     __syncthreads();
 
@@ -246,11 +251,11 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
     int c = n*8 + t*2;
     if (row_a < seq_len) {
       size_t p = obase + (size_t)row_a*query_width + c;
-      store_act(out,p,acc[n][0]*inv_a,narrow); store_act(out,p+1,acc[n][1]*inv_a,narrow);
+      *(unsigned*)(out+p) = pack2(acc[n][0]*inv_a,acc[n][1]*inv_a);
     }
     if (row_b < seq_len) {
       size_t p = obase + (size_t)row_b*query_width + c;
-      store_act(out,p,acc[n][2]*inv_b,narrow); store_act(out,p+1,acc[n][3]*inv_b,narrow);
+      *(unsigned*)(out+p) = pack2(acc[n][2]*inv_b,acc[n][3]*inv_b);
     }
   }
   if (t == 0) {
@@ -263,10 +268,10 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
 // `delta` term the softmax backward needs. One warp per row, two dimensions a
 // lane, so both loads are contiguous.
 extern "C" __global__ void flash_attention_delta(
-    const void* __restrict__ out,
+    const unsigned short* __restrict__ out,
     const float* __restrict__ grad_out,
     float* __restrict__ delta,
-    int rows, int heads, int query_width, int delta_head_stride, int narrow)
+    int rows, int heads, int query_width, int delta_head_stride)
 {
   int lane = threadIdx.x & 31;
   int total = rows*heads;
@@ -275,7 +280,7 @@ extern "C" __global__ void flash_attention_delta(
     int h = warp / rows, r = warp % rows;
     size_t o = (size_t)r*query_width + h*FA_D;
     const float* g = grad_out + (size_t)r*query_width + h*FA_D;
-    float sum = load_act(out,o+lane,narrow)*g[lane] + load_act(out,o+lane+32,narrow)*g[lane+32];
+    float sum = bf16_load(out,o+lane)*g[lane] + bf16_load(out,o+lane+32)*g[lane+32];
     #pragma unroll
     for (int step=16; step; step>>=1) sum += __shfl_xor_sync(0xffffffff,sum,step);
     if (lane == 0) delta[(size_t)h*delta_head_stride + r] = sum;
@@ -288,11 +293,11 @@ extern "C" __global__ void flash_attention_delta(
 // shared memory: keys twice, once each way round, because the score matmul
 // wants them key-major and the query matmul wants them dimension-major.
 extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
-    const float* __restrict__ qkv,
+    const unsigned short* __restrict__ qkv,
     const float* __restrict__ grad_out,
     const float* __restrict__ lse,
     const float* __restrict__ delta,
-    float* __restrict__ grad_qkv,
+    unsigned short* __restrict__ grad_qkv,
     int seq_len, int qkv_width, int query_width,
     int key_base, int value_base, int group,
     int lse_head_stride, float scale)
@@ -313,7 +318,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
   unsigned qf[4][4], df[4][4];
   float lse_a=0.f, lse_b=0.f, del_a=0.f, del_b=0.f;
   {
-    const float* qbase = qkv + seq_base*(size_t)qkv_width + h*FA_D;
+    const size_t qbase = seq_base*(size_t)qkv_width + h*FA_D;
     const float* gbase = grad_out + seq_base*(size_t)query_width + h*FA_D;
     #pragma unroll
     for (int kk=0; kk<4; ++kk) {
@@ -321,14 +326,16 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
       float q0=0.f,q1=0.f,q2=0.f,q3=0.f,q4=0.f,q5=0.f,q6=0.f,q7=0.f;
       float d0=0.f,d1=0.f,d2=0.f,d3=0.f,d4=0.f,d5=0.f,d6=0.f,d7=0.f;
       if (row_a < seq_len) {
-        const float* p = qbase + (size_t)row_a*qkv_width;
-        q0=p[c]*scale; q1=p[c+1]*scale; q4=p[c+8]*scale; q5=p[c+9]*scale;
+        size_t p = qbase + (size_t)row_a*qkv_width;
+        q0=bf16_load(qkv,p+c)*scale;   q1=bf16_load(qkv,p+c+1)*scale;
+        q4=bf16_load(qkv,p+c+8)*scale; q5=bf16_load(qkv,p+c+9)*scale;
         const float* e = gbase + (size_t)row_a*query_width;
         d0=e[c]; d1=e[c+1]; d4=e[c+8]; d5=e[c+9];
       }
       if (row_b < seq_len) {
-        const float* p = qbase + (size_t)row_b*qkv_width;
-        q2=p[c]*scale; q3=p[c+1]*scale; q6=p[c+8]*scale; q7=p[c+9]*scale;
+        size_t p = qbase + (size_t)row_b*qkv_width;
+        q2=bf16_load(qkv,p+c)*scale;   q3=bf16_load(qkv,p+c+1)*scale;
+        q6=bf16_load(qkv,p+c+8)*scale; q7=bf16_load(qkv,p+c+9)*scale;
         const float* e = gbase + (size_t)row_b*query_width;
         d2=e[c]; d3=e[c+1]; d6=e[c+8]; d7=e[c+9];
       }
@@ -351,19 +358,19 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
 
   for (int ktile=0; ktile<=qt; ++ktile) {
     __syncthreads();
-    for (int i = threadIdx.x; i < 64*FA_D; i += 128) {
+    for (int i = threadIdx.x*2; i < 64*FA_D; i += 256) {
       int r = i >> 6, c = i & 63;
       int key = ktile*64 + r;
-      float kval = 0.f, vval = 0.f;
+      unsigned kw = 0, vw = 0;
       if (key < seq_len) {
-        const float* p = qkv + (seq_base + key)*(size_t)qkv_width;
-        kval = p[key_base + kv + c];
-        vval = p[value_base + kv + c];
+        size_t p = (seq_base + key)*(size_t)qkv_width;
+        kw = bf16_pair(qkv,p + key_base + kv + c);
+        vw = bf16_pair(qkv,p + value_base + kv + c);
       }
-      unsigned short kb = bf16_bits(kval);
-      ks[r*FA_ROW + c] = kb;
-      kt[c*FA_ROW + r] = kb;
-      vs[r*FA_ROW + c] = bf16_bits(vval);
+      *(unsigned*)(ks + r*FA_ROW + c) = kw;
+      kt[c*FA_ROW + r] = (unsigned short)kw;
+      kt[(c+1)*FA_ROW + r] = (unsigned short)(kw >> 16);
+      *(unsigned*)(vs + r*FA_ROW + c) = vw;
     }
     __syncthreads();
 
@@ -425,17 +432,17 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
     }
   }
 
-  float* obase = grad_qkv + seq_base*(size_t)qkv_width + h*FA_D;
+  const size_t obase = seq_base*(size_t)qkv_width + h*FA_D;
   #pragma unroll
   for (int n=0;n<8;++n) {
     int c = n*8 + t*2;
     if (row_a < seq_len) {
-      float* p = obase + (size_t)row_a*qkv_width;
-      p[c]=acc[n][0]*scale; p[c+1]=acc[n][1]*scale;
+      size_t p = obase + (size_t)row_a*qkv_width;
+      *(unsigned*)(grad_qkv+p+c) = pack2(acc[n][0]*scale,acc[n][1]*scale);
     }
     if (row_b < seq_len) {
-      float* p = obase + (size_t)row_b*qkv_width;
-      p[c]=acc[n][2]*scale; p[c+1]=acc[n][3]*scale;
+      size_t p = obase + (size_t)row_b*qkv_width;
+      *(unsigned*)(grad_qkv+p+c) = pack2(acc[n][2]*scale,acc[n][3]*scale);
     }
   }
 }
@@ -446,11 +453,11 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
 // the query head is what keeps grouped-query attention exact without atomics:
 // every query head that shares a key head is summed inside one block.
 extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
-    const float* __restrict__ qkv,
+    const unsigned short* __restrict__ qkv,
     const float* __restrict__ grad_out,
     const float* __restrict__ lse,
     const float* __restrict__ delta,
-    float* __restrict__ grad_qkv,
+    unsigned short* __restrict__ grad_qkv,
     int seq_len, int qkv_width, int query_width,
     int key_base, int value_base, int group,
     int lse_head_stride, float scale)
@@ -475,26 +482,26 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
   // every matmul below.
   unsigned kf[4][4], vf[4][4];
   {
-    const float* base = qkv + seq_base*(size_t)qkv_width + kvh*FA_D;
+    const size_t base = seq_base*(size_t)qkv_width + kvh*FA_D;
     #pragma unroll
     for (int kk=0; kk<4; ++kk) {
       int c = kk*16 + t*2;
-      float k0=0.f,k1=0.f,k2=0.f,k3=0.f,k4=0.f,k5=0.f,k6=0.f,k7=0.f;
-      float v0=0.f,v1=0.f,v2=0.f,v3=0.f,v4=0.f,v5=0.f,v6=0.f,v7=0.f;
+      kf[kk][0]=0; kf[kk][1]=0; kf[kk][2]=0; kf[kk][3]=0;
+      vf[kk][0]=0; vf[kk][1]=0; vf[kk][2]=0; vf[kk][3]=0;
       if (key_a < seq_len) {
-        const float* p = base + (size_t)key_a*qkv_width;
-        k0=p[key_base+c]; k1=p[key_base+c+1]; k4=p[key_base+c+8]; k5=p[key_base+c+9];
-        v0=p[value_base+c]; v1=p[value_base+c+1]; v4=p[value_base+c+8]; v5=p[value_base+c+9];
+        size_t p = base + (size_t)key_a*qkv_width;
+        kf[kk][0]=bf16_pair(qkv,p+key_base+c);
+        kf[kk][2]=bf16_pair(qkv,p+key_base+c+8);
+        vf[kk][0]=bf16_pair(qkv,p+value_base+c);
+        vf[kk][2]=bf16_pair(qkv,p+value_base+c+8);
       }
       if (key_b < seq_len) {
-        const float* p = base + (size_t)key_b*qkv_width;
-        k2=p[key_base+c]; k3=p[key_base+c+1]; k6=p[key_base+c+8]; k7=p[key_base+c+9];
-        v2=p[value_base+c]; v3=p[value_base+c+1]; v6=p[value_base+c+8]; v7=p[value_base+c+9];
+        size_t p = base + (size_t)key_b*qkv_width;
+        kf[kk][1]=bf16_pair(qkv,p+key_base+c);
+        kf[kk][3]=bf16_pair(qkv,p+key_base+c+8);
+        vf[kk][1]=bf16_pair(qkv,p+value_base+c);
+        vf[kk][3]=bf16_pair(qkv,p+value_base+c+8);
       }
-      kf[kk][0]=pack2(k0,k1); kf[kk][1]=pack2(k2,k3);
-      kf[kk][2]=pack2(k4,k5); kf[kk][3]=pack2(k6,k7);
-      vf[kk][0]=pack2(v0,v1); vf[kk][1]=pack2(v2,v3);
-      vf[kk][2]=pack2(v4,v5); vf[kk][3]=pack2(v6,v7);
     }
   }
 
@@ -507,17 +514,24 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
   for (int hq = kvh*group; hq < (kvh+1)*group; ++hq) {
     for (int it = jt; it < tiles; ++it) {
       __syncthreads();
-      for (int i = threadIdx.x; i < 64*FA_D; i += 128) {
+      for (int i = threadIdx.x*2; i < 64*FA_D; i += 256) {
         int r = i >> 6, c = i & 63;
         int q = it*64 + r;
-        float qv = 0.f, gv = 0.f;
+        unsigned qw = 0;
+        float g0 = 0.f, g1 = 0.f;
         if (q < seq_len) {
-          qv = qkv[(seq_base+q)*(size_t)qkv_width + hq*FA_D + c] * scale;
-          gv = grad_out[(seq_base+q)*(size_t)query_width + hq*FA_D + c];
+          qw = bf16_pair(qkv,(seq_base+q)*(size_t)qkv_width + hq*FA_D + c);
+          float2 gp = *(const float2*)(grad_out + (seq_base+q)*(size_t)query_width + hq*FA_D + c);
+          g0 = gp.x; g1 = gp.y;
         }
-        unsigned short qb = bf16_bits(qv), gb = bf16_bits(gv);
-        qs[r*FA_ROW + c] = qb;  qtr[c*FA_ROW + r] = qb;
-        gs[r*FA_ROW + c] = gb;  gtr[c*FA_ROW + r] = gb;
+        // The queries are stored unscaled, so the scores carry the scale
+        // instead: one multiply per score rather than one per element here.
+        *(unsigned*)(qs + r*FA_ROW + c) = qw;
+        qtr[c*FA_ROW + r] = (unsigned short)qw;
+        qtr[(c+1)*FA_ROW + r] = (unsigned short)(qw >> 16);
+        unsigned short b0 = bf16_bits(g0), b1 = bf16_bits(g1);
+        gs[r*FA_ROW + c] = b0;  gs[r*FA_ROW + c + 1] = b1;
+        gtr[c*FA_ROW + r] = b0; gtr[(c+1)*FA_ROW + r] = b1;
       }
       if (threadIdx.x < 64) {
         int q = it*64 + threadIdx.x;
@@ -553,10 +567,10 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
         int q0 = it*64 + col, q1 = q0 + 1;
         float l0 = lse_s[col], l1 = lse_s[col+1];
         float d0 = del_s[col], d1 = del_s[col+1];
-        float p0 = (q0 >= key_a && q0 < seq_len) ? __expf(st[n][0]-l0) : 0.f;
-        float p1 = (q1 >= key_a && q1 < seq_len) ? __expf(st[n][1]-l1) : 0.f;
-        float p2 = (q0 >= key_b && q0 < seq_len) ? __expf(st[n][2]-l0) : 0.f;
-        float p3 = (q1 >= key_b && q1 < seq_len) ? __expf(st[n][3]-l1) : 0.f;
+        float p0 = (q0 >= key_a && q0 < seq_len) ? __expf(st[n][0]*scale-l0) : 0.f;
+        float p1 = (q1 >= key_a && q1 < seq_len) ? __expf(st[n][1]*scale-l1) : 0.f;
+        float p2 = (q0 >= key_b && q0 < seq_len) ? __expf(st[n][2]*scale-l0) : 0.f;
+        float p3 = (q1 >= key_b && q1 < seq_len) ? __expf(st[n][3]*scale-l1) : 0.f;
         st[n][0]=p0; st[n][1]=p1; st[n][2]=p2; st[n][3]=p3;
         dpt[n][0]=p0*(dpt[n][0]-d0); dpt[n][1]=p1*(dpt[n][1]-d1);
         dpt[n][2]=p2*(dpt[n][2]-d0); dpt[n][3]=p3*(dpt[n][3]-d1);
@@ -587,19 +601,19 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
     }
   }
 
-  float* base = grad_qkv + seq_base*(size_t)qkv_width + kvh*FA_D;
+  const size_t base = seq_base*(size_t)qkv_width + kvh*FA_D;
   #pragma unroll
   for (int n=0;n<8;++n) {
     int c = n*8 + t*2;
     if (key_a < seq_len) {
-      float* p = base + (size_t)key_a*qkv_width;
-      p[key_base+c]=dk[n][0]; p[key_base+c+1]=dk[n][1];
-      p[value_base+c]=dv[n][0]; p[value_base+c+1]=dv[n][1];
+      size_t p = base + (size_t)key_a*qkv_width;
+      *(unsigned*)(grad_qkv+p+key_base+c) = pack2(dk[n][0]*scale,dk[n][1]*scale);
+      *(unsigned*)(grad_qkv+p+value_base+c) = pack2(dv[n][0],dv[n][1]);
     }
     if (key_b < seq_len) {
-      float* p = base + (size_t)key_b*qkv_width;
-      p[key_base+c]=dk[n][2]; p[key_base+c+1]=dk[n][3];
-      p[value_base+c]=dv[n][2]; p[value_base+c+1]=dv[n][3];
+      size_t p = base + (size_t)key_b*qkv_width;
+      *(unsigned*)(grad_qkv+p+key_base+c) = pack2(dk[n][2]*scale,dk[n][3]*scale);
+      *(unsigned*)(grad_qkv+p+value_base+c) = pack2(dv[n][2],dv[n][3]);
     }
   }
 }

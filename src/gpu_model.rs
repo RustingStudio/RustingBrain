@@ -247,7 +247,9 @@ struct BlockCache {
     attention_normed: Act,
     /// Query, key and value in one buffer, three slices of every row, because
     /// they are produced by one GEMM against the three weights packed together.
-    qkv: CudaSlice<f32>,
+    /// Narrow whenever the fused attention kernels run, because they are the
+    /// only readers and they rounded it to BF16 on every tile load anyway.
+    qkv: Act,
     /// Those three weights packed, which the input gradient reads again in the
     /// backward pass.
     qkv_weights: Act,
@@ -478,10 +480,22 @@ impl Gpu<'_> {
     /// compare against the host path.
     #[cfg(test)]
     fn download_act(&self, source: &Act) -> Result<Vec<f32>, NetworkError> {
-        self.context
+        if !source.is_narrow() {
+            return self
+                .context
+                .stream
+                .clone_dtoh(&source.wide())
+                .map_err(cuda_err("device to host copy"));
+        }
+        let bytes = self
+            .context
             .stream
-            .clone_dtoh(&source.wide())
-            .map_err(cuda_err("device to host copy"))
+            .clone_dtoh(&source.all())
+            .map_err(cuda_err("device to host copy"))?;
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|half| f32::from_bits(u32::from(u16::from_le_bytes([half[0], half[1]])) << 16))
+            .collect())
     }
 
     fn upload_signed(&self, data: &[i32]) -> Result<CudaSlice<i32>, NetworkError> {
@@ -729,7 +743,7 @@ impl Gpu<'_> {
     #[allow(clippy::too_many_arguments)]
     fn rope(
         &self,
-        tensor: &mut CudaSlice<f32>,
+        tensor: &mut Act,
         tables: &DeviceRope,
         rows: usize,
         heads: usize,
@@ -740,11 +754,12 @@ impl Gpu<'_> {
         offset: usize,
     ) -> Result<(), NetworkError> {
         let elements = rows * heads * head_dim / 2;
+        let narrow = tensor.flag();
         unsafe {
             self.context
                 .stream
                 .launch_builder(&self.context.model.rope)
-                .arg(tensor)
+                .arg(tensor.destination())
                 .arg(&tables.cos)
                 .arg(&tables.sin)
                 .arg(&(rows as i32))
@@ -754,6 +769,7 @@ impl Gpu<'_> {
                 .arg(&direction)
                 .arg(&(width as i32))
                 .arg(&(offset as i32))
+                .arg(&narrow)
                 .launch(cfg(elements))
                 .map_err(cuda_err("RoPE kernel"))?;
         }
@@ -814,13 +830,13 @@ impl Gpu<'_> {
     fn flash_attention(
         &self,
         flash: &crate::cuda_flash::FlashKernels,
-        qkv: &CudaSlice<f32>,
+        qkv: &Act,
         merged: &mut Act,
         log_sum_exp: &mut CudaSlice<f32>,
         shape: FlashShape,
         scale: f32,
     ) -> Result<(), NetworkError> {
-        let narrow = merged.flag();
+        debug_assert!(qkv.is_narrow() && merged.is_narrow());
         let config = cudarc::driver::LaunchConfig {
             grid_dim: (
                 shape.seq_len.div_ceil(crate::cuda_flash::TILE) as u32,
@@ -834,7 +850,7 @@ impl Gpu<'_> {
             self.context
                 .stream
                 .launch_builder(&flash.forward)
-                .arg(qkv)
+                .arg(&qkv.all())
                 .arg(merged.destination())
                 .arg(log_sum_exp)
                 .arg(&(shape.seq_len as i32))
@@ -845,7 +861,6 @@ impl Gpu<'_> {
                 .arg(&(shape.group as i32))
                 .arg(&(shape.rows as i32))
                 .arg(&scale)
-                .arg(&narrow)
                 .launch(config)
                 .map_err(cuda_err("fused attention kernel"))?;
         }
@@ -865,12 +880,12 @@ impl Gpu<'_> {
     fn flash_attention_backward(
         &self,
         flash: &crate::cuda_flash::FlashKernels,
-        qkv: &CudaSlice<f32>,
+        qkv: &Act,
         merged: &Act,
         grad_merged: &CudaSlice<f32>,
         log_sum_exp: &CudaSlice<f32>,
         delta: &mut CudaSlice<f32>,
-        grad_qkv: &mut CudaSlice<f32>,
+        grad_qkv: &mut Act,
         shape: FlashShape,
         scale: f32,
     ) -> Result<(), NetworkError> {
@@ -887,13 +902,16 @@ impl Gpu<'_> {
                 .arg(&(shape.heads as i32))
                 .arg(&(shape.query_width as i32))
                 .arg(&(shape.rows as i32))
-                .arg(&merged.flag())
                 .launch(warp_per_row_grid(warps))
                 .map_err(cuda_err("attention delta kernel"))?;
         }
 
         let delta = &*delta;
-        let grad_qkv = &*grad_qkv;
+        // Both kernels write disjoint columns of `grad_qkv`, so they take it
+        // as a shared view rather than one after the other.
+        debug_assert!(qkv.is_narrow() && grad_qkv.is_narrow());
+        let qkv = qkv.all();
+        let grad_qkv = grad_qkv.all();
         let launch = |function, grid_y, shared_mem_bytes| {
             let config = cudarc::driver::LaunchConfig {
                 grid_dim: (tiles, grid_y, shape.sequences as u32),
@@ -904,11 +922,11 @@ impl Gpu<'_> {
                 self.context
                     .stream
                     .launch_builder(function)
-                    .arg(qkv)
+                    .arg(&qkv)
                     .arg(grad_merged)
                     .arg(log_sum_exp)
                     .arg(&*delta)
-                    .arg(&*grad_qkv)
+                    .arg(&grad_qkv)
                     .arg(&(shape.seq_len as i32))
                     .arg(&(shape.qkv_width as i32))
                     .arg(&(shape.query_width as i32))
@@ -1223,6 +1241,7 @@ impl Gpu<'_> {
             weights,
             inner,
             narrow,
+            false,
             out,
             units,
             rows,
@@ -1230,6 +1249,40 @@ impl Gpu<'_> {
             inner,
             1.0,
             beta,
+        )
+    }
+
+    /// [`Gpu::linear_packed`] straight into a narrow result.
+    ///
+    /// Only for a result whose readers all take narrow input: cuBLAS writes
+    /// BF16 itself, so there is no cast kernel and no FP32 round trip.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_packed_act(
+        &self,
+        weights: &CudaView<'_, u8>,
+        units: usize,
+        inner: usize,
+        x: &CudaView<'_, u8>,
+        narrow: bool,
+        out: &mut Act,
+        rows: usize,
+    ) -> Result<(), NetworkError> {
+        let out_narrow = out.is_narrow();
+        act_rhs_transposed(
+            self.context,
+            x,
+            inner,
+            weights,
+            inner,
+            narrow,
+            out_narrow,
+            out.destination(),
+            units,
+            rows,
+            units,
+            inner,
+            1.0,
+            0.0,
         )
     }
 
@@ -1533,6 +1586,14 @@ fn forward_block(
     // width of the projection being read.
     let kv_width = kv_heads * head_dim;
     let qkv_width = query_width + 2 * kv_width;
+    // Only the fused kernels read a narrow `qkv`; the batched-GEMM fallback
+    // below wants FP32, so the projection's output type follows the same
+    // choice the attention path does.
+    let fused = gpu
+        .context
+        .flash
+        .as_ref()
+        .filter(|_| crate::cuda_flash::eligible(gpu.context.mixed_precision, head_dim));
     let qkv_weights = gpu.pack(
         &[
             device_of(&attention.query)?,
@@ -1541,8 +1602,8 @@ fn forward_block(
         ],
         narrow,
     )?;
-    let mut qkv = gpu.uninit(rows * qkv_width)?;
-    gpu.linear_packed(
+    let mut qkv = gpu.act(rows * qkv_width, narrow && fused.is_some())?;
+    gpu.linear_packed_act(
         &qkv_weights.all(),
         qkv_width,
         d_model,
@@ -1550,7 +1611,6 @@ fn forward_block(
         narrow,
         &mut qkv,
         rows,
-        0.0,
     )?;
     let key_base = query_width;
     let value_base = query_width + kv_width;
@@ -1586,11 +1646,6 @@ fn forward_block(
         key_base,
         value_base,
     };
-    let fused = gpu
-        .context
-        .flash
-        .as_ref()
-        .filter(|_| crate::cuda_flash::eligible(gpu.context.mixed_precision, head_dim));
     let mut log_sum_exp = gpu.uninit(heads * rows)?;
     // Only the fused kernel knows how to write a narrow `merged`; the batched
     // GEMM the fallback path ends with produces FP32.
@@ -1599,6 +1654,7 @@ fn forward_block(
         gpu.flash_attention(flash, &qkv, &mut merged, &mut log_sum_exp, shape, scale)?;
     } else {
         let mut wide_merged = merged.wide_mut();
+        let qkv = qkv.wide();
         let block_size = seq_len * seq_len;
         let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
         for head in 0..heads {
@@ -2547,12 +2603,14 @@ fn backward_attention(
     // The fused path, where the device can take it: the same three kernels
     // that replaced the forward softmax replace six passes over two
     // `[seq_len, seq_len]` buffers and four batched GEMMs here.
-    let fused = gpu
-        .context
-        .flash
-        .as_ref()
-        .filter(|_| crate::cuda_flash::eligible(gpu.context.mixed_precision, head_dim));
-    let mut grad_qkv = if let Some(flash) = fused {
+    // A narrow `qkv` is one only the fused kernels can read, and they write
+    // one in turn, so the forward pass's choice decides the path here.
+    let fused = gpu.context.flash.as_ref().filter(|_| cache.qkv.is_narrow());
+    // The backward kernels read `qkv` and write `grad_qkv` in the same layout,
+    // so the gradient is narrow exactly when the forward projection was.
+    let narrow_qkv = cache.qkv.is_narrow();
+    let mut grad_qkv = gpu.act(rows * qkv_width, narrow_qkv)?;
+    if let Some(flash) = fused {
         let shape = FlashShape {
             rows,
             seq_len,
@@ -2568,7 +2626,6 @@ fn backward_attention(
         // Every column of `grad_qkv` is written rather than accumulated: the
         // query gradient by the query-tile kernel, the key and value gradients
         // by the key-tile one, so there is nothing to clear first.
-        let mut grad_qkv = gpu.uninit(rows * qkv_width)?;
         gpu.flash_attention_backward(
             flash,
             &cache.qkv,
@@ -2580,17 +2637,17 @@ fn backward_attention(
             shape,
             scale,
         )?;
-        grad_qkv
     } else {
         // The forward pass kept only the log-sum-exp, so the probabilities are
         // rebuilt here: one batched GEMM per head for the scores, then one
         // exponential per element. The matrix lives for this block's backward pass
         // alone rather than for the whole depth of the model.
+        let qkv = cache.qkv.wide();
         let mut probabilities = gpu.uninit(heads * sequences * block_size)?;
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
-            let query = cache.qkv.slice(head * head_dim..);
-            let key = cache.qkv.slice(key_base + kv_base..);
+            let query = qkv.slice(head * head_dim..);
+            let key = qkv.slice(key_base + kv_base..);
             let mut scores = probabilities.slice_mut(head * sequences * block_size..);
             gemm_rhs_transposed_batched(
                 gpu.context,
@@ -2625,11 +2682,15 @@ fn backward_attention(
         // The query slice is overwritten head by head, but the key and value
         // slices accumulate over every query head in a group, so the whole fused
         // buffer starts at zero.
-        let mut grad_qkv = gpu.zeros(rows * qkv_width)?;
+        let mut grad_qkv = grad_qkv.wide_mut();
+        gpu.context
+            .stream
+            .memset_zeros(&mut grad_qkv)
+            .map_err(cuda_err("gradient clear"))?;
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
             let upstream = grad_merged.slice(head * head_dim..);
-            let value = cache.qkv.slice(value_base + kv_base..);
+            let value = qkv.slice(value_base + kv_base..);
             let mut scores = grad_scores.slice_mut(head * sequences * block_size..);
             gemm_rhs_transposed_batched(
                 gpu.context,
@@ -2682,7 +2743,7 @@ fn backward_attention(
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
             let scores = grad_scores.slice(head * sequences * block_size..);
-            let key = cache.qkv.slice(key_base + kv_base..);
+            let key = qkv.slice(key_base + kv_base..);
             let mut grad_query = grad_qkv.slice_mut(head * head_dim..);
             gemm_plain_batched(
                 gpu.context,
@@ -2703,7 +2764,7 @@ fn backward_attention(
                 seq_len * qkv_width,
             )?;
 
-            let query = cache.qkv.slice(head * head_dim..);
+            let query = qkv.slice(head * head_dim..);
             let mut grad_key = grad_qkv.slice_mut(key_base + kv_base..);
             gemm_lhs_transposed_batched(
                 gpu.context,
@@ -2724,9 +2785,7 @@ fn backward_attention(
                 seq_len * qkv_width,
             )?;
         }
-
-        grad_qkv
-    };
+    }
 
     let tables = gpu.rope_tables(&attention.rope)?;
     gpu.rope(
@@ -2752,10 +2811,14 @@ fn backward_attention(
         key_base,
     )?;
 
-    // RoPE rotates `grad_qkv` in place in FP32, so the narrowing happens after
-    // it rather than inside the attention backward kernels.
+    // The fused kernels already wrote a narrow gradient; the fallback path's
+    // batched GEMMs produce FP32, so that one still pays for a cast.
     let narrow = cache.qkv_weights.is_narrow();
-    let grad_qkv = gpu.narrowed(&grad_qkv.slice(..), rows * qkv_width, narrow)?;
+    let grad_qkv = if narrow == narrow_qkv {
+        grad_qkv
+    } else {
+        gpu.narrowed(&grad_qkv.wide(), rows * qkv_width, narrow)?
+    };
     let mut grad_input = gpu.uninit(rows * d_model)?;
     gpu.linear_packed_backward_input(
         &cache.qkv_weights.all(),
@@ -3159,49 +3222,63 @@ mod tests {
         let gpu = Gpu { context: &context };
         let (sequences, seq_len, heads, head_dim) = (2, 3, 2, 4);
         let rows = sequences * seq_len;
+        let width = heads * head_dim;
 
         let rope = Rope::new(head_dim, 16, 10_000.0).unwrap();
-        let mut host = Matrix::from_vec(rows, heads * head_dim, ramp(rows * heads * head_dim));
-        let mut device = gpu.upload(&host.data).unwrap();
         let tables = gpu.rope_tables(&rope).unwrap();
+        // The kernel rotates in place in whichever precision the buffer holds,
+        // so both layouts run here; BF16 keeps eight mantissa bits, hence the
+        // wider tolerance.
+        for (narrow, tolerance) in [(false, 1e-5), (true, 1e-2)] {
+            let mut host = Matrix::from_vec(rows, width, ramp(rows * width));
+            let wide = gpu.upload(&host.data).unwrap();
+            let mut device = gpu
+                .narrowed(&wide.slice(..), rows * width, narrow)
+                .unwrap();
 
-        gpu.rope(
-            &mut device,
-            &tables,
-            rows,
-            heads,
-            head_dim,
-            seq_len,
-            1.0,
-            heads * head_dim,
-            0,
-        )
-        .unwrap();
-        rope.apply_batched(&mut host, heads, seq_len).unwrap();
-        assert_close("rope", &gpu.download(&device).unwrap(), &host.data, 1e-5);
-
-        // The inverse is the same kernel with the opposite sign, which is what
-        // the backward pass uses.
-        gpu.rope(
-            &mut device,
-            &tables,
-            rows,
-            heads,
-            head_dim,
-            seq_len,
-            -1.0,
-            heads * head_dim,
-            0,
-        )
-        .unwrap();
-        rope.apply_inverse_batched(&mut host, heads, seq_len)
+            gpu.rope(
+                &mut device,
+                &tables,
+                rows,
+                heads,
+                head_dim,
+                seq_len,
+                1.0,
+                width,
+                0,
+            )
             .unwrap();
-        assert_close(
-            "rope inverse",
-            &gpu.download(&device).unwrap(),
-            &host.data,
-            1e-5,
-        );
+            rope.apply_batched(&mut host, heads, seq_len).unwrap();
+            assert_close(
+                "rope",
+                &gpu.download_act(&device).unwrap(),
+                &host.data,
+                tolerance,
+            );
+
+            // The inverse is the same kernel with the opposite sign, which is
+            // what the backward pass uses.
+            gpu.rope(
+                &mut device,
+                &tables,
+                rows,
+                heads,
+                head_dim,
+                seq_len,
+                -1.0,
+                width,
+                0,
+            )
+            .unwrap();
+            rope.apply_inverse_batched(&mut host, heads, seq_len)
+                .unwrap();
+            assert_close(
+                "rope inverse",
+                &gpu.download_act(&device).unwrap(),
+                &host.data,
+                tolerance,
+            );
+        }
     }
 
     #[test]

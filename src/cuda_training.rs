@@ -49,6 +49,9 @@ __device__ __forceinline__ void store_act4(void*p,size_t i,float4 v,int narrow){
   if(narrow){ushort4 o;o.x=f32_to_bf16(v.x);o.y=f32_to_bf16(v.y);o.z=f32_to_bf16(v.z);o.w=f32_to_bf16(v.w);((ushort4*)p)[i]=o;}
   else ((float4*)p)[i]=v;
 }
+__device__ __forceinline__ float load_act(const void*p,size_t i,int narrow){
+  return narrow ? __uint_as_float((unsigned)((const unsigned short*)p)[i]<<16) : ((const float*)p)[i];
+}
 // `dst = src`, narrowed or not, for an operand whose producer is a cuBLAS call
 // rather than one of the kernels above.
 extern "C" __global__ void cast_act(void*dst,const float*src,int n,int narrow){
@@ -119,7 +122,7 @@ extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const flo
 // `width` and `off` locate the rotated block inside a wider row: queries and
 // keys are two slices of one fused projection output, so they share a row
 // stride and differ only in where they start.
-extern "C" __global__ void rope_rotate(float*x,const float*cs,const float*sn,int rows,int heads,int head_dim,int seq_len,float dir,int width,int off){int half=head_dim/2;int total=rows*heads*half;int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;int ch=i%half;int h=(i/half)%heads;int r=i/(half*heads);int t=(r%seq_len)*half+ch;float c=cs[t];float s=dir*sn[t];size_t base=(size_t)r*width+off+(size_t)h*head_dim+ch;float lo=x[base];float hi=x[base+half];x[base]=lo*c-hi*s;x[base+half]=hi*c+lo*s;}
+extern "C" __global__ void rope_rotate(void*x,const float*cs,const float*sn,int rows,int heads,int head_dim,int seq_len,float dir,int width,int off,int narrow){int half=head_dim/2;int total=rows*heads*half;int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;int ch=i%half;int h=(i/half)%heads;int r=i/(half*heads);int t=(r%seq_len)*half+ch;float c=cs[t];float s=dir*sn[t];size_t base=(size_t)r*width+off+(size_t)h*head_dim+ch;float lo=load_act(x,base,narrow);float hi=load_act(x,base+half,narrow);store_act(x,base,lo*c-hi*s,narrow);store_act(x,base+half,hi*c+lo*s,narrow);}
 // Attention rows are short (one per query position, and only the positions up
 // to it are visible), so a whole block per row would leave most of its threads
 // idle. One warp per row instead, reducing through shuffles with no shared
