@@ -294,6 +294,11 @@ pub struct DeviceParam {
     value: CudaSlice<f32>,
     /// `-dL/dw`, see the module documentation.
     negated_grad: CudaSlice<f32>,
+    /// Whether anything has written `negated_grad` since the last optimizer
+    /// step. A step leaves the buffer holding its stale gradient rather than
+    /// zeroing it, because the first writer of the next step can overwrite it;
+    /// that spares the run a pass over every parameter once per step.
+    grad_dirty: bool,
     moment1: CudaSlice<f32>,
     moment2: CudaSlice<f32>,
 }
@@ -345,6 +350,7 @@ impl Clone for DeviceParam {
             cols: self.cols,
             value: take(0),
             negated_grad: take(1),
+            grad_dirty: self.grad_dirty,
             moment1: take(2),
             moment2: take(3),
         }
@@ -359,6 +365,7 @@ impl DeviceParam {
             cols: value.cols,
             value: context.upload(value)?,
             negated_grad: context.zeros(len)?,
+            grad_dirty: false,
             moment1: context.zeros(len)?,
             moment2: context.zeros(len)?,
             context,
@@ -386,6 +393,26 @@ impl DeviceParam {
     /// uses `alpha = -1.0`.
     pub(crate) fn negated_grad_mut(&mut self) -> &mut CudaSlice<f32> {
         &mut self.negated_grad
+    }
+
+    /// The `beta` the next writer of `negated_grad` should use, and a claim on
+    /// being that writer: zero while the buffer still holds the last step's
+    /// gradient, so the writer overwrites it, and one for everyone after.
+    pub(crate) fn grad_beta(&mut self) -> f32 {
+        f32::from(u8::from(std::mem::replace(&mut self.grad_dirty, true)))
+    }
+
+    /// Zeroes `negated_grad` for a caller that can only accumulate into it,
+    /// such as a scatter of atomic adds. Does nothing once the buffer holds
+    /// this step's gradient.
+    pub(crate) fn clear_grad(&mut self) -> Result<(), NetworkError> {
+        if std::mem::replace(&mut self.grad_dirty, true) {
+            return Ok(());
+        }
+        self.context
+            .stream
+            .memset_zeros(&mut self.negated_grad)
+            .map_err(cuda_err("gradient reset"))
     }
 
     pub(crate) fn download_value(&self, target: &mut Matrix) -> Result<(), NetworkError> {
@@ -416,6 +443,10 @@ impl DeviceParam {
 
     /// The plain `dL/dw`, negating the device convention on the way out.
     pub(crate) fn download_grad(&self, target: &mut Matrix) -> Result<(), NetworkError> {
+        if !self.grad_dirty {
+            target.zeros();
+            return Ok(());
+        }
         self.context.download(&self.negated_grad, target)?;
         for slot in &mut target.data {
             *slot = -*slot;
@@ -424,12 +455,7 @@ impl DeviceParam {
     }
 
     pub(crate) fn zero_grad(&mut self) {
-        let result = self
-            .context
-            .stream
-            .memset_zeros(&mut self.negated_grad)
-            .map_err(cuda_err("gradient reset"));
-        self.context.guard(result, ());
+        self.grad_dirty = false;
     }
 
     /// `output[tokens, rows] = input[tokens, cols] . value^T`.
@@ -489,6 +515,7 @@ impl DeviceParam {
         let result = (|| {
             let device_grad_output = self.context.upload(grad_output)?;
             let device_input = self.context.upload(input)?;
+            let beta = self.grad_beta();
             gemm_lhs_transposed(
                 &self.context,
                 &device_grad_output,
@@ -501,7 +528,7 @@ impl DeviceParam {
                 self.rows,
                 self.cols,
                 -1.0,
-                1.0,
+                beta,
             )
         })();
         self.context.guard(result, ());
@@ -546,6 +573,7 @@ impl DeviceParam {
                 .clone_htod(&ids.to_vec())
                 .map_err(cuda_err("host to device copy"))?;
             let device_grad = self.context.upload(grad_output)?;
+            self.clear_grad()?;
             let elements = ids.len() * self.cols;
             unsafe {
                 self.context
@@ -568,6 +596,9 @@ impl DeviceParam {
     pub(crate) fn step(&mut self, optimizer: &Optimizer, step: usize, scale: f32) {
         let elements = self.rows * self.cols;
         let result = (|| -> Result<(), NetworkError> {
+            // A parameter that took no gradient this step still takes a step,
+            // on its moments alone, so the stale buffer has to become zeros.
+            self.clear_grad()?;
             if scale != 1.0 {
                 unsafe {
                     self.context
@@ -622,10 +653,8 @@ impl DeviceParam {
                     }
                 }
             }
-            self.context
-                .stream
-                .memset_zeros(&mut self.negated_grad)
-                .map_err(cuda_err("gradient reset"))
+            self.grad_dirty = false;
+            Ok(())
         })();
         self.context.guard(result, ());
     }
