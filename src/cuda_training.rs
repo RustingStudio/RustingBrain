@@ -100,19 +100,24 @@ extern "C" __global__ void rmsnorm_fwd(void*out,float*inv,const float*x,const fl
 // floats, so the scale gradient accumulates per block and lands in `gw` with
 // one atomic per column instead of one per element. A model wide enough to
 // overflow shared memory falls back to the direct atomic.
-extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const float*gy,const float*w,const float*inv,int rows,int cols,int use_smem){
+extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const float*gy,const float*w,const float*inv,int rows,int cols,int use_smem,const float*res,int add_res){
   extern __shared__ float acc[];
   __shared__ float red[ROW_THREADS];int tid=threadIdx.x;
   if(use_smem)for(int c=tid;c<cols;c+=ROW_THREADS)acc[c]=0.f;
   __syncthreads();
   for(int r=blockIdx.x;r<rows;r+=gridDim.x){
-    const float*src=x+(size_t)r*cols;const float*up=gy+(size_t)r*cols;float t=inv[r];
+    size_t base=(size_t)r*cols;
+    const float*src=x+base;const float*up=gy+base;float t=inv[r];
     float proj=0.f;for(int c=tid;c<cols;c+=ROW_THREADS)proj+=up[c]*w[c]*src[c];
     proj=row_sum(proj,red);
     float shared=proj*t*t*t/(float)cols;
-    float*dst=gx+(size_t)r*cols;
+    float*dst=gx+base;
     for(int c=tid;c<cols;c+=ROW_THREADS){
-      dst[c]=up[c]*w[c]*t-src[c]*shared;
+      float g_in=up[c]*w[c]*t-src[c]*shared;
+      // The residual carries the upstream gradient past the branch, so it is
+      // one more addend here rather than a separate pass over the whole tensor.
+      if(add_res)g_in+=res[base+c];
+      dst[c]=g_in;
       float g=up[c]*src[c]*t;
       if(use_smem)acc[c]+=g;else atomicAdd(&gw[c],g);
     }
