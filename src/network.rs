@@ -1,3 +1,9 @@
+//! Dense feed-forward networks: layers, the builder, and the training loop.
+//!
+//! This is the [`Network`] side of the crate, for tabular regression and
+//! classification. The transformer side starts at
+//! [`TransformerLm`](crate::TransformerLm).
+
 use crate::activations::Activation;
 use crate::dataset::Dataset;
 use crate::losses::Loss;
@@ -479,6 +485,12 @@ impl Network {
         Ok(self.forward_internal(input).0)
     }
 
+    /// [`Network::predict`] for callers that have already checked the shape.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `input` is not exactly [`Network::input_size`] long. Use
+    /// `predict` for anything reading input the program did not construct.
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
         self.predict(input).expect("invalid input shape")
     }

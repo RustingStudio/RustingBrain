@@ -18,5 +18,19 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo check --examples
-      - run: cargo check --features onnx
-      - run: cargo check --features cuda
+      - run: cargo check --all-targets --features onnx
+      - run: cargo check --all-targets --features cuda
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `rust-version` in Cargo.toml is a promise to anyone on an older
+      # toolchain. Stable alone never checks it, and a transitive dependency
+      # can raise its own MSRV in a patch release, so this job is the only
+      # thing that catches the break before a user does.
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+      - run: cargo check --locked --all-targets --features onnx
+      - run: cargo check --locked --all-targets --features cuda

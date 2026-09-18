@@ -26,22 +26,18 @@ cargo run --example cuda_training_smoke --features cuda
 
 The training smoke example runs the CUDA doctor (driver, cuBLAS, kernels,
 memory, allocation) and then trains a small MSE regression model. On a 12 GiB
-RTX 3060, configure RustingTrade with `memory_budget_mib: 8192`.
+RTX 3060, leave around 3 GiB for the desktop and the driver: pass a budget of
+about `9000` MiB to `to_cuda`, or set `memory_budget_mib: 8192` on a
+`TrainConfig` for a dense network.
 
-The `cuda` feature currently points to CUDA 13.1 bindings. Other binding
-versions are available:
+`cuda` is the only feature you need. It binds the CUDA 13.1 runtime and loads
+it dynamically, so the same build runs against any driver new enough to
+provide it.
 
-```bash
-cargo check --features cuda-11-8
-cargo check --features cuda-12-0
-cargo check --features cuda-12-4
-cargo check --features cuda-12-6
-cargo check --features cuda-12-8
-cargo check --features cuda-13-0
-cargo check --features cuda-13-1
-```
-
-Use the closest version at or below the CUDA runtime installed on the machine.
+The names `cuda-11-8`, `cuda-12-0`, `cuda-12-4`, `cuda-12-6`, `cuda-12-8`,
+`cuda-13-0` and `cuda-13-1` still exist and all enable exactly `cuda`. They are
+kept so older `Cargo.toml` files keep building; there is no reason to pick one
+for a new project.
 
 ## CachyOS / Arch
 

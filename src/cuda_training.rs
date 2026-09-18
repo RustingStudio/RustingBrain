@@ -1143,9 +1143,10 @@ impl State {
             let out = net.layers[i].weights.rows;
             let inp = net.layers[i].weights.cols;
             let fb = &self.kernels.grad_b;
-            // GW[out, inp] = (1/b) * D^T . X. The old hand-written kernel gave
-            // each of out*inp threads a serial loop over the batch with strided
-            // reads; cuBLAS does the same reduction as a real GEMM.
+            // GW[out, inp] = (1/b) * D^T . X, through cuBLAS rather than a
+            // hand-written kernel: this is a real GEMM, and a kernel giving
+            // each of the out*inp threads a serial strided loop over the batch
+            // reaches a fraction of the same bandwidth.
             if i == 0 {
                 let l = &mut self.layers[0];
                 grad_weights(&self.blas, &l.d, &self.input, &mut l.gw, b, out, inp)?;
@@ -1379,8 +1380,9 @@ fn gemm(
     let c = GemmConfig {
         // `w` is stored row-major as [units, input]. cuBLAS reads the same
         // bytes as column-major [input, units] (W^T), so OP_T is required to
-        // compute Z^T = W * X^T. The old OP_N path was only shape-compatible;
-        // it multiplied a scrambled interpretation of W for non-square layers.
+        // compute Z^T = W * X^T. OP_N would also typecheck here, and is
+        // wrong: it multiplies that column-major reinterpretation of W, which
+        // only coincides with W itself when the layer is square.
         transa: cublasOperation_t::CUBLAS_OP_T,
         transb: cublasOperation_t::CUBLAS_OP_N,
         m: units as i32,

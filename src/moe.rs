@@ -197,13 +197,13 @@ pub const UNROUTED: usize = usize::MAX;
 /// This is the dropless formulation: every token is processed by all of its
 /// chosen experts, and no token is ever dropped.
 ///
-/// TODO: a fixed-capacity variant, where each expert accepts at most
-/// `capacity_factor * tokens * k / num_experts` tokens and the overflow is
-/// dropped (passed through the residual unchanged), is the follow-up. It trades
-/// a little quality for statically shaped per-expert buffers, which is what
-/// makes batched GPU dispatch and expert parallelism practical. Nothing here
-/// assumes unbounded groups beyond the `expert_tokens` vectors, so it is a
-/// change to [`MoeLayer::route`] and a drop mask in the scatter.
+/// The alternative, not implemented here, is a fixed-capacity layer: each
+/// expert accepts at most `capacity_factor * tokens * k / num_experts` tokens
+/// and the overflow passes through the residual unchanged. That trades a
+/// little quality for statically shaped per-expert buffers, which is what
+/// makes batched GPU dispatch and expert parallelism practical. Only
+/// [`MoeLayer::route`] and a drop mask in the scatter would have to change;
+/// nothing else here assumes the groups are unbounded.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MoeLayer {
     pub router: Router,

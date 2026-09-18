@@ -13,7 +13,10 @@ use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 fn kernels() -> String {
     let source = include_str!("../src/cuda_flash.rs");
     let body = source.split("r#\"").nth(1).expect("the kernel string");
-    body.rsplit_once("\"#").expect("the kernel string ends").0.to_string()
+    body.rsplit_once("\"#")
+        .expect("the kernel string ends")
+        .0
+        .to_string()
 }
 
 fn main() {
@@ -59,11 +62,7 @@ fn main() {
             let (function, grid_y, shared_mem_bytes) = match index {
                 0 => ("flash_attention_fwd", heads, shared(1)),
                 1 => ("flash_attention_dq", heads, shared(1) + 64 * 72 * 2),
-                _ => (
-                    "flash_attention_dkv",
-                    kv_heads,
-                    shared(2) + 2 * 64 * 4,
-                ),
+                _ => ("flash_attention_dkv", kv_heads, shared(2) + 2 * 64 * 4),
             };
             let kernel = module.load_function(function).unwrap();
             kernel

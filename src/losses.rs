@@ -1,3 +1,10 @@
+//! Loss functions for dense networks.
+//!
+//! [`Loss::output_delta`] returns `dL/dz` for the output layer directly, not
+//! `dL/dy`: for the softmax/cross-entropy and sigmoid/binary-cross-entropy
+//! pairs the activation derivative cancels, and computing the product would
+//! reintroduce the catastrophic cancellation the pairing exists to avoid.
+
 use crate::activations::Activation;
 use serde::{Deserialize, Serialize};
 

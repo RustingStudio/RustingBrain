@@ -1,3 +1,11 @@
+//! Inference for ONNX models trained in another framework.
+//!
+//! Requires the `onnx` feature. Without it the type still exists and every
+//! call returns [`OnnxError::FeatureDisabled`], so downstream code compiles
+//! either way and fails with a clear message rather than a missing symbol.
+//!
+//! See `IMPORT_MODELS.md` for the TensorFlow/Keras export flow.
+
 use std::path::Path;
 use thiserror::Error;
 

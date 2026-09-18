@@ -1,3 +1,8 @@
+//! In-memory tabular data: rows of inputs paired with rows of targets.
+//!
+//! This is the input to [`Network::fit`](crate::Network::fit). Token sequences
+//! for a language model go through [`TokenBatch`](crate::TokenBatch) instead.
+
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;

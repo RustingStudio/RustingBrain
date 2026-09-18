@@ -105,12 +105,9 @@ fn main() {
 
         // What a `gemm_dispatch` that narrowed its own operands would pay:
         // both operands cast into scratch on every call.
-        let mut cast_both = |iterations: usize| {
+        let cast_both = |iterations: usize| {
             for _ in 0..iterations {
-                for (dst, src, n) in [
-                    (&a16, &a, units * inner),
-                    (&b16, &b, rows * inner),
-                ] {
+                for (dst, src, n) in [(&a16, &a, units * inner), (&b16, &b, rows * inner)] {
                     let mut dst = dst.clone();
                     let config = LaunchConfig::for_num_elems(n as u32);
                     let n = n as i32;

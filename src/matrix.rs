@@ -1,4 +1,11 @@
-use crate::tensor::Tensor;
+//! Row-major `f32` matrices and the matmuls the CPU path is built on.
+//!
+//! Every product writes into a caller-owned `target` rather than returning a
+//! new matrix, so a training step allocates nothing after the first one. The
+//! five shapes here are the five that backpropagation actually needs; they
+//! exist separately because transposing an operand costs more than reading it
+//! in a different order.
+
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -8,59 +15,6 @@ pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
     pub data: Vec<f32>,
-}
-
-impl Tensor for Matrix {
-    fn rows(&self) -> usize {
-        self.rows
-    }
-    fn cols(&self) -> usize {
-        self.cols
-    }
-
-    fn new(rows: usize, cols: usize) -> Self {
-        Matrix::new(rows, cols)
-    }
-
-    fn random(rows: usize, cols: usize) -> Self {
-        Matrix::random(rows, cols)
-    }
-
-    fn zeros(&mut self) {
-        self.zeros()
-    }
-
-    fn dot(&self, other: &Self, target: &mut Self) {
-        self.dot(other, target)
-    }
-
-    fn dot_rhs_transposed(&self, other: &Self, target: &mut Self) {
-        self.dot_rhs_transposed(other, target)
-    }
-
-    fn dot_self_transposed(&self, other: &Self, target: &mut Self) {
-        self.dot_self_transposed(other, target)
-    }
-
-    fn outer_product(&self, input: &Self, target: &mut Self) {
-        self.outer_product(input, target)
-    }
-
-    fn dot_transpose_self(&self, error: &Self, target: &mut Self) {
-        self.dot_transpose_self(error, target)
-    }
-
-    fn data(&self) -> &[f32] {
-        &self.data
-    }
-
-    fn data_mut(&mut self) -> &mut [f32] {
-        &mut self.data
-    }
-
-    fn copy_from_slice(&mut self, source: &[f32]) {
-        self.copy_from_slice(source)
-    }
 }
 
 /// Dot product with eight accumulators.

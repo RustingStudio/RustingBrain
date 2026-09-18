@@ -1,4 +1,9 @@
 [build]
 # Zen4/AVX-512 and modern AVX2 kernels for the hand-written element-wise loops.
-# Worth ~9% on a CPU training step here; harmless on older hosts.
+# Worth ~9% on a CPU training step here.
+#
+# This makes the binary specific to the machine that built it. Building on an
+# older host is fine, but a binary built here and run on a host without these
+# instructions dies with SIGILL. Drop this file, or set an explicit
+# `target-cpu`, for anything you intend to ship.
 rustflags = ["-C", "target-cpu=native"]
