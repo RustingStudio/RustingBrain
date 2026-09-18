@@ -1,3 +1,7 @@
+//! CPU-versus-GPU matmul benchmark, used to check that a CUDA install works.
+//!
+//! Run it with `cargo run --release --example cuda_benchmark --features cuda`.
+
 use crate::gpu_matrix::{GpuMatrix, gpu_dot};
 use crate::matrix::Matrix;
 use cudarc::cublas::CudaBlas;
@@ -141,12 +145,12 @@ fn run_gpu_benchmark_inner() -> Result<f64, String> {
         let cpu_a = Matrix::random(m, k);
         let cpu_b = Matrix::random(k, n);
 
-        let gpu_a = GpuMatrix::from_cpu(stream.clone(), dev.clone(), &cpu_a);
-        let gpu_b = GpuMatrix::from_cpu(stream.clone(), dev.clone(), &cpu_b);
-        let mut gpu_c = GpuMatrix::new(stream.clone(), dev.clone(), m, n);
+        let gpu_a = GpuMatrix::from_cpu(&stream, &cpu_a)?;
+        let gpu_b = GpuMatrix::from_cpu(&stream, &cpu_b)?;
+        let mut gpu_c = GpuMatrix::zeros(&stream, m, n)?;
 
         for _ in 0..5 {
-            gpu_dot(&blas, &gpu_a, &gpu_b, &mut gpu_c);
+            gpu_dot(&blas, &gpu_a, &gpu_b, &mut gpu_c)?;
         }
         stream.synchronize().unwrap();
 
@@ -155,7 +159,7 @@ fn run_gpu_benchmark_inner() -> Result<f64, String> {
 
         for _ in 0..iterations {
             let start = Instant::now();
-            gpu_dot(&blas, &gpu_a, &gpu_b, &mut gpu_c);
+            gpu_dot(&blas, &gpu_a, &gpu_b, &mut gpu_c)?;
             stream.synchronize().unwrap();
             times.push(start.elapsed());
         }

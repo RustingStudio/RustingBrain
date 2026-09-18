@@ -281,6 +281,15 @@ struct SwiGluCache {
     down: Option<Act>,
 }
 
+/// The normed activations, the inverse RMS of each row that the backward pass
+/// needs, and the optional FP32 duplicate of the input.
+type NormOutput = (Act, CudaSlice<f32>, Option<CudaSlice<f32>>);
+
+/// The dense variant stays unboxed despite being the larger of the two: a
+/// cache is built for every layer of every step, and 272 bytes of stack beats
+/// an allocation on that path. The routed variant is boxed because it is
+/// larger again by an order of magnitude.
+#[allow(clippy::large_enum_variant)]
 enum FfnCache {
     Dense(SwiGluCache),
     Moe(Box<MoeGpuCache>),
@@ -384,7 +393,6 @@ impl Gpu<'_> {
         let mut act = self.act(len, narrow)?;
         let mut dst = act.bytes.slice_mut(..);
         self.cast_into(&mut dst, src, len, narrow)?;
-        drop(dst);
         Ok(act)
     }
 
@@ -669,7 +677,6 @@ impl Gpu<'_> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// `copy` asks for an FP32 duplicate of `input` alongside the normed
     /// output. The residual branch below a norm wants one, because its
     /// projection accumulates over the block input with `beta = 1`; this kernel
@@ -684,7 +691,7 @@ impl Gpu<'_> {
         eps: f32,
         narrow: bool,
         copy: bool,
-    ) -> Result<(Act, CudaSlice<f32>, Option<CudaSlice<f32>>), NetworkError> {
+    ) -> Result<NormOutput, NetworkError> {
         let mut out = self.act(rows * cols, narrow)?;
         let mut inverse = self.uninit(rows)?;
         // A one-element stand-in keeps the launch arguments uniform when no
@@ -1226,7 +1233,6 @@ impl Gpu<'_> {
                 .bytes
                 .slice_mut(base * element..(base + len) * element);
             self.cast_into(&mut slot, &part.value().slice(..), len, narrow)?;
-            drop(slot);
             base += len;
         }
         Ok(packed)
@@ -2453,10 +2459,13 @@ fn backward_from_final(
     // the receiving feed forward's; a routed one takes FP32 and narrows the
     // shared expert's operand on its own, so it asks for no copy at all.
     let operand = |index: usize| {
-        cache.blocks.get(index).and_then(|block| match &block.feed_forward {
-            FfnCache::Dense(_) => Some(block.feed_forward_normed.is_narrow()),
-            FfnCache::Moe(_) => None,
-        })
+        cache
+            .blocks
+            .get(index)
+            .and_then(|block| match &block.feed_forward {
+                FfnCache::Dense(_) => Some(block.feed_forward_normed.is_narrow()),
+                FfnCache::Moe(_) => None,
+            })
     };
     let (mut grad_hidden, mut grad_hidden_act) = gpu.rmsnorm_backward(
         &cache.final_input,
@@ -2589,8 +2598,7 @@ fn backward_block(
     )?;
     let grad_residual_act = grad_residual_act.expect("a copy was asked for");
 
-    let grad_attention_normed =
-        backward_attention(gpu, block, cache, &grad_residual_act, batch)?;
+    let grad_attention_normed = backward_attention(gpu, block, cache, &grad_residual_act, batch)?;
 
     let (grad_input, grad_input_act) = gpu.rmsnorm_backward(
         &cache.input,
@@ -3309,9 +3317,7 @@ mod tests {
         for (narrow, tolerance) in [(false, 1e-5), (true, 1e-2)] {
             let mut host = Matrix::from_vec(rows, width, ramp(rows * width));
             let wide = gpu.upload(&host.data).unwrap();
-            let mut device = gpu
-                .narrowed(&wide.slice(..), rows * width, narrow)
-                .unwrap();
+            let mut device = gpu.narrowed(&wide.slice(..), rows * width, narrow).unwrap();
 
             gpu.rope(
                 &mut device,
@@ -3440,7 +3446,12 @@ mod tests {
 
         let silu = |x: f32| x / (1.0 + (-x).exp());
         let expected: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
-        assert_close("swiglu", &gpu.download_act(&hidden).unwrap(), &expected, 1e-6);
+        assert_close(
+            "swiglu",
+            &gpu.download_act(&hidden).unwrap(),
+            &expected,
+            1e-6,
+        );
 
         let grad_hidden = gpu.upload(&vec![1.0; len]).unwrap();
         let grad_fused = gpu

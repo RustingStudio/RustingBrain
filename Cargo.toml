@@ -1,15 +1,15 @@
 [package]
 name = "rusting_brain"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
-description = "A Rust neural-network library for learning, training, and inference from small models to small size LLM."
+description = "A Rust deep-learning library for training and running transformer language models, dense and mixture-of-experts, on CPU or CUDA."
 readme = "README.md"
 license-file = "LICENSE.md"
 rust-version = "1.85"
 documentation = "https://docs.rs/rusting_brain"
 homepage = "https://github.com/Vasyl-Trefilov/RustingBrain"
 repository = "https://github.com/Vasyl-Trefilov/RustingBrain.git"
-keywords = ["neural-network", "machine-learning", "onnx", "cuda", "education"]
+keywords = ["llm", "transformer", "machine-learning", "cuda", "mixture-of-experts"]
 categories = ["science", "algorithms"]
 
 [dependencies]
@@ -52,6 +52,14 @@ required-features = ["cuda"]
 
 [[example]]
 name = "cuda_persistent_training"
+required-features = ["cuda"]
+
+[[example]]
+name = "gemm_probe"
+required-features = ["cuda"]
+
+[[example]]
+name = "flash_probe"
 required-features = ["cuda"]
 
 [profile.release]

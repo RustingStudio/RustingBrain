@@ -83,9 +83,9 @@ fn main() {
     model.synchronize().unwrap();
 
     let steps = 3;
-    // `RB_PHASES=1` times the pre-fusion path instead: forward, host loss,
-    // backward and step as separate calls, which is what `train_step_batch`
-    // used to do and so is the honest before-and-after comparison.
+    // `RB_PHASES=1` times the unfused path instead: forward, host loss,
+    // backward and step as four separate calls. That is the comparison the
+    // fused `train_step_batch` below has to beat to be worth its complexity.
     if std::env::var_os("RB_PHASES").is_none() {
         let fused = Instant::now();
         for _ in 0..steps {

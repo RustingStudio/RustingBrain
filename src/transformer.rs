@@ -774,7 +774,6 @@ impl TransformerLm {
         self.check_device()
     }
 
-    /// Whether the matmul-bound parameters currently live on a device.
     /// Waits for every queued device operation to finish.
     ///
     /// A no-op on the host path. Timing code needs it because the optimizer
@@ -788,6 +787,7 @@ impl TransformerLm {
         Ok(())
     }
 
+    /// Whether the matmul-bound parameters currently live on a device.
     pub fn on_device(&self) -> bool {
         #[cfg(feature = "cuda")]
         {

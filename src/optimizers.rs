@@ -1,3 +1,9 @@
+//! Parameter update rules.
+//!
+//! The optimizer is a value, not a trait object, and it is re-read from the
+//! model on every step. Assigning a fresh one with a new learning rate is all
+//! a warmup or cosine schedule needs to do.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

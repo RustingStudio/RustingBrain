@@ -1,8 +1,12 @@
 # Import Models
 
 RustingBrain runs external models through ONNX. This is inference-only: you can
-load a model trained in TensorFlow or Keras and run predictions from Rust, but
-training continues to belong in the original framework.
+load a model trained in TensorFlow, Keras or PyTorch and run predictions from
+Rust, but training continues to belong in the original framework.
+
+Chapter 12 of the tutorials, [Importing Models From TensorFlow and
+PyTorch](tutorials/12_import_models.md), covers the same ground with the
+reasoning and the failure modes.
 
 ## TensorFlow Or Keras
 
@@ -27,6 +31,29 @@ Run it from RustingBrain:
 ```bash
 cargo run --example onnx_inference --features onnx -- model.onnx
 ```
+
+## PyTorch
+
+`torch.onnx.export` traces the model, so it needs an example input of the
+shape you will run:
+
+```python
+import torch
+
+model.eval()                       # trace the inference graph, not the training one
+example = torch.randn(1, 2)
+
+torch.onnx.export(
+    model, example, "model.onnx",
+    opset_version=13,
+    input_names=["input"],
+    output_names=["output"],
+)
+```
+
+`model.eval()` matters: traced in training mode, dropout and batch-norm bake
+their training behaviour into the exported graph and the model gives different
+answers in Rust than it did in Python.
 
 ## Dynamic Input Shapes
 

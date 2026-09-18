@@ -8,3 +8,8 @@
 perf.data
 perf.data.old
 flamegraph.svg
+
+# Written by `cargo run --example language_model -- train`
+lm.rbw
+lm.rbw.opt
+lm.vocab

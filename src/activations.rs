@@ -1,3 +1,10 @@
+//! Element-wise activations for dense layers.
+//!
+//! [`Activation::derivative`] takes the *activated* value rather than the
+//! pre-activation one, because every activation here can be differentiated
+//! from its own output. That is what lets a layer keep one buffer instead of
+//! two.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

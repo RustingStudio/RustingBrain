@@ -1,3 +1,10 @@
+//! JSON save/load for both model types.
+//!
+//! JSON is readable and portable but costs roughly ten bytes per weight. A
+//! transformer past a few million parameters should use
+//! [`TransformerLm::save_bin`](crate::TransformerLm::save_bin), which writes
+//! F32 or quantized I8 and carries optimizer state alongside.
+
 use crate::network::{Network, NetworkError};
 use crate::transformer::TransformerLm;
 use std::path::Path;
