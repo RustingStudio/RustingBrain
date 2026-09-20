@@ -31,15 +31,15 @@ vector alongside the states in place of the separate `pool`.
   partitions instead, which is most of a small model's decode step back.
 - The CUDA image kernels were rewritten around what a profile said they were
   actually spending time on, which took a Stable Diffusion XL UNet pass at
-  1024x1024 from 0.65 s to 0.42 s and the VAE decode of that image from 1.72 s
-  to 0.70 s, and a whole guided 1024x1024 image at 30 steps from 37.4 s to
-  26.6 s. The convolution lowering writes a whole KxK patch per thread
+  1024x1024 from 0.65 s to 0.33 s and the VAE decode of that image from 1.72 s
+  to 0.53 s, and a whole guided 1024x1024 image at 30 steps from 37.4 s to
+  20.5 s. The convolution lowering writes a whole KxK patch per thread
   rather than one tap, and writes its columns transposed so the matmul lands
   channel-major with no separate pass to reorder it. Group normalization is
   three kernels — partial sums, a double-precision fold, then one pass that
   scales and activates — instead of one, which is also where the activation
-  after a normalization now happens. The attention softmax normalizes the bf16
-  score matrix in place rather than expanding it into a second buffer, and it
+  after a normalization now happens. The attention softmax normalizes the
+  narrow score matrix in place rather than expanding it into a second buffer, and it
   makes one pass over each row with a running maximum. Every kernel that walks
   a plane takes its row from the grid rather than dividing a flat index, and
   every kernel that streams one moves four values a thread instead of one.
@@ -57,6 +57,15 @@ vector alongside the states in place of the separate `pool`.
   which reduces in registers instead of across sixteen barriers, and reads four
   scores per load where the row length allows it. A row too long for one warp
   to walk still gets a block.
+
+  The image path holds its weights and activations as FP16 rather than BF16,
+  and its matmuls accumulate in FP16 as well. A consumer Ampere card runs its
+  tensor cores at half rate when the accumulator is FP32, so this is the same
+  arithmetic at about 1.7 times the throughput; FP16's eleven mantissa bits
+  pay back what the narrow accumulator loses, and the worst relative error
+  against the CPU reference on a whole UNet pass went down rather than up.
+  Training is unaffected and stays on BF16, where the wider exponent range is
+  what keeps small gradients from flushing to zero.
 
 ### Added
 
