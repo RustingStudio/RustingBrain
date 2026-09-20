@@ -53,6 +53,9 @@ pub struct GpuContext {
     /// Set by [`GpuContext::with_precision`]. Read by the training step, which
     /// runs the LM head in bf16 when it is on.
     pub(crate) mixed_precision: bool,
+    /// Set by [`GpuContext::half_accumulate`]. Narrow operands are then FP16
+    /// rather than BF16 and the accumulator is FP16 too.
+    pub(crate) half_accumulate: bool,
     adam: CudaFunction,
     sgd: CudaFunction,
     scale: CudaFunction,
@@ -82,6 +85,22 @@ impl GpuContext {
     /// quiet CPU fallback.
     pub fn new(device: usize) -> Result<Arc<Self>, NetworkError> {
         Self::with_precision(device, false)
+    }
+
+    /// A context whose narrow GEMMs read FP16 operands and accumulate in FP16.
+    ///
+    /// The image path uses it. A consumer Ampere card runs its tensor cores at
+    /// half rate when the accumulator is FP32, and FP16's eleven mantissa bits
+    /// pay back what the narrow accumulator loses, so the same arithmetic is
+    /// about 1.7x quicker for the same measured error. Training does not use
+    /// it: BF16's exponent range is what keeps gradients from flushing to
+    /// zero, and that is worth more there than the rate.
+    pub(crate) fn half_accumulate(device: usize) -> Result<Arc<Self>, NetworkError> {
+        let mut context = Self::with_precision(device, false)?;
+        Arc::get_mut(&mut context)
+            .expect("a context this function just built is unshared")
+            .half_accumulate = true;
+        Ok(context)
     }
 
     /// As [`GpuContext::new`], but `mixed_precision` lets cuBLAS run its GEMMs
@@ -119,6 +138,7 @@ impl GpuContext {
             stream,
             blas,
             mixed_precision,
+            half_accumulate: false,
             adam: get("adam")?,
             sgd: get("sgd")?,
             scale: get("scale_inplace")?,
@@ -823,7 +843,7 @@ where
     .map_err(cuda_err("cuBLAS BF16 GEMM"))
 }
 
-/// One GEMM whose operands are untyped bytes, either BF16 or FP32.
+/// One GEMM whose operands are untyped bytes, either narrow or FP32.
 ///
 /// [`Act`](crate::gpu_model::Act) stores the block activations narrow whenever
 /// reduced precision is on, because every one of them is read only by a GEMM
@@ -832,6 +852,10 @@ where
 /// type changes which kernel it picks: `s16816 ... align8`, twice the k per
 /// instruction, rather than `s1688 ... align4`. The accumulator stays FP32
 /// either way, so this is the same arithmetic on a better kernel.
+///
+/// A context built by [`GpuContext::half_accumulate`] reads those same narrow
+/// bytes as FP16 and accumulates in FP16 too, which is the one case where the
+/// arithmetic does change. See that function for why.
 ///
 /// # Safety
 ///
@@ -850,7 +874,12 @@ unsafe fn act_dispatch<T, C: DevicePtrMut<T>>(
     // uses, so a buffer that stayed FP32 (the routed feed-forward's, whose
     // gathers and scatters are FP32 kernels) runs on exactly the kernel it ran
     // on before.
-    let (operand, compute) = if narrow {
+    let (operand, compute) = if narrow && context.half_accumulate {
+        (
+            cublas_sys::cudaDataType_t::CUDA_R_16F,
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+        )
+    } else if narrow {
         (
             cublas_sys::cudaDataType_t::CUDA_R_16BF,
             cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -866,6 +895,23 @@ unsafe fn act_dispatch<T, C: DevicePtrMut<T>>(
             cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
         )
     };
+    // cuBLAS reads the two scalars at the compute type's width, so an FP16
+    // accumulator wants them as halves and anything else as floats.
+    let half = compute == cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F;
+    let scalars = (
+        half::f16::from_f32(config.alpha),
+        half::f16::from_f32(config.beta),
+    );
+    let (alpha, beta): (*const std::ffi::c_void, *const std::ffi::c_void) = match half {
+        true => (
+            &scalars.0 as *const half::f16 as *const _,
+            &scalars.1 as *const half::f16 as *const _,
+        ),
+        false => (
+            &config.alpha as *const f32 as *const _,
+            &config.beta as *const f32 as *const _,
+        ),
+    };
     let (a_pointer, _a_guard) = a.device_ptr(&context.stream);
     let (b_pointer, _b_guard) = b.device_ptr(&context.stream);
     let (c_pointer, _c_guard) = c.device_ptr_mut(&context.stream);
@@ -877,19 +923,19 @@ unsafe fn act_dispatch<T, C: DevicePtrMut<T>>(
             config.m,
             config.n,
             config.k,
-            &config.alpha as *const f32 as *const std::ffi::c_void,
+            alpha,
             a_pointer as *const std::ffi::c_void,
             operand,
             config.lda,
             b_pointer as *const std::ffi::c_void,
             operand,
             config.ldb,
-            &config.beta as *const f32 as *const std::ffi::c_void,
+            beta,
             c_pointer as *mut std::ffi::c_void,
-            if out_narrow {
-                cublas_sys::cudaDataType_t::CUDA_R_16BF
-            } else {
-                cublas_sys::cudaDataType_t::CUDA_R_32F
+            match (out_narrow, half) {
+                (true, true) => cublas_sys::cudaDataType_t::CUDA_R_16F,
+                (true, false) => cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                (false, _) => cublas_sys::cudaDataType_t::CUDA_R_32F,
             },
             config.ldc,
             compute,

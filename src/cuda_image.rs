@@ -7,17 +7,26 @@
 //! upsampling and a *bidirectional* attention. So this is a second set of
 //! kernels over the same [`GpuContext`], reusing its stream, its cuBLAS handle
 //! and the `gemm_ex` wrappers that already know how to feed the tensor cores
-//! BF16 operands with an FP32 accumulator.
+//! narrow operands.
 //!
 //! Three decisions are worth stating, because they are what makes a 2.6B
 //! parameter UNet fit in 12 GB:
 //!
-//! * **Everything on the device is BF16.** An `f32` SDXL UNet is 10.4 GB of
+//! * **Everything on the device is FP16.** An `f32` SDXL UNet is 10.4 GB of
 //!   weights alone, which does not fit; at two bytes it is 5.2 GB, which does.
-//!   BF16 costs about the same relative error per weight (2^-9) as the
+//!   FP16 costs about the same relative error per weight (2^-11) as the
 //!   [`Precision::Q8`](crate::transformer::Precision) path the CPU already
-//!   runs, and every accumulation is still FP32 — `CUBLAS_COMPUTE_32F` in the
-//!   GEMMs, an FP32 running sum in each reduction kernel.
+//!   runs. The GEMMs accumulate in FP16 too, because a consumer Ampere card
+//!   halves its tensor-core rate for an FP32 accumulator and FP16's wider
+//!   mantissa pays the accumulator's error back; the reduction kernels keep
+//!   their FP32 running sums, where the accumulation is long and the operands
+//!   are few.
+//!
+//!   NOTE: FP16 tops out at 65504, and the Stable Diffusion XL decoder is
+//!   the one part of a published model known to reach that on some latents.
+//!   Nothing seen here has, and the upgrade path if one does is a second
+//!   module compiled from this same source with the two conversion helpers
+//!   written for BF16, handed to the decoder alone.
 //! * **`Precision::Q8` is dequantized on upload**, not in the kernel. Keeping
 //!   the bytes and unpacking per GEMM would halve the weight footprint again,
 //!   but it means a custom kernel for every matmul instead of cuBLAS, and the
@@ -50,21 +59,21 @@ use cudarc::driver::{
     PushKernelArg,
 };
 use cudarc::nvrtc::{Ptx, compile_ptx};
-use half::bf16;
+use half::f16;
 use std::sync::{Arc, OnceLock};
 
-/// The largest im2col scratch buffer, in BF16 elements: 32 MiB.
+/// The largest im2col scratch buffer, in FP16 elements: 32 MiB.
 ///
 /// A convolution is split into as many chunks of output pixels as it takes to
 /// stay under this. One chunk is one extra GEMM launch, and a GEMM at this size
 /// is already far past the point where launch overhead matters.
 const COLUMN_BUDGET: usize = 1 << 24;
 
-/// The largest attention score scratch, in FP32 elements: 64 MiB.
+/// The largest attention score scratch, in FP16 elements: 32 MiB.
 ///
 /// The VAE's self-attention at 1024x1024 is 16384 queries over 16384 keys,
-/// which is a gigabyte of scores if they all exist at once. They do not need
-/// to: the softmax is per query row, so the queries split into chunks.
+/// which is half a gigabyte of scores if they all exist at once. They do not
+/// need to: the softmax is per query row, so the queries split into chunks.
 const SCORE_BUDGET: usize = 1 << 24;
 
 /// Threads per block for every reduction kernel below. Also the size of the
@@ -72,18 +81,22 @@ const SCORE_BUDGET: usize = 1 << 24;
 const THREADS: u32 = 256;
 
 const IMAGE_KERNELS: &str = r#"
-// The same bit-pattern bf16 helpers `cuda_training` uses: NVRTC compiles this
-// string with no header search path, and bf16 is FP32 with the low sixteen
-// mantissa bits dropped. Rounding is round-to-nearest-even, which is what both
-// the tensor cores and `half::bf16::from_f32` do, so a value that makes the
-// trip through host code, a kernel and cuBLAS lands on one answer.
-typedef unsigned short bf16_t;
-__device__ __forceinline__ float b2f(bf16_t b){return __uint_as_float((unsigned int)b<<16);}
-__device__ __forceinline__ bf16_t f2b(float v){
-  unsigned int u=__float_as_uint(v);
-  if((u&0x7f800000u)==0x7f800000u&&(u&0x007fffffu))return (bf16_t)0x7fc0u;
-  unsigned int r=((u>>16)&1u)+0x7fffu;
-  return (bf16_t)((u+r)>>16);
+// FP16 helpers. NVRTC compiles this string with no header search path, so
+// `cuda_fp16.h` is out of reach and the two conversions are written as the PTX
+// instructions that header would have inlined anyway.
+//
+// The image path stores every activation and weight as FP16 rather than BF16
+// because that is what lets the GEMMs accumulate in FP16 as well, and a
+// consumer Ampere card runs its tensor cores at twice the rate when the
+// accumulator is narrow. FP16's eleven mantissa bits buy back what the narrow
+// accumulator loses: measured against an FP32 reference, an FP16 product with
+// an FP16 accumulator is as accurate as a BF16 product with an FP32 one.
+typedef unsigned short half_t;
+__device__ __forceinline__ float h2f(half_t h){
+  float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f;
+}
+__device__ __forceinline__ half_t f2h(float v){
+  half_t h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v)); return h;
 }
 
 #define THREADS 256
@@ -124,19 +137,19 @@ __device__ __forceinline__ float act_of(float x,int kind){
 //
 // One thread writes a whole patch column for one input channel — all nine
 // taps of a 3x3 — rather than one tap. The stores are the same stores either
-// way, but a thread that writes one BF16 and exits spends most of its life on
+// way, but a thread that writes one FP16 and exits spends most of its life on
 // the index arithmetic that found it, and nine independent stores in flight
 // per thread is what keeps the memory pipe busy. It is also nine times fewer
 // blocks, and the one division left, from the flat pixel index to a row and a
 // column, is now paid once per nine values instead of once per value.
-extern "C" __global__ void im2col(bf16_t*__restrict__ columns,const bf16_t*__restrict__ input,
+extern "C" __global__ void im2col(half_t*__restrict__ columns,const half_t*__restrict__ input,
     int in_h,int in_w,int kernel,int stride,int pad,int out_w,int row,int span,long long pitch){
   int s=blockIdx.x*blockDim.x+threadIdx.x;
   if(s>=span)return;
   int line=s/out_w,ox=s-line*out_w;
   int c=blockIdx.y;
-  const bf16_t*source=input+(long long)c*in_h*in_w;
-  bf16_t*target=columns+(long long)c*kernel*kernel*pitch+s;
+  const half_t*source=input+(long long)c*in_h*in_w;
+  half_t*target=columns+(long long)c*kernel*kernel*pitch+s;
   int y0=(row+line)*stride-pad,x0=ox*stride-pad;
   for(int ky=0;ky<kernel;ky++){
     int y=y0+ky;
@@ -144,57 +157,57 @@ extern "C" __global__ void im2col(bf16_t*__restrict__ columns,const bf16_t*__res
     for(int kx=0;kx<kernel;kx++){
       int x=x0+kx;
       float v=0.f;
-      if(inside&&x>=0&&x<in_w)v=b2f(source[(long long)y*in_w+x]);
-      target[(long long)(ky*kernel+kx)*pitch]=f2b(v);
+      if(inside&&x>=0&&x<in_w)v=h2f(source[(long long)y*in_w+x]);
+      target[(long long)(ky*kernel+kx)*pitch]=f2h(v);
     }
   }
 }
 
 // The row rides in the grid, so the column index is a thread index rather
 // than a 64-bit remainder per element.
-extern "C" __global__ void add_bias_rows(bf16_t*__restrict__ x,const float*__restrict__ b,int cols){
+extern "C" __global__ void add_bias_rows(half_t*__restrict__ x,const float*__restrict__ b,int cols){
   int c=blockIdx.x*blockDim.x+threadIdx.x;
   if(c>=cols)return;
   long long i=(long long)blockIdx.y*cols+c;
-  x[i]=f2b(b2f(x[i])+b[c]);
+  x[i]=f2h(h2f(x[i])+b[c]);
 }
 // One value per channel, spread over that channel's plane: a convolution's
 // bias, or the noise level a residual block carries in. The channel is the
 // grid's second dimension, for the reason `im2col` takes its row that way.
-extern "C" __global__ void add_channel(bf16_t*__restrict__ x,const bf16_t*__restrict__ v,
+extern "C" __global__ void add_channel(half_t*__restrict__ x,const half_t*__restrict__ v,
     long long pixels){
-  bf16_t*row=x+(long long)blockIdx.y*pixels;
-  float offset=b2f(v[blockIdx.y]);
+  half_t*row=x+(long long)blockIdx.y*pixels;
+  float offset=h2f(v[blockIdx.y]);
   long long base=(long long)blockIdx.x*blockDim.x*LANE+threadIdx.x;
   for(int k=0;k<LANE;k++){
     long long p=base+(long long)k*blockDim.x;
-    if(p<pixels)row[p]=f2b(b2f(row[p])+offset);
+    if(p<pixels)row[p]=f2h(h2f(row[p])+offset);
   }
 }
 // A convolution's bias, which stays f32.
-extern "C" __global__ void add_plane_bias(bf16_t*__restrict__ x,const float*__restrict__ b,
+extern "C" __global__ void add_plane_bias(half_t*__restrict__ x,const float*__restrict__ b,
     long long pixels){
-  bf16_t*row=x+(long long)blockIdx.y*pixels;
+  half_t*row=x+(long long)blockIdx.y*pixels;
   float bias=b[blockIdx.y];
   long long base=(long long)blockIdx.x*blockDim.x*LANE+threadIdx.x;
   for(int k=0;k<LANE;k++){
     long long p=base+(long long)k*blockDim.x;
-    if(p<pixels)row[p]=f2b(b2f(row[p])+bias);
+    if(p<pixels)row[p]=f2h(h2f(row[p])+bias);
   }
 }
-extern "C" __global__ void add_inplace(bf16_t*__restrict__ x,const bf16_t*__restrict__ y,
+extern "C" __global__ void add_inplace(half_t*__restrict__ x,const half_t*__restrict__ y,
     long long n){
   long long base=(long long)blockIdx.x*blockDim.x*LANE+threadIdx.x;
   for(int k=0;k<LANE;k++){
     long long i=base+(long long)k*blockDim.x;
-    if(i<n)x[i]=f2b(b2f(x[i])+b2f(y[i]));
+    if(i<n)x[i]=f2h(h2f(x[i])+h2f(y[i]));
   }
 }
-extern "C" __global__ void activate(bf16_t*__restrict__ x,long long n,int kind){
+extern "C" __global__ void activate(half_t*__restrict__ x,long long n,int kind){
   long long base=(long long)blockIdx.x*blockDim.x*LANE+threadIdx.x;
   for(int k=0;k<LANE;k++){
     long long i=base+(long long)k*blockDim.x;
-    if(i<n)x[i]=f2b(act_of(b2f(x[i]),kind));
+    if(i<n)x[i]=f2h(act_of(h2f(x[i]),kind));
   }
 }
 
@@ -207,14 +220,14 @@ extern "C" __global__ void activate(bf16_t*__restrict__ x,long long n,int kind){
 // available bandwidth and, at 1024x1024, cost more than the convolutions it
 // sits between. So the group is split along its own span, every slice gets a
 // block, and a second launch folds the slices together.
-extern "C" __global__ void group_partials(const bf16_t*__restrict__ x,float*__restrict__ out,
+extern "C" __global__ void group_partials(const half_t*__restrict__ x,float*__restrict__ out,
     long long span,int splits){
   __shared__ float red[THREADS];
   long long g=blockIdx.y,s=blockIdx.x;
-  const bf16_t*v=x+g*span;
+  const half_t*v=x+g*span;
   long long begin=span*s/splits,end=span*(s+1)/splits;
   float sum=0.f,square=0.f;
-  for(long long i=begin+threadIdx.x;i<end;i+=THREADS){float t=b2f(v[i]);sum+=t;square+=t*t;}
+  for(long long i=begin+threadIdx.x;i<end;i+=THREADS){float t=h2f(v[i]);sum+=t;square+=t*t;}
   float a=block_sum(sum,red),b=block_sum(square,red);
   if(threadIdx.x==0){out[g*splits+s]=a;out[((long long)gridDim.y+g)*splits+s]=b;}
 }
@@ -242,35 +255,35 @@ extern "C" __global__ void group_fold(const float*__restrict__ partials,float*__
 // by an activation nearly every time — the activation, in one pass. `act` is
 // negative when the caller wants the normalization on its own. The channel
 // rides in the grid, so there is no division per element.
-extern "C" __global__ void group_apply(bf16_t*__restrict__ x,const float*__restrict__ stats,
+extern "C" __global__ void group_apply(half_t*__restrict__ x,const float*__restrict__ stats,
     const float*__restrict__ w,const float*__restrict__ b,
     long long pixels,int per_group,int act){
   int c=blockIdx.y,g=c/per_group;
-  bf16_t*row=x+(long long)c*pixels;
+  half_t*row=x+(long long)c*pixels;
   float mean=stats[2*g],inv=stats[2*g+1]*w[c],shift=b[c];
   long long base=(long long)blockIdx.x*blockDim.x*LANE+threadIdx.x;
   for(int k=0;k<LANE;k++){
     long long p=base+(long long)k*blockDim.x;
     if(p>=pixels)continue;
-    float v=(b2f(row[p])-mean)*inv+shift;
-    row[p]=f2b(act>=0?act_of(v,act):v);
+    float v=(h2f(row[p])-mean)*inv+shift;
+    row[p]=f2h(act>=0?act_of(v,act):v);
   }
 }
 
 // One block per token. The learned scale and offset are the ones CLIP trains
 // and the UNet's transformer blocks reuse.
-extern "C" __global__ void layer_norm(bf16_t*out,const bf16_t*x,const float*w,const float*b,
+extern "C" __global__ void layer_norm(half_t*out,const half_t*x,const float*w,const float*b,
     int cols,float eps){
   __shared__ float red[THREADS];
-  const bf16_t*src=x+(long long)blockIdx.x*cols;
-  bf16_t*dst=out+(long long)blockIdx.x*cols;
+  const half_t*src=x+(long long)blockIdx.x*cols;
+  half_t*dst=out+(long long)blockIdx.x*cols;
   float total=0.f;
-  for(int i=threadIdx.x;i<cols;i+=THREADS)total+=b2f(src[i]);
+  for(int i=threadIdx.x;i<cols;i+=THREADS)total+=h2f(src[i]);
   float mean=block_sum(total,red)/(float)cols;
   float square=0.f;
-  for(int i=threadIdx.x;i<cols;i+=THREADS){float d=b2f(src[i])-mean;square+=d*d;}
+  for(int i=threadIdx.x;i<cols;i+=THREADS){float d=h2f(src[i])-mean;square+=d*d;}
   float inv=rsqrtf(block_sum(square,red)/(float)cols+eps);
-  for(int i=threadIdx.x;i<cols;i+=THREADS)dst[i]=f2b((b2f(src[i])-mean)*inv*w[i]+b[i]);
+  for(int i=threadIdx.x;i<cols;i+=THREADS)dst[i]=f2h((h2f(src[i])-mean)*inv*w[i]+b[i]);
 }
 
 // One block per query row of the batched score matrix, which is laid out
@@ -284,9 +297,9 @@ extern "C" __global__ void layer_norm(bf16_t*out,const bf16_t*x,const float*w,co
 // Every score is touched by exactly one thread at one index, so the rewrite is
 // in place; nothing is read after it has been written.
 //
-// Holding the scores in BF16 costs about 0.2% on each one, which becomes the
+// Holding the scores in FP16 costs about 0.05% on each one, which becomes the
 // same on each probability, and the merge that follows averages a few hundred
-// of them against values that are themselves BF16. It is the same trade the
+// of them against values that are themselves FP16. It is the same trade the
 // rest of this module already makes.
 // One warp to a score row. A block-wide softmax over a thousand-wide row
 // gives each of its two hundred and fifty-six threads four values and then
@@ -302,30 +315,30 @@ __device__ __forceinline__ float warp_sum(float v){
   for(int s=16;s;s>>=1)v+=__shfl_xor_sync(0xffffffff,v,s);
   return v;
 }
-extern "C" __global__ void softmax_warp(bf16_t*__restrict__ scores,
+extern "C" __global__ void softmax_warp(half_t*__restrict__ scores,
     int context,int rows){
   int row=blockIdx.x*WARPS+(threadIdx.x>>5);
   if(row>=rows)return;
   int lane=threadIdx.x&31,quads=context>>2;
-  bf16_t*s=scores+(long long)row*context;
+  half_t*s=scores+(long long)row*context;
   float largest=__int_as_float(0xff800000),total=0.f;
   if(context&3){
     // A cross-attention row is as short as the prompt and never a whole
     // number of quads. It still wants a warp rather than a block.
     for(int i=lane;i<context;i+=32){
-      float x=b2f(s[i]);
+      float x=h2f(s[i]);
       if(x>largest){total*=__expf(largest-x);largest=x;}
       total+=__expf(x-largest);
     }
     float top=warp_max(largest);
     float scale=1.f/warp_sum(total*__expf(largest-top));
-    for(int i=lane;i<context;i+=32)s[i]=f2b(__expf(b2f(s[i])-top)*scale);
+    for(int i=lane;i<context;i+=32)s[i]=f2h(__expf(h2f(s[i])-top)*scale);
     return;
   }
   ushort4*v=(ushort4*)s;
   for(int i=lane;i<quads;i+=32){
     ushort4 q=v[i];
-    float a=b2f(q.x),b=b2f(q.y),c=b2f(q.z),d=b2f(q.w);
+    float a=h2f(q.x),b=h2f(q.y),c=h2f(q.z),d=h2f(q.w);
     float top=fmaxf(fmaxf(a,b),fmaxf(c,d));
     if(top>largest){total*=__expf(largest-top);largest=top;}
     total+=__expf(a-largest)+__expf(b-largest)+__expf(c-largest)+__expf(d-largest);
@@ -334,10 +347,10 @@ extern "C" __global__ void softmax_warp(bf16_t*__restrict__ scores,
   float inv=1.f/warp_sum(total*__expf(largest-peak));
   for(int i=lane;i<quads;i+=32){
     ushort4 q=v[i];
-    q.x=f2b(__expf(b2f(q.x)-peak)*inv);
-    q.y=f2b(__expf(b2f(q.y)-peak)*inv);
-    q.z=f2b(__expf(b2f(q.z)-peak)*inv);
-    q.w=f2b(__expf(b2f(q.w)-peak)*inv);
+    q.x=f2h(__expf(h2f(q.x)-peak)*inv);
+    q.y=f2h(__expf(h2f(q.y)-peak)*inv);
+    q.z=f2h(__expf(h2f(q.z)-peak)*inv);
+    q.w=f2h(__expf(h2f(q.w)-peak)*inv);
     v[i]=q;
   }
 }
@@ -345,10 +358,10 @@ extern "C" __global__ void softmax_warp(bf16_t*__restrict__ scores,
 // The wide case, and the general one. A row long enough that a warp would
 // walk it serially gets a whole block instead; `packed` says the row is a
 // whole number of quads with nothing masked, so four scores move per load.
-extern "C" __global__ void softmax_rows(bf16_t*__restrict__ scores,
+extern "C" __global__ void softmax_rows(half_t*__restrict__ scores,
     int context,int rows,int causal,int first,int packed){
   __shared__ float red[THREADS];
-  bf16_t*s=scores+(long long)blockIdx.x*context;
+  half_t*s=scores+(long long)blockIdx.x*context;
   int query=(int)(blockIdx.x%rows)+first;
   int visible=causal?(query+1<context?query+1:context):context;
   float largest=__int_as_float(0xff800000),total=0.f;
@@ -357,7 +370,7 @@ extern "C" __global__ void softmax_rows(bf16_t*__restrict__ scores,
     int quads=context>>2;
     for(int i=threadIdx.x;i<quads;i+=THREADS){
       ushort4 q=v[i];
-      float a=b2f(q.x),b=b2f(q.y),c=b2f(q.z),d=b2f(q.w);
+      float a=h2f(q.x),b=h2f(q.y),c=h2f(q.z),d=h2f(q.w);
       float top=fmaxf(fmaxf(a,b),fmaxf(c,d));
       if(top>largest){total*=__expf(largest-top);largest=top;}
       total+=__expf(a-largest)+__expf(b-largest)+__expf(c-largest)+__expf(d-largest);
@@ -367,16 +380,16 @@ extern "C" __global__ void softmax_rows(bf16_t*__restrict__ scores,
     float inv=1.f/block_sum(total,red);
     for(int i=threadIdx.x;i<quads;i+=THREADS){
       ushort4 q=v[i];
-      q.x=f2b(__expf(b2f(q.x)-peak)*inv);
-      q.y=f2b(__expf(b2f(q.y)-peak)*inv);
-      q.z=f2b(__expf(b2f(q.z)-peak)*inv);
-      q.w=f2b(__expf(b2f(q.w)-peak)*inv);
+      q.x=f2h(__expf(h2f(q.x)-peak)*inv);
+      q.y=f2h(__expf(h2f(q.y)-peak)*inv);
+      q.z=f2h(__expf(h2f(q.z)-peak)*inv);
+      q.w=f2h(__expf(h2f(q.w)-peak)*inv);
       v[i]=q;
     }
     return;
   }
   for(int i=threadIdx.x;i<visible;i+=THREADS){
-    float v=b2f(s[i]);
+    float v=h2f(s[i]);
     if(v>largest){total*=__expf(largest-v);largest=v;}
     total+=__expf(v-largest);
   }
@@ -386,23 +399,23 @@ extern "C" __global__ void softmax_rows(bf16_t*__restrict__ scores,
   total*=__expf(largest-peak);
   float inv=1.f/block_sum(total,red);
   for(int i=threadIdx.x;i<context;i+=THREADS)
-    s[i]=f2b(i<visible?__expf(b2f(s[i])-peak)*inv:0.f);
+    s[i]=f2h(i<visible?__expf(h2f(s[i])-peak)*inv:0.f);
 }
 
 // Half the projection is the value and half is its gate, which is the gated
 // feed-forward every one of these transformer blocks ends in.
-extern "C" __global__ void gelu_gate(bf16_t*__restrict__ out,const bf16_t*__restrict__ x,
+extern "C" __global__ void gelu_gate(half_t*__restrict__ out,const half_t*__restrict__ x,
     int inner){
-  const bf16_t*row=x+(long long)blockIdx.y*2*inner;
-  bf16_t*target=out+(long long)blockIdx.y*inner;
+  const half_t*row=x+(long long)blockIdx.y*2*inner;
+  half_t*target=out+(long long)blockIdx.y*inner;
   int base=blockIdx.x*blockDim.x*LANE+threadIdx.x;
   for(int k=0;k<LANE;k++){
     int c=base+k*blockDim.x;
-    if(c<inner)target[c]=f2b(b2f(row[c])*act_of(b2f(row[inner+c]),1));
+    if(c<inner)target[c]=f2h(h2f(row[c])*act_of(h2f(row[inner+c]),1));
   }
 }
 
-extern "C" __global__ void upsample(bf16_t*out,const bf16_t*in,
+extern "C" __global__ void upsample(half_t*out,const half_t*in,
     long long n,int h,int w,int factor){
   long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   if(i>=n)return;
@@ -415,7 +428,7 @@ extern "C" __global__ void upsample(bf16_t*out,const bf16_t*in,
 // directions is always uncoalesced.
 // NOTE: a tiled shared-memory transpose is the standard fix; this runs
 // twice per attention block, not per convolution, so it has not been worth it.
-extern "C" __global__ void transpose(bf16_t*out,const bf16_t*in,long long rows,long long cols){
+extern "C" __global__ void transpose(half_t*out,const half_t*in,long long rows,long long cols){
   long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   if(i<rows*cols)out[(i%cols)*rows+i/cols]=in[i];
 }
@@ -473,7 +486,7 @@ impl ImageGpu {
                 .map_err(cuda_err("CUDA kernel lookup"))
         };
         Ok(Arc::new(Self {
-            context: GpuContext::new(device)?,
+            context: GpuContext::half_accumulate(device)?,
             im2col: get("im2col")?,
             add_bias_rows: get("add_bias_rows")?,
             add_channel: get("add_channel")?,
@@ -502,7 +515,7 @@ impl ImageGpu {
     /// written by the kernel that follows.
     fn uninit(&self, rows: usize, cols: usize) -> Result<Tensor, NetworkError> {
         Ok(Tensor {
-            data: unsafe { self.context.stream.alloc::<bf16>((rows * cols).max(1)) }
+            data: unsafe { self.context.stream.alloc::<f16>((rows * cols).max(1)) }
                 .map_err(cuda_err("device allocation"))?,
             rows,
             cols,
@@ -518,16 +531,16 @@ impl ImageGpu {
             true => std::thread::available_parallelism().map_or(1, |count| count.get()),
             false => 1,
         };
-        let narrowed: Vec<bf16> = match lanes {
-            1 => values.iter().copied().map(bf16::from_f32).collect(),
+        let narrowed: Vec<f16> = match lanes {
+            1 => values.iter().copied().map(f16::from_f32).collect(),
             _ => {
-                let mut narrowed = vec![bf16::ZERO; values.len()];
+                let mut narrowed = vec![f16::ZERO; values.len()];
                 let stride = values.len().div_ceil(lanes);
                 std::thread::scope(|scope| {
                     for (slot, source) in narrowed.chunks_mut(stride).zip(values.chunks(stride)) {
                         scope.spawn(move || {
                             for (target, value) in slot.iter_mut().zip(source) {
-                                *target = bf16::from_f32(*value);
+                                *target = f16::from_f32(*value);
                             }
                         });
                     }
@@ -573,18 +586,18 @@ impl ImageGpu {
         Ok(Matrix::from_vec(
             tensor.rows,
             tensor.cols,
-            narrow.iter().copied().map(bf16::to_f32).collect(),
+            narrow.iter().copied().map(f16::to_f32).collect(),
         ))
     }
 }
 
-/// A `[rows, cols]` row-major BF16 buffer.
+/// A `[rows, cols]` row-major FP16 buffer.
 ///
 /// A feature map is one of these too, held channel-major: `rows` is the channel
 /// count and `cols` the pixel count, which is the layout every convolution and
 /// every checkpoint reads.
 struct Tensor {
-    data: CudaSlice<bf16>,
+    data: CudaSlice<f16>,
     rows: usize,
     cols: usize,
 }
@@ -630,7 +643,7 @@ impl Tensor {
 /// these.
 #[derive(Clone, Copy)]
 struct View<'a> {
-    data: &'a CudaSlice<bf16>,
+    data: &'a CudaSlice<f16>,
     base: usize,
     lead: usize,
     rows: usize,
@@ -847,7 +860,7 @@ impl ImageGpu {
         Ok(())
     }
 
-    /// The convolution with its im2col scratch bounded by `budget` BF16
+    /// The convolution with its im2col scratch bounded by `budget` FP16
     /// elements, which is a parameter only so a test can force the chunk loop
     /// without shrinking a constant the rest of the crate sizes itself by.
     fn conv_with_budget(
@@ -908,7 +921,7 @@ impl ImageGpu {
         // channel-major. That covers every projection into and out of a
         // transformer, every residual shortcut, and the VAE's `post_quant_conv`.
         if conv.kernel == 1 && conv.stride == 1 && conv.padding == 0 {
-            act_plain::<bf16, _>(
+            act_plain::<f16, _>(
                 &self.context,
                 &conv.weight.bytes(),
                 conv.in_channels,
@@ -965,7 +978,7 @@ impl ImageGpu {
                 // column `row * width` of a buffer whose rows are `pixels`
                 // apart.
                 let mut target = output.data.slice_mut(row * width..);
-                act_plain::<bf16, _>(
+                act_plain::<f16, _>(
                     &self.context,
                     &conv.weight.bytes(),
                     patch,
@@ -1032,7 +1045,7 @@ impl ImageGpu {
                 actual: output.len(),
             });
         }
-        act_rhs_transposed::<bf16, _>(
+        act_rhs_transposed::<f16, _>(
             &self.context,
             &tokens.bytes(),
             tokens.cols,
@@ -1436,6 +1449,7 @@ impl ImageGpu {
         let (key_pointer, _key) = key.device_ptr(&self.context.stream);
         let (query_pointer, _query) = query.device_ptr(&self.context.stream);
         let (out_pointer, _out) = scores.data.device_ptr_mut(&self.context.stream);
+        let (scale, zero) = (f16::from_f32(scale), f16::ZERO);
         unsafe {
             cublas::gemm_strided_batched_ex(
                 *self.context.blas.handle(),
@@ -1444,22 +1458,22 @@ impl ImageGpu {
                 context as i32,
                 rows as i32,
                 head_dim as i32,
-                &scale as *const f32 as *const std::ffi::c_void,
+                &scale as *const f16 as *const std::ffi::c_void,
                 key_pointer as *const std::ffi::c_void,
-                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
                 keys.lead as i32,
                 head_dim as i64,
                 query_pointer as *const std::ffi::c_void,
-                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
                 queries.lead as i32,
                 head_dim as i64,
-                &0.0f32 as *const f32 as *const std::ffi::c_void,
+                &zero as *const f16 as *const std::ffi::c_void,
                 out_pointer as *mut std::ffi::c_void,
-                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
                 context as i32,
                 (rows * context) as i64,
                 heads as i32,
-                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
                 cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
             )
         }
@@ -1487,6 +1501,7 @@ impl ImageGpu {
         let (probability_pointer, _probability) =
             probabilities.data.device_ptr(&self.context.stream);
         let (out_pointer, _out) = target.device_ptr_mut(&self.context.stream);
+        let (one, zero) = (f16::ONE, f16::ZERO);
         unsafe {
             cublas::gemm_strided_batched_ex(
                 *self.context.blas.handle(),
@@ -1495,22 +1510,22 @@ impl ImageGpu {
                 head_dim as i32,
                 rows as i32,
                 context as i32,
-                &1.0f32 as *const f32 as *const std::ffi::c_void,
+                &one as *const f16 as *const std::ffi::c_void,
                 value_pointer as *const std::ffi::c_void,
-                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
                 values.lead as i32,
                 head_dim as i64,
                 probability_pointer as *const std::ffi::c_void,
-                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
                 context as i32,
                 (rows * context) as i64,
-                &0.0f32 as *const f32 as *const std::ffi::c_void,
+                &zero as *const f16 as *const std::ffi::c_void,
                 out_pointer as *mut std::ffi::c_void,
-                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
                 width as i32,
                 head_dim as i64,
                 heads as i32,
-                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
                 cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
             )
         }
@@ -2247,7 +2262,7 @@ mod tests {
         .expect("a well-shaped map")
     }
 
-    /// BF16 carries eight mantissa bits, so a value is good to about 0.4%
+    /// FP16 carries eleven mantissa bits, so a value is good to about 0.05%
     /// before any accumulation. The bars below are relative to the largest
     /// value in the reference, which is what makes them comparable across
     /// layers of very different scale.
