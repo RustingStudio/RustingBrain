@@ -118,6 +118,22 @@ impl Preprocessing {
 }
 ```
 
+> **If you standardise instead of min-max scaling**, half of this is already
+> written: `Dataset::standardize` returns a `Standardizer` that is
+> `serde`-serializable, so it saves as JSON in two lines and scales a later row
+> with `apply_row`:
+>
+> ```rust
+> let statistics = train.standardize();
+> std::fs::write("scaler.json", serde_json::to_string(&statistics)?)?;
+> // later, beside the model:
+> let statistics: Standardizer = serde_json::from_str(&std::fs::read_to_string("scaler.json")?)?;
+> let scaled = statistics.apply_row(&raw_row);
+> ```
+>
+> The class names still have to travel with it, which is what the struct below
+> is for.
+
 For the file format we'll use one line per field — no serialisation crate
 needed, and you can read and edit it by hand:
 
@@ -474,9 +490,41 @@ infinite. A corrupt checkpoint returns an error instead of half-restoring.
 | You want to… | Save |
 |---|---|
 | deploy for inference | `save_json` + your `Preprocessing` sidecar |
+| run the model outside Rust | `save_onnx` + your `Preprocessing` sidecar |
 | stop and resume a long training run | `cuda_checkpoint(...).save_json(...)` |
 | survive a crash mid-training | a checkpoint every N epochs |
 | keep the best model during early stopping (ch. 7) | `model.clone()` in memory |
+
+### Saving for a different runtime: ONNX
+
+`save_json` is RustingBrain's own format — nothing else reads it. ONNX is the
+format everything else reads:
+
+```rust
+model.save_onnx("model.onnx")?;
+```
+
+That writes the network as a graph: one `Gemm` node per layer and one
+activation node after it, with the weights as initializers. ONNX Runtime,
+TensorRT, or a browser through onnxruntime-web will all load it, and so will
+this crate's own reader:
+
+```bash
+cargo run --example onnx_inference --features onnx -- model.onnx 1,4 5.1,3.5,1.4,0.2
+```
+
+Three things to know:
+
+- **The input is a `[batch, input_size]` tensor named `input`.** The batch
+  dimension is symbolic, so one row and a thousand both load.
+- **Writing needs no feature flag; reading needs `--features onnx`.** Export is
+  a few hundred lines of protobuf; import pulls in `tract-onnx`.
+- **Dense networks only.** A transformer's RMSNorm, SwiGLU and MoE routing have
+  no equally short representation — `TransformerLm::save_bin` is how you move
+  one of those.
+
+The `Preprocessing` sidecar still travels with it. ONNX carries the graph, not
+your scaler.
 
 A common setup does both: a checkpoint every 10 epochs while training, then one
 final `save_json` for the thing you actually ship. The checkpoints are working

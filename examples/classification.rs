@@ -42,5 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{input:?} -> {:?}", model.predict(input)?);
     }
 
+    // Loss is what the optimizer minimized; accuracy is what the result is
+    // reported in. Six samples and no held-out split, so this only says the
+    // model fitted what it was shown.
+    println!("\naccuracy {:.1}%", 100.0 * model.accuracy(&dataset)?);
+
     Ok(())
 }

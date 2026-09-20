@@ -9,9 +9,7 @@ use crate::ffn::{GeluMlp, GeluMlpCache, SwiGlu, SwiGluCache};
 use crate::matrix::Matrix;
 use crate::moe::{MoeCache, MoeConfig, MoeLayer};
 use crate::network::NetworkError;
-#[cfg(feature = "cuda")]
-use crate::param::Linear;
-use crate::param::Param;
+use crate::param::{Linear, Param};
 use crate::rope::Rope;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
@@ -97,12 +95,20 @@ impl FeedForward {
         }
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn linears_mut(&mut self) -> Vec<&mut Linear> {
         match self {
             Self::SwiGlu(ffn) => ffn.linears_mut(),
             Self::Gelu(ffn) => ffn.linears_mut(),
             Self::Moe(ffn) => ffn.linears_mut(),
+        }
+    }
+
+    /// [`FeedForward::linears_mut`] minus anything an adapter should not go on.
+    pub(crate) fn lora_linears_mut(&mut self) -> Vec<&mut Linear> {
+        match self {
+            Self::SwiGlu(ffn) => ffn.linears_mut(),
+            Self::Gelu(ffn) => ffn.linears_mut(),
+            Self::Moe(ffn) => ffn.lora_linears_mut(),
         }
     }
 
@@ -263,7 +269,14 @@ impl TransformerBlock {
         Ok(grad_input)
     }
 
-    #[cfg(feature = "cuda")]
+    /// Every projection in the block that takes a LoRA adapter: all four
+    /// attention projections and the feed-forward's, the MoE router aside.
+    pub(crate) fn lora_linears_mut(&mut self) -> Vec<&mut Linear> {
+        let mut linears = self.attention.linears_mut();
+        linears.extend(self.feed_forward.lora_linears_mut());
+        linears
+    }
+
     pub(crate) fn linears_mut(&mut self) -> Vec<&mut Linear> {
         let mut linears = self.attention.linears_mut();
         linears.extend(self.feed_forward.linears_mut());

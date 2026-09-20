@@ -267,6 +267,35 @@ That's actionable in a way no aggregate number is:
 **Always slice your errors** — by class, by value range, by any feature you have.
 Aggregate metrics are for reporting; sliced metrics are for improving.
 
+### The slice a classifier always wants: a confusion matrix
+
+For classification the useful slice is which class was mistaken for which, and
+that is one call:
+
+```rust
+println!("actual \\ predicted   {}", classes.join("  "));
+for (class, row) in classes.iter().zip(model.confusion_matrix(&test)?) {
+    println!("{class:>12}   {row:?}");
+}
+```
+
+```
+actual \ predicted   borealis  rosetta  valentia
+    borealis   [7, 0, 1]
+     rosetta   [0, 10, 0]
+    valentia   [2, 0, 2]
+```
+
+Row = the true class, column = what the model said, so the diagonal is the
+correct predictions and `accuracy` is that diagonal divided by the total —
+which is exactly how `Network::accuracy` computes it. Everything off the
+diagonal is what accuracy hides: here `valentia` is right half the time and
+loses to `borealis`, while a single accuracy number (`79%`) says nothing about
+which class is in trouble.
+
+It is defined for classification only; asking for one on a network trained with
+`Loss::Mse` is an error rather than a meaningless table.
+
 ---
 
 ## 8.6 The honest evaluation checklist
@@ -278,6 +307,7 @@ Aggregate metrics are for reporting; sliced metrics are for improving.
 - [ ] Improvements confirmed larger than seed noise
 - [ ] K-fold used if the dataset is small
 - [ ] Errors sliced by group, not just averaged
+- [ ] Confusion matrix read, not just accuracy (classification)
 - [ ] Worst predictions actually read
 - [ ] Uncertainty reported: `17.5k ± 1.8k`, not `17.526k`
 
@@ -314,6 +344,8 @@ set implies a precision you do not have.
 - Report `mean ± std`, not a single over-precise number.
 - Slice your errors. Our model was 2× better on expensive houses, and the
   aggregate hid it.
+- For classification, `confusion_matrix` is the slice that always applies:
+  accuracy is its diagonal, and everything else is what accuracy hides.
 - Read your worst predictions — some failures are data problems that no model
   can fix.
 

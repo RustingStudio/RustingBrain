@@ -301,6 +301,12 @@ pub struct DeviceParam {
     grad_dirty: bool,
     moment1: CudaSlice<f32>,
     moment2: CudaSlice<f32>,
+    /// Whether the parameter is held for its value alone. A frozen parameter
+    /// is what a LoRA adapter leaves behind, and the point of freezing is that
+    /// its gradient and both Adam moments never get allocated, so the base
+    /// model costs one weight-sized device buffer to train with rather than
+    /// four.
+    frozen: bool,
 }
 
 impl std::fmt::Debug for DeviceParam {
@@ -353,13 +359,20 @@ impl Clone for DeviceParam {
             grad_dirty: self.grad_dirty,
             moment1: take(2),
             moment2: take(3),
+            frozen: self.frozen,
         }
     }
 }
 
 impl DeviceParam {
-    pub(crate) fn new(context: Arc<GpuContext>, value: &Matrix) -> Result<Self, NetworkError> {
-        let len = value.data.len();
+    pub(crate) fn new(
+        context: Arc<GpuContext>,
+        value: &Matrix,
+        frozen: bool,
+    ) -> Result<Self, NetworkError> {
+        // A frozen parameter never takes a gradient or an optimizer step, so
+        // the three training buffers are placeholders rather than weights.
+        let len = if frozen { 1 } else { value.data.len() };
         Ok(Self {
             rows: value.rows,
             cols: value.cols,
@@ -368,8 +381,15 @@ impl DeviceParam {
             grad_dirty: false,
             moment1: context.zeros(len)?,
             moment2: context.zeros(len)?,
+            frozen,
             context,
         })
+    }
+
+    /// Whether a gradient written here would be thrown away, which is what
+    /// every accumulation site checks before doing its GEMM.
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.frozen
     }
 
     pub(crate) fn context(&self) -> &Arc<GpuContext> {
@@ -426,6 +446,9 @@ impl DeviceParam {
         first: &mut Matrix,
         second: &mut Matrix,
     ) -> Result<(), NetworkError> {
+        if self.frozen {
+            return Ok(());
+        }
         self.context.download(&self.moment1, first)?;
         self.context.download(&self.moment2, second)
     }
@@ -436,14 +459,48 @@ impl DeviceParam {
         first: &Matrix,
         second: &Matrix,
     ) -> Result<(), NetworkError> {
+        if self.frozen {
+            return Ok(());
+        }
         self.moment1 = self.context.upload(first)?;
         self.moment2 = self.context.upload(second)?;
         Ok(())
     }
 
+    /// The L2 norm of this parameter's gradient, computed on the device.
+    ///
+    /// The sign convention does not matter to a norm, so the negated buffer is
+    /// read as it stands. A parameter that took no gradient this step reports
+    /// zero rather than the stale buffer `grad_dirty` is guarding.
+    pub(crate) fn grad_norm(&self) -> Result<f32, NetworkError> {
+        if self.frozen || !self.grad_dirty {
+            return Ok(0.0);
+        }
+        let (pointer, _guard) = self.negated_grad.device_ptr(&self.context.stream);
+        let mut norm = 0.0f32;
+        // cuBLAS scales internally, so a gradient that would overflow the
+        // square of an f32 still gets a finite norm. Pointer mode is the
+        // default host one, which makes this call synchronizing.
+        let status = unsafe {
+            cublas_sys::cublasSnrm2_v2(
+                *self.context.blas.handle(),
+                (self.rows * self.cols) as i32,
+                pointer as *const f32,
+                1,
+                &mut norm,
+            )
+        };
+        if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(NetworkError::Cuda(format!(
+                "cuBLAS gradient norm failed: {status:?}"
+            )));
+        }
+        Ok(norm)
+    }
+
     /// The plain `dL/dw`, negating the device convention on the way out.
     pub(crate) fn download_grad(&self, target: &mut Matrix) -> Result<(), NetworkError> {
-        if !self.grad_dirty {
+        if self.frozen || !self.grad_dirty {
             target.zeros();
             return Ok(());
         }
@@ -512,6 +569,9 @@ impl DeviceParam {
 
     /// `negated_grad -= grad_output[tokens, rows]^T . input[tokens, cols]`.
     pub(crate) fn accumulate_grad(&mut self, grad_output: &Matrix, input: &Matrix) {
+        if self.frozen {
+            return;
+        }
         let result = (|| {
             let device_grad_output = self.context.upload(grad_output)?;
             let device_input = self.context.upload(input)?;
@@ -566,6 +626,9 @@ impl DeviceParam {
 
     /// Scatter-add of the gather's gradient, one row per token id.
     pub(crate) fn scatter_grad(&mut self, ids: &[u32], grad_output: &Matrix) {
+        if self.frozen {
+            return;
+        }
         let result = (|| -> Result<(), NetworkError> {
             let device_ids = self
                 .context
@@ -594,6 +657,9 @@ impl DeviceParam {
 
     /// One optimizer step on the device, reusing `cuda_training`'s kernels.
     pub(crate) fn step(&mut self, optimizer: &Optimizer, step: usize, scale: f32) {
+        if self.frozen {
+            return;
+        }
         let elements = self.rows * self.cols;
         let result = (|| -> Result<(), NetworkError> {
             // A parameter that took no gradient this step still takes a step,
@@ -651,6 +717,11 @@ impl DeviceParam {
                             .launch(cfg(elements))
                             .map_err(cuda_err("Adam update kernel"))?;
                     }
+                }
+                Optimizer::Lion { .. } => {
+                    return Err(NetworkError::UnsupportedCuda(
+                        "the Lion optimizer, which has no device kernel".into(),
+                    ));
                 }
             }
             self.grad_dirty = false;
@@ -1286,6 +1357,33 @@ mod tests {
     }
 
     #[test]
+    fn gpu_grad_norm_matches_cpu_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let mut cpu = tiny().build().unwrap();
+        let mut gpu = cpu.clone();
+        gpu.to_cuda(0, 8192).unwrap();
+        let batch = crate::batch::TokenBatch::new(&[[3u32, 8, 1, 5, 2, 7]]).unwrap();
+
+        // A parameter that never took a gradient must read as zero rather than
+        // as whatever the device buffer held before `zero_grad`.
+        cpu.zero_grad();
+        gpu.zero_grad();
+        assert_eq!(gpu.grad_norm().unwrap(), 0.0);
+
+        cpu.accumulate_step(&batch).unwrap();
+        gpu.accumulate_step(&batch).unwrap();
+
+        let (host, device) = (cpu.grad_norm().unwrap(), gpu.grad_norm().unwrap());
+        assert!(host > 0.0);
+        assert!(
+            (device - host).abs() <= 1e-3 * host,
+            "{device} on the device vs {host} on the host"
+        );
+    }
+
+    #[test]
     fn gpu_forward_matches_cpu_or_skips_without_device() {
         if !cuda_or_skip() {
             return;
@@ -1316,6 +1414,64 @@ mod tests {
         gpu.sync_from_device().unwrap();
 
         assert!((host.total() - device.total()).abs() < 1e-3);
+        for (index, (device_param, host_param)) in
+            gpu.params_mut().iter().zip(cpu.params_mut()).enumerate()
+        {
+            assert_close(
+                &format!("parameter {index}"),
+                &device_param.value.data,
+                &host_param.value.data,
+                1e-3,
+            );
+        }
+    }
+
+    #[test]
+    fn a_gpu_lora_step_matches_the_host_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let mut cpu = tiny().build().unwrap();
+        cpu.add_lora(crate::transformer::LoraConfig::new(4).alpha(8.0))
+            .unwrap();
+        let mut gpu = cpu.clone();
+        gpu.to_cuda(0, 8192).unwrap();
+        let ids = [3u32, 8, 1, 5, 2, 7];
+        let before = cpu.blocks[0].attention.query.weight.value.clone();
+
+        // Two steps, not one. `up` starts at zero, so the first step is the
+        // only thing that moves it off zero and the second is the first one
+        // where the adapter contributes to the forward pass at all.
+        for step in 0..2 {
+            let host = cpu.train_step(&[&ids[..]]).unwrap();
+            let device = gpu.train_step(&[&ids[..]]).unwrap();
+            assert!(
+                (host.total() - device.total()).abs() < 1e-3,
+                "step {step}: {} on the device vs {} on the host",
+                device.total(),
+                host.total()
+            );
+        }
+        gpu.sync_from_device().unwrap();
+
+        // The frozen base is the same matrix it started as, on both paths.
+        assert_close(
+            "frozen base weight",
+            &gpu.blocks[0].attention.query.weight.value.data,
+            &before.data,
+            0.0,
+        );
+        let adapter = gpu.blocks[0]
+            .attention
+            .query
+            .lora
+            .as_ref()
+            .expect("the query projection carries an adapter");
+        assert!(
+            adapter.up.value.data.iter().any(|&value| value != 0.0),
+            "the device step left the adapter at its zero initialization"
+        );
+
         for (index, (device_param, host_param)) in
             gpu.params_mut().iter().zip(cpu.params_mut()).enumerate()
         {

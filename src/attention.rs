@@ -119,6 +119,17 @@ pub struct MultiHeadAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    /// Whether a query may only read keys at or before its own position.
+    ///
+    /// False is the encoder shape: every position reads the whole sequence.
+    /// Defaults to true on load, so a snapshot written before this existed
+    /// restores as the decoder it was.
+    #[serde(default = "causal_by_default")]
+    causal: bool,
+}
+
+pub(crate) fn causal_by_default() -> bool {
+    true
 }
 
 impl MultiHeadAttention {
@@ -156,7 +167,22 @@ impl MultiHeadAttention {
             num_heads,
             num_kv_heads,
             head_dim,
+            causal: true,
         })
+    }
+
+    /// Drops the causal mask, so every position reads the whole sequence.
+    ///
+    /// This is what separates an encoder from a decoder. Nothing else about
+    /// the layer changes: the backward pass already treats a masked weight as
+    /// a zero probability rather than as a special case, so it needs no
+    /// knowledge of which shape it is differentiating.
+    pub fn set_causal(&mut self, causal: bool) {
+        self.causal = causal;
+    }
+
+    pub fn is_causal(&self) -> bool {
+        self.causal
     }
 
     pub fn d_model(&self) -> usize {
@@ -235,6 +261,13 @@ impl MultiHeadAttention {
         input: &Matrix,
         cache: &mut KvCache,
     ) -> Result<Matrix, NetworkError> {
+        if !self.causal {
+            return Err(NetworkError::InvalidConfig(
+                "a bidirectional layer cannot decode from a cache: every position reads the \
+                 whole sequence, so an appended token changes the tokens before it"
+                    .into(),
+            ));
+        }
         let position_offset = cache.len();
         let (queries, keys, values) = self.project(input, position_offset)?;
         cache.append(&keys, &values)?;
@@ -436,8 +469,7 @@ impl MultiHeadAttention {
         Ok(grad_input)
     }
 
-    /// Every projection in this layer, for uploading to a device.
-    #[cfg(feature = "cuda")]
+    /// Every projection in this layer, for uploading to a device or quantizing.
     pub(crate) fn linears_mut(&mut self) -> Vec<&mut Linear> {
         vec![
             &mut self.query,
@@ -576,9 +608,13 @@ impl MultiHeadAttention {
             .par_chunks_mut(seq_len)
             .enumerate()
             .for_each(|(row, weights)| {
-                let position = row % seq_len;
-                softmax(&mut weights[..position + 1]);
-                weights[position + 1..].fill(0.0);
+                let visible = if self.causal {
+                    row % seq_len + 1
+                } else {
+                    seq_len
+                };
+                softmax(&mut weights[..visible]);
+                weights[visible..].fill(0.0);
             });
 
         scores
@@ -793,6 +829,73 @@ mod tests {
 
         assert_eq!(&before.data[..3 * 8], &after.data[..3 * 8]);
         assert_ne!(before.row(3), after.row(3));
+    }
+
+    #[test]
+    fn a_bidirectional_layer_lets_a_later_token_change_an_earlier_output() {
+        let mut layer = attention(2, 1);
+        layer.set_causal(false);
+        let original = inputs(4, 8);
+        let (before, _) = layer.forward_train(&original, Layout::default()).unwrap();
+
+        let mut edited = original.clone();
+        for value in edited.row_mut(3) {
+            *value = 9.0;
+        }
+        let (after, _) = layer.forward_train(&edited, Layout::default()).unwrap();
+
+        // The exact opposite of the causal case: every earlier position reads
+        // the token that changed, so every output moves.
+        for token in 0..4 {
+            assert_ne!(before.row(token), after.row(token), "token {token}");
+        }
+    }
+
+    #[test]
+    fn a_bidirectional_layer_refuses_to_decode_from_a_cache() {
+        let mut layer = attention(2, 1);
+        layer.set_causal(false);
+        let mut cache = KvCache::new(1, 4);
+
+        assert!(layer.forward_cached(&inputs(1, 8), &mut cache).is_err());
+    }
+
+    #[test]
+    fn bidirectional_backward_matches_finite_differences() {
+        let mut layer = attention(2, 1);
+        layer.set_causal(false);
+        let input = inputs(4, 8);
+
+        let (output, cache) = layer.forward_train(&input, Layout::default()).unwrap();
+        let grad_output = Matrix::from_vec(output.rows, output.cols, vec![1.0; output.data.len()]);
+        let grad_input = layer.backward(&cache, &grad_output).unwrap();
+
+        let epsilon = 1e-3;
+        for index in 0..input.data.len() {
+            let mut bumped = input.clone();
+            bumped.data[index] += epsilon;
+            let high: f32 = layer
+                .forward_train(&bumped, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
+            bumped.data[index] -= 2.0 * epsilon;
+            let low: f32 = layer
+                .forward_train(&bumped, Layout::default())
+                .unwrap()
+                .0
+                .data
+                .iter()
+                .sum();
+            let numeric = (high - low) / (2.0 * epsilon);
+            assert!(
+                (grad_input.data[index] - numeric).abs() < 2e-2,
+                "index {index}: {} vs {numeric}",
+                grad_input.data[index]
+            );
+        }
     }
 
     #[test]

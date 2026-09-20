@@ -42,25 +42,23 @@
 //!
 //! # Generating text
 //!
-//! [`TransformerLm::forward_cached`] appends to a per-layer [`KvCache`], so
-//! decoding the *n*-th token costs one row of attention instead of *n*:
+//! [`TransformerLm::generate`] prefills a per-layer [`KvCache`] with the prompt
+//! and then decodes one token at a time, so the *n*-th token costs one row of
+//! attention instead of *n*. [`Sampler`] decides which token that is.
 //!
 //! ```no_run
-//! # use rusting_brain::TransformerLm;
+//! # use rusting_brain::{Sampler, TransformerLm};
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let model = TransformerLm::builder().build()?;
 //! # let prompt = [1u32, 2, 3];
-//! let mut caches = model.new_kv_caches();
-//! let mut logits = model.forward_cached(&prompt, &mut caches)?;   // prefill
-//!
-//! for _ in 0..50 {
-//!     let next = argmax(logits.row(logits.rows - 1));
-//!     logits = model.forward_cached(&[next], &mut caches)?;       // decode
-//! }
-//! # fn argmax(row: &[f32]) -> u32 { 0 }
+//! let mut sampler = Sampler::temperature(0.8, Some(42)).top_k(40).top_p(0.95);
+//! let generated = model.generate(&prompt, 50, &mut sampler)?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`TransformerLm::forward_cached`] is the cache underneath, for driving
+//! decoding by hand.
 //!
 //! # Running on a GPU
 //!
@@ -105,23 +103,41 @@ pub mod activations;
 pub mod attention;
 pub mod batch;
 pub mod causal_lm_loss;
+pub mod clip;
+pub mod conv;
 pub mod dataset;
+pub mod diffusion;
 pub mod embedding;
 pub mod ffn;
 pub mod losses;
+pub mod masked_lm;
 pub mod matrix;
+pub mod mmdit;
 pub mod moe;
 pub mod network;
 pub mod norm;
 pub mod optimizers;
 pub mod param;
+pub mod pipeline;
+pub mod quantized;
 pub mod rope;
+pub mod safetensors;
+pub mod sampling;
 pub mod serialization;
+pub mod t5;
+pub mod text_encoder;
+pub mod token_file;
+pub mod tokenizer;
 pub mod transformer;
 pub mod transformer_block;
+pub mod unet;
+pub mod vae;
+pub mod vision;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_flash;
+#[cfg(feature = "cuda")]
+pub mod cuda_image;
 #[cfg(feature = "cuda")]
 pub mod cuda_training;
 #[cfg(feature = "cuda")]
@@ -136,6 +152,7 @@ pub mod gpu_transformer;
 pub mod metal_training;
 
 pub mod onnx;
+pub(crate) mod onnx_export;
 
 pub use accelerator::{
     AcceleratorDoctorReport, AcceleratorStats, TrainingSession, accelerator_doctor,
@@ -145,27 +162,47 @@ pub use activations::Activation;
 pub use attention::{KvCache, MultiHeadAttention};
 pub use batch::{Layout, TokenBatch};
 pub use causal_lm_loss::{CausalLmLoss, TotalLoss, causal_lm_loss, causal_lm_loss_batch};
+pub use clip::{ClipTextConfig, ClipTextEncoder};
+pub use conv::{Conv2d, FeatureMap, GroupNorm, pixel_shuffle, pixel_unshuffle, upsample_nearest};
 #[cfg(feature = "cuda")]
 pub use cuda_training::{CudaDoctorReport, CudaTrainingSession, CudaTrainingStats, cuda_doctor};
-pub use dataset::{Dataset, DatasetBatch};
+pub use dataset::{
+    BatchCursor, BatchSource, Dataset, DatasetBatch, DatasetStream, JsonlStream, Standardizer,
+};
+pub use diffusion::{Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_from};
 pub use embedding::Embedding;
 pub use ffn::{GeluMlp, SwiGlu};
 #[cfg(feature = "cuda")]
 pub use gpu_transformer::GpuContext;
 pub use losses::Loss;
+pub use masked_lm::{MaskedBatch, masked_lm_loss};
 pub use matrix::Matrix;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_training::{MetalTrainingSession, metal_doctor};
+pub use mmdit::{Conditioning, Dit, DitConfig};
 pub use moe::{Expert, MoeConfig, MoeLayer, Router};
 pub use network::{
     CudaTrainingCheckpoint, Dense, DenseLayer, Network, NetworkBuilder, NetworkError, TrainConfig,
     TrainingBackend, TrainingHistory,
 };
 pub use norm::RmsNorm;
-pub use optimizers::Optimizer;
-pub use param::{Linear, Param};
+pub use optimizers::{Optimizer, Schedule};
+pub use param::{Linear, Lora, Param};
+pub use pipeline::{
+    DynamicShift, ImageDenoiser, ImagePipeline, PipelineConfig, PooledEncoder, PromptEncoder,
+};
 pub use rope::Rope;
+pub use safetensors::{Dtype, SafeTensors, ShardedSafeTensors, TensorInfo};
+pub use sampling::Sampler;
+pub use t5::{T5Config, T5Encoder};
+pub use text_encoder::{TextEncoder, TextEncoderConfig};
+pub use token_file::{TokenFile, TokenStream};
+pub use tokenizer::{Bpe, Unigram};
 pub use transformer::{
-    ParameterCounts, Precision, TransformerBuilder, TransformerConfig, TransformerLm,
+    Decoder, LoraConfig, ParameterCounts, Precision, TransformerBuilder, TransformerConfig,
+    TransformerLm,
 };
 pub use transformer_block::{FeedForward, TransformerBlock};
+pub use unet::{Unet, UnetConfig};
+pub use vae::{VaeConfig, VaeDecoder, VaeEncoder, to_rgb8};
+pub use vision::{VisionTransformer, VitConfig};

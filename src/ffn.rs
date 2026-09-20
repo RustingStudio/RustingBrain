@@ -119,7 +119,6 @@ impl SwiGlu {
         grad_input
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn linears_mut(&mut self) -> Vec<&mut Linear> {
         vec![&mut self.gate, &mut self.up, &mut self.down]
     }
@@ -210,7 +209,6 @@ impl GeluMlp {
         self.up.backward(&cache.input, &grad_hidden)
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn linears_mut(&mut self) -> Vec<&mut Linear> {
         vec![&mut self.up, &mut self.down]
     }

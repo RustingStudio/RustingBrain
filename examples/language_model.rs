@@ -9,13 +9,18 @@
 //! `train` writes `lm.rbw` and `lm.vocab`; `generate` reads them back, so the
 //! two halves run in separate processes and the checkpoint is really exercised.
 //!
+//! The corpus is a paragraph and the model is 0.6M parameters, so the held-out
+//! loss printed beside the training loss turns back up within a hundred steps:
+//! there is nothing here to generalize to and memorizing is the only thing left
+//! to do. That gap is the point of printing it.
+//!
 //! Character-level because the crate ships no tokenizer: tokenization is a
 //! text problem rather than a neural-network one, and the `tokenizers` crate
 //! already solves it. Swap a BPE vocabulary in and nothing else here changes.
 //!
 //! Tutorial chapters 14 to 16 explain every decision in this file.
 
-use rusting_brain::{Optimizer, Precision, TokenBatch, TransformerLm};
+use rusting_brain::{Optimizer, Precision, Sampler, Schedule, TokenBatch, TransformerLm};
 
 const WEIGHTS: &str = "lm.rbw";
 const VOCABULARY: &str = "lm.vocab";
@@ -27,6 +32,7 @@ const ACCUMULATE: usize = 2;
 const STEPS: usize = 600;
 const WARMUP: usize = 60;
 const PEAK_LR: f32 = 3e-3;
+const MAX_GRAD_NORM: f32 = 1.0;
 
 const CORPUS: &str = "\
 ownership moves, borrows do not. a value has exactly one owner, and when the \
@@ -84,29 +90,23 @@ impl CharTokenizer {
     }
 }
 
-/// Warmup, then cosine decay to a tenth of the peak.
-///
-/// Full-size steps before Adam's moment estimates have settled can knock the
-/// model somewhere it takes a long time to leave; full-size steps at the end
-/// stop it settling at all.
-fn learning_rate(step: usize) -> f32 {
-    if step < WARMUP {
-        PEAK_LR * step as f32 / WARMUP as f32
-    } else {
-        let progress = (step - WARMUP) as f32 / (STEPS - WARMUP) as f32;
-        let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
-        PEAK_LR * (0.1 + 0.9 * cosine)
-    }
-}
-
 fn train(moe: bool) -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = CharTokenizer::fit(CORPUS);
     let ids = tokenizer.encode(CORPUS);
-    let windows: Vec<Vec<u32>> = ids
-        .windows(SEQ_LEN)
-        .step_by(STRIDE)
-        .map(<[u32]>::to_vec)
-        .collect();
+
+    // The held-out split is a slice of the text, not a sample of the windows:
+    // windows overlap, so holding out every n-th one would put most of a
+    // validation window inside a training window and report a loss that means
+    // nothing.
+    let split = ids.len() * 85 / 100;
+    let window = |ids: &[u32]| -> Vec<Vec<u32>> {
+        ids.windows(SEQ_LEN)
+            .step_by(STRIDE)
+            .map(<[u32]>::to_vec)
+            .collect()
+    };
+    let windows = window(&ids[..split]);
+    let held_out = TokenBatch::new(&window(&ids[split..]))?;
 
     let mut builder = TransformerLm::builder()
         .vocab_size(tokenizer.len())
@@ -138,19 +138,25 @@ fn train(moe: bool) -> Result<(), Box<dyn std::error::Error>> {
     // model.to_cuda(0, 9_000)?;
 
     println!(
-        "{} windows of {SEQ_LEN} tokens, vocabulary {}",
+        "{} training windows of {SEQ_LEN} tokens, {} held out, vocabulary {}",
         windows.len(),
+        held_out.batch(),
         tokenizer.len()
     );
     println!("{}\n", model.parameter_counts());
-    println!(" step      lr     loss    ppl     aux");
+    println!(" step      lr     loss    ppl     aux    |g|      val");
+
+    // Warmup then cosine decay: full-size steps before Adam's moments have
+    // settled knock the model somewhere it takes a long time to leave, and
+    // full-size steps at the end stop it settling at all.
+    let schedule = Schedule::warmup_cosine(PEAK_LR, WARMUP, STEPS);
 
     let mut cursor = 0;
-    for step in 1..=STEPS {
+    for step in 0..STEPS {
         // The optimizer is read fresh at every step, so a schedule is one
         // assignment and there is nothing to register.
-        let rate = learning_rate(step);
-        model.optimizer = Optimizer::adam(rate);
+        let rate = schedule.rate(step);
+        model.optimizer.set_learning_rate(rate);
 
         // Gradient accumulation: the effective batch is not bounded by the
         // memory one forward pass needs.
@@ -171,14 +177,25 @@ fn train(moe: bool) -> Result<(), Box<dyn std::error::Error>> {
         // The averaging belongs on the step: Adam normalizes by the gradient's
         // own second moment, so scaling every accumulation identically would
         // cancel out and change nothing.
-        model.step(1.0 / ACCUMULATE as f32);
+        //
+        // Clipping is not an optimization. A single batch whose gradient is an
+        // order of magnitude larger than usual moves the weights far enough to
+        // undo thousands of steps, and the norm printed below is the warning
+        // that it happened.
+        let norm = model.step_clipped(1.0 / ACCUMULATE as f32, MAX_GRAD_NORM)?;
 
-        if step == 1 || step % 100 == 0 {
+        if step == 0 || (step + 1) % 100 == 0 {
             let lm = lm / ACCUMULATE as f32;
+            // Training loss falls whether or not the model is learning anything
+            // general. The held-out loss is what says which, and the step where
+            // it turns back up is the step to have stopped at.
+            let validation = model.evaluate(&held_out)?;
             println!(
-                "{step:>5}  {rate:.5}  {lm:.4}  {:>6.2}  {:.4}",
+                "{:>5}  {rate:.5}  {lm:.4}  {:>6.2}  {:.4}  {norm:.3}  {:.4}",
+                step + 1,
                 lm.exp(),
-                aux / ACCUMULATE as f32
+                aux / ACCUMULATE as f32,
+                validation.lm_loss
             );
         }
     }
@@ -196,36 +213,6 @@ fn train(moe: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Temperature sharpens or flattens the distribution; top-k cuts the long tail.
-///
-/// Without top-k the thirty thousand individually-impossible tokens carry
-/// enough probability between them that one is eventually drawn, and a single
-/// wrong token derails everything after it.
-fn sample(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
-    let mut scaled: Vec<(usize, f32)> = logits
-        .iter()
-        .enumerate()
-        .map(|(id, &value)| (id, value / temperature.max(1e-6)))
-        .collect();
-    scaled.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scaled.truncate(top_k.clamp(1, logits.len()));
-
-    // Subtracting the maximum before `exp` is not a nicety: logits reach 30 or
-    // more, `exp(30)` overflows to infinity, and every weight becomes NaN.
-    let max = scaled[0].1;
-    let weights: Vec<f32> = scaled.iter().map(|&(_, v)| (v - max).exp()).collect();
-    let total: f32 = weights.iter().sum();
-
-    let mut threshold = rand::random::<f32>() * total;
-    for (&(id, _), &weight) in scaled.iter().zip(&weights) {
-        threshold -= weight;
-        if threshold <= 0.0 {
-            return id as u32;
-        }
-    }
-    scaled[0].0 as u32
-}
-
 fn generate(prompt: &str, new_tokens: usize) -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = CharTokenizer::load(VOCABULARY)
         .map_err(|_| format!("{VOCABULARY} not found - run `language_model -- train` first"))?;
@@ -238,25 +225,25 @@ fn generate(prompt: &str, new_tokens: usize) -> Result<(), Box<dyn std::error::E
 
     // Two temperatures from the same prompt, because the difference is the
     // whole point: low is repetitive and safe, high is varied and wrong more
-    // often.
+    // often. Top-k matters as much as the temperature: without it the thirty
+    // thousand individually-impossible tokens carry enough probability between
+    // them that one is eventually drawn, and a single wrong token derails
+    // everything after it.
     for (temperature, top_k) in [(0.2, 8), (0.8, 8)] {
-        let mut generated = ids.clone();
+        // A fixed seed, so re-running the example on the same checkpoint prints
+        // the same text; pass `None` for a different sample each run.
+        let mut sampler = Sampler::temperature(temperature, Some(42)).top_k(top_k);
 
-        // Prefill the caches with the whole prompt in one pass, then append one
-        // token at a time. The caches carry the position, so nothing tracks it.
-        let mut caches = model.new_kv_caches();
-        let mut logits = model.forward_cached(&generated, &mut caches)?;
-
-        for _ in 0..new_tokens {
-            let next = sample(logits.row(logits.rows - 1), temperature, top_k);
-            generated.push(next);
-            logits = model.forward_cached(&[next], &mut caches)?;
-        }
-
-        println!(
-            "T={temperature:.1} k={top_k}\n  {}\n",
-            tokenizer.decode(&generated)
-        );
+        // Printed as it decodes rather than at the end: each token costs a
+        // forward pass, and on a real model that is several seconds of nothing.
+        // `flush`, because stdout is line buffered and none of this is a line.
+        print!("T={temperature:.1} k={top_k}\n  {}", tokenizer.decode(&ids));
+        model.generate_with(&ids, new_tokens, &mut sampler, |id| {
+            print!("{}", tokenizer.decode(&[id]));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            true
+        })?;
+        println!("\n");
     }
 
     Ok(())

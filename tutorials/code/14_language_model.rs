@@ -6,7 +6,7 @@
 //!
 //! Run with `cargo run --release --example 14_language_model`.
 
-use rusting_brain::{Optimizer, Precision, TransformerLm};
+use rusting_brain::{Optimizer, Precision, Sampler, TransformerLm};
 
 const CORPUS: &str = "\
 the borrow checker is not your enemy. it is a colleague who has read the code \
@@ -52,35 +52,6 @@ impl CharTokenizer {
     }
 }
 
-/// Pick the next token from one row of logits.
-///
-/// `temperature` below 1.0 sharpens toward the top choice; `top_k` cuts the
-/// long tail, which is what stops one unlucky token derailing the rest.
-fn sample(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
-    let mut scaled: Vec<(usize, f32)> = logits
-        .iter()
-        .enumerate()
-        .map(|(id, &value)| (id, value / temperature.max(1e-6)))
-        .collect();
-    scaled.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scaled.truncate(top_k.clamp(1, logits.len()));
-
-    // Subtracting the maximum before `exp` is not a nicety: logits reach 30 or
-    // more, `exp(30)` overflows to infinity, and every weight becomes NaN.
-    let max = scaled[0].1;
-    let weights: Vec<f32> = scaled.iter().map(|&(_, v)| (v - max).exp()).collect();
-    let total: f32 = weights.iter().sum();
-
-    let mut threshold = rand::random::<f32>() * total;
-    for (&(id, _), &weight) in scaled.iter().zip(&weights) {
-        threshold -= weight;
-        if threshold <= 0.0 {
-            return id as u32;
-        }
-    }
-    scaled[0].0 as u32
-}
-
 fn generate(
     model: &TransformerLm,
     tokenizer: &CharTokenizer,
@@ -89,20 +60,18 @@ fn generate(
     temperature: f32,
     top_k: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut ids = tokenizer.encode(prompt);
-    let mut caches = model.new_kv_caches();
+    let ids = tokenizer.encode(prompt);
 
-    // Prefill: the whole prompt in one pass.
-    let mut logits = model.forward_cached(&ids, &mut caches)?;
+    // `Sampler` holds the decoding knobs: temperature reshapes the
+    // distribution, top-k cuts the long tail that would otherwise derail
+    // everything after one unlucky token. A fixed seed so the output above is
+    // the output you get.
+    let mut sampler = Sampler::temperature(temperature, Some(7)).top_k(top_k);
 
-    for _ in 0..new_tokens {
-        let next = sample(logits.row(logits.rows - 1), temperature, top_k);
-        ids.push(next);
-        // Decode: one token, attending to everything already cached.
-        logits = model.forward_cached(&[next], &mut caches)?;
-    }
-
-    Ok(tokenizer.decode(&ids))
+    // `generate` runs the prefill-then-decode loop over a KV cache and returns
+    // the new tokens only, so the prompt goes back in front for printing.
+    let continuation = model.generate(&ids, new_tokens, &mut sampler)?;
+    Ok(tokenizer.decode(&[ids, continuation].concat()))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

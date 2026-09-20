@@ -48,8 +48,25 @@ cp /path/to/RustingBrain/tutorials/data/flowers.csv data/
 
 ## 4.2 Reading a CSV
 
-RustingBrain has no CSV loader, on purpose — it's a neural network library, not
-a data library. For simple files, Rust's standard library is enough:
+This exact file shape — numeric columns, a text label last — has a one-line
+reader:
+
+```rust
+use rusting_brain::Dataset;
+
+let (dataset, classes) = Dataset::from_csv_labeled("data/flowers.csv")?;
+println!("{} rows, classes {classes:?}", dataset.len());
+```
+
+`classes` comes back sorted (`["borealis", "cascade", "rosetta"]`) and each
+target is already the one-hot row section 4.3 explains. If the last columns are
+numbers rather than a name, `Dataset::from_csv("prices.csv", 1)` reads the file
+with the last column as the target instead.
+
+The rest of this section parses the same file by hand anyway. Not because the
+loader is lacking, but because every real dataset eventually has a column the
+loader does not understand, and a parser you have written once is a parser you
+can change. For simple files, Rust's standard library is enough:
 
 ```rust
 use std::error::Error;
@@ -273,9 +290,23 @@ moves in jumps of 33 percentage points. One lucky prediction looks like a huge
 improvement. Always print this table — if a class is nearly missing from a
 split, treat that split's numbers with suspicion.
 
-The proper fix is a **stratified split**: split each class separately at 70/15/15
-and concatenate, so every split has the same class proportions. Try it as an
-exercise; for this dataset the simple version is good enough to learn on.
+The proper fix is a **stratified split**: split each class separately and
+concatenate, so every split has the same class proportions. `Dataset` does it
+for you:
+
+```rust
+let (train, rest) = dataset.split_stratified(0.7);
+let (validation, test) = rest.split_stratified(0.5);
+```
+
+Same call shape as `split`, and the class balance above stops jumping around.
+It reads the class off the target — the largest entry of a one-hot row, or the
+value itself for a single-column target — so it applies to classification only;
+a continuous target has no class and stays on plain `split`.
+
+Shuffle before either one. `split_stratified` keeps the row order it is given
+inside each class, so an unshuffled dataset splits into whatever order the
+loader produced.
 
 ---
 
@@ -413,6 +444,59 @@ scaled = (value − mean) / std_dev
 
 Min-max is a fine default. Switch to standardisation when you have outliers.
 
+`Dataset` has standardisation built in, and it hands back the statistics it
+measured so later data goes through the same transform:
+
+```rust
+let statistics = train.standardize();     // train is now mean 0, deviation 1
+statistics.apply(&mut validation);        // the SAME numbers, not validation's own
+statistics.apply(&mut test);
+
+let scaled = statistics.apply_row(&[5.6, 1.8, 6.0, 3.1]);   // one new sample
+```
+
+`Standardizer` is `serde`-serializable, so it saves next to the model — which
+is the point of the box above, and chapter 9 does exactly that. A constant
+column has no deviation to divide by; it is left alone rather than turned into
+`NaN`.
+
+---
+
+## 4.6b Files that are not CSV
+
+CSV is where tutorials start and rarely where real data lives. Four more
+formats read straight into a `Dataset`:
+
+```rust
+// NumPy arrays, which is how data leaves PyTorch, TensorFlow and scikit-learn
+let mut dataset = Dataset::from_npy("x.npy", "y.npy")?;
+dataset.one_hot_targets(10)?;             // y held class indices, not one-hot rows
+
+// MNIST and everything shaped like it (gunzip the archives first)
+let mut train = Dataset::from_idx("train-images-idx3-ubyte", "train-labels-idx1-ubyte")?;
+train.one_hot_targets(10)?;
+
+// A directory per class, images inside it  (--features images)
+let (mut images, classes) = Dataset::from_image_folder("photos", 32, 32, true)?;
+```
+
+`from_npy` reads `float32`, `float64`, `int32`, `int64` and `uint8`;
+`from_idx` reads the IDX type codes and scales `u8` pixels to `0.0..=1.0`;
+`from_image_folder` decodes PNG and JPEG in parallel, resizes, and flattens each
+image into one row with a one-hot target and the class names beside it.
+
+Images get one augmentation for free:
+
+```rust
+let (mut train, test) = images.split_stratified(0.8);
+train.flip_horizontal(32)?;               // the image width, in pixels
+```
+
+That mirrors every image and appends it with its label — twice the training
+data for one decode. Run it on the training split **only**: augment before the
+split and an image and its mirror land on opposite sides, which turns the test
+score into a memory test.
+
 ---
 
 ## 4.7 Batching
@@ -441,9 +525,10 @@ Every dataset, every time:
 1. **Read** the file; fail loudly with a line number.
 2. **Encode** text labels as one-hot vectors, with a deterministic class order.
 3. **Shuffle** — before splitting, always.
-4. **Split** into train / validation / test.
+4. **Split** into train / validation / test — `split_stratified` for classes.
 5. **Check** class balance in each split.
-6. **Scale** features, fitting on **train only**.
+6. **Scale** features, fitting on **train only** (`standardize` on train,
+   `apply` on the rest).
 7. **Keep** the scaler; you need it at prediction time.
 
 ---
@@ -462,10 +547,13 @@ Every dataset, every time:
 
 ## Recap
 
-- The standard library is enough to read a simple CSV; report line numbers.
+- `Dataset::from_csv_labeled`, `from_csv`, `from_npy`, `from_idx` and
+  `from_image_folder` read the common formats; the standard library is enough
+  for anything they do not, and a hand-written parser should report line numbers.
 - One-hot encode categorical labels — never integer codes.
 - Use a sorted, deterministic class order.
-- **Shuffle before splitting.** `split` slices, it does not shuffle.
+- **Shuffle before splitting.** `split` slices, it does not shuffle;
+  `split_stratified` keeps each class's share on both sides.
 - Three splits: train (learn), validation (tune), test (final honest score).
 - Check class balance; tiny per-class counts make a split's metrics unreliable.
 - Scale your features, and **fit the scaler on training data only** — otherwise

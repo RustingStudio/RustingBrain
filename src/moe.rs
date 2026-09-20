@@ -113,7 +113,6 @@ impl Router {
         self.projection.backward(input, grad_logits)
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn linears_mut(&mut self) -> Vec<&mut Linear> {
         vec![&mut self.projection]
     }
@@ -489,9 +488,22 @@ impl MoeLayer {
         grad_input
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn linears_mut(&mut self) -> Vec<&mut Linear> {
         let mut linears = self.router.linears_mut();
+        for expert in &mut self.experts {
+            linears.extend(expert.linears_mut());
+        }
+        if let Some(shared) = &mut self.shared {
+            linears.extend(shared.linears_mut());
+        }
+        linears
+    }
+
+    /// The projections a LoRA adapter goes on: the experts, not the router.
+    /// Adapting the router changes which expert a token reaches, which is a
+    /// different thing from adapting what the experts compute.
+    pub(crate) fn lora_linears_mut(&mut self) -> Vec<&mut Linear> {
+        let mut linears = Vec::new();
         for expert in &mut self.experts {
             linears.extend(expert.linears_mut());
         }

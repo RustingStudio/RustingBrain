@@ -1,6 +1,6 @@
 //! Decoder-only transformer assembly: configuration, builder, and the model.
 
-use crate::attention::KvCache;
+use crate::attention::{KvCache, causal_by_default};
 use crate::batch::TokenBatch;
 use crate::causal_lm_loss::{TotalLoss, causal_lm_loss_batch};
 use crate::embedding::Embedding;
@@ -43,8 +43,58 @@ pub struct TransformerConfig {
     pub rmsnorm_eps: f32,
     /// Reuses the embedding matrix as the output projection.
     pub tie_embeddings: bool,
+    /// Whether attention is causal. False is the encoder shape: every position
+    /// reads the whole sequence, which is what a masked-language-model or a
+    /// vision transformer wants and what generation cannot use.
+    ///
+    /// Defaults to true on load, so a checkpoint written before this existed
+    /// restores as the decoder it was.
+    #[serde(default = "causal_by_default")]
+    pub causal: bool,
     pub aux_loss_weight: f32,
     pub router_z_loss_weight: f32,
+    /// Set by [`TransformerLm::add_lora`]. Recorded here because it is what
+    /// tells [`TransformerLm::load_bin`] to rebuild the adapters and re-freeze
+    /// the base weights before it reads a file that holds both.
+    #[serde(default)]
+    pub lora: Option<LoraConfig>,
+}
+
+/// The shape of the low-rank adapters [`TransformerLm::add_lora`] attaches.
+///
+/// `rank` is the bottleneck width; 8 to 32 is the usual range, and the cost of
+/// the adapters is `rank * (in + out)` per projection against the `in * out`
+/// the projection itself costs. `alpha / rank` scales the adapter's output, so
+/// raising the rank does not by itself raise how much the adapter moves the
+/// model; the convention is `alpha == rank` or `alpha == 2 * rank`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LoraConfig {
+    pub rank: usize,
+    pub alpha: f32,
+    /// Seeds the initialization of the down-projections, so two runs that
+    /// adapt the same base model the same way start from the same adapters.
+    pub seed: u64,
+}
+
+impl LoraConfig {
+    /// `alpha` defaults to `rank`, which is scale one.
+    pub fn new(rank: usize) -> Self {
+        Self {
+            rank,
+            alpha: rank as f32,
+            seed: 0,
+        }
+    }
+
+    pub fn alpha(mut self, alpha: f32) -> Self {
+        self.alpha = alpha;
+        self
+    }
+
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
 }
 
 impl Default for TransformerConfig {
@@ -68,8 +118,10 @@ impl Default for TransformerConfig {
             rope_base: 10_000.0,
             rmsnorm_eps: 1e-6,
             tie_embeddings: true,
+            causal: true,
             aux_loss_weight: DEFAULT_AUX_LOSS_WEIGHT,
             router_z_loss_weight: DEFAULT_ROUTER_Z_LOSS_WEIGHT,
+            lora: None,
         }
     }
 }
@@ -113,6 +165,11 @@ impl TransformerConfig {
         }
         if !self.moe_layers.is_empty() {
             self.moe_config().validate()?;
+        }
+        if self.lora.is_some_and(|lora| lora.rank == 0) {
+            return Err(NetworkError::InvalidConfig(
+                "lora rank must be non-zero".into(),
+            ));
         }
 
         Ok(())
@@ -298,6 +355,23 @@ impl TransformerBuilder {
         self
     }
 
+    /// Drops the causal mask, so every position reads the whole sequence.
+    ///
+    /// This is the encoder shape — BERT-style masked language modelling, or a
+    /// vision transformer over patches. A bidirectional model cannot generate:
+    /// appending a token changes the tokens before it, so the KV cache has
+    /// nothing to cache and [`TransformerLm::generate`] reports that. Training
+    /// it on the next-token loss would also be meaningless, because every
+    /// position can see the token it is asked to predict.
+    ///
+    /// CUDA is decoder-only: the flash-attention kernel is causal, so
+    /// [`TransformerLm::to_cuda`] reports that rather than training the wrong
+    /// mask on a device.
+    pub fn bidirectional(mut self, bidirectional: bool) -> Self {
+        self.config.causal = !bidirectional;
+        self
+    }
+
     pub fn tie_embeddings(mut self, tie_embeddings: bool) -> Self {
         self.config.tie_embeddings = tie_embeddings;
         self
@@ -414,6 +488,7 @@ impl TransformerCache {
 /// outdated file is rejected instead of being read as moments.
 const OPTIMIZER_STATE_MAGIC: &[u8; 8] = b"RBOPT001";
 const WEIGHTS_MAGIC: &[u8; 8] = b"RBWTS001";
+const LORA_MAGIC: &[u8; 8] = b"RBLOR001";
 
 /// How [`TransformerLm::save_bin`] stores each weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,12 +591,22 @@ impl TransformerLm {
                 config.rmsnorm_eps,
                 &mut rng,
             )?);
+            if !config.causal {
+                // Set after construction rather than threaded through a
+                // ninth argument: the block owns the attention and nothing
+                // else in it changes.
+                blocks
+                    .last_mut()
+                    .expect("a block was just pushed")
+                    .attention
+                    .set_causal(false);
+            }
         }
 
         let lm_head = (!config.tie_embeddings)
             .then(|| Linear::new(config.d_model, config.vocab_size, &mut rng));
 
-        Ok(Self {
+        let mut model = Self {
             final_norm: RmsNorm::new(config.d_model, config.rmsnorm_eps),
             config,
             embedding,
@@ -532,7 +617,11 @@ impl TransformerLm {
             #[cfg(feature = "cuda")]
             device: None,
             mixed_precision: builder.mixed_precision,
-        })
+        };
+        if let Some(lora) = model.config.lora {
+            model.attach_lora(lora);
+        }
+        Ok(model)
     }
 
     /// Counts taken from the built modules. Agrees with
@@ -674,12 +763,461 @@ impl TransformerLm {
         Ok(logits)
     }
 
+    /// Continues `prompt` by `max_new_tokens` ids, returning only the new ones.
+    ///
+    /// The prompt is prefilled into a fresh set of caches in one pass and each
+    /// token after it costs one row of attention. A caller that wants the
+    /// tokens as they arrive, or wants to stop on one, uses
+    /// [`generate_with`](TransformerLm::generate_with); a caller that wants to
+    /// keep the caches for a second turn runs the loop itself.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Sampler, TransformerLm};
+    /// # let mut model = TransformerLm::load_bin("model.rbw")?;
+    /// let mut sampler = Sampler::temperature(0.8, None).top_k(40);
+    /// let continuation = model.generate(&[1, 2, 3], 128, &mut sampler)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn generate(
+        &self,
+        prompt: &[u32],
+        max_new_tokens: usize,
+        sampler: &mut crate::sampling::Sampler,
+    ) -> Result<Vec<u32>, NetworkError> {
+        self.generate_with(prompt, max_new_tokens, sampler, |_| true)
+    }
+
+    /// [`generate`](TransformerLm::generate), calling `on_token` with each id
+    /// as it is decoded and stopping early when it returns `false`.
+    ///
+    /// Decoding a hundred tokens takes as long as a hundred forward passes, so
+    /// a caller that prints the result at the end prints nothing for several
+    /// seconds. This hands over each token at the point it exists, which is
+    /// also where an end-of-text id or a stop sequence is noticed:
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Sampler, TransformerLm};
+    /// # let mut model = TransformerLm::load_bin("model.rbw")?;
+    /// # let mut sampler = Sampler::greedy();
+    /// # let end_of_text = 0;
+    /// let continuation = model.generate_with(&[1, 2, 3], 128, &mut sampler, |id| {
+    ///     print!("{id} ");
+    ///     id != end_of_text
+    /// })?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// The id that stopped the generation is in the returned continuation: it
+    /// was sampled, and hiding it would make the two functions disagree about
+    /// what the model produced.
+    pub fn generate_with(
+        &self,
+        prompt: &[u32],
+        max_new_tokens: usize,
+        sampler: &mut crate::sampling::Sampler,
+        mut on_token: impl FnMut(u32) -> bool,
+    ) -> Result<Vec<u32>, NetworkError> {
+        if prompt.is_empty() {
+            return Err(NetworkError::InvalidConfig(
+                "generation needs at least one prompt token".into(),
+            ));
+        }
+
+        let mut caches = self.new_kv_caches();
+        let mut logits = self.forward_cached(prompt, &mut caches)?;
+        let mut history = prompt.to_vec();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+
+        for remaining in (1..=max_new_tokens).rev() {
+            let next = sampler.pick(logits.row(logits.rows - 1), &history);
+            generated.push(next);
+            if !on_token(next) {
+                break;
+            }
+            // The last token needs no forward pass, and running one anyway
+            // would fail a generation that ends exactly on `max_seq_len`.
+            if remaining > 1 {
+                history.push(next);
+                logits = self.forward_cached(&[next], &mut caches)?;
+            }
+        }
+
+        Ok(generated)
+    }
+
+    /// A decoding session that keeps its caches between turns.
+    ///
+    /// [`generate`](TransformerLm::generate) throws the caches away when it
+    /// returns, so a chat loop re-reads the whole conversation on every turn —
+    /// quadratic work in the number of turns, and the second turn of a long
+    /// conversation is the expensive one. A [`Decoder`] holds them:
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Sampler, TransformerLm};
+    /// # let model = TransformerLm::load_bin("model.rbw")?;
+    /// # let mut sampler = Sampler::greedy();
+    /// let mut decoder = model.decoder();
+    /// decoder.feed(&[1, 2, 3])?;                  // prompt
+    /// let reply: Vec<u32> = (0..20).map(|_| decoder.next(&mut sampler)).collect::<Result<_, _>>()?;
+    /// decoder.feed(&[4, 5])?;                     // the user's next turn
+    /// let second = decoder.next(&mut sampler)?;   // no re-read of anything above
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn decoder(&self) -> Decoder<'_> {
+        Decoder {
+            caches: self.new_kv_caches(),
+            model: self,
+            history: Vec::new(),
+            logits: None,
+            pending: None,
+        }
+    }
+
+    /// Replaces every projection weight with one `i8` per value and a scale per
+    /// row, and drops the gradients and Adam moments. Returns the bytes the
+    /// weights now occupy.
+    ///
+    /// A CPU decode step reads every active weight once, so it is bound by
+    /// memory bandwidth: a quarter of the bytes is most of the way to a quarter
+    /// of the time. Rounding to 255 levels per row costs about 0.4% relative
+    /// error per weight, which generation absorbs.
+    ///
+    /// One-way. The `f32` weights are gone afterwards, so
+    /// [`train_step`](TransformerLm::train_step),
+    /// [`backward`](TransformerLm::backward), `save_bin` and `to_cuda` all
+    /// refuse rather than write out or train on rounded weights.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Sampler, TransformerLm};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut model = TransformerLm::load_bin("model.rbw")?;
+    /// let bytes = model.quantize();
+    /// println!("{} MiB of weights", bytes / (1024 * 1024));
+    /// let continuation = model.generate(&[1, 2, 3], 128, &mut Sampler::greedy())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quantize(&mut self) -> usize {
+        let mut bytes = self.embedding.weight.quantize();
+        for block in &mut self.blocks {
+            for linear in block.linears_mut() {
+                bytes += linear.weight.quantize();
+            }
+        }
+        if let Some(head) = &mut self.lm_head {
+            bytes += head.weight.quantize();
+        }
+        bytes
+    }
+
+    /// Rounds every weight [`quantize`](TransformerLm::quantize) would round
+    /// through the int8 grid in the forward pass, while the stored weights and
+    /// the optimizer stay in full precision.
+    ///
+    /// This is quantization-aware training: what backpropagates is the loss of
+    /// the rounded model, so the weights settle where rounding costs least and
+    /// the accuracy `quantize` gives up afterwards shrinks. The backward pass
+    /// is a straight-through estimator: it differentiates as though the
+    /// rounding were the identity, rounding having a derivative of zero almost
+    /// everywhere.
+    ///
+    /// It covers the embedding table, every projection in every block and an
+    /// untied output head, which is the set `quantize` replaces. A forward pass
+    /// costs one rounding pass over each of those weights, so this is usually
+    /// worth turning on for the last part of a run rather than all of it.
+    ///
+    /// CPU only: device training never reads these weights, so a model on a
+    /// device reports that rather than training as though the flag had taken.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Precision, TransformerLm};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut model = TransformerLm::load_bin("model.rbw")?;
+    /// # let sequences: Vec<Vec<u32>> = Vec::new();
+    /// // The last part of a run, once the loss has mostly settled.
+    /// model.quantization_aware(true)?;
+    /// for batch in &sequences {
+    ///     model.train_step(&[batch])?;
+    /// }
+    /// model.quantization_aware(false)?;
+    /// model.save_bin("model.q8.rbw", Precision::Q8)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quantization_aware(&mut self, enabled: bool) -> Result<(), NetworkError> {
+        self.check_not_quantized("train quantization-aware")?;
+        self.check_not_on_device("train quantization-aware")?;
+        self.embedding.weight.set_fake_quantize(enabled);
+        for block in &mut self.blocks {
+            for linear in block.linears_mut() {
+                linear.weight.set_fake_quantize(enabled);
+            }
+        }
+        if let Some(head) = &mut self.lm_head {
+            head.weight.set_fake_quantize(enabled);
+        }
+        Ok(())
+    }
+
+    /// Whether [`quantization_aware`](TransformerLm::quantization_aware) is on.
+    pub fn is_quantization_aware(&self) -> bool {
+        self.embedding.weight.is_fake_quantized()
+    }
+
+    /// Whether [`quantize`](TransformerLm::quantize) has been called.
+    pub fn is_quantized(&self) -> bool {
+        self.embedding.weight.quantized.is_some()
+    }
+
+    fn check_not_quantized(&self, action: &str) -> Result<(), NetworkError> {
+        if self.is_quantized() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "this model was quantized for inference, so it cannot {action}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Attaches a low-rank adapter to every attention and feed-forward
+    /// projection and freezes everything else.
+    ///
+    /// This is the fine-tuning shape: the base weights keep their values but
+    /// lose their gradient and Adam moments, so a model that needed four
+    /// weight-sized buffers to train now needs one plus the adapters. The
+    /// adapters start at zero, so the first forward pass after this call
+    /// returns exactly what the base model returned.
+    ///
+    /// The MoE router is left alone. Everything else the training loop already
+    /// does — [`train_step_batch`](TransformerLm::train_step_batch),
+    /// [`step`](TransformerLm::step), [`save_bin`](TransformerLm::save_bin),
+    /// [`to_cuda`](TransformerLm::to_cuda) — keeps working unchanged; the
+    /// frozen parameters simply ignore the step.
+    ///
+    /// Call this while the model is on the host. A device-resident model has
+    /// already allocated the gradients and moments freezing would release, so
+    /// attaching there would cost the memory the adapter exists to save.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{LoraConfig, TransformerLm};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut model = TransformerLm::load_bin("base.rbw")?;
+    /// model.add_lora(LoraConfig::new(16).alpha(32.0))?;
+    /// // ... train ...
+    /// model.save_lora("adapter.rbl")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn add_lora(&mut self, lora: LoraConfig) -> Result<(), NetworkError> {
+        self.check_not_quantized("take a LoRA adapter")?;
+        if lora.rank == 0 {
+            return Err(NetworkError::InvalidConfig(
+                "lora rank must be non-zero".into(),
+            ));
+        }
+        if self.config.lora.is_some() {
+            return Err(NetworkError::InvalidConfig(
+                "this model already has a LoRA adapter; merge it first".into(),
+            ));
+        }
+        self.check_not_on_device("take a LoRA adapter")?;
+        self.config.lora = Some(lora);
+        self.attach_lora(lora);
+        Ok(())
+    }
+
+    /// Puts the frozen flags back after a snapshot that carried the adapters
+    /// but not the flags. Freezing everything and then thawing the adapters
+    /// avoids a second traversal that could disagree with `params_mut`.
+    fn refreeze_for_lora(&mut self) {
+        for param in self.params_mut() {
+            param.freeze();
+        }
+        for block in &mut self.blocks {
+            for linear in block.lora_linears_mut() {
+                if let Some(lora) = &mut linear.lora {
+                    for param in lora.params_mut() {
+                        param.unfreeze();
+                    }
+                }
+            }
+        }
+    }
+
+    fn attach_lora(&mut self, lora: LoraConfig) {
+        for param in self.params_mut() {
+            param.freeze();
+        }
+        let mut rng = StdRng::seed_from_u64(lora.seed);
+        for block in &mut self.blocks {
+            for linear in block.lora_linears_mut() {
+                linear.attach_lora(lora.rank, lora.alpha, &mut rng);
+            }
+        }
+    }
+
+    /// Folds every adapter into the weight it adapts and unfreezes the model.
+    ///
+    /// What comes out is an ordinary model that predicts what the adapted one
+    /// predicted, with no adapters left to carry and no inference cost over the
+    /// base. It is the only way to get a trained adapter through
+    /// [`quantize`](TransformerLm::quantize), and, like
+    /// [`add_lora`](TransformerLm::add_lora), it runs on the host: call
+    /// [`to_cpu`](TransformerLm::to_cpu) first.
+    pub fn merge_lora(&mut self) -> Result<(), NetworkError> {
+        self.check_not_quantized("merge a LoRA adapter")?;
+        self.check_not_on_device("merge a LoRA adapter")?;
+        for block in &mut self.blocks {
+            for linear in block.lora_linears_mut() {
+                linear.merge_lora();
+            }
+        }
+        for param in self.params_mut() {
+            param.unfreeze();
+        }
+        self.config.lora = None;
+        Ok(())
+    }
+
+    /// Whether [`add_lora`](TransformerLm::add_lora) is in effect.
+    pub fn has_lora(&self) -> bool {
+        self.config.lora.is_some()
+    }
+
+    /// Every parameter the optimizer will actually move: the adapters alone
+    /// once [`add_lora`](TransformerLm::add_lora) has run, and the whole model
+    /// otherwise.
+    pub fn trainable_params_mut(&mut self) -> Vec<&mut Param> {
+        self.params_mut()
+            .into_iter()
+            .filter(|param| !param.is_frozen())
+            .collect()
+    }
+
+    /// How many weights a training step updates.
+    pub fn trainable_parameters(&mut self) -> usize {
+        self.trainable_params_mut()
+            .iter()
+            .map(|param| param.len())
+            .sum()
+    }
+
+    /// Writes the adapter weights alone, which is the point of training one:
+    /// a rank-16 adapter over a 50M-parameter model is a few megabytes, and
+    /// several of them share one base checkpoint.
+    ///
+    /// Read back by [`load_lora`](TransformerLm::load_lora) onto a base model
+    /// that [`add_lora`](TransformerLm::add_lora) has prepared the same way.
+    pub fn save_lora<P: AsRef<Path>>(&mut self, path: P) -> Result<(), NetworkError> {
+        let lora = self.config.lora.ok_or_else(|| {
+            NetworkError::InvalidConfig("this model has no LoRA adapter to save".into())
+        })?;
+        let header = serde_json::to_vec(&lora)?;
+
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(LORA_MAGIC)?;
+        writer.write_all(&(header.len() as u64).to_le_bytes())?;
+        writer.write_all(&header)?;
+
+        let params = self.trainable_params_mut();
+        writer.write_all(&(params.len() as u64).to_le_bytes())?;
+        for param in params {
+            writer.write_all(&(param.value.rows as u64).to_le_bytes())?;
+            writer.write_all(&(param.value.cols as u64).to_le_bytes())?;
+            let bytes: Vec<u8> = param
+                .value
+                .data
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            writer.write_all(&bytes)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Restores adapter weights written by [`save_lora`](TransformerLm::save_lora).
+    ///
+    /// The model must already carry adapters of the same shape, so the usual
+    /// sequence is `load_bin` the base, `add_lora` with the same
+    /// [`LoraConfig`], then this. Fails closed on any mismatch rather than
+    /// loading part of an adapter.
+    pub fn load_lora<P: AsRef<Path>>(&mut self, path: P) -> Result<(), NetworkError> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != LORA_MAGIC {
+            return Err(NetworkError::InvalidSnapshot(
+                "not a RustingBrain LoRA file".into(),
+            ));
+        }
+        let mut word = [0u8; 8];
+        reader.read_exact(&mut word)?;
+        let mut header = vec![0u8; u64::from_le_bytes(word) as usize];
+        reader.read_exact(&mut header)?;
+        let header: LoraConfig = serde_json::from_slice(&header)?;
+        match self.config.lora {
+            Some(lora) if lora == header => {}
+            Some(lora) => {
+                return Err(NetworkError::InvalidSnapshot(format!(
+                    "adapter file holds rank {} alpha {}, this model has rank {} alpha {}",
+                    header.rank, header.alpha, lora.rank, lora.alpha
+                )));
+            }
+            None => {
+                return Err(NetworkError::InvalidSnapshot(
+                    "this model has no LoRA adapter to load into; call add_lora first".into(),
+                ));
+            }
+        }
+
+        reader.read_exact(&mut word)?;
+        let count = u64::from_le_bytes(word) as usize;
+        let params = self.trainable_params_mut();
+        if count != params.len() {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "adapter file holds {count} parameters, this model has {}",
+                params.len()
+            )));
+        }
+        for param in params {
+            reader.read_exact(&mut word)?;
+            let rows = u64::from_le_bytes(word) as usize;
+            reader.read_exact(&mut word)?;
+            let cols = u64::from_le_bytes(word) as usize;
+            if rows != param.value.rows || cols != param.value.cols {
+                return Err(NetworkError::InvalidSnapshot(format!(
+                    "adapter file has a {rows}x{cols} parameter where the model has {}x{}",
+                    param.value.rows, param.value.cols
+                )));
+            }
+            let mut bytes = vec![0u8; rows * cols * 4];
+            reader.read_exact(&mut bytes)?;
+            for (slot, chunk) in param.value.data.iter_mut().zip(bytes.chunks_exact(4)) {
+                *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        Ok(())
+    }
+
+    fn check_not_on_device(&self, action: &str) -> Result<(), NetworkError> {
+        if self.on_device() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a device-resident model cannot {action}; call to_cpu first"
+            )));
+        }
+        Ok(())
+    }
+
     /// Accumulates gradients for every parameter from `dL/dlogits`.
     pub fn backward(
         &mut self,
         cache: &TransformerCache,
         grad_logits: &Matrix,
     ) -> Result<(), NetworkError> {
+        self.check_not_quantized("be trained")?;
         #[cfg(feature = "cuda")]
         if let Some(device) = &cache.device {
             let context = self
@@ -724,9 +1262,22 @@ impl TransformerLm {
     /// [`accelerator_doctor`](crate::accelerator::accelerator_doctor) first.
     #[cfg(feature = "cuda")]
     pub fn to_cuda(&mut self, device: usize, memory_budget_mib: usize) -> Result<(), NetworkError> {
+        self.check_not_quantized("move to a device")?;
+        if !self.config.causal {
+            return Err(NetworkError::InvalidConfig(
+                "a bidirectional model cannot move to a device: the flash-attention kernel \
+                 masks every key after the query, so the device would train a different model \
+                 than the host"
+                    .into(),
+            ));
+        }
         let counts = self.config.parameter_counts();
-        // Value, gradient and the two Adam moments, all FP32.
-        let estimated_mib = (counts.total * 4 * 4).div_ceil(1024 * 1024);
+        // Value, gradient and the two Adam moments, all FP32 - except under a
+        // LoRA adapter, where the frozen base carries its value alone and the
+        // adapters, which the counts above do not include, are the only things
+        // holding the other three.
+        let buffers_per_weight = if self.has_lora() { 1 } else { 4 };
+        let estimated_mib = (counts.total * 4 * buffers_per_weight).div_ceil(1024 * 1024);
         if memory_budget_mib > 0 && estimated_mib > memory_budget_mib {
             return Err(NetworkError::CudaMemoryBudget {
                 estimated_mib,
@@ -739,7 +1290,11 @@ impl TransformerLm {
         self.embedding.weight.move_to_cuda(&context)?;
         for block in &mut self.blocks {
             for linear in block.linears_mut() {
-                linear.weight.move_to_cuda(&context)?;
+                // `params_mut` rather than `weight`, so a LoRA adapter rides
+                // onto the device with the projection it adapts.
+                for param in linear.params_mut() {
+                    param.move_to_cuda(&context)?;
+                }
             }
         }
         if let Some(head) = &mut self.lm_head {
@@ -812,6 +1367,24 @@ impl TransformerLm {
         Ok(())
     }
 
+    /// The loss over a batch, without gradients and without a step.
+    ///
+    /// This is what a held-out split is for: training loss falls whether or not
+    /// the model is learning anything general, and the gap between the two is
+    /// the only thing that says which.
+    ///
+    /// NOTE: on a device this materializes the full `[rows, vocab]` logits
+    /// on the host, where `train_step_batch` fuses the loss into the head and
+    /// never does. Evaluate in batches the size of a training batch, or add a
+    /// device loss-only path if that stops being enough.
+    pub fn evaluate(&self, batch: &TokenBatch) -> Result<TotalLoss, NetworkError> {
+        let (logits, cache) = self.forward_batch(batch)?;
+        Ok(TotalLoss {
+            lm_loss: causal_lm_loss_batch(&logits, batch)?.loss,
+            auxiliary_loss: cache.auxiliary_loss(),
+        })
+    }
+
     /// Forward, loss, backward and one optimizer update over a batch of
     /// sequences.
     ///
@@ -859,6 +1432,75 @@ impl TransformerLm {
         })
     }
 
+    /// Forward, masked-language-model loss, backward and one optimizer update.
+    ///
+    /// This is the encoder objective: the batch carries corrupted ids, and the
+    /// loss scores the model on the tokens that were corrupted, each from both
+    /// sides at once. Build the batch with
+    /// [`MaskedBatch::corrupt`](crate::masked_lm::MaskedBatch::corrupt).
+    ///
+    /// The model must be bidirectional, which is what
+    /// [`TransformerBuilder::bidirectional`] makes it: with a causal mask a
+    /// masked position reads nothing after itself, so most of the objective's
+    /// signal is not there to learn from. CPU only, since a bidirectional model
+    /// cannot move to a device.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{MaskedBatch, TransformerLm};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut model = TransformerLm::builder()
+    ///     .vocab_size(32_000)
+    ///     .bidirectional(true)
+    ///     .build()?;
+    /// let batch = MaskedBatch::corrupt(&[vec![5u32, 6, 7, 8]], 32_000, 4, 0.15, None)?;
+    /// let loss = model.train_step_masked(&batch)?;
+    /// println!("{}", loss.lm_loss);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn train_step_masked(
+        &mut self,
+        batch: &crate::masked_lm::MaskedBatch,
+    ) -> Result<TotalLoss, NetworkError> {
+        self.check_bidirectional()?;
+        let (logits, cache) = self.forward_batch(batch.inputs())?;
+        let loss = crate::masked_lm::masked_lm_loss(&logits, batch)?;
+
+        self.zero_grad();
+        self.backward(&cache, &loss.grad_logits)?;
+        self.step(1.0);
+
+        Ok(TotalLoss {
+            lm_loss: loss.loss,
+            auxiliary_loss: cache.auxiliary_loss(),
+        })
+    }
+
+    /// The masked loss over a batch, without gradients and without a step.
+    pub fn evaluate_masked(
+        &self,
+        batch: &crate::masked_lm::MaskedBatch,
+    ) -> Result<TotalLoss, NetworkError> {
+        self.check_bidirectional()?;
+        let (logits, cache) = self.forward_batch(batch.inputs())?;
+        Ok(TotalLoss {
+            lm_loss: crate::masked_lm::masked_lm_loss(&logits, batch)?.loss,
+            auxiliary_loss: cache.auxiliary_loss(),
+        })
+    }
+
+    fn check_bidirectional(&self) -> Result<(), NetworkError> {
+        if self.config.causal {
+            return Err(NetworkError::InvalidConfig(
+                "a masked language-modelling loss needs a bidirectional model: under a causal \
+                 mask a masked position reads only the tokens before it, which is the next-token \
+                 objective with holes in it. Build the model with `bidirectional(true)`"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Forward and backward over one batch, adding into whatever gradients are
     /// already there.
     ///
@@ -885,6 +1527,7 @@ impl TransformerLm {
     /// different halves rather than against the whole. The language-modelling
     /// gradient is unaffected; only the auxiliary term shifts.
     pub fn accumulate_step(&mut self, batch: &TokenBatch) -> Result<TotalLoss, NetworkError> {
+        self.check_not_quantized("be trained")?;
         #[cfg(feature = "cuda")]
         if let Some(context) = self.device.clone() {
             self.check_length(batch.seq_len(), 0)?;
@@ -959,6 +1602,35 @@ impl TransformerLm {
             .for_each(|param| param.step(&optimizer, step, scale));
     }
 
+    /// The L2 norm of the accumulated gradients, over every parameter at once.
+    ///
+    /// Worth logging on its own: a run that is about to diverge shows it in
+    /// this number one or two steps before the loss moves.
+    pub fn grad_norm(&mut self) -> Result<f32, NetworkError> {
+        let mut total = 0.0;
+        for param in self.params_mut() {
+            total += param.grad_sum_squares()?;
+        }
+        Ok(total.sqrt() as f32)
+    }
+
+    /// [`TransformerLm::step`] with the gradients clipped to a global norm of
+    /// `max_norm` first, and the pre-clip norm returned for logging.
+    ///
+    /// Clipping is a uniform rescale of every gradient, and `scale` already
+    /// multiplies every gradient uniformly, so this folds the clip into that
+    /// factor rather than rewriting the gradient buffers.
+    pub fn step_clipped(&mut self, scale: f32, max_norm: f32) -> Result<f32, NetworkError> {
+        let norm = self.grad_norm()?;
+        let clip = if norm > max_norm && norm > 0.0 {
+            max_norm / norm
+        } else {
+            1.0
+        };
+        self.step(scale * clip);
+        Ok(norm)
+    }
+
     pub fn zero_grad(&mut self) {
         if self.on_device() {
             for param in self.params_mut() {
@@ -1006,8 +1678,14 @@ impl TransformerLm {
 
     pub fn load_json<P: AsRef<Path>>(path: P) -> Result<Self, NetworkError> {
         let file = std::fs::File::open(path)?;
-        let model: Self = serde_json::from_reader(std::io::BufReader::new(file))?;
+        let mut model: Self = serde_json::from_reader(std::io::BufReader::new(file))?;
         model.config.validate()?;
+        // What is frozen is not in the snapshot; the adapters are, and the
+        // configuration says they are there, which is enough to put the base
+        // weights back the way `add_lora` left them.
+        if model.has_lora() {
+            model.refreeze_for_lora();
+        }
         Ok(model)
     }
 
@@ -1086,10 +1764,16 @@ impl TransformerLm {
             let rows = u64::from_le_bytes(word) as usize;
             reader.read_exact(&mut word)?;
             let cols = u64::from_le_bytes(word) as usize;
-            if rows != param.value.rows || cols != param.value.cols {
+            // A frozen parameter released its moments, so it wrote a 0x0
+            // placeholder and expects one back.
+            let (expected_rows, expected_cols) = if param.is_frozen() {
+                (0, 0)
+            } else {
+                (param.value.rows, param.value.cols)
+            };
+            if rows != expected_rows || cols != expected_cols {
                 return Err(NetworkError::InvalidSnapshot(format!(
-                    "optimizer state has a {rows}x{cols} parameter where the model has {}x{}",
-                    param.value.rows, param.value.cols
+                    "optimizer state has a {rows}x{cols} parameter where the model has {expected_rows}x{expected_cols}"
                 )));
             }
             let mut bytes = vec![0u8; rows * cols * 4];
@@ -1119,11 +1803,54 @@ impl TransformerLm {
     /// The header holds the configuration and optimizer as JSON, so
     /// [`TransformerLm::load_bin`] rebuilds the module tree before it reads any
     /// weights and does not need a matching model to load into.
+    /// Writes the model out as an ONNX graph for another runtime to serve.
+    ///
+    /// The graph takes `seq_len` token ids as `int64` under the name `ids` and
+    /// returns `[seq_len, vocab_size]` logits. Both the rotary tables and the
+    /// causal mask are baked in at that length, so a model that has to serve
+    /// several lengths is exported once per length. Weights are written as
+    /// `f32` whatever [`Precision`] a checkpoint would use.
+    ///
+    /// What it does not cover:
+    ///
+    /// - Mixture-of-experts layers. Routing is data-dependent control flow
+    ///   rather than a graph of tensor ops, and exporting one silently as a
+    ///   dense layer would be a different model.
+    /// - An attached LoRA adapter. Call
+    ///   [`merge_lora`](TransformerLm::merge_lora) first, which folds it into
+    ///   the weights the export writes.
+    /// - A quantized or device-resident model, as everywhere else.
+    ///
+    /// There is no KV cache in the graph: it is a prefill, so a runtime
+    /// generating from it re-reads the whole prefix per token. Export is a
+    /// serving seam for scoring and short prompts, not a fast decode loop.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::TransformerLm;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let model = TransformerLm::load_bin("model.rbw")?;
+    /// model.save_onnx("model.onnx", 128)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn save_onnx<P: AsRef<Path>>(&self, path: P, seq_len: usize) -> Result<(), NetworkError> {
+        self.check_not_quantized("be exported to ONNX")?;
+        self.check_not_on_device("be exported to ONNX")?;
+        if self.has_lora() {
+            return Err(NetworkError::InvalidConfig(
+                "an adapted model cannot be exported to ONNX; call merge_lora first".into(),
+            ));
+        }
+        self.check_length(seq_len, 0)?;
+        crate::onnx_export::export_transformer(self, seq_len, path)
+    }
+
     pub fn save_bin<P: AsRef<Path>>(
         &mut self,
         path: P,
         precision: Precision,
     ) -> Result<(), NetworkError> {
+        self.check_not_quantized("be saved")?;
         let header = serde_json::to_vec(&BinHeader {
             config: self.config.clone(),
             optimizer: self.optimizer.clone(),
@@ -1258,10 +1985,64 @@ impl TransformerLm {
     }
 }
 
+/// A decoding session: the KV caches, the ids that filled them, and the logits
+/// for whatever comes next. Built by [`TransformerLm::decoder`].
+pub struct Decoder<'a> {
+    model: &'a TransformerLm,
+    caches: Vec<KvCache>,
+    history: Vec<u32>,
+    logits: Option<Matrix>,
+    /// Sampled but not yet run through the model. The forward pass for a token
+    /// is only needed to produce the token after it, so deferring it means a
+    /// session that stops decoding never pays for one, and a session that fills
+    /// `max_seq_len` exactly does not overflow its caches on the way out.
+    pending: Option<u32>,
+}
+
+impl Decoder<'_> {
+    /// Appends `ids` to the session: a prompt, or the next turn of a
+    /// conversation. Only these tokens are read, not the ones before them.
+    pub fn feed(&mut self, ids: &[u32]) -> Result<(), NetworkError> {
+        self.catch_up()?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.logits = Some(self.model.forward_cached(ids, &mut self.caches)?);
+        self.history.extend_from_slice(ids);
+        Ok(())
+    }
+
+    /// Samples the next token and appends it to the session.
+    pub fn next(&mut self, sampler: &mut crate::sampling::Sampler) -> Result<u32, NetworkError> {
+        self.catch_up()?;
+        let logits = self.logits.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig("decoding needs a prompt fed in first".into())
+        })?;
+
+        let next = sampler.pick(logits.row(logits.rows - 1), &self.history);
+        self.history.push(next);
+        self.pending = Some(next);
+        Ok(next)
+    }
+
+    /// Every id the session has seen, prompts and generated tokens alike.
+    pub fn history(&self) -> &[u32] {
+        &self.history
+    }
+
+    fn catch_up(&mut self) -> Result<(), NetworkError> {
+        if let Some(id) = self.pending.take() {
+            self.logits = Some(self.model.forward_cached(&[id], &mut self.caches)?);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::causal_lm_loss::causal_lm_loss;
+    use crate::sampling::Sampler;
 
     #[test]
     fn accumulating_two_half_batches_sums_the_half_gradients() {
@@ -1393,6 +2174,150 @@ mod tests {
         }
     }
 
+    #[test]
+    fn grad_norm_matches_the_flattened_gradient() {
+        let mut model = tiny().build().unwrap();
+        model.zero_grad();
+        model
+            .accumulate_step(&TokenBatch::new(&[[1u32, 2, 3, 4]]).unwrap())
+            .unwrap();
+
+        let expected: f64 = model
+            .params_mut()
+            .iter()
+            .flat_map(|param| param.grad.data.iter())
+            .map(|&g| f64::from(g) * f64::from(g))
+            .sum();
+
+        let norm = model.grad_norm().unwrap();
+        assert!(norm > 0.0);
+        assert!((norm - expected.sqrt() as f32).abs() < 1e-5, "{norm}");
+    }
+
+    /// Clipping to a norm the gradients already sit under must leave the step
+    /// byte for byte identical to an unclipped one, and clipping to half the
+    /// norm must move the weights exactly half as far as clipping to the full
+    /// norm does.
+    #[test]
+    fn clipping_rescales_the_step_it_takes() {
+        let batch = TokenBatch::new(&[[1u32, 2, 3, 4]]).unwrap();
+        let stepped = |max_norm: Option<f32>| {
+            let mut model = tiny().optimizer(Optimizer::sgd(0.1)).build().unwrap();
+            let before = model.blocks[0].attention.query.weight.value.clone();
+            model.zero_grad();
+            model.accumulate_step(&batch).unwrap();
+            let norm = match max_norm {
+                Some(max_norm) => model.step_clipped(1.0, max_norm).unwrap(),
+                None => {
+                    let norm = model.grad_norm().unwrap();
+                    model.step(1.0);
+                    norm
+                }
+            };
+            let after = &model.blocks[0].attention.query.weight.value;
+            let delta: Vec<f32> = after
+                .data
+                .iter()
+                .zip(&before.data)
+                .map(|(after, before)| after - before)
+                .collect();
+            (norm, delta)
+        };
+
+        let (norm, unclipped) = stepped(None);
+        assert!(norm > 0.0);
+        assert_eq!(stepped(Some(norm * 2.0)).1, unclipped);
+
+        let (_, half) = stepped(Some(norm / 2.0));
+        for (half, unclipped) in half.iter().zip(&unclipped) {
+            assert!((half - unclipped / 2.0).abs() < 1e-6, "{half} {unclipped}");
+        }
+    }
+
+    /// Fake quantization has to be the *same* rounding `quantize` performs,
+    /// or a run trained under it optimizes for arithmetic the checkpoint will
+    /// never do. Both models see the same batch, so the two losses agree to
+    /// within summation order.
+    #[test]
+    fn a_fake_quantized_forward_matches_the_quantized_model() {
+        let batch = TokenBatch::new(&[[1u32, 2, 3, 4, 5, 6]]).unwrap();
+        let mut aware = tiny().build().unwrap();
+        let mut rounded = aware.clone();
+
+        aware.quantization_aware(true).unwrap();
+        assert!(aware.is_quantization_aware());
+        rounded.quantize();
+
+        let aware_loss = aware.evaluate(&batch).unwrap().total();
+        let rounded_loss = rounded.evaluate(&batch).unwrap().total();
+        assert!(
+            (aware_loss - rounded_loss).abs() < 1e-4,
+            "{aware_loss} against {rounded_loss}"
+        );
+
+        // And it is reversible, unlike `quantize`.
+        aware.quantization_aware(false).unwrap();
+        assert!(!aware.is_quantization_aware());
+        assert!((aware.evaluate(&batch).unwrap().total() - aware_loss).abs() > 1e-6);
+    }
+
+    /// Rounding has a derivative of zero almost everywhere, so a backward
+    /// pass that differentiated it would learn nothing. The straight-through
+    /// estimator is what keeps the gradients flowing, and the weights that
+    /// move are the full precision ones, not the grid.
+    #[test]
+    fn a_fake_quantized_weight_still_trains_in_full_precision() {
+        let batch = TokenBatch::new(&[[1u32, 2, 3, 4, 5, 6]]).unwrap();
+        let mut model = tiny().optimizer(Optimizer::sgd(0.05)).build().unwrap();
+        model.quantization_aware(true).unwrap();
+
+        let before = model.blocks[0].attention.query.weight.value.clone();
+        model.zero_grad();
+        model.accumulate_step(&batch).unwrap();
+        assert!(model.grad_norm().unwrap() > 0.0);
+        model.step(1.0);
+
+        let after = &model.blocks[0].attention.query.weight.value;
+        assert_ne!(after.data, before.data);
+        // A step smaller than the grid it is rounded onto still lands
+        // somewhere new: the stored weight never touches the grid.
+        let step = after.data.iter().fold(0.0f32, |acc, v| acc.max(v.abs())) / 127.0;
+        let moved = after
+            .data
+            .iter()
+            .zip(&before.data)
+            .map(|(after, before)| (after - before).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            moved > 0.0 && moved < step,
+            "moved {moved}, grid step {step}"
+        );
+    }
+
+    #[test]
+    fn a_quantized_model_still_generates_and_refuses_to_train() {
+        let mut model = tiny().build().unwrap();
+        let before = model
+            .generate(&[1, 2, 3], 4, &mut Sampler::greedy())
+            .unwrap();
+
+        assert!(model.quantize() > 0);
+        assert!(model.is_quantized());
+
+        // Rounded weights are close enough that a three-layer toy model picks
+        // the same greedy tokens; what matters here is that it runs at all.
+        let after = model
+            .generate(&[1, 2, 3], 4, &mut Sampler::greedy())
+            .unwrap();
+        assert_eq!(before.len(), after.len());
+
+        // One-way: the `f32` weights are gone, so anything that would write
+        // them out or update them has to say so rather than produce rounded
+        // nonsense.
+        assert!(model.train_step(&[[1u32, 2, 3]]).is_err());
+        assert!(model.save_bin("/dev/null", Precision::F32).is_err());
+    }
+
     fn tiny() -> TransformerBuilder {
         TransformerLm::builder()
             .vocab_size(24)
@@ -1406,6 +2331,63 @@ mod tests {
             .shared_expert(true)
             .max_seq_len(32)
             .seed(1234)
+    }
+
+    #[test]
+    fn masked_training_needs_a_bidirectional_model_and_drives_the_loss_down() {
+        use crate::masked_lm::MaskedBatch;
+
+        // Every sequence is the same, so the model can learn to reconstruct a
+        // hole in it from the tokens on both sides.
+        let sequences = [[3u32, 4, 5, 6, 7, 8], [3, 4, 5, 6, 7, 8]];
+        let batch = MaskedBatch::corrupt(&sequences, 24, 1, 0.3, Some(5)).unwrap();
+
+        let mut causal = tiny().optimizer(Optimizer::adam(3e-3)).build().unwrap();
+        let error = causal.train_step_masked(&batch).unwrap_err().to_string();
+        assert!(error.contains("bidirectional"), "{error}");
+
+        let mut model = tiny()
+            .bidirectional(true)
+            .optimizer(Optimizer::adam(3e-3))
+            .build()
+            .unwrap();
+        let first = model.train_step_masked(&batch).unwrap().lm_loss;
+        for _ in 0..40 {
+            model.train_step_masked(&batch).unwrap();
+        }
+        let last = model.evaluate_masked(&batch).unwrap().lm_loss;
+
+        assert!(last < first * 0.5, "{first} -> {last}");
+    }
+
+    #[test]
+    fn a_bidirectional_model_carries_the_flag_to_every_block_and_back_from_disk() {
+        let mut model = tiny().bidirectional(true).build().unwrap();
+        assert!(
+            model
+                .blocks
+                .iter()
+                .all(|block| !block.attention.is_causal())
+        );
+
+        let path = std::env::temp_dir().join("rb_bidirectional.rbw");
+        model.save_bin(&path, Precision::F32).unwrap();
+        let loaded = TransformerLm::load_bin(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!loaded.config.causal);
+        assert!(
+            loaded
+                .blocks
+                .iter()
+                .all(|block| !block.attention.is_causal())
+        );
+        // Generation needs a cache, and a cache needs causality.
+        assert!(
+            loaded
+                .generate(&[1, 2, 3], 4, &mut crate::sampling::Sampler::greedy())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1504,6 +2486,151 @@ mod tests {
         for (actual, expected) in logits.data.iter().zip(expected.row(2)) {
             assert!((actual - expected).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn evaluate_reports_the_loss_a_step_would_and_changes_nothing() {
+        let mut model = tiny().build().unwrap();
+        let batch = TokenBatch::new(&[[1u32, 2, 3, 4], [5, 6, 7, 8]]).unwrap();
+
+        let before = model.evaluate(&batch).unwrap();
+        // Same value twice: evaluating must not have moved the weights.
+        assert_eq!(before, model.evaluate(&batch).unwrap());
+
+        // `train_step_batch` reports the loss it measured before updating, so
+        // the two have to agree.
+        let stepped = model.train_step_batch(&batch).unwrap();
+        assert!((before.lm_loss - stepped.lm_loss).abs() < 1e-6);
+        assert!(model.evaluate(&batch).unwrap().lm_loss < before.lm_loss);
+        assert!((before.perplexity() - before.lm_loss.exp()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn greedy_generation_matches_a_hand_written_decode_loop() {
+        let model = tiny().build().unwrap();
+        let prompt = [7u32, 1, 12];
+
+        let generated = model
+            .generate(&prompt, 5, &mut crate::Sampler::greedy())
+            .unwrap();
+
+        let mut caches = model.new_kv_caches();
+        let mut logits = model.forward_cached(&prompt, &mut caches).unwrap();
+        let mut expected = Vec::new();
+        for _ in 0..5 {
+            let row = logits.row(logits.rows - 1);
+            let next = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0 as u32;
+            expected.push(next);
+            logits = model.forward_cached(&[next], &mut caches).unwrap();
+        }
+        assert_eq!(generated, expected);
+    }
+
+    #[test]
+    fn a_callback_sees_every_token_and_can_stop_the_generation() {
+        let model = tiny().build().unwrap();
+        let prompt = [7u32, 1, 12];
+
+        let mut seen = Vec::new();
+        let all = model
+            .generate_with(&prompt, 5, &mut crate::Sampler::greedy(), |id| {
+                seen.push(id);
+                true
+            })
+            .unwrap();
+        assert_eq!(seen, all);
+        assert_eq!(all.len(), 5);
+
+        // Stopping on the second token keeps it: it was sampled.
+        let mut count = 0;
+        let stopped = model
+            .generate_with(&prompt, 5, &mut crate::Sampler::greedy(), |_| {
+                count += 1;
+                count < 2
+            })
+            .unwrap();
+        assert_eq!(stopped, all[..2]);
+    }
+
+    #[test]
+    fn a_decoder_continues_across_turns_and_matches_generate() {
+        let model = tiny().build().unwrap();
+        let prompt = [7u32, 1, 12];
+
+        let expected = model
+            .generate(&prompt, 5, &mut crate::Sampler::greedy())
+            .unwrap();
+
+        let mut decoder = model.decoder();
+        // Sampling before a prompt has nothing to sample from.
+        assert!(decoder.next(&mut crate::Sampler::greedy()).is_err());
+
+        decoder.feed(&prompt).unwrap();
+        let mut sampler = crate::Sampler::greedy();
+        let generated: Vec<u32> = (0..5)
+            .map(|_| decoder.next(&mut sampler).unwrap())
+            .collect();
+        assert_eq!(generated, expected);
+        assert_eq!(decoder.history().len(), prompt.len() + 5);
+
+        // A second turn continues from the same caches, and the result is what
+        // a fresh generation over the whole history would have produced.
+        let turn = [3u32, 4];
+        decoder.feed(&turn).unwrap();
+        let after = decoder.next(&mut sampler).unwrap();
+
+        let mut whole = prompt.to_vec();
+        whole.extend(&generated);
+        whole.extend(&turn);
+        assert_eq!(
+            after,
+            model
+                .generate(&whole, 1, &mut crate::Sampler::greedy())
+                .unwrap()[0]
+        );
+
+        // Deferring the forward pass means a session can fill the context
+        // exactly, as `generate` can.
+        let mut decoder = model.decoder();
+        decoder.feed(&[3]).unwrap();
+        // 32 tokens from a one-token prompt, the same count `generate` manages,
+        // because the last one is never run back through the model.
+        for _ in 0..32 {
+            decoder.next(&mut sampler).unwrap();
+        }
+        assert_eq!(decoder.history().len(), 33);
+        assert!(decoder.next(&mut sampler).is_err());
+    }
+
+    #[test]
+    fn generation_can_fill_the_context_exactly() {
+        let model = tiny().build().unwrap();
+        // The final token needs no forward pass, so a run that ends on
+        // `max_seq_len` must not overflow the cache.
+        let generated = model
+            .generate(&[3], 32, &mut crate::Sampler::greedy())
+            .unwrap();
+        assert_eq!(generated.len(), 32);
+        assert!(
+            model
+                .generate(&[3], 33, &mut crate::Sampler::greedy())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generation_rejects_an_empty_prompt() {
+        let model = tiny().build().unwrap();
+        assert!(
+            model
+                .generate(&[], 4, &mut crate::Sampler::greedy())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1835,6 +2962,98 @@ mod tests {
             model.forward_cached(&[4], &mut caches),
             Err(NetworkError::SequenceTooLong { length: 4, .. })
         ));
+    }
+
+    /// The whole adapter workflow on a model with both dense and routed
+    /// layers: attaching changes nothing, training moves only the adapters,
+    /// the adapter file round-trips, and merging keeps the predictions.
+    #[test]
+    fn a_lora_adapter_trains_saves_and_merges() {
+        let batch = TokenBatch::new(&[[1u32, 2, 3, 4]]).unwrap();
+        let mut model = tiny().build().unwrap();
+        let base_logits = model.forward_batch(&batch).unwrap().0;
+        let base_params = model.parameter_counts().total;
+
+        model.add_lora(LoraConfig::new(4).alpha(8.0)).unwrap();
+        assert_eq!(model.forward_batch(&batch).unwrap().0, base_logits);
+        // A rank-4 adapter over a 16-wide toy model is not the fraction it
+        // would be over a real one, but it is still strictly less than the
+        // model, and it is all the optimizer touches.
+        let trainable = model.trainable_parameters();
+        assert!(trainable > 0 && trainable < base_params, "{trainable}");
+
+        let base_embedding = model.embedding.weight.value.clone();
+        model.zero_grad();
+        model.train_step_batch(&batch).unwrap();
+        model.step(1.0);
+
+        // The frozen half did not move; the adapted half did.
+        assert_eq!(model.embedding.weight.value, base_embedding);
+        let adapted = model.forward_batch(&batch).unwrap().0;
+        assert_ne!(adapted, base_logits);
+
+        let directory = std::env::temp_dir().join("rusting_brain_lora_test");
+        std::fs::create_dir_all(&directory).unwrap();
+        let adapter = directory.join("adapter.rbl");
+        model.save_lora(&adapter).unwrap();
+
+        // A fresh base model plus the adapter file predicts what the trained
+        // model predicts.
+        let mut restored = tiny().build().unwrap();
+        restored.add_lora(LoraConfig::new(4).alpha(8.0)).unwrap();
+        restored.load_lora(&adapter).unwrap();
+        assert_eq!(restored.forward_batch(&batch).unwrap().0, adapted);
+
+        // A rank the file does not hold is refused rather than half-loaded.
+        let mut wrong = tiny().build().unwrap();
+        wrong.add_lora(LoraConfig::new(2)).unwrap();
+        assert!(wrong.load_lora(&adapter).is_err());
+
+        // A full snapshot carries base and adapters, and comes back adapted.
+        let snapshot = directory.join("adapted.rbw");
+        model.save_bin(&snapshot, Precision::F32).unwrap();
+        let reloaded = TransformerLm::load_bin(&snapshot).unwrap();
+        assert!(reloaded.has_lora());
+        assert_eq!(reloaded.forward_batch(&batch).unwrap().0, adapted);
+
+        model.merge_lora().unwrap();
+        assert!(!model.has_lora());
+        assert_eq!(model.trainable_parameters(), base_params);
+        for (merged, expected) in model
+            .forward_batch(&batch)
+            .unwrap()
+            .0
+            .data
+            .iter()
+            .zip(&adapted.data)
+        {
+            assert!((merged - expected).abs() < 1e-4, "{merged} vs {expected}");
+        }
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A JSON snapshot carries the adapters and the configuration, but not the
+    /// frozen flags, so loading has to put them back.
+    #[test]
+    fn a_json_snapshot_restores_the_frozen_base() {
+        let directory = std::env::temp_dir().join("rusting_brain_lora_json_test");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("adapted.json");
+
+        let mut model = tiny().build().unwrap();
+        model.add_lora(LoraConfig::new(4)).unwrap();
+        model.save_json(&path).unwrap();
+
+        let mut restored = TransformerLm::load_json(&path).unwrap();
+        assert!(restored.has_lora());
+        assert!(restored.embedding.weight.is_frozen());
+        assert_eq!(
+            restored.trainable_parameters(),
+            model.trainable_parameters()
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

@@ -110,9 +110,11 @@ impl RmsNorm {
             })
             .collect();
 
-        for partial in &partials {
-            for (slot, value) in self.weight.grad.data.iter_mut().zip(partial) {
-                *slot += value;
+        if !self.weight.is_frozen() {
+            for partial in &partials {
+                for (slot, value) in self.weight.grad.data.iter_mut().zip(partial) {
+                    *slot += value;
+                }
             }
         }
 

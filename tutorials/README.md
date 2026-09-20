@@ -64,10 +64,12 @@ is worse than one that looks bad.
 | Ship a trained model | [9](9_save_load.md) |
 | Make it run on your GPU | [11](11_gpu_cuda.md) |
 | Run a model someone else trained | [12](12_import_models.md) |
+| Export a model for another runtime | [12](12_import_models.md) |
 | Fix a loss curve that looks wrong | [13](13_troubleshooting.md) |
 | Train a language model | [14](14_language_model.md) |
 | Fit a bigger model in the same memory | [15](15_mixture_of_experts.md) |
 | Plan a run that takes days | [16](16_training_an_llm.md) |
+| Fine-tune a model to answer questions | [16](16_training_an_llm.md) |
 
 ## Running the code
 

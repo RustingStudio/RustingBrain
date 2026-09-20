@@ -1218,6 +1218,11 @@ impl State {
         let (f, adam) = match net.optimizer.clone() {
             Optimizer::Sgd { .. } => (&self.kernels.sgd, false),
             Optimizer::Adam { .. } => (&self.kernels.adam, true),
+            Optimizer::Lion { .. } => {
+                return Err(NetworkError::UnsupportedCuda(
+                    "the Lion optimizer, which has no device kernel".into(),
+                ));
+            }
         };
         if adam {
             net.adam_step += 1;

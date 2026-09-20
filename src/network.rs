@@ -5,7 +5,7 @@
 //! [`TransformerLm`](crate::TransformerLm).
 
 use crate::activations::Activation;
-use crate::dataset::Dataset;
+use crate::dataset::{BatchCursor, BatchSource, Dataset};
 use crate::losses::Loss;
 use crate::matrix::Matrix;
 use crate::optimizers::Optimizer;
@@ -25,6 +25,8 @@ pub enum NetworkError {
     InvalidTarget { expected: usize, actual: usize },
     #[error("dataset is empty")]
     EmptyDataset,
+    #[error("invalid dataset file: {0}")]
+    InvalidDataset(String),
     #[error("invalid network snapshot: {0}")]
     InvalidSnapshot(String),
     #[error("io error: {0}")]
@@ -304,6 +306,14 @@ impl InferenceScratch {
             next: vec![0.0; widest],
         }
     }
+}
+
+/// Index of the largest entry, which is the class a row of outputs names.
+fn argmax(row: &[f32]) -> usize {
+    row.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map_or(0, |(index, _)| index)
 }
 
 fn widest_layer(network: &Network) -> usize {
@@ -609,27 +619,162 @@ impl Network {
         dataset: &Dataset,
         config: TrainConfig,
     ) -> Result<TrainingHistory, NetworkError> {
+        self.fit_with(dataset, config, |_, _| true)
+    }
+
+    /// [`fit`](Network::fit), calling `on_epoch` with each epoch index and its
+    /// mean loss, and stopping when it returns `false`.
+    ///
+    /// Two thousand epochs is otherwise two thousand epochs of silence, with no
+    /// way to print progress and no way to stop once the loss has flattened.
+    /// The history returned holds only the epochs that ran.
+    ///
+    /// ```
+    /// # use rusting_brain::{Activation, Dataset, Loss, Network, TrainConfig};
+    /// # let dataset = Dataset::new(vec![vec![0.0], vec![1.0]], vec![vec![0.0], vec![1.0]]);
+    /// # let mut model = Network::builder().input_size(1).dense(1, Activation::Linear).build();
+    /// let history = model.fit_with(&dataset, TrainConfig::default(), |epoch, loss| {
+    ///     if epoch % 10 == 0 {
+    ///         println!("epoch {epoch}  loss {loss:.4}");
+    ///     }
+    ///     loss > 1e-4                  // stop once it is small enough
+    /// })?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn fit_with(
+        &mut self,
+        dataset: &Dataset,
+        config: TrainConfig,
+        on_epoch: impl FnMut(usize, f32) -> bool,
+    ) -> Result<TrainingHistory, NetworkError> {
         if dataset.is_empty() {
             return Err(NetworkError::EmptyDataset);
         }
 
+        // The clone is what the shuffling rewrites: `fit_with` takes the
+        // dataset by shared reference and leaves the caller's row order alone.
         let mut working = dataset.clone();
-        let mut losses = Vec::with_capacity(config.epochs);
+        let mut stream = working.stream(&config);
+        self.fit_stream_with(&mut stream, config, on_epoch)
+    }
 
-        for epoch in 0..config.epochs {
-            if config.shuffle {
-                let seed = config.seed.map(|seed| seed + epoch as u64);
-                working.shuffle(seed);
-            }
+    /// [`fit`](Network::fit) over any [`BatchSource`], which is how a dataset
+    /// too large to hold in memory is trained on.
+    ///
+    /// The source decides what a batch is and where it comes from; `config`
+    /// contributes only its epoch count here, the rest of it having been read
+    /// when the source was built.
+    pub fn fit_stream(
+        &mut self,
+        source: &mut impl BatchSource,
+        config: TrainConfig,
+    ) -> Result<TrainingHistory, NetworkError> {
+        self.fit_stream_with(source, config, |_, _| true)
+    }
+
+    /// [`fit_stream`](Network::fit_stream), reporting each epoch to `on_epoch`
+    /// and stopping when it returns `false`.
+    pub fn fit_stream_with(
+        &mut self,
+        source: &mut impl BatchSource,
+        config: TrainConfig,
+        on_epoch: impl FnMut(usize, f32) -> bool,
+    ) -> Result<TrainingHistory, NetworkError> {
+        self.fit_stream_core(
+            source,
+            config,
+            BatchCursor::default(),
+            |_, _| true,
+            on_epoch,
+        )
+    }
+
+    /// [`fit_stream`](Network::fit_stream) starting from `resume`, calling
+    /// `on_batch` with the position after every batch.
+    ///
+    /// The cursor `on_batch` receives is what a checkpoint holds beside the
+    /// model and the optimizer state; handing it back here restarts at the same
+    /// row of the same epoch instead of at the top of the run. Returning
+    /// `false` from `on_batch` stops the training where it stands, which is how
+    /// a run ends on a step count rather than an epoch count.
+    ///
+    /// ```
+    /// # use rusting_brain::{Activation, BatchCursor, Dataset, Network, TrainConfig};
+    /// # let mut dataset = Dataset::new(vec![vec![0.0], vec![1.0]], vec![vec![0.0], vec![1.0]]);
+    /// # let mut model = Network::builder().input_size(1).dense(1, Activation::Linear).build();
+    /// let config = TrainConfig { epochs: 10, batch_size: 1, ..Default::default() };
+    /// let mut saved = BatchCursor::default();
+    ///
+    /// // Stop after three batches, remembering where that was.
+    /// let mut trained = 0;
+    /// model.fit_stream_resuming(&mut dataset.stream(&config), config, saved, |cursor, _| {
+    ///     saved = cursor;
+    ///     trained += 1;
+    ///     trained < 3
+    /// })?;
+    ///
+    /// // And carry on from there.
+    /// model.fit_stream_resuming(&mut dataset.stream(&config), config, saved, |_, _| true)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn fit_stream_resuming(
+        &mut self,
+        source: &mut impl BatchSource,
+        config: TrainConfig,
+        resume: BatchCursor,
+        on_batch: impl FnMut(BatchCursor, f32) -> bool,
+    ) -> Result<TrainingHistory, NetworkError> {
+        self.fit_stream_core(source, config, resume, on_batch, |_, _| true)
+    }
+
+    fn fit_stream_core(
+        &mut self,
+        source: &mut impl BatchSource,
+        config: TrainConfig,
+        resume: BatchCursor,
+        mut on_batch: impl FnMut(BatchCursor, f32) -> bool,
+        mut on_epoch: impl FnMut(usize, f32) -> bool,
+    ) -> Result<TrainingHistory, NetworkError> {
+        let mut losses = Vec::with_capacity(config.epochs.saturating_sub(resume.epoch));
+
+        for epoch in resume.epoch..config.epochs {
+            source.start_epoch(epoch)?;
+
+            // Only the epoch the cursor names is partly spent. Every epoch
+            // after it starts whole.
+            let skipped = if epoch == resume.epoch {
+                resume.batch
+            } else {
+                0
+            };
+            source.skip_batches(skipped)?;
 
             let mut epoch_loss = 0.0;
             let mut batches = 0;
-            for batch in working.batches(config.batch_size.max(1)) {
-                epoch_loss += self.train_batch_parallel(batch.inputs, batch.targets, 0)?;
+            let mut stopped = false;
+            while let Some(batch) = source.next_batch()? {
+                let loss = self.train_batch_parallel(batch.inputs, batch.targets, 0)?;
+                epoch_loss += loss;
                 batches += 1;
+
+                let cursor = BatchCursor {
+                    epoch,
+                    batch: skipped + batches,
+                };
+                if !on_batch(cursor, loss) {
+                    stopped = true;
+                    break;
+                }
+            }
+            if batches == 0 {
+                return Err(NetworkError::EmptyDataset);
             }
 
-            losses.push(epoch_loss / batches as f32);
+            let epoch_loss = epoch_loss / batches as f32;
+            losses.push(epoch_loss);
+            if stopped || !on_epoch(epoch, epoch_loss) {
+                break;
+            }
         }
 
         Ok(TrainingHistory { losses })
@@ -760,6 +905,71 @@ impl Network {
         Ok(())
     }
 
+    /// Share of samples the network classifies correctly, between 0 and 1.
+    ///
+    /// A single output is a probability and is compared against 0.5; several
+    /// outputs are compared by which one is largest, so a one-hot target and a
+    /// softmax-free logit vector both work. `Loss::Mse` is a regression loss
+    /// and has no accuracy: it is rejected rather than scored against a
+    /// threshold that means nothing.
+    ///
+    /// Loss is what the optimizer minimizes, but it is not what anyone reports
+    /// a classifier's quality in.
+    pub fn accuracy(&self, dataset: &Dataset) -> Result<f32, NetworkError> {
+        let matrix = self.confusion_matrix(dataset)?;
+        let correct: usize = matrix
+            .iter()
+            .enumerate()
+            .map(|(class, row)| row[class])
+            .sum();
+        Ok(correct as f32 / dataset.len() as f32)
+    }
+
+    /// Counts of every actual class against what the network predicted for it:
+    /// `matrix[actual][predicted]`.
+    ///
+    /// Accuracy is the diagonal over the total and says nothing about the rest.
+    /// A classifier at 90% on ten classes is either uniformly decent or perfect
+    /// on nine and useless on the tenth, and only this tells you which. Class
+    /// order is the order of the output units, which is the order of the names
+    /// [`Dataset::from_csv_labeled`](crate::Dataset::from_csv_labeled) and
+    /// [`from_image_folder`](crate::Dataset::from_image_folder) return.
+    ///
+    /// A single output is a probability thresholded at 0.5, so the matrix is
+    /// 2x2: row 0 is the negative class, and `matrix[0][1]` is the false
+    /// positives.
+    pub fn confusion_matrix(&self, dataset: &Dataset) -> Result<Vec<Vec<usize>>, NetworkError> {
+        if self.loss == Loss::Mse {
+            return Err(NetworkError::InvalidConfig(
+                "a confusion matrix is not defined for a regression loss".into(),
+            ));
+        }
+        if dataset.is_empty() {
+            return Err(NetworkError::EmptyDataset);
+        }
+        for target in &dataset.targets {
+            self.validate_target(target)?;
+        }
+
+        let classes = self.output_size().max(2);
+        let mut matrix = vec![vec![0usize; classes]; classes];
+        for (prediction, target) in self
+            .predict_batch(&dataset.inputs)?
+            .iter()
+            .zip(&dataset.targets)
+        {
+            let (actual, predicted) = match self.output_size() {
+                1 => (
+                    usize::from(target[0] >= 0.5),
+                    usize::from(prediction[0] >= 0.5),
+                ),
+                _ => (argmax(target), argmax(prediction)),
+            };
+            matrix[actual][predicted] += 1;
+        }
+        Ok(matrix)
+    }
+
     pub fn evaluate_loss(&self, dataset: &Dataset) -> Result<f32, NetworkError> {
         if dataset.is_empty() {
             return Err(NetworkError::EmptyDataset);
@@ -790,6 +1000,29 @@ impl Network {
             .collect();
 
         Ok(losses.iter().sum::<f32>() / dataset.len() as f32)
+    }
+
+    /// Writes the network out as an ONNX graph: one `Gemm` per layer and one
+    /// activation node after it.
+    ///
+    /// This is the way a model trained here runs somewhere else — ONNX Runtime,
+    /// TensorRT, a browser. The graph takes a `[batch, input_size]` float
+    /// tensor called `input` and its batch dimension is symbolic, so one row
+    /// and a thousand both load.
+    ///
+    /// Dense networks only. A transformer's RMSNorm, SwiGLU and MoE routing
+    /// have no such short representation, and
+    /// [`TransformerLm::save_bin`](crate::TransformerLm::save_bin) stays the
+    /// way to move one.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Activation, Network};
+    /// # let model = Network::builder().input_size(2).dense(1, Activation::Linear).build();
+    /// model.save_onnx("model.onnx")?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn save_onnx<P: AsRef<Path>>(&self, path: P) -> Result<(), NetworkError> {
+        crate::onnx_export::export(self, path)
     }
 
     pub fn save_json<P: AsRef<Path>>(&self, path: P) -> Result<(), NetworkError> {
@@ -1065,6 +1298,38 @@ impl Network {
                     );
                 }
             }
+            Optimizer::Lion {
+                learning_rate,
+                beta1,
+                beta2,
+                weight_decay,
+            } => {
+                for index in 0..self.layers.len() {
+                    apply_lion(
+                        &mut self.layers[index].weights.data,
+                        &gradients.weights[index].data,
+                        &mut self.adam_m_weights[index].data,
+                        LionHyperparams {
+                            learning_rate,
+                            beta1,
+                            beta2,
+                            weight_decay,
+                        },
+                    );
+                    apply_lion(
+                        &mut self.layers[index].biases.data,
+                        &gradients.biases[index].data,
+                        &mut self.adam_m_biases[index].data,
+                        LionHyperparams {
+                            learning_rate,
+                            beta1,
+                            beta2,
+                            // As for Adam: decay shrinks weights, not biases.
+                            weight_decay: 0.0,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -1133,6 +1398,26 @@ struct AdamHyperparams {
     weight_decay: f32,
 }
 
+struct LionHyperparams {
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    weight_decay: f32,
+}
+
+/// One Lion update over a layer's values.
+///
+/// `gradients` here is the descent direction, as it is for [`apply_adam`], so
+/// the sign is added rather than subtracted.
+fn apply_lion(values: &mut [f32], gradients: &[f32], moment1: &mut [f32], params: LionHyperparams) {
+    for ((value, gradient), m) in values.iter_mut().zip(gradients).zip(moment1) {
+        let update = params.beta1 * *m + (1.0 - params.beta1) * *gradient;
+        *m = params.beta2 * *m + (1.0 - params.beta2) * *gradient;
+        *value -= params.learning_rate * params.weight_decay * *value;
+        *value += params.learning_rate * crate::optimizers::sign(update);
+    }
+}
+
 fn apply_adam(
     values: &mut [f32],
     gradients: &[f32],
@@ -1193,6 +1478,193 @@ impl Gradients {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DatasetBatch;
+
+    /// A source that holds no dataset at all: it generates each batch into one
+    /// reusable buffer, which is the shape a file-backed reader has and the one
+    /// the borrowing `DatasetBatch` has to survive.
+    struct Generated {
+        inputs: Vec<Vec<f32>>,
+        targets: Vec<Vec<f32>>,
+        remaining: usize,
+        epochs_started: usize,
+    }
+
+    impl BatchSource for Generated {
+        fn next_batch(&mut self) -> Result<Option<DatasetBatch<'_>>, NetworkError> {
+            if self.remaining == 0 {
+                return Ok(None);
+            }
+            self.remaining -= 1;
+
+            // Overwriting the buffer in place is the whole point: the previous
+            // batch borrowed it and has to be gone by now.
+            let first = self.remaining as f32;
+            self.inputs = vec![vec![first], vec![first + 1.0]];
+            self.targets = self.inputs.iter().map(|row| vec![row[0] * 2.0]).collect();
+
+            Ok(Some(DatasetBatch {
+                inputs: &self.inputs,
+                targets: &self.targets,
+            }))
+        }
+
+        fn start_epoch(&mut self, _epoch: usize) -> Result<(), NetworkError> {
+            self.epochs_started += 1;
+            self.remaining = 4;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_streaming_source_trains_and_is_restarted_once_per_epoch() {
+        let mut source = Generated {
+            inputs: Vec::new(),
+            targets: Vec::new(),
+            remaining: 0,
+            epochs_started: 0,
+        };
+        let mut model = Network::builder()
+            .input_size(1)
+            .dense(1, Activation::Linear)
+            .optimizer(Optimizer::sgd(0.01))
+            .build();
+
+        let history = model
+            .fit_stream(
+                &mut source,
+                TrainConfig {
+                    epochs: 30,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(source.epochs_started, 30);
+        assert_eq!(history.losses.len(), 30);
+        assert!(
+            history.losses[29] < history.losses[0],
+            "the loss went from {} to {}",
+            history.losses[0],
+            history.losses[29]
+        );
+    }
+
+    #[test]
+    fn xor_learns_with_lion() {
+        let dataset = Dataset::new(
+            vec![
+                vec![0.0, 0.0],
+                vec![0.0, 1.0],
+                vec![1.0, 0.0],
+                vec![1.0, 1.0],
+            ],
+            vec![vec![0.0], vec![1.0], vec![1.0], vec![0.0]],
+        );
+        let mut model = Network::builder()
+            .input_size(2)
+            .dense(8, Activation::Tanh)
+            .dense(1, Activation::Sigmoid)
+            .loss(Loss::BinaryCrossEntropy)
+            // A tenth of the rate the same model takes for Adam: the update is
+            // a sign, so the rate is the whole step.
+            .optimizer(Optimizer::lion(0.005))
+            .build();
+
+        let initial = model.evaluate_loss(&dataset).unwrap();
+        model
+            .fit(
+                &dataset,
+                TrainConfig {
+                    epochs: 2_000,
+                    batch_size: 4,
+                    shuffle: true,
+                    seed: Some(7),
+                },
+            )
+            .unwrap();
+        let final_loss = model.evaluate_loss(&dataset).unwrap();
+
+        // A sign flipped anywhere in the update walks the loss up instead.
+        assert!(final_loss < initial);
+        assert!(final_loss < 0.2, "final loss was {final_loss}");
+        assert_eq!(model.accuracy(&dataset).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn a_resumed_run_ends_exactly_where_an_uninterrupted_one_does() {
+        let inputs: Vec<Vec<f32>> = (0..6).map(|row| vec![row as f32]).collect();
+        let targets: Vec<Vec<f32>> = inputs.iter().map(|row| vec![row[0] * 2.0]).collect();
+        let dataset = Dataset::new(inputs, targets);
+        let config = TrainConfig {
+            epochs: 4,
+            batch_size: 2,
+            shuffle: true,
+            seed: Some(11),
+        };
+        let base = Network::builder()
+            .input_size(1)
+            .dense(4, Activation::Tanh)
+            .dense(1, Activation::Linear)
+            .optimizer(Optimizer::sgd(0.01))
+            .build();
+
+        let mut straight = base.clone();
+        let mut working = dataset.clone();
+        straight
+            .fit_stream(&mut working.stream(&config), config)
+            .unwrap();
+
+        // Stopped four batches in, which is three for the first epoch and one
+        // into the second.
+        let mut resumed = base.clone();
+        let mut saved = BatchCursor::default();
+        let mut seen = 0;
+        let mut working = dataset.clone();
+        resumed
+            .fit_stream_resuming(&mut working.stream(&config), config, saved, |cursor, _| {
+                saved = cursor;
+                seen += 1;
+                seen < 4
+            })
+            .unwrap();
+        assert_eq!(saved, BatchCursor { epoch: 1, batch: 1 });
+
+        // A fresh copy and a fresh stream: the second run carries nothing over
+        // from the first except the cursor and the weights, which is all a
+        // restarted process would have.
+        let mut working = dataset.clone();
+        resumed
+            .fit_stream_resuming(&mut working.stream(&config), config, saved, |_, _| true)
+            .unwrap();
+
+        assert_eq!(
+            straight, resumed,
+            "the resumed run trained on different rows than the run it continued"
+        );
+    }
+
+    #[test]
+    fn a_dataset_stream_yields_the_same_batches_as_batches() {
+        let mut dataset = Dataset::new(vec![vec![0.0]; 5], vec![vec![1.0]; 5]);
+        let config = TrainConfig {
+            batch_size: 2,
+            shuffle: false,
+            ..Default::default()
+        };
+
+        let expected: Vec<usize> = dataset.batches(2).iter().map(|b| b.inputs.len()).collect();
+        let mut stream = dataset.stream(&config);
+        stream.start_epoch(0).unwrap();
+
+        let mut sizes = Vec::new();
+        while let Some(batch) = stream.next_batch().unwrap() {
+            assert_eq!(batch.inputs.len(), batch.targets.len());
+            sizes.push(batch.inputs.len());
+        }
+
+        assert_eq!(sizes, expected);
+    }
 
     #[test]
     fn xor_learns_with_adam() {
@@ -1229,6 +1701,160 @@ mod tests {
 
         assert!(final_loss < initial);
         assert!(final_loss < 0.2, "final loss was {final_loss}");
+        assert_eq!(model.accuracy(&dataset).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn the_epoch_callback_sees_every_loss_and_can_stop_the_training() {
+        let dataset = Dataset::new(vec![vec![0.0], vec![1.0]], vec![vec![0.0], vec![1.0]]);
+        let config = TrainConfig {
+            epochs: 20,
+            batch_size: 2,
+            shuffle: false,
+            seed: None,
+        };
+        let mut model = Network::builder()
+            .input_size(1)
+            .dense(1, Activation::Linear)
+            .optimizer(Optimizer::sgd(0.1))
+            .seed(1)
+            .build();
+
+        let mut seen = Vec::new();
+        let history = model
+            .fit_with(&dataset, config, |epoch, loss| {
+                seen.push((epoch, loss));
+                epoch < 4
+            })
+            .unwrap();
+
+        // Five epochs ran, the callback saw all five, and the history holds
+        // exactly those and not the fifteen that were configured.
+        assert_eq!(history.losses.len(), 5);
+        assert_eq!(seen.len(), 5);
+        assert_eq!(
+            seen.iter().map(|&(epoch, _)| epoch).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            seen.iter().map(|&(_, loss)| loss).collect::<Vec<_>>(),
+            history.losses
+        );
+    }
+
+    #[test]
+    fn accuracy_compares_argmaxes_and_rejects_a_regression_loss() {
+        // Three classes, and the network is never trained: whatever it
+        // predicts, accuracy has to be the share of rows whose largest target
+        // entry matches the largest prediction.
+        let dataset = Dataset::new(
+            vec![vec![0.0, 1.0], vec![1.0, 0.0]],
+            vec![vec![1.0, 0.0, 0.0], vec![0.0, 0.0, 1.0]],
+        );
+        let model = Network::builder()
+            .input_size(2)
+            .dense(3, Activation::Linear)
+            .loss(Loss::CrossEntropy)
+            .seed(11)
+            .build();
+
+        let predicted: Vec<usize> = model
+            .predict_batch(&dataset.inputs)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        let expected = [0usize, 2]
+            .iter()
+            .zip(&predicted)
+            .filter(|(target, prediction)| *target == *prediction)
+            .count() as f32
+            / 2.0;
+        assert_eq!(model.accuracy(&dataset).unwrap(), expected);
+
+        let regression = Network::builder()
+            .input_size(2)
+            .dense(3, Activation::Linear)
+            .loss(Loss::Mse)
+            .build();
+        assert!(regression.accuracy(&dataset).is_err());
+        assert!(regression.confusion_matrix(&dataset).is_err());
+    }
+
+    #[test]
+    fn the_confusion_matrix_counts_every_row_and_agrees_with_accuracy() {
+        // XOR, trained to the same place `xor_learns_with_adam` trains it: a
+        // perfect classifier is a matrix with nothing off the diagonal.
+        let dataset = Dataset::new(
+            vec![
+                vec![0.0, 0.0],
+                vec![0.0, 1.0],
+                vec![1.0, 0.0],
+                vec![1.0, 1.0],
+            ],
+            vec![vec![0.0], vec![1.0], vec![1.0], vec![0.0]],
+        );
+        let mut model = Network::builder()
+            .input_size(2)
+            .dense(8, Activation::Tanh)
+            .dense(1, Activation::Sigmoid)
+            .loss(Loss::BinaryCrossEntropy)
+            .optimizer(Optimizer::adam(0.05))
+            .build();
+        model
+            .fit(
+                &dataset,
+                TrainConfig {
+                    epochs: 2_000,
+                    batch_size: 4,
+                    shuffle: true,
+                    seed: Some(7),
+                },
+            )
+            .unwrap();
+
+        // One output means a 2x2: actual by predicted, thresholded at 0.5.
+        let matrix = model.confusion_matrix(&dataset).unwrap();
+        assert_eq!(matrix, vec![vec![2, 0], vec![0, 2]]);
+
+        let total: usize = matrix.iter().flatten().sum();
+        assert_eq!(total, dataset.len());
+        let diagonal: usize = (0..2).map(|class| matrix[class][class]).sum();
+        assert_eq!(
+            model.accuracy(&dataset).unwrap(),
+            diagonal as f32 / total as f32
+        );
+
+        // Three classes, untrained: the matrix still holds every row, and its
+        // diagonal is still the accuracy.
+        let multiclass = Dataset::new(
+            vec![vec![0.0, 1.0], vec![1.0, 0.0], vec![1.0, 1.0]],
+            vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+                vec![0.0, 1.0, 0.0],
+            ],
+        );
+        let untrained = Network::builder()
+            .input_size(2)
+            .dense(3, Activation::Softmax)
+            .loss(Loss::CrossEntropy)
+            .seed(7)
+            .build();
+        let matrix = untrained.confusion_matrix(&multiclass).unwrap();
+        assert_eq!(matrix.len(), 3);
+        assert_eq!(matrix.iter().flatten().sum::<usize>(), 3);
+        let diagonal: usize = (0..3).map(|class| matrix[class][class]).sum();
+        assert_eq!(
+            untrained.accuracy(&multiclass).unwrap(),
+            diagonal as f32 / 3.0
+        );
     }
 
     #[test]
