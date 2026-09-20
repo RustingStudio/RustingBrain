@@ -34,6 +34,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub(crate) const TILE: usize = 64;
 /// Threads per block: four warps, sixteen query rows each.
 pub(crate) const THREADS: u32 = 128;
+
+/// The image variant's block: eight warps over 128 query rows rather than
+/// four over 64, which is twice the work out of every key tile it streams
+/// through shared memory, for the same shared memory and the same occupancy.
+pub(crate) const IMAGE_ROWS: usize = 128;
+pub(crate) const IMAGE_THREADS: u32 = 256;
 /// Two `[64][64]` BF16 tiles, each row padded by eight elements so that the
 /// eight lanes of an `mma` fragment land in eight different shared-memory
 /// banks instead of all in one.
@@ -122,7 +128,7 @@ __device__ __forceinline__ float highh(unsigned p){ return h2f((unsigned short)(
 //
 // One block per (query tile, head). Nothing here writes a log-sum-exp: there
 // is no backward pass over an image model in this crate.
-extern "C" __global__ __launch_bounds__(128) void image_attention_fwd(
+extern "C" __global__ __launch_bounds__(256) void image_attention_fwd(
     const unsigned short* __restrict__ queries,
     const unsigned short* __restrict__ keys,
     unsigned short* __restrict__ out,
@@ -138,7 +144,7 @@ extern "C" __global__ __launch_bounds__(128) void image_attention_fwd(
   const int h = blockIdx.y;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
-  const int q_row0 = blockIdx.x*64 + warp*16;
+  const int q_row0 = blockIdx.x*128 + warp*16;
   const int row_a = q_row0 + g, row_b = q_row0 + g + 8;
   const int head = h*FA_D;
 
@@ -173,7 +179,7 @@ extern "C" __global__ __launch_bounds__(128) void image_attention_fwd(
 
   for (int kt=0; kt*64 < context; ++kt) {
     __syncthreads();
-    for (int i = threadIdx.x; i < 64*FA_D; i += 128) {
+    for (int i = threadIdx.x; i < 64*FA_D; i += 256) {
       int r = i >> 6, c = i & 63;
       int key = kt*64 + r;
       unsigned short kb = 0, vb = 0;
@@ -231,12 +237,16 @@ extern "C" __global__ __launch_bounds__(128) void image_attention_fwd(
     max_b=fmaxf(max_b,__shfl_xor_sync(0xffffffff,max_b,2));
 
     float new_a=fmaxf(m_a,max_a), new_b=fmaxf(m_b,max_b);
-    float corr_a=__expf(m_a-new_a), corr_b=__expf(m_b-new_b);
+    // The caller folded log2(e) into the scale, so every score arrives in
+    // base two and `exp2f` is the bare hardware instruction that `__expf`
+    // wraps in a multiply. A softmax has no base of its own: the running
+    // maximum, the correction and the sum all live in whichever one it is.
+    float corr_a=exp2f(m_a-new_a), corr_b=exp2f(m_b-new_b);
     float sum_a=0.f, sum_b=0.f;
     #pragma unroll
     for (int n=0;n<8;++n) {
-      s[n][0]=__expf(s[n][0]-new_a); s[n][1]=__expf(s[n][1]-new_a);
-      s[n][2]=__expf(s[n][2]-new_b); s[n][3]=__expf(s[n][3]-new_b);
+      s[n][0]=exp2f(s[n][0]-new_a); s[n][1]=exp2f(s[n][1]-new_a);
+      s[n][2]=exp2f(s[n][2]-new_b); s[n][3]=exp2f(s[n][3]-new_b);
       sum_a+=s[n][0]+s[n][1]; sum_b+=s[n][2]+s[n][3];
     }
     sum_a+=__shfl_xor_sync(0xffffffff,sum_a,1); sum_a+=__shfl_xor_sync(0xffffffff,sum_a,2);

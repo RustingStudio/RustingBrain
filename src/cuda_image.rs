@@ -1418,14 +1418,17 @@ impl ImageGpu {
                 && keys.lead % 8 == 0
                 && !crate::cuda_flash::disabled()
         }) {
+            // The kernel exponentiates in base two, so the scale carries the
+            // change of base and no score pays for it.
+            let log2_scale = scale * std::f32::consts::LOG2_E;
             let mut output = self.uninit(tokens, queries.cols)?;
             let config = cudarc::driver::LaunchConfig {
                 grid_dim: (
-                    tokens.div_ceil(crate::cuda_flash::TILE) as u32,
+                    tokens.div_ceil(crate::cuda_flash::IMAGE_ROWS) as u32,
                     heads as u32,
                     1,
                 ),
-                block_dim: (crate::cuda_flash::THREADS, 1, 1),
+                block_dim: (crate::cuda_flash::IMAGE_THREADS, 1, 1),
                 shared_mem_bytes: crate::cuda_flash::SHARED_BYTES,
             };
             unsafe {
@@ -1443,7 +1446,7 @@ impl ImageGpu {
                     .arg(&(queries.base as i32))
                     .arg(&(keys.base as i32))
                     .arg(&(values.base as i32))
-                    .arg(&scale)
+                    .arg(&log2_scale)
                     .launch(config)
                     .map_err(cuda_err("fused image attention kernel"))?;
             }
