@@ -31,9 +31,9 @@ vector alongside the states in place of the separate `pool`.
   partitions instead, which is most of a small model's decode step back.
 - The CUDA image kernels were rewritten around what a profile said they were
   actually spending time on, which took a Stable Diffusion XL UNet pass at
-  1024x1024 from 0.65 s to 0.27 s and the VAE decode of that image from 1.72 s
+  1024x1024 from 0.65 s to 0.25 s and the VAE decode of that image from 1.72 s
   to 0.53 s, and a whole guided 1024x1024 image at 30 steps from 37.4 s to
-  17.4 s. The convolution lowering writes a whole KxK patch per thread
+  16.1 s. The convolution lowering writes a whole KxK patch per thread
   rather than one tap, and writes its columns transposed so the matmul lands
   channel-major with no separate pass to reorder it. Group normalization is
   three kernels — partial sums, a double-precision fold, then one pass that
@@ -76,7 +76,16 @@ vector alongside the states in place of the separate `pool`.
   the pass is neither written nor read back three times: at 1024x1024 that is
   5.8 GB of traffic a pass that no longer happens. A device older than Ampere,
   a head of another width, or `RUSTING_BRAIN_NO_FLASH` falls back to the
-  three-kernel path.
+  three-kernel path. The scores themselves accumulate in FP16 inside the
+  kernel, at twice the tensor-core rate, while the weighted values keep an
+  FP32 accumulator: a score is a dot product over one head width, where
+  eleven mantissa bits are finer than the softmax downstream can resolve,
+  and the values are a sum over the whole context, where they are not.
+
+  The gated feed-forward applies its projection's bias itself. That
+  projection writes the widest tensor a transformer block holds -- four
+  times the model width, twice over for the gate -- and a bias pass of its
+  own cost a full read and write of it.
 
 ### Added
 

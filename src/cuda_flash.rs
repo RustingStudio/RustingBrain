@@ -101,6 +101,19 @@ __device__ __forceinline__ unsigned packh2(float lo,float hi){
   : "+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3]) \
   : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]))
 
+// The same product with an FP16 accumulator, which a consumer Ampere card
+// issues at twice the rate. The two result registers hold the four elements
+// the FP32 form spreads over four, packed in pairs. Only the scores use it:
+// they are a dot product over one head width, where eleven mantissa bits are
+// more than the softmax downstream can tell apart.
+#define MMAH16(d,a,b) asm volatile( \
+  "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 " \
+  "{%0,%1},{%2,%3,%4,%5},{%6,%7},{%0,%1};\n" \
+  : "+r"(d[0]),"+r"(d[1]) \
+  : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]))
+__device__ __forceinline__ float lowh(unsigned p){ return h2f((unsigned short)(p&0xffff)); }
+__device__ __forceinline__ float highh(unsigned p){ return h2f((unsigned short)(p>>16)); }
+
 // The same fused attention for the image path: FP16 operands, no mask, and
 // queries that may come from one tensor while keys and values come from
 // another, which is what a cross-attention is. `q_base`, `k_base` and
@@ -174,11 +187,9 @@ extern "C" __global__ __launch_bounds__(128) void image_attention_fwd(
     }
     __syncthreads();
 
-    float s[8][4];
+    unsigned packed[8][2];
     #pragma unroll
-    for (int n=0;n<8;++n)
-      #pragma unroll
-      for (int i=0;i<4;++i) s[n][i]=0.f;
+    for (int n=0;n<8;++n) { packed[n][0]=0; packed[n][1]=0; }
     #pragma unroll
     for (int n=0;n<8;++n) {
       #pragma unroll
@@ -187,8 +198,14 @@ extern "C" __global__ __launch_bounds__(128) void image_attention_fwd(
         unsigned bf[2];
         bf[0] = *(const unsigned*)p;
         bf[1] = *(const unsigned*)(p+8);
-        MMAH(s[n], qf[kk], bf);
+        MMAH16(packed[n], qf[kk], bf);
       }
+    }
+    float s[8][4];
+    #pragma unroll
+    for (int n=0;n<8;++n) {
+      s[n][0]=lowh(packed[n][0]); s[n][1]=highh(packed[n][0]);
+      s[n][2]=lowh(packed[n][1]); s[n][3]=highh(packed[n][1]);
     }
 
     // A key past the end read as zero, and a zero score is a probability of
