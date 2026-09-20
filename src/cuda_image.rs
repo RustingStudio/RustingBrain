@@ -404,14 +404,22 @@ extern "C" __global__ void softmax_rows(half_t*__restrict__ scores,
 
 // Half the projection is the value and half is its gate, which is the gated
 // feed-forward every one of these transformer blocks ends in.
+// The projection that feeds this is the widest tensor a transformer block
+// writes, so its bias rides along here rather than in a pass of its own: a
+// read and a write of `[tokens, 2 * inner]` that no longer happen. A null
+// `bias` is a projection that has none.
 extern "C" __global__ void gelu_gate(half_t*__restrict__ out,const half_t*__restrict__ x,
-    int inner){
+    const float*__restrict__ bias,int inner){
   const half_t*row=x+(long long)blockIdx.y*2*inner;
   half_t*target=out+(long long)blockIdx.y*inner;
   int base=blockIdx.x*blockDim.x*LANE+threadIdx.x;
   for(int k=0;k<LANE;k++){
     int c=base+k*blockDim.x;
-    if(c<inner)target[c]=f2h(h2f(row[c])*act_of(h2f(row[inner+c]),1));
+    if(c<inner){
+      float value=h2f(row[c]), gate=h2f(row[inner+c]);
+      if(bias){ value+=bias[c]; gate+=bias[inner+c]; }
+      target[c]=f2h(value*act_of(gate,1));
+    }
   }
 }
 
@@ -1025,12 +1033,30 @@ impl ImageGpu {
         self.dense_into(dense, tokens, target, 1.0)
     }
 
+    /// The product alone, for a caller that applies the bias itself.
+    fn dense_unbiased(&self, dense: &DeviceDense, tokens: &Tensor) -> Result<Tensor, NetworkError> {
+        let mut output = self.uninit(tokens.rows, dense.weight.rows)?;
+        self.dense_into_with(dense, tokens, &mut output, 0.0, false)?;
+        Ok(output)
+    }
+
     fn dense_into(
         &self,
         dense: &DeviceDense,
         tokens: &Tensor,
         output: &mut Tensor,
         beta: f32,
+    ) -> Result<(), NetworkError> {
+        self.dense_into_with(dense, tokens, output, beta, true)
+    }
+
+    fn dense_into_with(
+        &self,
+        dense: &DeviceDense,
+        tokens: &Tensor,
+        output: &mut Tensor,
+        beta: f32,
+        apply_bias: bool,
     ) -> Result<(), NetworkError> {
         if tokens.cols != dense.weight.cols {
             return Err(NetworkError::InvalidTarget {
@@ -1061,7 +1087,7 @@ impl ImageGpu {
             1.0,
             beta,
         )?;
-        if let Some(bias) = &dense.bias {
+        if let Some(bias) = dense.bias.as_ref().filter(|_| apply_bias) {
             let width = units as i32;
             unsafe {
                 self.context
@@ -1328,16 +1354,25 @@ impl ImageGpu {
         })
     }
 
-    fn gelu_gate(&self, projected: &Tensor) -> Result<Tensor, NetworkError> {
+    /// The gated feed-forward, taking the projection's bias rather than a
+    /// tensor that already has it: see the kernel.
+    fn gelu_gate(
+        &self,
+        projected: &Tensor,
+        bias: Option<&CudaSlice<f32>>,
+    ) -> Result<Tensor, NetworkError> {
         let inner = projected.cols / 2;
         let mut output = self.uninit(projected.rows, inner)?;
         let shape = lanes(inner, projected.rows);
+        let null = 0u64;
         unsafe {
-            self.context
-                .stream
-                .launch_builder(&self.gelu_gate)
-                .arg(&mut output.data)
-                .arg(&projected.data)
+            let mut launch = self.context.stream.launch_builder(&self.gelu_gate);
+            launch.arg(&mut output.data).arg(&projected.data);
+            match bias {
+                Some(bias) => launch.arg(bias),
+                None => launch.arg(&null),
+            };
+            launch
                 .arg(&(inner as i32))
                 .launch(shape)
                 .map_err(cuda_err("gated feed-forward kernel"))?;
@@ -1380,6 +1415,7 @@ impl ImageGpu {
                 && !causal
                 && std::ptr::eq(keys.data, values.data)
                 && keys.lead == values.lead
+                && keys.lead % 8 == 0
                 && !crate::cuda_flash::disabled()
         }) {
             let mut output = self.uninit(tokens, queries.cols)?;
@@ -1805,8 +1841,8 @@ impl DeviceUnet {
             )?;
 
             let normed = gpu.layer_norm(&block.norm3, &tokens, self.eps)?;
-            let projected = gpu.dense(&block.gate, &normed)?;
-            let hidden = gpu.gelu_gate(&projected)?;
+            let projected = gpu.dense_unbiased(&block.gate, &normed)?;
+            let hidden = gpu.gelu_gate(&projected, block.gate.bias.as_ref())?;
             gpu.dense_add(&block.output, &hidden, &mut tokens)?;
         }
 
@@ -2581,14 +2617,24 @@ mod tests {
         let Some(gpu) = device() else { return };
         let projected = Matrix::from_vec(3, 8, ramp(24, 0.45));
         let inner = 4;
+        // The bias the projection did not apply, which this kernel owes the
+        // gate and the value alike.
+        let bias = ramp(8, 0.1);
         let mut expected = Vec::with_capacity(12);
         for row in projected.data.chunks(8) {
             for index in 0..inner {
-                expected.push(row[index] * crate::ffn::gelu(row[inner + index]));
+                expected.push(
+                    (row[index] + bias[index])
+                        * crate::ffn::gelu(row[inner + index] + bias[inner + index]),
+                );
             }
         }
+        let bias = gpu.context.stream.clone_htod(&bias).expect("a bias upload");
         let actual = gpu
-            .gelu_gate(&gpu.upload_matrix(&projected).expect("an upload"))
+            .gelu_gate(
+                &gpu.upload_matrix(&projected).expect("an upload"),
+                Some(&bias),
+            )
             .expect("a gate");
         assert_close(
             "gelu gate",
