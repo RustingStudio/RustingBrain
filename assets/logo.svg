@@ -1,0 +1,115 @@
+<svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 512 512"
+    width="512"
+    height="512"
+>
+  <defs>
+    <linearGradient id="brainGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E8622C" />
+      <stop offset="100%" stop-color="#B8371A" />
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#3a3a3a" />
+      <stop offset="100%" stop-color="#2a2a2a" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="48" fill="#181818" />
+
+  <g transform="translate(256,256)">
+    <path
+            fill-rule="evenodd"
+            fill="url(#ringGrad)"
+            d="M 0,-214 A 214,214 0 1 1 -0.1,-214 Z
+         M 0,-190 A 190,190 0 1 0 0.1,-190 Z"
+        />
+
+    <g fill="url(#ringGrad)">
+      <g id="cogTooth">
+        <circle cx="0" cy="-214" r="20" />
+      </g>
+      <use href="#cogTooth" transform="rotate(45)" />
+      <use href="#cogTooth" transform="rotate(90)" />
+      <use href="#cogTooth" transform="rotate(135)" />
+      <use href="#cogTooth" transform="rotate(180)" />
+      <use href="#cogTooth" transform="rotate(225)" />
+      <use href="#cogTooth" transform="rotate(270)" />
+      <use href="#cogTooth" transform="rotate(315)" />
+    </g>
+
+    <g fill="url(#ringGrad)">
+      <g id="cogNub">
+        <rect x="-4" y="-186" width="8" height="16" rx="2" />
+      </g>
+      <use href="#cogNub" transform="rotate(22.5)" />
+      <use href="#cogNub" transform="rotate(67.5)" />
+      <use href="#cogNub" transform="rotate(112.5)" />
+      <use href="#cogNub" transform="rotate(157.5)" />
+      <use href="#cogNub" transform="rotate(202.5)" />
+      <use href="#cogNub" transform="rotate(247.5)" />
+      <use href="#cogNub" transform="rotate(292.5)" />
+      <use href="#cogNub" transform="rotate(337.5)" />
+    </g>
+  </g>
+
+  <g transform="translate(256,266)">
+    <path
+            d="
+      M 0,-96
+      C -34,-96 -56,-80 -66,-58
+      C -84,-58 -100,-46 -100,-26
+      C -112,-22 -120,-8 -114,8
+      C -122,18 -120,36 -106,44
+      C -108,60 -96,74 -78,76
+      C -74,92 -58,102 -40,98
+      C -30,110 -12,112 0,102
+      Z"
+            fill="url(#brainGrad)"
+        />
+    <path
+            d="
+      M 0,-96
+      C 34,-96 56,-80 66,-58
+      C 84,-58 100,-46 100,-26
+      C 112,-22 120,-8 114,8
+      C 122,18 120,36 106,44
+      C 108,60 96,74 78,76
+      C 74,92 58,102 40,98
+      C 30,110 12,112 0,102
+      Z"
+            fill="url(#brainGrad)"
+        />
+
+    <g
+            stroke="#F4A261"
+            stroke-width="4"
+            fill="none"
+            stroke-linecap="round"
+            opacity="0.9"
+        >
+      <path d="M -84,-40 L -84,-14 L -60,-14 L -60,10" />
+      <path d="M -100,4 L -76,4 L -76,26 L -50,26" />
+      <path d="M -66,50 L -66,66 L -40,66" />
+      <path d="M 84,-40 L 84,-14 L 60,-14 L 60,10" />
+      <path d="M 100,4 L 76,4 L 76,26 L 50,26" />
+      <path d="M 66,50 L 66,66 L 40,66" />
+      <path d="M -14,-90 L -14,-70 L 14,-70 L 14,-90" />
+    </g>
+    <g fill="#181818" stroke="#F4A261" stroke-width="4">
+      <circle cx="-84" cy="-40" r="5" />
+      <circle cx="-60" cy="10" r="5" />
+      <circle cx="-100" cy="4" r="5" />
+      <circle cx="-50" cy="26" r="5" />
+      <circle cx="-66" cy="50" r="5" />
+      <circle cx="-40" cy="66" r="5" />
+      <circle cx="84" cy="-40" r="5" />
+      <circle cx="60" cy="10" r="5" />
+      <circle cx="100" cy="4" r="5" />
+      <circle cx="50" cy="26" r="5" />
+      <circle cx="66" cy="50" r="5" />
+      <circle cx="40" cy="66" r="5" />
+    </g>
+    <line x1="0" y1="-96" x2="0" y2="102" stroke="#181818" stroke-width="5" />
+  </g>
+</svg>

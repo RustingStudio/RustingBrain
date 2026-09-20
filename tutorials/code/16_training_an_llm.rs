@@ -11,7 +11,8 @@
 //! Run with `cargo run --release`.
 
 use rusting_brain::{
-    NetworkError, Optimizer, Precision, TokenBatch, TransformerLm, causal_lm_loss_batch,
+    NetworkError, Optimizer, Precision, Schedule, TokenBatch, TransformerLm,
+    causal_lm_loss_batch,
 };
 
 const SEQ_LEN: usize = 48;
@@ -32,21 +33,6 @@ a mutable reference is exclusive and there may be only one. these two rules \
 together are what make data races impossible to write, not merely unlikely. \
 the cost is that some correct programs are rejected, and the reward is that \
 no incorrect program of this kind is accepted.";
-
-/// Warmup, then cosine decay to 10% of peak.
-///
-/// Full-size steps early are dangerous because Adam's moment estimates are
-/// still noise; full-size steps late stop the model settling. Decaying to 10%
-/// rather than 0 leaves it still learning if the run is extended.
-fn learning_rate(step: usize) -> f32 {
-    if step < WARMUP_STEPS {
-        PEAK_LR * step as f32 / WARMUP_STEPS as f32
-    } else {
-        let progress = (step - WARMUP_STEPS) as f32 / (TOTAL_STEPS - WARMUP_STEPS) as f32;
-        let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
-        PEAK_LR * (0.1 + 0.9 * cosine)
-    }
-}
 
 struct CharTokenizer {
     vocabulary: Vec<char>,
@@ -140,12 +126,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}\n", model.parameter_counts());
     println!(" step      lr     train    held-out");
 
+    let schedule = Schedule::warmup_cosine(PEAK_LR, WARMUP_STEPS, TOTAL_STEPS);
+
     let mut cursor = 0;
     for step in 1..=TOTAL_STEPS {
-        // The optimizer is read fresh every step, so a schedule is one
-        // assignment. There is no schedule object to register.
-        let rate = learning_rate(step);
-        model.optimizer = Optimizer::adam(rate);
+        // Warmup, then cosine decay to 10% of peak: full-size steps early are
+        // dangerous because Adam's moment estimates are still noise, and
+        // full-size steps late stop the model settling. The optimizer is read
+        // fresh every step, so applying it is one assignment.
+        let rate = schedule.rate(step);
+        model.optimizer.set_learning_rate(rate);
 
         // Gradient accumulation: the effective batch is not bounded by memory.
         model.zero_grad();

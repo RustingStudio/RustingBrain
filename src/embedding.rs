@@ -3,6 +3,7 @@
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::param::Param;
+use crate::quantized::Quantized;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 
@@ -56,9 +57,16 @@ impl Embedding {
 
         for (position, &id) in ids.iter().enumerate() {
             let row = self.row_index(id)?;
-            output
-                .row_mut(position)
-                .copy_from_slice(self.weight.value.row(row));
+            match &self.weight.quantized {
+                Some(quantized) => quantized.dequantize_row(row, output.row_mut(position)),
+                None => {
+                    let target = output.row_mut(position);
+                    target.copy_from_slice(self.weight.value.row(row));
+                    if self.weight.is_fake_quantized() {
+                        Quantized::round_row(target);
+                    }
+                }
+            }
         }
 
         Ok(output)
@@ -82,6 +90,15 @@ impl Embedding {
             return Ok(());
         }
 
+        // A frozen embedding released its gradient buffer, but the ids still
+        // have to be checked: a caller gets the same error either way.
+        if self.weight.is_frozen() {
+            for &id in ids {
+                self.row_index(id)?;
+            }
+            return Ok(());
+        }
+
         for (position, &id) in ids.iter().enumerate() {
             let row = self.row_index(id)?;
             let grad_row = &grad_output.data[position * d_model..(position + 1) * d_model];
@@ -100,6 +117,12 @@ impl Embedding {
         if let Some(device) = &self.weight.device {
             return device.matmul_rhs_transposed(hidden);
         }
+        if let Some(quantized) = &self.weight.quantized {
+            return quantized.matmul_rhs_transposed(hidden);
+        }
+        if self.weight.is_fake_quantized() {
+            return Quantized::from_matrix(&self.weight.value).matmul_rhs_transposed(hidden);
+        }
         let mut logits = Matrix::new(hidden.rows, self.vocab_size());
         hidden.dot_rhs_transposed(&self.weight.value, &mut logits);
         logits
@@ -114,7 +137,9 @@ impl Embedding {
             device.accumulate_grad(grad_logits, hidden);
             return device.matmul(grad_logits);
         }
-        grad_logits.dot_self_transposed_accumulate(hidden, &mut self.weight.grad);
+        if !self.weight.is_frozen() {
+            grad_logits.dot_self_transposed_accumulate(hidden, &mut self.weight.grad);
+        }
 
         let mut grad_hidden = Matrix::new(hidden.rows, self.d_model());
         grad_logits.dot(&self.weight.value, &mut grad_hidden);

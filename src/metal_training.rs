@@ -1061,7 +1061,7 @@ impl State {
                 dispatch_1d(encoder, b * input);
             }
         }
-        self.update(encoder, net);
+        self.update(encoder, net)?;
         encoder.set_compute_pipeline_state(&self.gpu.pipelines.mse_epoch_sum);
         encoder.set_buffer(0, Some(&self.loss.buffer), 0);
         encoder.set_buffer(1, Some(&self.layers[last].a.buffer), 0);
@@ -1084,7 +1084,11 @@ impl State {
         Ok(())
     }
 
-    fn update(&self, encoder: &ComputeCommandEncoderRef, net: &mut Network) {
+    fn update(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        net: &mut Network,
+    ) -> Result<(), NetworkError> {
         let optimizer = net.optimizer.clone();
         if matches!(optimizer, Optimizer::Adam { .. }) {
             net.adam_step += 1;
@@ -1132,8 +1136,14 @@ impl State {
                         dispatch_1d(encoder, parameter.len());
                     }
                 }
+                Optimizer::Lion { .. } => {
+                    return Err(NetworkError::UnsupportedMetal(
+                        "the Lion optimizer, which has no device shader".into(),
+                    ));
+                }
             }
         }
+        Ok(())
     }
 
     fn copy_back(&self, net: &mut Network) {

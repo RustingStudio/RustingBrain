@@ -33,7 +33,7 @@ use crate::gpu_transformer::{
 use crate::matrix::Matrix;
 use crate::moe::MoeLayer;
 use crate::network::NetworkError;
-use crate::param::{Linear, Param};
+use crate::param::{Linear, Lora, Param};
 use crate::rope::Rope;
 use crate::transformer::TransformerLm;
 use crate::transformer_block::{FeedForward, TransformerBlock};
@@ -597,33 +597,6 @@ impl Gpu<'_> {
         Ok(out)
     }
 
-    /// `out = alpha * x . weight^T + beta * out`, for a caller that already has
-    /// the destination buffer (a residual, say).
-    #[allow(clippy::too_many_arguments)]
-    fn linear_into<X: DevicePtr<f32>, O: DevicePtrMut<f32>>(
-        &self,
-        weight: &DeviceParam,
-        x: &X,
-        out: &mut O,
-        rows: usize,
-        beta: f32,
-    ) -> Result<(), NetworkError> {
-        gemm_rhs_transposed(
-            self.context,
-            x,
-            weight.cols(),
-            weight.value(),
-            weight.cols(),
-            out,
-            weight.rows(),
-            rows,
-            weight.rows(),
-            weight.cols(),
-            1.0,
-            beta,
-        )
-    }
-
     /// `out = grad_output . weight + beta * out`, the input-gradient half of a
     /// linear layer.
     fn linear_backward_input<G: DevicePtr<f32>, O: DevicePtrMut<f32>>(
@@ -659,6 +632,9 @@ impl Gpu<'_> {
         input: &X,
         rows: usize,
     ) -> Result<(), NetworkError> {
+        if weight.is_frozen() {
+            return Ok(());
+        }
         let (units, cols) = (weight.rows(), weight.cols());
         let beta = weight.grad_beta();
         gemm_lhs_transposed(
@@ -1222,20 +1198,72 @@ impl Gpu<'_> {
     /// of the single wide projection that replaces them. cuBLAS is close to
     /// twice as fast on one wide shape as on two narrow ones, and the packing
     /// itself is a device-to-device copy of weight-sized buffers.
-    fn pack(&self, parts: &[&DeviceParam], narrow: bool) -> Result<Act, NetworkError> {
-        let total: usize = parts.iter().map(|part| part.rows() * part.cols()).sum();
+    fn pack(&self, parts: &[&Linear], narrow: bool) -> Result<Act, NetworkError> {
+        let element = Act::element(narrow);
+        let mut total = 0;
+        for part in parts {
+            let device = device_of(part)?;
+            total += device.rows() * device.cols();
+        }
         let mut packed = self.act(total, narrow)?;
         let mut base = 0;
         for part in parts {
-            let len = part.rows() * part.cols();
-            let element = Act::element(narrow);
+            let device = device_of(part)?;
+            let (units, inner) = (device.rows(), device.cols());
+            let len = units * inner;
             let mut slot = packed
                 .bytes
                 .slice_mut(base * element..(base + len) * element);
-            self.cast_into(&mut slot, &part.value().slice(..), len, narrow)?;
+            self.cast_into(&mut slot, &device.value().slice(..), len, narrow)?;
+            if let Some(lora) = &part.lora {
+                self.fold_lora(lora, &mut slot, units, inner, narrow)?;
+            }
             base += len;
         }
         Ok(packed)
+    }
+
+    /// Adds `scale * up . down` to a packed weight, which is what makes a LoRA
+    /// adapter free everywhere the packed weight is read.
+    ///
+    /// NOTE: the adapter is materialized into the weight once per forward
+    /// pass rather than carried as two extra GEMMs at every reader. That costs
+    /// one `[out, in]` GEMM of inner dimension `rank` per projection per step,
+    /// against two `[rows, rank]` GEMMs in the forward pass and one more in the
+    /// backward pass, and it leaves the projection GEMM and the input-gradient
+    /// GEMM - packed, strided, BF16, flash-attention-fed - untouched. Move the
+    /// adapter to the readers if a run is ever weight-bound rather than
+    /// token-bound.
+    fn fold_lora(
+        &self,
+        lora: &Lora,
+        slot: &mut CudaViewMut<'_, u8>,
+        units: usize,
+        inner: usize,
+        narrow: bool,
+    ) -> Result<(), NetworkError> {
+        let down = device_param(&lora.down)?;
+        let up = device_param(&lora.up)?;
+        let rank = down.rows();
+        // Both adapter matrices are FP32 on the device whatever the
+        // activations are doing, so the operands go in wide and only the
+        // accumulator follows the packed weight's precision.
+        act_plain(
+            self.context,
+            &bytes_of(up.value(), units * rank),
+            rank,
+            &bytes_of(down.value(), rank * inner),
+            inner,
+            false,
+            narrow,
+            slot,
+            inner,
+            units,
+            inner,
+            rank,
+            lora.scale,
+            1.0,
+        )
     }
 
     /// The gate and up weights of every given feed-forward, one after another,
@@ -1247,9 +1275,23 @@ impl Gpu<'_> {
     ) -> Result<Act, NetworkError> {
         let mut parts = Vec::new();
         for ffn in ffns {
-            parts.push(device_of(&ffn.gate)?);
-            parts.push(device_of(&ffn.up)?);
+            parts.push(&ffn.gate);
+            parts.push(&ffn.up);
         }
+        self.pack(&parts, narrow)
+    }
+
+    /// The down projections of the given feed-forwards, one after another.
+    ///
+    /// The routed path packs them for the same reason the dense path does:
+    /// a packed weight is where a LoRA adapter is folded in, so the readers
+    /// of the routed expert's output projection need no adapter of their own.
+    fn pack_down<'a>(
+        &self,
+        ffns: impl Iterator<Item = &'a SwiGlu>,
+        narrow: bool,
+    ) -> Result<Act, NetworkError> {
+        let parts: Vec<&Linear> = ffns.map(|ffn| &ffn.down).collect();
         self.pack(&parts, narrow)
     }
 
@@ -1361,6 +1403,9 @@ impl Gpu<'_> {
         narrow: bool,
         rows: usize,
     ) -> Result<(), NetworkError> {
+        if weight.is_frozen() {
+            return Ok(());
+        }
         let (units, cols) = (weight.rows(), weight.cols());
         let beta = weight.grad_beta();
         act_lhs_transposed(
@@ -1392,6 +1437,13 @@ impl Gpu<'_> {
         narrow: bool,
         rows: usize,
     ) -> Result<(), NetworkError> {
+        if parts.iter().all(|part| part.is_frozen()) {
+            return Ok(());
+        }
+        debug_assert!(
+            parts.iter().all(|part| !part.is_frozen()),
+            "a packed projection freezes as a unit"
+        );
         let inner = parts[0].cols();
         let units: usize = parts.iter().map(|part| part.rows()).sum();
         let mut scratch = self.uninit(units * inner)?;
@@ -1419,6 +1471,197 @@ impl Gpu<'_> {
         }
         Ok(())
     }
+
+    /// One projection's weight gradients: the base weight's unless it is
+    /// frozen, and its adapter's if it has one.
+    ///
+    /// `dL/dinput` is not this function's business either way. The packed
+    /// weight the input-gradient GEMM reads already carries
+    /// `scale * up . down`, folded in by [`Gpu::fold_lora`].
+    fn accumulate_projection_grad(
+        &self,
+        linear: &mut Linear,
+        grad_output: &CudaView<'_, u8>,
+        input: &CudaView<'_, u8>,
+        narrow: bool,
+        rows: usize,
+    ) -> Result<(), NetworkError> {
+        let units = linear.out_features();
+        self.accumulate_weight_grad_act(device_of_mut(linear)?, grad_output, input, narrow, rows)?;
+        match &mut linear.lora {
+            Some(lora) => self.accumulate_lora_grad(lora, grad_output, units, input, narrow, rows),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Gpu::accumulate_projection_grad`] for projections that share one wide
+    /// GEMM, each adapter reading its own column band of the fused gradient.
+    fn accumulate_packed_projection_grad(
+        &self,
+        parts: &mut [&mut Linear],
+        grad_output: &CudaView<'_, u8>,
+        input: &CudaView<'_, u8>,
+        narrow: bool,
+        rows: usize,
+    ) -> Result<(), NetworkError> {
+        let stride: usize = parts.iter().map(|part| part.out_features()).sum();
+        {
+            let mut devices = Vec::with_capacity(parts.len());
+            for part in parts.iter_mut() {
+                devices.push(device_of_mut(part)?);
+            }
+            self.accumulate_packed_grad(&mut devices, grad_output, input, narrow, rows)?;
+        }
+        let element = Act::element(narrow);
+        let mut base = 0;
+        for part in parts.iter_mut() {
+            let units = part.out_features();
+            if let Some(lora) = &mut part.lora {
+                self.accumulate_lora_grad(
+                    lora,
+                    &grad_output.slice(base * element..),
+                    stride,
+                    input,
+                    narrow,
+                    rows,
+                )?;
+            }
+            base += units;
+        }
+        Ok(())
+    }
+
+    /// `-dL/dup` and `-dL/ddown` for one adapter.
+    ///
+    /// `grad_stride` is the row stride of the buffer `grad_output` points
+    /// into, which is wider than the projection whenever several projections
+    /// share one fused gradient. The adapter's own width comes from `up`.
+    fn accumulate_lora_grad(
+        &self,
+        lora: &mut Lora,
+        grad_output: &CudaView<'_, u8>,
+        grad_stride: usize,
+        input: &CudaView<'_, u8>,
+        narrow: bool,
+        rows: usize,
+    ) -> Result<(), NetworkError> {
+        let (rank, inner) = {
+            let down = device_param(&lora.down)?;
+            (down.rows(), down.cols())
+        };
+        let units = device_param(&lora.up)?.rows();
+        // One cuBLAS call reads one operand type, and the activations here may
+        // be BF16 while the adapter is always FP32, so the adapter matrices
+        // are cast to match. They are rank-sized: the cast is noise next to
+        // the GEMM that reads them.
+        let down_act = self.narrowed(
+            &device_param(&lora.down)?.value().slice(..),
+            rank * inner,
+            narrow,
+        )?;
+        let up_act = self.narrowed(
+            &device_param(&lora.up)?.value().slice(..),
+            units * rank,
+            narrow,
+        )?;
+
+        // The same `[rows, rank]` intermediate the forward pass would have
+        // produced, had the adapter not been folded into the weight. Recomputing
+        // it costs one thin GEMM; caching it would cost a buffer per projection
+        // per layer for the whole depth of the backward pass.
+        let mut hidden = self.act(rows * rank, narrow)?;
+        act_rhs_transposed(
+            self.context,
+            input,
+            inner,
+            &down_act.all(),
+            inner,
+            narrow,
+            narrow,
+            hidden.destination(),
+            rank,
+            rows,
+            rank,
+            inner,
+            lora.scale,
+            0.0,
+        )?;
+        {
+            let up = device_param_mut(&mut lora.up)?;
+            let beta = up.grad_beta();
+            act_lhs_transposed(
+                self.context,
+                grad_output,
+                grad_stride,
+                &hidden.all(),
+                rank,
+                narrow,
+                up.negated_grad_mut(),
+                rank,
+                rows,
+                units,
+                rank,
+                -1.0,
+                beta,
+            )?;
+        }
+
+        let mut grad_hidden = self.act(rows * rank, narrow)?;
+        act_plain(
+            self.context,
+            grad_output,
+            grad_stride,
+            &up_act.all(),
+            rank,
+            narrow,
+            narrow,
+            grad_hidden.destination(),
+            rank,
+            rows,
+            rank,
+            units,
+            lora.scale,
+            0.0,
+        )?;
+        let down = device_param_mut(&mut lora.down)?;
+        let beta = down.grad_beta();
+        act_lhs_transposed(
+            self.context,
+            &grad_hidden.all(),
+            rank,
+            input,
+            inner,
+            narrow,
+            down.negated_grad_mut(),
+            inner,
+            rows,
+            rank,
+            inner,
+            -1.0,
+            beta,
+        )
+    }
+}
+
+/// A device buffer read as untyped bytes, for a cuBLAS call whose other
+/// operand decides the element type.
+fn bytes_of(slice: &CudaSlice<f32>, len: usize) -> CudaView<'_, u8> {
+    unsafe { slice.transmute::<u8>(len * 4) }.expect("a device allocation is byte-aligned")
+}
+
+/// The device mirror of a LoRA matrix, or an error naming what is missing.
+fn device_param(param: &Param) -> Result<&DeviceParam, NetworkError> {
+    param
+        .device
+        .as_ref()
+        .ok_or_else(|| NetworkError::Cuda("a LoRA adapter is not resident on the device".into()))
+}
+
+fn device_param_mut(param: &mut Param) -> Result<&mut DeviceParam, NetworkError> {
+    param
+        .device
+        .as_mut()
+        .ok_or_else(|| NetworkError::Cuda("a LoRA adapter is not resident on the device".into()))
 }
 
 /// The device mirror of a projection, or an error naming the layer that is
@@ -1636,11 +1879,7 @@ fn forward_block(
         .as_ref()
         .filter(|_| crate::cuda_flash::eligible(gpu.context.mixed_precision, head_dim));
     let qkv_weights = gpu.pack(
-        &[
-            device_of(&attention.query)?,
-            device_of(&attention.key)?,
-            device_of(&attention.value)?,
-        ],
+        &[&attention.query, &attention.key, &attention.value],
         narrow,
     )?;
     let mut qkv = gpu.act(rows * qkv_width, narrow && fused.is_some())?;
@@ -1756,7 +1995,7 @@ fn forward_block(
 
     // The residual add is the output projection's GEMM with beta = 1 over the
     // duplicate the norm above left behind, so it costs no extra kernel.
-    let output_weight = gpu.pack(&[device_of(&attention.output)?], merged.is_narrow())?;
+    let output_weight = gpu.pack(&[&attention.output], merged.is_narrow())?;
     gpu.linear_packed(
         &output_weight.all(),
         d_model,
@@ -1848,7 +2087,7 @@ fn forward_swiglu(
         0.0,
     )?;
     let hidden = gpu.swiglu(&gate_up, rows, width, narrow)?;
-    let down = gpu.pack(&[device_of(&ffn.down)?], narrow)?;
+    let down = gpu.pack(&[&ffn.down], narrow)?;
     gpu.linear_packed(
         &down.all(),
         inner,
@@ -2002,17 +2241,22 @@ fn forward_moe(
     }
     let hidden = gpu.swiglu(&gate_up, routed, width, false)?;
 
+    let down_weights = gpu.pack_down(moe.experts.iter(), false)?;
+    let down_stride = d_model * width;
     let mut expert_output = gpu.uninit(routed * d_model)?;
-    for (expert, module) in moe.experts.iter().enumerate() {
+    for (expert, _) in moe.experts.iter().enumerate() {
         let count = counts[expert];
         if count == 0 {
             continue;
         }
-        let rows_in = hidden.wide().slice(offsets[expert] * width..);
+        let rows_in = hidden.at(offsets[expert] * width);
         let mut rows_out = expert_output.slice_mut(offsets[expert] * d_model..);
-        gpu.linear_into(
-            device_of(&module.down)?,
+        gpu.linear_packed(
+            &down_weights.at(expert * down_stride),
+            d_model,
+            width,
             &rows_in,
+            false,
             &mut rows_out,
             count,
             0.0,
@@ -2071,7 +2315,7 @@ fn forward_moe(
                 gate_up,
                 hidden,
                 weights: expert_weights,
-                down: None,
+                down: Some(down_weights),
             },
             output: expert_output,
             shared,
@@ -2254,7 +2498,9 @@ impl HeadBf16 {
         gpu.cast_to_bf16(&mut weight, &head.value().slice(..), vocab * d_model)?;
         Ok(Self {
             weight,
-            weight_grad: gpu.uninit_bf16(vocab * d_model)?,
+            // A frozen head takes no gradient, so the buffer that would carry
+            // one is a placeholder.
+            weight_grad: gpu.uninit_bf16(if head.is_frozen() { 1 } else { vocab * d_model })?,
             input: gpu.uninit_bf16(chunk * d_model)?,
             logits: gpu.uninit_bf16(chunk * vocab)?,
             grad_input: gpu.uninit_bf16(chunk * d_model)?,
@@ -2322,6 +2568,9 @@ impl HeadBf16 {
             bf16::ZERO,
         )?;
         gpu.cast_from_bf16(grad_input, &self.grad_input, count * d_model)?;
+        if head.is_frozen() {
+            return Ok(());
+        }
         gemm_lhs_transposed(
             gpu.context,
             &self.logits,
@@ -2501,14 +2750,18 @@ fn backward_from_final(
             NetworkError::Cuda("the embedding table is not resident on the device".into())
         })?;
         // The scatter is a pile of atomic adds, so it needs real zeros under it.
-        embedding.clear_grad()?;
-        gpu.scatter_negated(
-            embedding.negated_grad_mut(),
-            &grad_hidden,
-            &cache.ids,
-            rows,
-            d_model,
-        )?;
+        // A frozen table has no buffer to scatter into and nothing that would
+        // read one.
+        if !embedding.is_frozen() {
+            embedding.clear_grad()?;
+            gpu.scatter_negated(
+                embedding.negated_grad_mut(),
+                &grad_hidden,
+                &cache.ids,
+                rows,
+                d_model,
+            )?;
+        }
     }
 
     // The one host round trip of the backward pass, after everything else is
@@ -2664,8 +2917,8 @@ fn backward_attention(
         rows,
         0.0,
     )?;
-    gpu.accumulate_weight_grad_act(
-        device_of_mut(&mut attention.output)?,
+    gpu.accumulate_projection_grad(
+        &mut attention.output,
         &grad_output_act.all(),
         &cache.merged.all(),
         merged_narrow,
@@ -2904,11 +3157,11 @@ fn backward_attention(
         rows,
         0.0,
     )?;
-    gpu.accumulate_packed_grad(
+    gpu.accumulate_packed_projection_grad(
         &mut [
-            device_of_mut(&mut attention.query)?,
-            device_of_mut(&mut attention.key)?,
-            device_of_mut(&mut attention.value)?,
+            &mut attention.query,
+            &mut attention.key,
+            &mut attention.value,
         ],
         &grad_qkv.all(),
         &cache.attention_normed.all(),
@@ -2951,8 +3204,8 @@ fn backward_swiglu(
         rows,
         0.0,
     )?;
-    gpu.accumulate_weight_grad_act(
-        device_of_mut(&mut ffn.down)?,
+    gpu.accumulate_projection_grad(
+        &mut ffn.down,
         &grad_output_act.all(),
         &cache.hidden.all(),
         narrow,
@@ -2975,8 +3228,8 @@ fn backward_swiglu(
         rows,
         0.0,
     )?;
-    gpu.accumulate_packed_grad(
-        &mut [device_of_mut(&mut ffn.gate)?, device_of_mut(&mut ffn.up)?],
+    gpu.accumulate_packed_projection_grad(
+        &mut [&mut ffn.gate, &mut ffn.up],
         &grad_gate_up.all(),
         &input.all(),
         narrow,
@@ -3051,6 +3304,11 @@ fn backward_moe(
             d_model,
         )?;
 
+        let down = cache.expert.down.as_ref().ok_or_else(|| {
+            NetworkError::Cuda("the routed feed-forward cache has no down projection".into())
+        })?;
+        let down_stride = d_model * width;
+        let grad_bytes = bytes_of(&grad_expert_output, routed * d_model);
         let mut grad_hidden = gpu.uninit(routed * width)?;
         for (expert, module) in moe.experts.iter_mut().enumerate() {
             let count = cache.counts[expert];
@@ -3058,14 +3316,24 @@ fn backward_moe(
                 continue;
             }
             let offset = cache.offsets[expert];
-            let upstream = grad_expert_output.slice(offset * d_model..);
+            let upstream = grad_bytes.slice(offset * d_model * 4..);
             let mut grad = grad_hidden.slice_mut(offset * width..);
-            gpu.linear_backward_input(device_of(&module.down)?, &upstream, &mut grad, count, 0.0)?;
-            let hidden = cache.expert.hidden.wide().slice(offset * width..);
-            gpu.accumulate_weight_grad(
-                device_of_mut(&mut module.down)?,
+            gpu.linear_packed_backward_input(
+                &down.at(expert * down_stride),
+                d_model,
+                width,
                 &upstream,
-                &hidden,
+                false,
+                false,
+                &mut grad,
+                count,
+                0.0,
+            )?;
+            gpu.accumulate_projection_grad(
+                &mut module.down,
+                &upstream,
+                &cache.expert.hidden.at(offset * width),
+                false,
                 count,
             )?;
         }
@@ -3096,11 +3364,8 @@ fn backward_moe(
                 count,
                 0.0,
             )?;
-            gpu.accumulate_packed_grad(
-                &mut [
-                    device_of_mut(&mut module.gate)?,
-                    device_of_mut(&mut module.up)?,
-                ],
+            gpu.accumulate_packed_projection_grad(
+                &mut [&mut module.gate, &mut module.up],
                 &upstream,
                 &rows_in,
                 false,

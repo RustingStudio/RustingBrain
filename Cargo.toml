@@ -21,6 +21,9 @@ serde_json = "1.0"
 thiserror = "2.0"
 cudarc = { version = "0.19.3", optional = true, default-features = false, features = ["std", "cublas", "nvrtc", "runtime", "dynamic-loading", "cuda-13010", "f16"] }
 tract-onnx = { version = "0.21", optional = true }
+# Decoders only: the default feature set pulls in every format plus their
+# encoders, and a dataset loader reads PNG and JPEG.
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 half = { version = "2", optional = true }
 
 # Metal only exists on Apple platforms, so the dependency is target-scoped:
@@ -45,6 +48,15 @@ cuda-13-0 = ["cuda"]
 cuda-13-1 = ["cuda"]
 metal = ["dep:metal"]
 onnx = ["dep:tract-onnx"]
+images = ["dep:image"]
+
+[[example]]
+name = "image_classification"
+required-features = ["images"]
+
+[[example]]
+name = "text_to_image"
+required-features = ["images"]
 
 [[example]]
 name = "cuda_training_smoke"
@@ -60,6 +72,10 @@ required-features = ["cuda"]
 
 [[example]]
 name = "flash_probe"
+required-features = ["cuda"]
+
+[[example]]
+name = "cuda_image_bench"
 required-features = ["cuda"]
 
 [profile.release]

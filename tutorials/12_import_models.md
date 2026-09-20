@@ -11,15 +11,18 @@ trained it in Keras. You found one on Hugging Face. You prototyped in PyTorch
 because the plotting was easier, and now the thing has to live inside a Rust
 service.
 
-That is what this chapter is for. It is a one-way street, and being clear about
-which way it runs will save you an afternoon:
+That is what this chapter is for. Most of it runs in one direction, and being
+clear about which way saves you an afternoon:
 
 ```
 TensorFlow / PyTorch  →  ONNX file  →  RustingBrain  →  predictions
 ```
 
-**Inference only.** You cannot import a model and keep training it here.
-Training stays in the framework that started it.
+**Imported models are inference only.** You cannot import a model and keep
+training it here. Training stays in the framework that started it.
+
+The other direction exists too, for dense networks: `Network::save_onnx` writes
+a file the same tools read (12.8).
 
 ---
 
@@ -234,15 +237,39 @@ There is no way around that except simplifying the model on the export side.
 
 ## 12.8 Going the other way
 
-RustingBrain does not export to ONNX. If you want a RustingBrain model in
-another framework, the practical route is to read the JSON — it is a documented
-format holding weights, biases, activations, and shapes — and rebuild the model
-where you need it. For a dense network that is about thirty lines of Python.
+A dense network exports:
 
-For RustingBrain's own models, use the native formats: `save_json` for dense
-networks (chapter 9), `save_bin` for transformers (chapter 14). They are
-smaller, faster, lossless, and they carry things ONNX has no place for, such as
-optimizer state.
+```rust
+model.save_onnx("model.onnx")?;
+```
+
+One `Gemm` node per layer, one activation node after it, weights as
+initializers, input named `input` with a symbolic batch dimension. ONNX
+Runtime, TensorRT, onnxruntime-web and `tract` all load it — including this
+crate's own reader, which is the cheapest way to check the export:
+
+```bash
+cargo run --example onnx_inference --features onnx -- model.onnx 1,2 1,1
+```
+
+Note the asymmetry: **writing an ONNX file needs no feature flag, reading one
+needs `--features onnx`.** Writing is a few hundred lines of protobuf; reading
+pulls in all of `tract-onnx`.
+
+What does not export:
+
+- **Transformers.** RMSNorm, SwiGLU, RoPE and MoE routing have no short ONNX
+  spelling. Use `save_bin` (chapter 14).
+- **Anything but `Linear`, `Relu`, `Sigmoid`, `Tanh`, `Softmax`.** Those are the
+  activations a dense `Network` has, so in practice this is not a limit.
+- **Your preprocessing.** Same as on the import side: the scaler is yours to
+  carry (chapter 9).
+- **Optimizer state.** ONNX has no place for it. A model you intend to keep
+  training stays in `save_json`.
+
+For RustingBrain-to-RustingBrain, still use the native formats: `save_json` for
+dense networks, `save_bin` for transformers. They are smaller, lossless, and
+they carry what ONNX drops.
 
 ---
 
@@ -276,7 +303,8 @@ optimizer state.
 
 ## Recap
 
-- ONNX is the neutral format in the middle. Import works; export does not.
+- ONNX is the neutral format in the middle. Import works for anything `tract`
+  supports; export works for dense networks.
 - The `onnx` feature is opt-in; without it the API returns `FeatureDisabled`
   rather than failing to compile.
 - `tf2onnx` for TensorFlow and Keras, `torch.onnx.export` for PyTorch, opset 13
@@ -287,6 +315,8 @@ optimizer state.
   rows is much faster than many calls.
 - Preprocessing does not travel with the file. Getting the weights without the
   normalization gives you confident nonsense.
+- `save_onnx` goes the other way for dense networks, and needs no feature flag —
+  only reading does.
 
 ---
 

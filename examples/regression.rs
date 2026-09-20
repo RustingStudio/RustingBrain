@@ -23,7 +23,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let initial = model.evaluate_loss(&dataset)?;
-    model.fit(
+    println!("initial loss: {initial:.6}");
+
+    // `fit_with` instead of `fit`: five hundred epochs are otherwise five
+    // hundred epochs of silence, and this problem is solved long before the
+    // last one. Returning `false` stops the loop, and the history holds only
+    // the epochs that ran.
+    let history = model.fit_with(
         &dataset,
         TrainConfig {
             epochs: 500,
@@ -31,10 +37,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shuffle: true,
             seed: Some(3),
         },
+        |epoch, loss| {
+            if epoch % 100 == 0 {
+                println!("  epoch {epoch:>3}  loss {loss:.6}");
+            }
+            loss > 1e-5
+        },
     )?;
     let final_loss = model.evaluate_loss(&dataset)?;
 
-    println!("initial loss: {initial:.6}");
+    println!("epochs run:   {}", history.losses.len());
     println!("final loss:   {final_loss:.6}");
     println!("[0.25, 0.50] -> {:.4}", model.predict(&[0.25, 0.50])?[0]);
 

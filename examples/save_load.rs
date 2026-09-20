@@ -31,5 +31,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("saved to {}", path.display());
     println!("[0.25] -> {:.4}", loaded.predict(&[0.25])?[0]);
 
+    // The same weights as an ONNX graph, for a runtime that is not this one.
+    // Run it with `cargo run --example onnx_inference --features onnx --
+    // <path> 1,1 0.25` and the number printed above comes back.
+    let onnx = std::env::temp_dir().join("rusting_brain_example_model.onnx");
+    model.save_onnx(&onnx)?;
+    println!("exported to {}", onnx.display());
+
     Ok(())
 }

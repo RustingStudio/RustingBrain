@@ -96,7 +96,7 @@ fixed forever — the weights and biases are the knobs.
 > **Term: parameter.** A single number inside the model that training is allowed
 > to change. If someone says "a 7-billion-parameter model", they mean it has
 > 7,000,000,000 of these knobs. RustingBrain models in this course will have
-> between 9 and a few thousand.
+> between 9 and a few millions.
 
 ---
 
@@ -111,18 +111,22 @@ Here is a layer of 3 neurons reading 2 inputs:
 
 ```
             ┌──────────┐
-  x1 ──┬───▶│ neuron 1 │──▶ a1     w = [w11, w12], b = b1
+  x1 ──┬───>│ neuron 1 │──▶ a1     w = [w11, w12], b = b1
        │    └──────────┘
        │    ┌──────────┐
-       ├───▶│ neuron 2 │──▶ a2     w = [w21, w22], b = b2
+       ├───>│ neuron 2 │──▶ a2     w = [w21, w22], b = b2
        │    └──────────┘
        │    ┌──────────┐
-  x2 ──┴───▶│ neuron 3 │──▶ a3     w = [w31, w32], b = b3
+  x2 ──┴───>│ neuron 3 │──▶ a3     w = [w31, w32], b = b3
             └──────────┘
 ```
 
 Every input connects to every neuron. That is what **dense** (or
-"fully connected") means, and it is the only layer type RustingBrain has.
+"fully connected") means, and it is the only layer type a `Network` has — the
+whole of chapters 1–13. Transformer language models are built from other layers
+(attention, RMSNorm, SwiGLU, a mixture of experts); they are a separate model
+type, `TransformerLm`, and they start in chapter 14. There are no convolutions
+anywhere in the crate.
 
 Counting parameters is easy: each of the 3 neurons has 2 weights and 1 bias, so
 `3 × 2 = 6` weights plus `3` biases = **9 parameters**.
@@ -136,9 +140,9 @@ Then you **stack** layers. The outputs of layer 1 become the inputs of layer 2:
  inputs        layer 1          layer 2        output
    (2)      (3 neurons)      (1 neuron)         (1)
 
-   x1  ─┬──▶  ●  ─┐
-        │     ●  ─┼────────▶     ●      ────▶  prediction
-   x2  ─┴──▶  ●  ─┘
+   x1  ─┬──>  ●  ─┐
+        │──>  ●  ─┼────────▶     ●      ────▶  prediction
+   x2  ─┴──>  ●  ─┘
 ```
 
 - The first thing on the left is the **input layer**. It isn't really a layer —
@@ -183,9 +187,9 @@ RustingBrain gives you five:
       a │      /
         │     /
         │    /
-    ────┼───/──────  z
-        │  /
-   flat │ /  slope 1
+    ────┼──────────  z
+        │
+   flat │    slope 1
 ```
 
 Negative in, zero out. Positive in, unchanged out. It is stupidly simple, very

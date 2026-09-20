@@ -62,6 +62,50 @@ impl TokenBatch {
         })
     }
 
+    /// Packs prompt-and-response pairs and flags the response spans, which is
+    /// the batch supervised fine-tuning wants.
+    ///
+    /// Each pair is concatenated into one sequence, and only the response
+    /// tokens count toward the loss: the prompt conditions the model without
+    /// being learned. Building the flat mask
+    /// [`with_loss_mask`](TokenBatch::with_loss_mask) takes is otherwise the
+    /// caller's job, and getting the padding or the row order wrong there
+    /// trains on the prompt without saying so.
+    ///
+    /// Append whatever end-of-turn token the model should learn to emit to the
+    /// response side; nothing is added here.
+    ///
+    /// ```
+    /// # use rusting_brain::TokenBatch;
+    /// // "<user>2+2<assistant>" -> "4<end>"
+    /// let batch = TokenBatch::supervised(&[(vec![1, 5, 2], vec![9, 3])])?;
+    /// assert_eq!(batch.predicted(), 2);        // the two response tokens
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn supervised<P: AsRef<[u32]>, C: AsRef<[u32]>>(
+        pairs: &[(P, C)],
+    ) -> Result<Self, NetworkError> {
+        let sequences: Vec<Vec<u32>> = pairs
+            .iter()
+            .map(|(prompt, response)| [prompt.as_ref(), response.as_ref()].concat())
+            .collect();
+        let batch = Self::new(&sequences)?;
+
+        let mut mask = vec![false; batch.rows()];
+        for (index, (prompt, response)) in pairs.iter().enumerate() {
+            let (prompt, response) = (prompt.as_ref().len(), response.as_ref().len());
+            if response == 0 {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "pair {index} has an empty response, so there is nothing to learn from it"
+                )));
+            }
+            let base = index * batch.seq_len() + prompt;
+            mask[base..base + response].fill(true);
+        }
+
+        batch.with_loss_mask(&mask)
+    }
+
     /// Restricts the loss to the token positions flagged `true`.
     ///
     /// `mask` holds one flag per row of [`TokenBatch::ids`] - `batch *
@@ -108,6 +152,23 @@ impl TokenBatch {
         self.supervised
             .as_ref()
             .is_none_or(|supervised| supervised[row + 1])
+    }
+
+    /// The same batch with different token ids, which is how a masked
+    /// language model swaps corrupted tokens in without repacking.
+    ///
+    /// Lengths, padding and any loss mask are kept, so only what the model
+    /// reads changes.
+    pub(crate) fn replacing_ids(mut self, ids: &[u32]) -> Result<Self, NetworkError> {
+        if ids.len() != self.ids.len() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a batch of {} rows cannot take {} ids",
+                self.ids.len(),
+                ids.len()
+            )));
+        }
+        self.ids.copy_from_slice(ids);
+        Ok(self)
     }
 
     /// Number of sequences.
@@ -220,6 +281,36 @@ mod tests {
         assert!(!batch.is_padded());
         assert_eq!(batch.layout().valid, None);
         assert_eq!(batch.predicted(), 4);
+    }
+
+    #[test]
+    fn supervised_pairs_flag_the_response_and_nothing_else() {
+        // Two pairs of different lengths, so padding is in play: prompts of 2
+        // and 3 tokens, responses of 3 and 1.
+        let batch =
+            TokenBatch::supervised(&[(vec![1u32, 2], vec![7u32, 8, 9]), (vec![3, 4, 5], vec![6])])
+                .unwrap();
+
+        assert_eq!(batch.seq_len(), 5);
+        assert_eq!(batch.ids(), &[1, 2, 7, 8, 9, 3, 4, 5, 6, 0]);
+        // Four response tokens, and the position before each one predicts it.
+        assert_eq!(batch.predicted(), 4);
+        assert!(batch.predicts(1)); // predicts 7, the first response token
+        assert!(!batch.predicts(0)); // predicts 2, still the prompt
+        assert!(batch.predicts(7)); // predicts 6
+        assert!(!batch.predicts(8)); // the response is over, the rest is padding
+
+        // The same pairs hand-masked agree with the helper.
+        let by_hand = TokenBatch::new(&[vec![1u32, 2, 7, 8, 9], vec![3, 4, 5, 6]])
+            .unwrap()
+            .with_loss_mask(&[
+                false, false, true, true, true, false, false, false, true, false,
+            ])
+            .unwrap();
+        assert_eq!(batch, by_hand);
+
+        // An empty response is named rather than left to fail as an empty mask.
+        assert!(TokenBatch::supervised(&[(vec![1u32, 2], vec![])]).is_err());
     }
 
     #[test]

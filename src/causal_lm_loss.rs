@@ -40,6 +40,12 @@ impl TotalLoss {
     pub fn total(&self) -> f32 {
         self.lm_loss + self.auxiliary_loss
     }
+
+    /// `exp(lm_loss)`. The auxiliary term is a routing regularizer and says
+    /// nothing about prediction quality, so it stays out of this.
+    pub fn perplexity(&self) -> f32 {
+        self.lm_loss.exp()
+    }
 }
 
 /// Cross-entropy of `logits[t]` against `ids[t + 1]`.
@@ -68,7 +74,6 @@ pub fn causal_lm_loss_batch(
         });
     }
 
-    let vocab_size = logits.cols;
     let ids = batch.ids();
     let predicted = batch.predicted();
     if predicted == 0 {
@@ -77,6 +82,23 @@ pub fn causal_lm_loss_batch(
         ));
     }
 
+    cross_entropy_rows(logits, predicted, |row| {
+        batch.predicts(row).then(|| ids[row + 1])
+    })
+}
+
+/// Cross-entropy of every row of `logits` against the target `target` returns
+/// for it, averaged over `predicted` rows.
+///
+/// A row with no target contributes nothing and keeps a zero gradient. The
+/// causal loss reads the next token here; a masked loss reads the row's own
+/// token, and neither needs its own softmax.
+pub(crate) fn cross_entropy_rows(
+    logits: &Matrix,
+    predicted: usize,
+    target: impl Fn(usize) -> Option<u32> + Sync,
+) -> Result<CausalLmLoss, NetworkError> {
+    let vocab_size = logits.cols;
     let mut grad_logits = Matrix::new(logits.rows, vocab_size);
     let inverse_predicted = 1.0 / predicted as f32;
 
@@ -89,17 +111,12 @@ pub fn causal_lm_loss_batch(
         .par_chunks_mut(vocab_size)
         .enumerate()
         .map(|(row_index, row)| {
-            // Padding rows, the last position of a sequence, and any position
-            // a loss mask excluded predict nothing.
-            if !batch.predicts(row_index) {
+            let Some(id) = target(row_index) else {
                 return Ok(0.0);
-            }
-            let target = ids[row_index + 1] as usize;
+            };
+            let target = id as usize;
             if target >= vocab_size {
-                return Err(NetworkError::TokenOutOfRange {
-                    id: ids[row_index + 1],
-                    vocab_size,
-                });
+                return Err(NetworkError::TokenOutOfRange { id, vocab_size });
             }
 
             row.copy_from_slice(logits.row(row_index));

@@ -201,6 +201,28 @@ Early stopping is the highest value-per-line technique in this entire course.
 It costs ten lines, needs no tuning, and prevents the most common failure mode
 in applied ML.
 
+### Stopping from inside `fit`
+
+The loop above calls `fit` once per epoch so that it can look between epochs.
+`fit_with` does the looking for you: it is `fit` with a callback per epoch, and
+returning `false` stops the run.
+
+```rust
+let history = model.fit_with(&train, config, |epoch, loss| {
+    if epoch % 10 == 0 {
+        println!("epoch {epoch:>4}  loss {loss:.5}");
+    }
+    loss > 1e-5                       // stop once it is small enough
+})?;
+println!("{} epochs actually ran", history.losses.len());
+```
+
+The `loss` handed to the callback is the mean **training** loss for that epoch,
+which is free — it was computed on the way past. Stopping on it is a different
+thing from stopping on validation loss: training loss almost always keeps
+falling, so use it for a "good enough, stop wasting time" cut-off and keep the
+per-epoch loop above when what you want is the best *generalizing* model.
+
 ---
 
 ## 7.4 Learning rate
@@ -236,6 +258,29 @@ The failure modes look different, which is how you diagnose them:
 **Practical recipe:** start at `0.01` with Adam. If the loss doesn't move, try
 `0.1`. If it explodes, try `0.001`. Change by factors of 10 — fine-tuning to
 `0.023` is not where your gains are.
+
+### Changing it as you go
+
+One rate for the whole run is a compromise: large steps find the valley, small
+steps settle in it. A **schedule** does both — warm up to a peak, then decay.
+
+```rust
+use rusting_brain::Schedule;
+
+let schedule = Schedule::warmup_cosine(0.01, 50, 1_000);   // peak, warmup, total steps
+for step in 0..1_000 {
+    model.optimizer.set_learning_rate(schedule.rate(step));
+    // ... one training step ...
+}
+```
+
+`rate(step)` rises linearly for the first 50 steps, then follows a cosine down
+to a tenth of the peak (`floor` changes that fraction). Use
+`set_learning_rate` rather than assigning a fresh `Optimizer::adam(rate)`,
+which would silently drop the betas and any weight decay back to defaults.
+
+This matters far more for transformers (chapter 16) than for the small dense
+networks here, where a flat `0.01` is usually fine.
 
 > `NaN` deserves a note. Once a single parameter becomes `NaN`, it spreads to
 > every parameter within a few updates and the model is permanently dead — no
@@ -323,6 +368,11 @@ println!("using epoch {best_epoch}, validation loss {best_loss:.5}");
 
 That's the professional version of `fit`. Copy it.
 
+> `fit_with` from 7.3 replaces the `fit`-per-epoch call when the thing you are
+> watching is the training loss. This loop keeps `fit(one_epoch)` because it
+> evaluates *validation* loss between epochs and snapshots the model, and that
+> needs `&model` between epochs, which the callback does not hand you.
+
 > **One cost to know about:** `evaluate_loss` on both sets every epoch adds real
 > time on large datasets. If it hurts, evaluate every 5 epochs instead. Just
 > don't skip validation entirely — that's trading your only honest signal for a
@@ -346,7 +396,8 @@ That's the professional version of `fit`. Copy it.
 
 ## Recap
 
-- `fit` with `epochs: 1` inside your own loop gives you control between epochs.
+- `fit` with `epochs: 1` inside your own loop gives you control between epochs;
+  `fit_with` gives you a callback per epoch without leaving `fit`.
 - `evaluate_loss` measures without training — safe on validation data.
 - **Training loss is not a progress report.** It falls even as the model gets
   worse. Validation loss is the honest signal.
@@ -355,7 +406,7 @@ That's the professional version of `fit`. Copy it.
   add to any training script.
 - The last epoch is almost never the best epoch. `model.clone()` your best.
 - Learning rate: start at `0.01`, adjust by factors of 10. It matters more than
-  anything else you'll tune.
+  anything else you'll tune. `Schedule::warmup_cosine` varies it across a run.
 - Batch size: use 32 and move on.
 
 You can now train a model properly and stop at the right time. Next: measuring

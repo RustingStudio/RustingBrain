@@ -88,6 +88,36 @@ impl Matrix {
         }
     }
 
+    /// [`Matrix::dot`] with `target` added to rather than overwritten.
+    ///
+    /// A LoRA adapter's `dL/dinput` lands on top of the base projection's, so
+    /// it needs the accumulating form to avoid a scratch matrix and a second
+    /// pass over it.
+    pub fn dot_accumulate(&self, other: &Matrix, target: &mut Matrix) {
+        debug_assert_eq!(self.cols, other.rows);
+        debug_assert_eq!(target.rows, self.rows);
+        debug_assert_eq!(target.cols, other.cols);
+
+        unsafe {
+            matrixmultiply::sgemm(
+                self.rows,
+                self.cols,
+                other.cols,
+                1.0,
+                self.data.as_ptr(),
+                self.cols as isize,
+                1,
+                other.data.as_ptr(),
+                other.cols as isize,
+                1,
+                1.0,
+                target.data.as_mut_ptr(),
+                target.cols as isize,
+                1,
+            );
+        }
+    }
+
     pub fn dot_rhs_transposed(&self, other: &Matrix, target: &mut Matrix) {
         debug_assert_eq!(self.cols, other.cols);
         debug_assert_eq!(target.rows, self.rows);

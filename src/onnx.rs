@@ -4,7 +4,9 @@
 //! call returns [`OnnxError::FeatureDisabled`], so downstream code compiles
 //! either way and fails with a clear message rather than a missing symbol.
 //!
-//! See `IMPORT_MODELS.md` for the TensorFlow/Keras export flow.
+//! See `IMPORT_MODELS.md` for the TensorFlow/Keras export flow. The other
+//! direction is [`Network::save_onnx`](crate::Network::save_onnx), which needs
+//! no feature flag: writing a graph is much less code than reading one.
 
 use std::path::Path;
 use thiserror::Error;
