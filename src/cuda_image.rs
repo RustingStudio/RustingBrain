@@ -1369,6 +1369,50 @@ impl ImageGpu {
             )));
         }
         let scale = (head_dim as f32).sqrt().recip();
+        // The fused kernel keeps a tile of scores in registers and never
+        // writes the `[tokens, context]` matrix at all, which is three passes
+        // over the largest buffer in the pass. It knows one head width, it has
+        // nothing to say about a masked row, and it reaches the values through
+        // the key pointer, so the two have to be windows on one buffer -- which
+        // is what a fused QKV projection hands it.
+        if let Some(flash) = self.context.flash.as_ref().filter(|_| {
+            head_dim == crate::cuda_flash::TILE
+                && !causal
+                && std::ptr::eq(keys.data, values.data)
+                && keys.lead == values.lead
+                && !crate::cuda_flash::disabled()
+        }) {
+            let mut output = self.uninit(tokens, queries.cols)?;
+            let config = cudarc::driver::LaunchConfig {
+                grid_dim: (
+                    tokens.div_ceil(crate::cuda_flash::TILE) as u32,
+                    heads as u32,
+                    1,
+                ),
+                block_dim: (crate::cuda_flash::THREADS, 1, 1),
+                shared_mem_bytes: crate::cuda_flash::SHARED_BYTES,
+            };
+            unsafe {
+                self.context
+                    .stream
+                    .launch_builder(&flash.image)
+                    .arg(queries.data)
+                    .arg(keys.data)
+                    .arg(&mut output.data)
+                    .arg(&(tokens as i32))
+                    .arg(&(context as i32))
+                    .arg(&(queries.lead as i32))
+                    .arg(&(keys.lead as i32))
+                    .arg(&(output.cols as i32))
+                    .arg(&(queries.base as i32))
+                    .arg(&(keys.base as i32))
+                    .arg(&(values.base as i32))
+                    .arg(&scale)
+                    .launch(config)
+                    .map_err(cuda_err("fused image attention kernel"))?;
+            }
+            return Ok(output);
+        }
         let chunk = (SCORE_BUDGET / (heads * context).max(1)).clamp(1, tokens);
         // Nothing is masked and the row packs into whole quads, so the
         // softmax can move four scores per load. A short row goes to a warp,
@@ -1474,7 +1518,7 @@ impl ImageGpu {
                 (rows * context) as i64,
                 heads as i32,
                 cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
         }
         .map_err(cuda_err("attention score GEMM"))
@@ -1526,7 +1570,7 @@ impl ImageGpu {
                 head_dim as i64,
                 heads as i32,
                 cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
         }
         .map_err(cuda_err("attention merge GEMM"))
@@ -2449,6 +2493,54 @@ mod tests {
                 0.02,
             );
         }
+    }
+
+    /// The other parity test runs four columns to a head, which is not a
+    /// width the fused kernel knows, so it never reaches the branch. This one
+    /// does: sixty-four columns to a head, keys and values two windows on one
+    /// buffer, and a token count that leaves the last tile of each axis part
+    /// empty, which is the only place the kernel masks.
+    #[test]
+    fn the_fused_attention_matches_the_host_or_skips_without_a_device() {
+        let Some(gpu) = device() else { return };
+        if gpu.context.flash.is_none() {
+            eprintln!("skipped: no fused attention module on this device");
+            return;
+        }
+        let (heads, head_dim, tokens) = (2usize, crate::cuda_flash::TILE, 70usize);
+        let units = heads * head_dim;
+        let fused = Matrix::from_vec(tokens, 3 * units, ramp(tokens * 3 * units, 0.2));
+        let part = |index: usize| {
+            Matrix::from_vec(
+                tokens,
+                units,
+                (0..tokens)
+                    .flat_map(|row| {
+                        let start = row * fused.cols + index * units;
+                        fused.data[start..start + units].to_vec()
+                    })
+                    .collect(),
+            )
+        };
+        let (queries, keys, values) = (part(0), part(1), part(2));
+        let expected = host_attention(&queries, &keys, &values, heads, heads, false);
+
+        let fused = gpu.upload_matrix(&fused).expect("an upload");
+        let actual = gpu
+            .attention(
+                fused.part(0, units),
+                fused.part(1, units),
+                fused.part(2, units),
+                heads,
+                false,
+            )
+            .expect("a device attention");
+        assert_close(
+            "fused attention",
+            &gpu.download(&actual).expect("a download").data,
+            &expected.data,
+            0.02,
+        );
     }
 
     #[test]
