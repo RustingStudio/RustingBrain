@@ -939,7 +939,14 @@ unsafe fn act_dispatch<T, C: DevicePtrMut<T>>(
             },
             config.ldc,
             compute,
-            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            // The tensor-op hint is what makes cuBLAS prefer a tensor-core
+            // kernel for operands it might otherwise run on the FP32 units.
+            // An FP16 accumulator has no such kernels to fall back to, and
+            // the hint measured slower there, so it is left off.
+            match half {
+                true => cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                false => cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            },
         )
     }
     .map_err(cuda_err("cuBLAS narrow GEMM"))

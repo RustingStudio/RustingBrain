@@ -31,9 +31,9 @@ vector alongside the states in place of the separate `pool`.
   partitions instead, which is most of a small model's decode step back.
 - The CUDA image kernels were rewritten around what a profile said they were
   actually spending time on, which took a Stable Diffusion XL UNet pass at
-  1024x1024 from 0.65 s to 0.33 s and the VAE decode of that image from 1.72 s
+  1024x1024 from 0.65 s to 0.27 s and the VAE decode of that image from 1.72 s
   to 0.53 s, and a whole guided 1024x1024 image at 30 steps from 37.4 s to
-  20.5 s. The convolution lowering writes a whole KxK patch per thread
+  17.4 s. The convolution lowering writes a whole KxK patch per thread
   rather than one tap, and writes its columns transposed so the matmul lands
   channel-major with no separate pass to reorder it. Group normalization is
   three kernels — partial sums, a double-precision fold, then one pass that
@@ -66,6 +66,17 @@ vector alongside the states in place of the separate `pool`.
   against the CPU reference on a whole UNet pass went down rather than up.
   Training is unaffected and stays on BF16, where the wider exponent range is
   what keeps small gradients from flushing to zero.
+
+  Self-attention in the image path never writes its score matrix. The fused
+  kernel `src/cuda_flash.rs` already ran for the text models; it gained an
+  FP16 variant that reads its keys and values as windows on the fused QKV
+  projection, and the image path uses it wherever a head is 64 wide and no
+  mask is in play. The scores stay in registers between the two matmuls and
+  the softmax runs online against a running maximum, so the largest buffer in
+  the pass is neither written nor read back three times: at 1024x1024 that is
+  5.8 GB of traffic a pass that no longer happens. A device older than Ampere,
+  a head of another width, or `RUSTING_BRAIN_NO_FLASH` falls back to the
+  three-kernel path.
 
 ### Added
 

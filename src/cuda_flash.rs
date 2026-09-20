@@ -83,6 +83,187 @@ __device__ __forceinline__ unsigned pack2(float lo,float hi){
   : "+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3]) \
   : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]))
 
+// FP16 conversions, for the image path, whose activations are FP16 rather
+// than BF16. `cvt` is the instruction <cuda_fp16.h> would have inlined, and
+// writing it out keeps NVRTC away from the include path it would need.
+__device__ __forceinline__ float h2f(unsigned short h){
+  float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f;
+}
+__device__ __forceinline__ unsigned short f2h(float v){
+  unsigned short h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v)); return h;
+}
+__device__ __forceinline__ unsigned packh2(float lo,float hi){
+  return (unsigned)f2h(lo)|((unsigned)f2h(hi)<<16);
+}
+#define MMAH(d,a,b) asm volatile( \
+  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " \
+  "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n" \
+  : "+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3]) \
+  : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]))
+
+// The same fused attention for the image path: FP16 operands, no mask, and
+// queries that may come from one tensor while keys and values come from
+// another, which is what a cross-attention is. `q_base`, `k_base` and
+// `v_base` are the column each projection starts at, so a fused QKV buffer
+// needs no split.
+//
+// One block per (query tile, head). Nothing here writes a log-sum-exp: there
+// is no backward pass over an image model in this crate.
+extern "C" __global__ __launch_bounds__(128) void image_attention_fwd(
+    const unsigned short* __restrict__ queries,
+    const unsigned short* __restrict__ keys,
+    unsigned short* __restrict__ out,
+    int rows, int context,
+    int q_lead, int kv_lead, int out_lead,
+    int q_base, int k_base, int v_base,
+    float scale)
+{
+  extern __shared__ unsigned short smem[];
+  unsigned short* ks = smem;                      // [key][dim]
+  unsigned short* vt = smem + 64*FA_ROW;          // [dim][key], transposed
+
+  const int h = blockIdx.y;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int q_row0 = blockIdx.x*64 + warp*16;
+  const int row_a = q_row0 + g, row_b = q_row0 + g + 8;
+  const int head = h*FA_D;
+
+  unsigned qf[4][4];
+  {
+    const size_t base = (size_t)q_base + head;
+    #pragma unroll
+    for (int kk=0; kk<4; ++kk) {
+      int c = kk*16 + t*2;
+      float a0=0.f,a1=0.f,a2=0.f,a3=0.f,a4=0.f,a5=0.f,a6=0.f,a7=0.f;
+      if (row_a < rows) {
+        size_t p = base + (size_t)row_a*q_lead;
+        a0=h2f(queries[p+c])*scale;   a1=h2f(queries[p+c+1])*scale;
+        a4=h2f(queries[p+c+8])*scale; a5=h2f(queries[p+c+9])*scale;
+      }
+      if (row_b < rows) {
+        size_t p = base + (size_t)row_b*q_lead;
+        a2=h2f(queries[p+c])*scale;   a3=h2f(queries[p+c+1])*scale;
+        a6=h2f(queries[p+c+8])*scale; a7=h2f(queries[p+c+9])*scale;
+      }
+      qf[kk][0]=packh2(a0,a1); qf[kk][1]=packh2(a2,a3);
+      qf[kk][2]=packh2(a4,a5); qf[kk][3]=packh2(a6,a7);
+    }
+  }
+
+  float acc[8][4];
+  #pragma unroll
+  for (int n=0;n<8;++n)
+    #pragma unroll
+    for (int i=0;i<4;++i) acc[n][i]=0.f;
+  float m_a=NEG_INF, m_b=NEG_INF, l_a=0.f, l_b=0.f;
+
+  for (int kt=0; kt*64 < context; ++kt) {
+    __syncthreads();
+    for (int i = threadIdx.x; i < 64*FA_D; i += 128) {
+      int r = i >> 6, c = i & 63;
+      int key = kt*64 + r;
+      unsigned short kb = 0, vb = 0;
+      if (key < context) {
+        size_t p = (size_t)key*kv_lead + head;
+        kb = keys[p + k_base + c];
+        vb = keys[p + v_base + c];
+      }
+      ks[r*FA_ROW + c] = kb;
+      vt[c*FA_ROW + r] = vb;
+    }
+    __syncthreads();
+
+    float s[8][4];
+    #pragma unroll
+    for (int n=0;n<8;++n)
+      #pragma unroll
+      for (int i=0;i<4;++i) s[n][i]=0.f;
+    #pragma unroll
+    for (int n=0;n<8;++n) {
+      #pragma unroll
+      for (int kk=0; kk<4; ++kk) {
+        const unsigned short* p = ks + (n*8+g)*FA_ROW + kk*16 + t*2;
+        unsigned bf[2];
+        bf[0] = *(const unsigned*)p;
+        bf[1] = *(const unsigned*)(p+8);
+        MMAH(s[n], qf[kk], bf);
+      }
+    }
+
+    // A key past the end read as zero, and a zero score is a probability of
+    // one. Only the last tile can hold one, so only it pays for the check.
+    if ((kt+1)*64 > context) {
+      #pragma unroll
+      for (int n=0;n<8;++n) {
+        int key = kt*64 + n*8 + t*2;
+        if (key   >= context) { s[n][0]=NEG_INF; s[n][2]=NEG_INF; }
+        if (key+1 >= context) { s[n][1]=NEG_INF; s[n][3]=NEG_INF; }
+      }
+    }
+
+    float max_a=NEG_INF, max_b=NEG_INF;
+    #pragma unroll
+    for (int n=0;n<8;++n) {
+      max_a=fmaxf(max_a,fmaxf(s[n][0],s[n][1]));
+      max_b=fmaxf(max_b,fmaxf(s[n][2],s[n][3]));
+    }
+    max_a=fmaxf(max_a,__shfl_xor_sync(0xffffffff,max_a,1));
+    max_a=fmaxf(max_a,__shfl_xor_sync(0xffffffff,max_a,2));
+    max_b=fmaxf(max_b,__shfl_xor_sync(0xffffffff,max_b,1));
+    max_b=fmaxf(max_b,__shfl_xor_sync(0xffffffff,max_b,2));
+
+    float new_a=fmaxf(m_a,max_a), new_b=fmaxf(m_b,max_b);
+    float corr_a=__expf(m_a-new_a), corr_b=__expf(m_b-new_b);
+    float sum_a=0.f, sum_b=0.f;
+    #pragma unroll
+    for (int n=0;n<8;++n) {
+      s[n][0]=__expf(s[n][0]-new_a); s[n][1]=__expf(s[n][1]-new_a);
+      s[n][2]=__expf(s[n][2]-new_b); s[n][3]=__expf(s[n][3]-new_b);
+      sum_a+=s[n][0]+s[n][1]; sum_b+=s[n][2]+s[n][3];
+    }
+    sum_a+=__shfl_xor_sync(0xffffffff,sum_a,1); sum_a+=__shfl_xor_sync(0xffffffff,sum_a,2);
+    sum_b+=__shfl_xor_sync(0xffffffff,sum_b,1); sum_b+=__shfl_xor_sync(0xffffffff,sum_b,2);
+    l_a=l_a*corr_a+sum_a; l_b=l_b*corr_b+sum_b; m_a=new_a; m_b=new_b;
+    #pragma unroll
+    for (int n=0;n<8;++n) {
+      acc[n][0]*=corr_a; acc[n][1]*=corr_a; acc[n][2]*=corr_b; acc[n][3]*=corr_b;
+    }
+
+    #pragma unroll
+    for (int kk=0; kk<4; ++kk) {
+      unsigned pf[4];
+      pf[0]=packh2(s[2*kk][0],  s[2*kk][1]);
+      pf[1]=packh2(s[2*kk][2],  s[2*kk][3]);
+      pf[2]=packh2(s[2*kk+1][0],s[2*kk+1][1]);
+      pf[3]=packh2(s[2*kk+1][2],s[2*kk+1][3]);
+      #pragma unroll
+      for (int n=0;n<8;++n) {
+        const unsigned short* p = vt + (n*8+g)*FA_ROW + kk*16 + t*2;
+        unsigned bf[2];
+        bf[0] = *(const unsigned*)p;
+        bf[1] = *(const unsigned*)(p+8);
+        MMAH(acc[n], pf, bf);
+      }
+    }
+  }
+
+  float inv_a = l_a>0.f ? 1.f/l_a : 0.f;
+  float inv_b = l_b>0.f ? 1.f/l_b : 0.f;
+  #pragma unroll
+  for (int n=0;n<8;++n) {
+    int c = n*8 + t*2;
+    if (row_a < rows) {
+      size_t p = (size_t)row_a*out_lead + head + c;
+      *(unsigned*)(out+p) = packh2(acc[n][0]*inv_a,acc[n][1]*inv_a);
+    }
+    if (row_b < rows) {
+      size_t p = (size_t)row_b*out_lead + head + c;
+      *(unsigned*)(out+p) = packh2(acc[n][2]*inv_b,acc[n][3]*inv_b);
+    }
+  }
+}
+
 // One block per (query tile, head, sequence). Queries live in registers for
 // the whole block; keys and values stream through shared memory one tile at a
 // time. `lse` is written in the same layout the three-kernel path used, so the
@@ -620,6 +801,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
 /// The fused kernels, resolved once per device.
 pub(crate) struct FlashKernels {
     pub(crate) forward: CudaFunction,
+    /// The image path's variant: FP16, unmasked, and able to read its keys
+    /// from a different tensor than its queries.
+    pub(crate) image: CudaFunction,
     pub(crate) delta: CudaFunction,
     pub(crate) grad_query: CudaFunction,
     pub(crate) grad_key_value: CudaFunction,
@@ -664,6 +848,7 @@ pub(crate) fn flash_kernels(device: usize, context: &Arc<CudaContext>) -> Option
     };
     Some(FlashKernels {
         forward: get("flash_attention_fwd")?,
+        image: get("image_attention_fwd")?,
         delta: get("flash_attention_delta")?,
         grad_query: get("flash_attention_dq")?,
         grad_key_value: get("flash_attention_dkv")?,
@@ -685,7 +870,7 @@ pub(crate) fn eligible(mixed_precision: bool, head_dim: usize) -> bool {
 /// fall back without a rebuild is a run that can be bisected.
 pub(crate) static DISABLED: AtomicBool = AtomicBool::new(false);
 
-fn disabled() -> bool {
+pub(crate) fn disabled() -> bool {
     static FROM_ENV: OnceLock<()> = OnceLock::new();
     FROM_ENV.get_or_init(|| {
         if std::env::var_os("RUSTING_BRAIN_NO_FLASH").is_some() {
