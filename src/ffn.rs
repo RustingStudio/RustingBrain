@@ -232,7 +232,7 @@ pub fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
-fn silu_derivative(x: f32) -> f32 {
+pub(crate) fn silu_derivative(x: f32) -> f32 {
     let s = sigmoid(x);
     s * (1.0 + x * (1.0 - s))
 }

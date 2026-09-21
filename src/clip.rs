@@ -321,27 +321,14 @@ impl ClipTextEncoder {
             if index == stop {
                 skipped = Some(hidden.clone());
             }
-            let normed = layer.attention_norm.forward(&hidden, self.config.eps);
-            let attended = attention(
-                &layer.query.forward(&normed)?,
-                &layer.key.forward(&normed)?,
-                &layer.value.forward(&normed)?,
+            run_layer(
+                layer,
+                &mut hidden,
                 heads,
-                heads,
+                self.config.eps,
+                self.config.quick_gelu,
                 true,
-            );
-            add(&mut hidden, &layer.output.forward(&attended)?);
-
-            let normed = layer.mlp_norm.forward(&hidden, self.config.eps);
-            let mut wide = layer.mlp_in.forward(&normed)?;
-            let quick = self.config.quick_gelu;
-            wide.data.par_iter_mut().for_each(|value| {
-                *value = match quick {
-                    true => quick_gelu(*value),
-                    false => crate::ffn::gelu(*value),
-                }
-            });
-            add(&mut hidden, &layer.mlp_out.forward(&wide)?);
+            )?;
         }
 
         let normalized = self.final_norm.forward(&hidden, self.config.eps);
@@ -391,13 +378,50 @@ impl ClipTextEncoder {
     }
 }
 
+/// Runs one layer in place: attention behind its norm, then the feed-forward
+/// behind its own.
+///
+/// Shared with the image tower in [`crate::vit_encoder`], which is the same
+/// layer with `causal` off. The two towers differ in what they put in front of
+/// the stack, not in the stack.
+pub(crate) fn run_layer(
+    layer: &Layer,
+    hidden: &mut Matrix,
+    heads: usize,
+    eps: f32,
+    quick_gelu: bool,
+    causal: bool,
+) -> Result<(), NetworkError> {
+    let normed = layer.attention_norm.forward(hidden, eps);
+    let attended = attention(
+        &layer.query.forward(&normed)?,
+        &layer.key.forward(&normed)?,
+        &layer.value.forward(&normed)?,
+        heads,
+        heads,
+        causal,
+    );
+    add(hidden, &layer.output.forward(&attended)?);
+
+    let normed = layer.mlp_norm.forward(hidden, eps);
+    let mut wide = layer.mlp_in.forward(&normed)?;
+    wide.data.par_iter_mut().for_each(|value| {
+        *value = match quick_gelu {
+            true => quick_gelu_value(*value),
+            false => crate::ffn::gelu(*value),
+        }
+    });
+    add(hidden, &layer.mlp_out.forward(&wide)?);
+    Ok(())
+}
+
 /// `x * sigmoid(1.702 * x)`, the activation the published towers were trained
 /// with.
-fn quick_gelu(value: f32) -> f32 {
+fn quick_gelu_value(value: f32) -> f32 {
     value / (1.0 + (-1.702 * value).exp())
 }
 
-fn add(target: &mut Matrix, source: &Matrix) {
+pub(crate) fn add(target: &mut Matrix, source: &Matrix) {
     target
         .data
         .par_iter_mut()
@@ -412,7 +436,7 @@ pub(crate) fn norm(file: &mut ShardedSafeTensors, name: &str) -> Result<Norm, Ne
     })
 }
 
-fn dense(
+pub(crate) fn dense(
     file: &mut ShardedSafeTensors,
     name: &str,
     precision: Precision,

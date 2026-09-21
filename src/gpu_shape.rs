@@ -802,7 +802,7 @@ mod tests {
         };
 
         let (host_mean, host_log_variance, host_distances, host_colors) = step(&mut host);
-        device.to_cuda(0, 0).unwrap();
+        device.to_cuda_with_precision(0, 0, false).unwrap();
         let (mean, log_variance, distances, colors) = step(&mut device);
 
         assert_close("mean", &mean.data, &host_mean.data, 1e-4);
@@ -849,7 +849,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(22);
         let mut host = ShapeVae::new(tiny(), &mut rng).unwrap();
         let mut device = host.clone();
-        device.to_cuda(0, 0).unwrap();
+        device.to_cuda_with_precision(0, 0, false).unwrap();
 
         let surface = rows(32, 6, 5);
         let queries = rows(24, 3, 6);

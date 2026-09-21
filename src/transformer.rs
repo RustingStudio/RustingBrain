@@ -13,7 +13,6 @@ use crate::param::{Linear, Param};
 use crate::rope::Rope;
 use crate::transformer_block::{FeedForward, TransformerBlock, TransformerBlockCache};
 use rand::{SeedableRng, rngs::StdRng};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -1587,19 +1586,7 @@ impl TransformerLm {
         self.optimizer_step += 1;
         let step = self.optimizer_step;
         let optimizer = self.optimizer.clone();
-
-        if self.on_device() {
-            // One stream, one cuBLAS handle: the launches would serialize
-            // anyway, and a rayon pool around them only adds contention.
-            for param in self.params_mut() {
-                param.step(&optimizer, step, scale);
-            }
-            return;
-        }
-
-        self.params_mut()
-            .par_iter_mut()
-            .for_each(|param| param.step(&optimizer, step, scale));
+        crate::optimizers::apply_step(&mut self.params_mut(), &optimizer, step, scale);
     }
 
     /// The L2 norm of the accumulated gradients, over every parameter at once.
@@ -1607,11 +1594,7 @@ impl TransformerLm {
     /// Worth logging on its own: a run that is about to diverge shows it in
     /// this number one or two steps before the loss moves.
     pub fn grad_norm(&mut self) -> Result<f32, NetworkError> {
-        let mut total = 0.0;
-        for param in self.params_mut() {
-            total += param.grad_sum_squares()?;
-        }
-        Ok(total.sqrt() as f32)
+        crate::optimizers::grad_norm(&mut self.params_mut())
     }
 
     /// [`TransformerLm::step`] with the gradients clipped to a global norm of
@@ -1621,27 +1604,14 @@ impl TransformerLm {
     /// multiplies every gradient uniformly, so this folds the clip into that
     /// factor rather than rewriting the gradient buffers.
     pub fn step_clipped(&mut self, scale: f32, max_norm: f32) -> Result<f32, NetworkError> {
-        let norm = self.grad_norm()?;
-        let clip = if norm > max_norm && norm > 0.0 {
-            max_norm / norm
-        } else {
-            1.0
-        };
-        self.step(scale * clip);
-        Ok(norm)
+        self.optimizer_step += 1;
+        let step = self.optimizer_step;
+        let optimizer = self.optimizer.clone();
+        crate::optimizers::step_clipped(&mut self.params_mut(), &optimizer, step, scale, max_norm)
     }
 
     pub fn zero_grad(&mut self) {
-        if self.on_device() {
-            for param in self.params_mut() {
-                param.zero_grad();
-            }
-            return;
-        }
-
-        self.params_mut()
-            .par_iter_mut()
-            .for_each(|param| param.zero_grad());
+        crate::optimizers::zero_grad(&mut self.params_mut());
     }
 
     pub fn optimizer_step(&self) -> usize {

@@ -49,11 +49,15 @@ pub(crate) struct ModelKernels {
     rmsnorm_forward: CudaFunction,
     rmsnorm_backward: CudaFunction,
     rope: CudaFunction,
-    causal_softmax_backward: CudaFunction,
-    causal_probs_from_lse: CudaFunction,
-    causal_softmax_lse: CudaFunction,
+    softmax_backward: CudaFunction,
+    probs_from_lse: CudaFunction,
+    softmax_lse_rows: CudaFunction,
     swiglu_forward: CudaFunction,
     swiglu_backward: CudaFunction,
+    adaln_modulate: CudaFunction,
+    adaln_modulate_backward: CudaFunction,
+    gate_residual: CudaFunction,
+    gate_residual_backward: CudaFunction,
     softmax_lse: CudaFunction,
     topk_gate: CudaFunction,
     gather: CudaFunction,
@@ -86,11 +90,15 @@ impl ModelKernels {
             rmsnorm_forward: get("rmsnorm_fwd")?,
             rmsnorm_backward: get("rmsnorm_bwd")?,
             rope: get("rope_rotate")?,
-            causal_softmax_backward: get("causal_softmax_bwd")?,
-            causal_probs_from_lse: get("causal_probs_from_lse")?,
-            causal_softmax_lse: get("causal_softmax_lse")?,
+            softmax_backward: get("attention_softmax_bwd")?,
+            probs_from_lse: get("attention_probs_from_lse")?,
+            softmax_lse_rows: get("attention_softmax_lse")?,
             swiglu_forward: get("swiglu_fwd")?,
             swiglu_backward: get("swiglu_bwd")?,
+            adaln_modulate: get("adaln_modulate")?,
+            adaln_modulate_backward: get("adaln_modulate_bwd")?,
+            gate_residual: get("gate_residual_fwd")?,
+            gate_residual_backward: get("gate_residual_bwd")?,
             softmax_lse: get("softmax_lse")?,
             topk_gate: get("topk_gate")?,
             gather: get("gather_rows")?,
@@ -196,25 +204,25 @@ pub(crate) struct Act {
 }
 
 impl Act {
-    fn element(narrow: bool) -> usize {
+    pub(crate) fn element(narrow: bool) -> usize {
         if narrow { 2 } else { 4 }
     }
 
-    fn is_narrow(&self) -> bool {
+    pub(crate) fn is_narrow(&self) -> bool {
         self.narrow
     }
 
-    fn flag(&self) -> i32 {
+    pub(crate) fn flag(&self) -> i32 {
         i32::from(self.narrow)
     }
 
     /// The operand starting at element `offset`, which is how a routed layer
     /// hands cuBLAS one expert's slice of a grouped buffer.
-    fn at(&self, offset: usize) -> CudaView<'_, u8> {
+    pub(crate) fn at(&self, offset: usize) -> CudaView<'_, u8> {
         self.bytes.slice(offset * Act::element(self.narrow)..)
     }
 
-    fn all(&self) -> CudaView<'_, u8> {
+    pub(crate) fn all(&self) -> CudaView<'_, u8> {
         self.bytes.slice(..)
     }
 
@@ -222,20 +230,20 @@ impl Act {
     ///
     /// Only sound on a wide buffer, which is why every caller is on the routed
     /// path, where [`Gpu::act`] is asked for `narrow = false`.
-    fn wide(&self) -> CudaView<'_, f32> {
+    pub(crate) fn wide(&self) -> CudaView<'_, f32> {
         debug_assert!(!self.narrow, "a narrow activation is not FP32");
         unsafe { self.bytes.transmute::<f32>(self.len) }
             .expect("a device allocation is aligned for FP32")
     }
 
-    fn wide_mut(&mut self) -> CudaViewMut<'_, f32> {
+    pub(crate) fn wide_mut(&mut self) -> CudaViewMut<'_, f32> {
         debug_assert!(!self.narrow, "a narrow activation is not FP32");
         unsafe { self.bytes.transmute_mut::<f32>(self.len) }
             .expect("a device allocation is aligned for FP32")
     }
 
     /// The destination argument of the kernel that writes this buffer.
-    fn destination(&mut self) -> &mut CudaSlice<u8> {
+    pub(crate) fn destination(&mut self) -> &mut CudaSlice<u8> {
         &mut self.bytes
     }
 }
@@ -267,18 +275,18 @@ struct BlockCache {
 }
 
 /// The three buffers a SwiGLU backward pass cannot recover from its output.
-struct SwiGluCache {
+pub(crate) struct SwiGluCache {
     /// Gate and up in one buffer, two halves of every row, because they are
     /// produced by one GEMM at twice the width.
-    gate_up: CudaSlice<f32>,
-    hidden: Act,
+    pub(crate) gate_up: CudaSlice<f32>,
+    pub(crate) hidden: Act,
     /// The gate and up weights concatenated, which the input gradient reads
     /// again in the backward pass.
-    weights: Act,
+    pub(crate) weights: Act,
     /// The down projection, narrowed to match `hidden`. A routed layer has one
     /// per expert and keeps them in the parameters instead, so this is `None`
     /// there.
-    down: Option<Act>,
+    pub(crate) down: Option<Act>,
 }
 
 /// The normed activations, the inverse RMS of each row that the backward pass
@@ -316,12 +324,12 @@ struct MoeGpuCache {
 
 /// A borrowed device, plus the kernel launches, so the model code below reads
 /// as a sequence of operations rather than a sequence of `unsafe` blocks.
-struct Gpu<'a> {
-    context: &'a Arc<GpuContext>,
+pub(crate) struct Gpu<'a> {
+    pub(crate) context: &'a Arc<GpuContext>,
 }
 
 impl Gpu<'_> {
-    fn zeros(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {
+    pub(crate) fn zeros(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {
         self.context
             .stream
             .alloc_zeros::<f32>(len.max(1))
@@ -334,20 +342,20 @@ impl Gpu<'_> {
     /// with `beta = 0`, or a kernel that writes every element. The zeroing
     /// `zeros` does is a full-bandwidth pass over the buffer, which on the
     /// chunked LM head alone cost more than every memcpy in a step combined.
-    fn uninit(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {
+    pub(crate) fn uninit(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {
         unsafe { self.context.stream.alloc::<f32>(len.max(1)) }
             .map_err(cuda_err("device allocation"))
     }
 
     /// [`Gpu::uninit`] for a BF16 buffer.
-    fn uninit_bf16(&self, len: usize) -> Result<CudaSlice<bf16>, NetworkError> {
+    pub(crate) fn uninit_bf16(&self, len: usize) -> Result<CudaSlice<bf16>, NetworkError> {
         unsafe { self.context.stream.alloc::<bf16>(len.max(1)) }
             .map_err(cuda_err("device allocation"))
     }
 
     /// [`Gpu::uninit`] for a GEMM operand of `len` elements, which the very
     /// next kernel writes in full.
-    fn act(&self, len: usize, narrow: bool) -> Result<Act, NetworkError> {
+    pub(crate) fn act(&self, len: usize, narrow: bool) -> Result<Act, NetworkError> {
         let bytes = unsafe {
             self.context
                 .stream
@@ -362,7 +370,7 @@ impl Gpu<'_> {
     /// For a buffer a GEMM or an FP32-only kernel produced and a GEMM has to
     /// read: the weights, and the gradients the RoPE backward pass rotates in
     /// place before anything multiplies by them.
-    fn cast_into(
+    pub(crate) fn cast_into(
         &self,
         dst: &mut CudaViewMut<'_, u8>,
         src: &CudaView<'_, f32>,
@@ -384,7 +392,7 @@ impl Gpu<'_> {
     }
 
     /// [`Gpu::cast_into`] into a fresh operand.
-    fn narrowed(
+    pub(crate) fn narrowed(
         &self,
         src: &CudaView<'_, f32>,
         len: usize,
@@ -397,7 +405,7 @@ impl Gpu<'_> {
     }
 
     /// `dst[..n] = bf16(src[..n])`, rounded to nearest even.
-    fn cast_to_bf16(
+    pub(crate) fn cast_to_bf16(
         &self,
         dst: &mut CudaSlice<bf16>,
         src: &CudaView<'_, f32>,
@@ -417,7 +425,7 @@ impl Gpu<'_> {
     }
 
     /// `dst[..n] = f32(src[..n])`, which is exact.
-    fn cast_from_bf16(
+    pub(crate) fn cast_from_bf16(
         &self,
         dst: &mut CudaViewMut<'_, f32>,
         src: &CudaSlice<bf16>,
@@ -437,7 +445,7 @@ impl Gpu<'_> {
     }
 
     /// `acc[..n] += f32(src[..n])`, the FP32 half of a BF16 gradient GEMM.
-    fn accumulate_bf16(
+    pub(crate) fn accumulate_bf16(
         &self,
         acc: &mut CudaSlice<f32>,
         src: &CudaSlice<bf16>,
@@ -456,28 +464,28 @@ impl Gpu<'_> {
         Ok(())
     }
 
-    fn upload(&self, data: &[f32]) -> Result<CudaSlice<f32>, NetworkError> {
+    pub(crate) fn upload(&self, data: &[f32]) -> Result<CudaSlice<f32>, NetworkError> {
         self.context
             .stream
             .clone_htod(data)
             .map_err(cuda_err("host to device copy"))
     }
 
-    fn upload_indices(&self, data: &[u32]) -> Result<CudaSlice<u32>, NetworkError> {
+    pub(crate) fn upload_indices(&self, data: &[u32]) -> Result<CudaSlice<u32>, NetworkError> {
         self.context
             .stream
             .clone_htod(data)
             .map_err(cuda_err("host to device copy"))
     }
 
-    fn upload_flags(&self, data: &[i32]) -> Result<CudaSlice<i32>, NetworkError> {
+    pub(crate) fn upload_flags(&self, data: &[i32]) -> Result<CudaSlice<i32>, NetworkError> {
         self.context
             .stream
             .clone_htod(data)
             .map_err(cuda_err("host to device copy"))
     }
 
-    fn download(&self, source: &CudaSlice<f32>) -> Result<Vec<f32>, NetworkError> {
+    pub(crate) fn download(&self, source: &CudaSlice<f32>) -> Result<Vec<f32>, NetworkError> {
         self.context
             .stream
             .clone_dtoh(source)
@@ -487,7 +495,7 @@ impl Gpu<'_> {
     /// [`Gpu::download`] for a wide activation, which is what the kernel tests
     /// compare against the host path.
     #[cfg(test)]
-    fn download_act(&self, source: &Act) -> Result<Vec<f32>, NetworkError> {
+    pub(crate) fn download_act(&self, source: &Act) -> Result<Vec<f32>, NetworkError> {
         if !source.is_narrow() {
             return self
                 .context
@@ -506,14 +514,17 @@ impl Gpu<'_> {
             .collect())
     }
 
-    fn upload_signed(&self, data: &[i32]) -> Result<CudaSlice<i32>, NetworkError> {
+    pub(crate) fn upload_signed(&self, data: &[i32]) -> Result<CudaSlice<i32>, NetworkError> {
         self.context
             .stream
             .clone_htod(data)
             .map_err(cuda_err("host to device copy"))
     }
 
-    fn download_signed(&self, source: &CudaSlice<i32>) -> Result<Vec<i32>, NetworkError> {
+    pub(crate) fn download_signed(
+        &self,
+        source: &CudaSlice<i32>,
+    ) -> Result<Vec<i32>, NetworkError> {
         self.context
             .stream
             .clone_dtoh(source)
@@ -521,7 +532,7 @@ impl Gpu<'_> {
     }
 
     /// `[rows, width]` back into a host matrix.
-    fn matrix(
+    pub(crate) fn matrix(
         &self,
         source: &CudaSlice<f32>,
         rows: usize,
@@ -544,13 +555,13 @@ impl Gpu<'_> {
     /// gradients into a single device buffer and downloads it once, because a
     /// download in the middle of the pass drains the stream: thirteen of them
     /// left the device idle for about 20 ms of every step.
-    fn accumulate_host_grad(param: &mut Param, values: &[f32]) {
+    pub(crate) fn accumulate_host_grad(param: &mut Param, values: &[f32]) {
         for (slot, value) in param.grad.data.iter_mut().zip(values) {
             *slot += value;
         }
     }
 
-    fn rope_tables(&self, rope: &Rope) -> Result<Arc<DeviceRope>, NetworkError> {
+    pub(crate) fn rope_tables(&self, rope: &Rope) -> Result<Arc<DeviceRope>, NetworkError> {
         let mut slot = self
             .context
             .rope
@@ -573,7 +584,7 @@ impl Gpu<'_> {
     }
 
     /// `out[rows, weight.rows] = x . weight^T`.
-    fn linear<X: DevicePtr<f32>>(
+    pub(crate) fn linear<X: DevicePtr<f32>>(
         &self,
         weight: &DeviceParam,
         x: &X,
@@ -599,7 +610,7 @@ impl Gpu<'_> {
 
     /// `out = grad_output . weight + beta * out`, the input-gradient half of a
     /// linear layer.
-    fn linear_backward_input<G: DevicePtr<f32>, O: DevicePtrMut<f32>>(
+    pub(crate) fn linear_backward_input<G: DevicePtr<f32>, O: DevicePtrMut<f32>>(
         &self,
         weight: &DeviceParam,
         grad_output: &G,
@@ -625,7 +636,7 @@ impl Gpu<'_> {
 
     /// `negated_grad -= grad_output^T . input`, which is the device gradient
     /// convention the shared optimizer kernels expect.
-    fn accumulate_weight_grad<G: DevicePtr<f32>, X: DevicePtr<f32>>(
+    pub(crate) fn accumulate_weight_grad<G: DevicePtr<f32>, X: DevicePtr<f32>>(
         &self,
         weight: &mut DeviceParam,
         grad_output: &G,
@@ -658,7 +669,7 @@ impl Gpu<'_> {
     /// projection accumulates over the block input with `beta = 1`; this kernel
     /// has the row in registers already, so it is a store rather than a pass.
     #[allow(clippy::too_many_arguments)]
-    fn rmsnorm(
+    pub(crate) fn rmsnorm(
         &self,
         input: &CudaSlice<f32>,
         weight: &CudaSlice<f32>,
@@ -700,7 +711,7 @@ impl Gpu<'_> {
     /// gradient: a residual branch's upstream gradient passes through here
     /// instead of costing a separate pass over the whole activation.
     #[allow(clippy::too_many_arguments)]
-    fn rmsnorm_backward(
+    pub(crate) fn rmsnorm_backward(
         &self,
         input: &CudaSlice<f32>,
         grad_output: &CudaSlice<f32>,
@@ -746,7 +757,7 @@ impl Gpu<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn rope(
+    pub(crate) fn rope(
         &self,
         tensor: &mut Act,
         tables: &DeviceRope,
@@ -781,46 +792,50 @@ impl Gpu<'_> {
         Ok(())
     }
 
-    fn causal_softmax_backward(
+    pub(crate) fn softmax_backward(
         &self,
         grad: &mut CudaSlice<f32>,
         probabilities: &CudaSlice<f32>,
         rows: usize,
-        seq_len: usize,
+        cols: usize,
+        causal: bool,
     ) -> Result<(), NetworkError> {
         unsafe {
             self.context
                 .stream
-                .launch_builder(&self.context.model.causal_softmax_backward)
+                .launch_builder(&self.context.model.softmax_backward)
                 .arg(grad)
                 .arg(probabilities)
                 .arg(&(rows as i32))
-                .arg(&(seq_len as i32))
+                .arg(&(cols as i32))
+                .arg(&i32::from(causal))
                 .launch(warp_per_row_grid(rows))
-                .map_err(cuda_err("causal softmax backward kernel"))?;
+                .map_err(cuda_err("attention softmax backward kernel"))?;
         }
         Ok(())
     }
 
     /// Causal softmax over the scores in place, writing the per-query
     /// log-sum-exp the backward pass keeps instead of the probabilities.
-    fn causal_softmax_lse(
+    pub(crate) fn softmax_lse(
         &self,
         scores: &mut CudaSlice<f32>,
         lse: &mut CudaSlice<f32>,
         rows: usize,
-        seq_len: usize,
+        cols: usize,
+        causal: bool,
     ) -> Result<(), NetworkError> {
         unsafe {
             self.context
                 .stream
-                .launch_builder(&self.context.model.causal_softmax_lse)
+                .launch_builder(&self.context.model.softmax_lse_rows)
                 .arg(scores)
                 .arg(lse)
                 .arg(&(rows as i32))
-                .arg(&(seq_len as i32))
+                .arg(&(cols as i32))
+                .arg(&i32::from(causal))
                 .launch(warp_per_row_grid(rows))
-                .map_err(cuda_err("causal softmax kernel"))?;
+                .map_err(cuda_err("attention softmax kernel"))?;
         }
         Ok(())
     }
@@ -832,7 +847,7 @@ impl Gpu<'_> {
     /// Produces exactly the `merged` and `log_sum_exp` the three-kernel path
     /// produced, which is why the backward pass needs no change to go with it.
     #[allow(clippy::too_many_arguments)]
-    fn flash_attention(
+    pub(crate) fn flash_attention(
         &self,
         flash: &crate::cuda_flash::FlashKernels,
         qkv: &Act,
@@ -882,7 +897,7 @@ impl Gpu<'_> {
     /// from the log-sum-exp in both, which costs one extra matmul and saves
     /// every byte of the round trip.
     #[allow(clippy::too_many_arguments)]
-    fn flash_attention_backward(
+    pub(crate) fn flash_attention_backward(
         &self,
         flash: &crate::cuda_flash::FlashKernels,
         qkv: &Act,
@@ -960,22 +975,24 @@ impl Gpu<'_> {
 
     /// Rebuild the attention probabilities in place from scaled scores and the
     /// stored log-sum-exp, which is what the backward GEMMs expect to read.
-    fn causal_probs_from_lse(
+    pub(crate) fn probs_from_lse(
         &self,
         scores: &mut CudaSlice<f32>,
         lse: &CudaSlice<f32>,
         rows: usize,
-        seq_len: usize,
+        cols: usize,
+        causal: bool,
     ) -> Result<(), NetworkError> {
         unsafe {
             self.context
                 .stream
-                .launch_builder(&self.context.model.causal_probs_from_lse)
+                .launch_builder(&self.context.model.probs_from_lse)
                 .arg(scores)
                 .arg(lse)
                 .arg(&(rows as i32))
-                .arg(&(seq_len as i32))
-                .launch(cfg(rows * seq_len))
+                .arg(&(cols as i32))
+                .arg(&i32::from(causal))
+                .launch(cfg(rows * cols))
                 .map_err(cuda_err("attention probability kernel"))?;
         }
         Ok(())
@@ -985,7 +1002,7 @@ impl Gpu<'_> {
     /// fused weight-gradient buffer be split back into two parameters.
     /// `keep` adds into `target`; without it `target` is overwritten, which is
     /// what a gradient buffer still holding the last step's value wants.
-    fn add(
+    pub(crate) fn add(
         &self,
         target: &mut CudaSlice<f32>,
         source: &CudaSlice<f32>,
@@ -1012,7 +1029,7 @@ impl Gpu<'_> {
         Ok(())
     }
 
-    fn gather(
+    pub(crate) fn gather(
         &self,
         out: &mut CudaViewMut<'_, f32>,
         source: &CudaView<'_, f32>,
@@ -1037,7 +1054,7 @@ impl Gpu<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gather_scaled(
+    pub(crate) fn gather_scaled(
         &self,
         out: &mut CudaSlice<f32>,
         source: &CudaSlice<f32>,
@@ -1063,7 +1080,7 @@ impl Gpu<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn scatter_scaled(
+    pub(crate) fn scatter_scaled(
         &self,
         out: &mut CudaSlice<f32>,
         source: &CudaSlice<f32>,
@@ -1088,7 +1105,7 @@ impl Gpu<'_> {
         Ok(())
     }
 
-    fn scatter(
+    pub(crate) fn scatter(
         &self,
         out: &mut CudaSlice<f32>,
         source: &CudaSlice<f32>,
@@ -1113,7 +1130,7 @@ impl Gpu<'_> {
 
     /// Scatters `-upstream` into a device gradient, which is the embedding
     /// table's backward pass under the negated-gradient convention.
-    fn scatter_negated(
+    pub(crate) fn scatter_negated(
         &self,
         grad: &mut CudaSlice<f32>,
         upstream: &CudaSlice<f32>,
@@ -1136,7 +1153,7 @@ impl Gpu<'_> {
         Ok(())
     }
 
-    fn swiglu(
+    pub(crate) fn swiglu(
         &self,
         gate_up: &CudaSlice<f32>,
         rows: usize,
@@ -1165,7 +1182,7 @@ impl Gpu<'_> {
 
     /// The gate and up gradients, in the same two-halves-per-row layout the
     /// forward activations use, so the weight gradient is one wide GEMM too.
-    fn swiglu_backward(
+    pub(crate) fn swiglu_backward(
         &self,
         gate_up: &CudaSlice<f32>,
         grad_hidden: &CudaSlice<f32>,
@@ -1194,11 +1211,136 @@ impl Gpu<'_> {
         Ok(grad_gate_up)
     }
 
+    /// AdaLN's modulation: `normalized * (1 + scale) + shift`.
+    ///
+    /// `triple` is `[sequences, 3 * cols]` — shift, scale and gate in that
+    /// order, one row per sequence, which is where
+    /// [`AdaLayerNorm`](crate::adaln::AdaLayerNorm) puts them. `rows` is
+    /// `sequences * seq_len`.
+    pub(crate) fn adaln_modulate(
+        &self,
+        normalized: &CudaView<'_, f32>,
+        triple: &CudaView<'_, f32>,
+        rows: usize,
+        cols: usize,
+        seq_len: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut out = self.uninit(rows * cols)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.adaln_modulate)
+                .arg(&mut out)
+                .arg(normalized)
+                .arg(triple)
+                .arg(&(rows as i32))
+                .arg(&(cols as i32))
+                .arg(&(seq_len as i32))
+                .launch(cfg(rows * cols))
+                .map_err(cuda_err("AdaLN modulation kernel"))?;
+        }
+        Ok(out)
+    }
+
+    /// Returns `dL/dnormalized` and accumulates the shift and scale gradients
+    /// into `grad_triple`, which the caller zeroed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adaln_modulate_backward(
+        &self,
+        grad_modulated: &CudaView<'_, f32>,
+        normalized: &CudaView<'_, f32>,
+        triple: &CudaView<'_, f32>,
+        grad_triple: &mut CudaViewMut<'_, f32>,
+        rows: usize,
+        cols: usize,
+        seq_len: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut grad_normalized = self.uninit(rows * cols)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.adaln_modulate_backward)
+                .arg(&mut grad_normalized)
+                .arg(grad_triple)
+                .arg(grad_modulated)
+                .arg(normalized)
+                .arg(triple)
+                .arg(&(rows as i32))
+                .arg(&(cols as i32))
+                .arg(&(seq_len as i32))
+                .launch(cfg(rows * cols))
+                .map_err(cuda_err("AdaLN modulation backward kernel"))?;
+        }
+        Ok(grad_normalized)
+    }
+
+    /// `residual + gate * branch`, with the gate read from `triple`'s third
+    /// slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gate_residual(
+        &self,
+        residual: &CudaView<'_, f32>,
+        branch: &CudaView<'_, f32>,
+        triple: &CudaView<'_, f32>,
+        rows: usize,
+        cols: usize,
+        seq_len: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut out = self.uninit(rows * cols)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.gate_residual)
+                .arg(&mut out)
+                .arg(residual)
+                .arg(branch)
+                .arg(triple)
+                .arg(&(rows as i32))
+                .arg(&(cols as i32))
+                .arg(&(seq_len as i32))
+                .launch(cfg(rows * cols))
+                .map_err(cuda_err("gated residual kernel"))?;
+        }
+        Ok(out)
+    }
+
+    /// Returns `dL/dbranch` and accumulates the gate gradient into
+    /// `grad_triple`. `dL/dresidual` is the upstream gradient unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gate_residual_backward(
+        &self,
+        branch: &CudaView<'_, f32>,
+        triple: &CudaView<'_, f32>,
+        grad_output: &CudaView<'_, f32>,
+        grad_triple: &mut CudaViewMut<'_, f32>,
+        rows: usize,
+        cols: usize,
+        seq_len: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut grad_branch = self.uninit(rows * cols)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.gate_residual_backward)
+                .arg(&mut grad_branch)
+                .arg(grad_triple)
+                .arg(branch)
+                .arg(triple)
+                .arg(grad_output)
+                .arg(&(rows as i32))
+                .arg(&(cols as i32))
+                .arg(&(seq_len as i32))
+                .launch(cfg(rows * cols))
+                .map_err(cuda_err("gated residual backward kernel"))?;
+        }
+        Ok(grad_branch)
+    }
+
     /// Several weight matrices end to end in one buffer, which is the weight
     /// of the single wide projection that replaces them. cuBLAS is close to
     /// twice as fast on one wide shape as on two narrow ones, and the packing
     /// itself is a device-to-device copy of weight-sized buffers.
-    fn pack(&self, parts: &[&Linear], narrow: bool) -> Result<Act, NetworkError> {
+    pub(crate) fn pack(&self, parts: &[&Linear], narrow: bool) -> Result<Act, NetworkError> {
         let element = Act::element(narrow);
         let mut total = 0;
         for part in parts {
@@ -1234,7 +1376,7 @@ impl Gpu<'_> {
     /// GEMM - packed, strided, BF16, flash-attention-fed - untouched. Move the
     /// adapter to the readers if a run is ever weight-bound rather than
     /// token-bound.
-    fn fold_lora(
+    pub(crate) fn fold_lora(
         &self,
         lora: &Lora,
         slot: &mut CudaViewMut<'_, u8>,
@@ -1268,7 +1410,7 @@ impl Gpu<'_> {
 
     /// The gate and up weights of every given feed-forward, one after another,
     /// so a routed layer pays a single allocation for all of its experts.
-    fn pack_gate_up<'a>(
+    pub(crate) fn pack_gate_up<'a>(
         &self,
         ffns: impl Iterator<Item = &'a SwiGlu>,
         narrow: bool,
@@ -1286,7 +1428,7 @@ impl Gpu<'_> {
     /// The routed path packs them for the same reason the dense path does:
     /// a packed weight is where a LoRA adapter is folded in, so the readers
     /// of the routed expert's output projection need no adapter of their own.
-    fn pack_down<'a>(
+    pub(crate) fn pack_down<'a>(
         &self,
         ffns: impl Iterator<Item = &'a SwiGlu>,
         narrow: bool,
@@ -1298,7 +1440,7 @@ impl Gpu<'_> {
     /// `out = x . weight^T + beta * out` for a weight that is a plain buffer
     /// rather than a parameter, which is what the packed gate-and-up is.
     #[allow(clippy::too_many_arguments)]
-    fn linear_packed<O: DevicePtrMut<f32>>(
+    pub(crate) fn linear_packed<O: DevicePtrMut<f32>>(
         &self,
         weights: &CudaView<'_, u8>,
         units: usize,
@@ -1332,7 +1474,7 @@ impl Gpu<'_> {
     /// Only for a result whose readers all take narrow input: cuBLAS writes
     /// BF16 itself, so there is no cast kernel and no FP32 round trip.
     #[allow(clippy::too_many_arguments)]
-    fn linear_packed_act(
+    pub(crate) fn linear_packed_act(
         &self,
         weights: &CudaView<'_, u8>,
         units: usize,
@@ -1363,7 +1505,7 @@ impl Gpu<'_> {
 
     /// The input-gradient half of [`Gpu::linear_packed`].
     #[allow(clippy::too_many_arguments)]
-    fn linear_packed_backward_input<T, O: DevicePtrMut<T>>(
+    pub(crate) fn linear_packed_backward_input<T, O: DevicePtrMut<T>>(
         &self,
         weights: &CudaView<'_, u8>,
         units: usize,
@@ -1395,7 +1537,7 @@ impl Gpu<'_> {
 
     /// [`Gpu::accumulate_weight_grad`] over [`Act`] operands, for the dense
     /// projections whose weights are packed narrow.
-    fn accumulate_weight_grad_act(
+    pub(crate) fn accumulate_weight_grad_act(
         &self,
         weight: &mut DeviceParam,
         grad_output: &CudaView<'_, u8>,
@@ -1429,7 +1571,7 @@ impl Gpu<'_> {
     /// the separate parameters afterwards. The split is one add per parameter
     /// over a weight-sized buffer, which is nothing next to halving the GEMM
     /// time.
-    fn accumulate_packed_grad(
+    pub(crate) fn accumulate_packed_grad(
         &self,
         parts: &mut [&mut DeviceParam],
         grad: &CudaView<'_, u8>,
@@ -1478,7 +1620,7 @@ impl Gpu<'_> {
     /// `dL/dinput` is not this function's business either way. The packed
     /// weight the input-gradient GEMM reads already carries
     /// `scale * up . down`, folded in by [`Gpu::fold_lora`].
-    fn accumulate_projection_grad(
+    pub(crate) fn accumulate_projection_grad(
         &self,
         linear: &mut Linear,
         grad_output: &CudaView<'_, u8>,
@@ -1496,7 +1638,7 @@ impl Gpu<'_> {
 
     /// [`Gpu::accumulate_projection_grad`] for projections that share one wide
     /// GEMM, each adapter reading its own column band of the fused gradient.
-    fn accumulate_packed_projection_grad(
+    pub(crate) fn accumulate_packed_projection_grad(
         &self,
         parts: &mut [&mut Linear],
         grad_output: &CudaView<'_, u8>,
@@ -1536,7 +1678,7 @@ impl Gpu<'_> {
     /// `grad_stride` is the row stride of the buffer `grad_output` points
     /// into, which is wider than the projection whenever several projections
     /// share one fused gradient. The adapter's own width comes from `up`.
-    fn accumulate_lora_grad(
+    pub(crate) fn accumulate_lora_grad(
         &self,
         lora: &mut Lora,
         grad_output: &CudaView<'_, u8>,
@@ -1686,7 +1828,7 @@ fn head_of_mut(model: &mut TransformerLm) -> Result<&mut DeviceParam, NetworkErr
     }
 }
 
-fn device_of(linear: &Linear) -> Result<&DeviceParam, NetworkError> {
+pub(crate) fn device_of(linear: &Linear) -> Result<&DeviceParam, NetworkError> {
     linear
         .weight
         .device
@@ -1694,7 +1836,7 @@ fn device_of(linear: &Linear) -> Result<&DeviceParam, NetworkError> {
         .ok_or_else(|| NetworkError::Cuda("a projection is not resident on the device".into()))
 }
 
-fn device_of_mut(linear: &mut Linear) -> Result<&mut DeviceParam, NetworkError> {
+pub(crate) fn device_of_mut(linear: &mut Linear) -> Result<&mut DeviceParam, NetworkError> {
     linear
         .weight
         .device
@@ -1704,7 +1846,7 @@ fn device_of_mut(linear: &mut Linear) -> Result<&mut DeviceParam, NetworkError> 
 
 /// The device path implements the SwiGLU shape only, which is what
 /// [`TransformerBuilder`](crate::transformer::TransformerBuilder) builds.
-fn unsupported(kind: &str) -> NetworkError {
+pub(crate) fn unsupported(kind: &str) -> NetworkError {
     NetworkError::UnsupportedCuda(format!(
         "the device training path implements SwiGLU feed-forwards and MoE layers, not {kind}"
     ))
@@ -1961,11 +2103,12 @@ fn forward_block(
                 block_size,
             )?;
         }
-        gpu.causal_softmax_lse(
+        gpu.softmax_lse(
             &mut probabilities,
             &mut log_sum_exp,
             heads * sequences * seq_len,
             seq_len,
+            true,
         )?;
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
@@ -2064,7 +2207,7 @@ fn forward_block(
 }
 
 /// `out += down(silu(gate(x)) * up(x))`.
-fn forward_swiglu(
+pub(crate) fn forward_swiglu(
     gpu: &Gpu<'_>,
     ffn: &SwiGlu,
     input: &Act,
@@ -2994,11 +3137,12 @@ fn backward_attention(
                 block_size,
             )?;
         }
-        gpu.causal_probs_from_lse(
+        gpu.probs_from_lse(
             &mut probabilities,
             &cache.log_sum_exp,
             heads * sequences * seq_len,
             seq_len,
+            true,
         )?;
 
         // Every head overwrites its own slice of `grad_scores`, so the buffer does
@@ -3059,11 +3203,12 @@ fn backward_attention(
             )?;
         }
 
-        gpu.causal_softmax_backward(
+        gpu.softmax_backward(
             &mut grad_scores,
             &probabilities,
             heads * sequences * seq_len,
             seq_len,
+            true,
         )?;
 
         for head in 0..heads {
@@ -3174,7 +3319,7 @@ fn backward_attention(
 
 /// Accumulates the three projection gradients and adds `dL/dinput` into
 /// `grad_input`, which the caller has already zeroed.
-fn backward_swiglu(
+pub(crate) fn backward_swiglu(
     gpu: &Gpu<'_>,
     ffn: &mut SwiGlu,
     cache: &SwiGluCache,
@@ -3649,7 +3794,7 @@ mod tests {
             .collect();
         let mut device = gpu.upload(&scores).unwrap();
         let device_lse = gpu.upload(&log_sum_exp).unwrap();
-        gpu.causal_probs_from_lse(&mut device, &device_lse, rows, seq_len)
+        gpu.probs_from_lse(&mut device, &device_lse, rows, seq_len, true)
             .unwrap();
         let probabilities = gpu.download(&device).unwrap();
 
@@ -3678,7 +3823,7 @@ mod tests {
         // The backward pass of a softmax whose upstream gradient is constant is
         // zero, which is a check the masking cannot pass by accident.
         let mut grad = gpu.upload(&vec![1.0; rows * seq_len]).unwrap();
-        gpu.causal_softmax_backward(&mut grad, &device, rows, seq_len)
+        gpu.softmax_backward(&mut grad, &device, rows, seq_len, true)
             .unwrap();
         assert_close(
             "causal softmax backward",
@@ -3963,11 +4108,12 @@ mod tests {
             .unwrap();
         scores_of(&mut probabilities);
         let mut lse = gpu.zeros(shape.heads * rows).unwrap();
-        gpu.causal_softmax_lse(
+        gpu.softmax_lse(
             &mut probabilities,
             &mut lse,
             shape.heads * shape.sequences * shape.seq_len,
             shape.seq_len,
+            true,
         )
         .unwrap();
         assert_close(
@@ -4013,11 +4159,12 @@ mod tests {
         // from the scores and the log-sum-exp, so the rebuild has to reproduce
         // the same softmax.
         scores_of(&mut probabilities);
-        gpu.causal_probs_from_lse(
+        gpu.probs_from_lse(
             &mut probabilities,
             &lse,
             shape.heads * shape.sequences * shape.seq_len,
             shape.seq_len,
+            true,
         )
         .unwrap();
         assert_close(

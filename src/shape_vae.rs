@@ -780,7 +780,25 @@ impl ShapeVae {
     /// against covers weights, gradients and Adam moments, not activations.
     #[cfg(feature = "cuda")]
     pub fn to_cuda(&mut self, device: usize, memory_budget_mib: usize) -> Result<(), NetworkError> {
-        let context = crate::gpu_transformer::GpuContext::new(device)?;
+        self.to_cuda_with_precision(device, memory_budget_mib, true)
+    }
+
+    /// [`ShapeVae::to_cuda`] with the tensor cores under the caller's control.
+    ///
+    /// Mixed precision keeps every buffer and every accumulator in FP32 and
+    /// only rounds the GEMM multiplier inputs, which is what lets cuBLAS pick a
+    /// tensor-core kernel instead of the FP32 SIMT one. On an RTX 3060 that is
+    /// where most of a training step goes, so training wants it on. A test that
+    /// compares device numbers against the host path wants it off.
+    #[cfg(feature = "cuda")]
+    pub fn to_cuda_with_precision(
+        &mut self,
+        device: usize,
+        memory_budget_mib: usize,
+        mixed_precision: bool,
+    ) -> Result<(), NetworkError> {
+        let context =
+            crate::gpu_transformer::GpuContext::with_precision(device, mixed_precision)?;
         crate::gpu_shape::to_cuda(self, &context, memory_budget_mib)?;
         self.device = Some(context);
         Ok(())
