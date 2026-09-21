@@ -1,4 +1,4 @@
-//! Reading the weight format every published model ships in.
+//! Reading and writing the weight format every published model ships in.
 //!
 //! A `.safetensors` file is an 8-byte little-endian header length, a JSON
 //! header naming each tensor with its dtype, shape and byte range, and then the
@@ -19,7 +19,7 @@ use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// The element types a `.safetensors` header can name.
@@ -231,6 +231,24 @@ impl SafeTensors {
                 continue;
             }
             tensors.insert(name.clone(), Self::parse_tensor(&path, name, value)?);
+        }
+
+        // The header can promise bytes the file does not have, which is what a
+        // run killed mid-write leaves behind. Catching it here turns a
+        // resumable preprocessing run's bad shard into a named error instead of
+        // an `UnexpectedEof` thousands of reads later.
+        let promised = tensors
+            .values()
+            .map(|tensor| tensor.end)
+            .max()
+            .unwrap_or_default();
+        if 8 + length + promised > size {
+            return Err(NetworkError::InvalidDataset(format!(
+                "{}: the header promises {} bytes of tensor data and the file holds {}",
+                path.display(),
+                promised,
+                size.saturating_sub(8 + length)
+            )));
         }
 
         Ok(Self {
@@ -484,6 +502,136 @@ impl ShardedSafeTensors {
     }
 }
 
+/// Writes tensors to a `.safetensors` file.
+///
+/// The counterpart of [`SafeTensors::open`], and the reason the crate's own
+/// checkpoints are readable from Python: this is the published format, not a
+/// private one. Everything is written as `F32`.
+///
+/// `tensors` is `(name, shape, values)`, and a name may appear only once. The
+/// values are streamed straight to the file, so a checkpoint costs the size of
+/// its header in memory rather than the size of its weights.
+///
+/// `metadata` lands in the header's `__metadata__` entry, where a loader can
+/// read it back without touching the tensor bytes. The format stores it as
+/// strings; a caller with more to say puts JSON in one.
+///
+/// ```no_run
+/// # use rusting_brain::safetensors;
+/// # use std::collections::BTreeMap;
+/// let weight = vec![1.0f32, 2.0, 3.0, 4.0];
+/// safetensors::write(
+///     "tiny.safetensors",
+///     &[("layer.weight", &[2, 2][..], &weight[..])],
+///     &BTreeMap::from([("format".into(), "rusting-brain".into())]),
+/// )?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn write<P: AsRef<Path>>(
+    path: P,
+    tensors: &[(&str, &[usize], &[f32])],
+    metadata: &BTreeMap<String, String>,
+) -> Result<(), NetworkError> {
+    write_as(path, tensors, metadata, Dtype::F32)
+}
+
+/// [`write`], at a chosen width.
+///
+/// `F32` and `Bf16` are the two that are written. Bfloat16 halves a file for
+/// three decimal digits of precision, which is the trade a cache of frozen
+/// activations wants and a checkpoint of trainable weights does not: it is the
+/// same width the mixed-precision training path already computes in.
+///
+/// Anything else is refused rather than silently widened, because a caller that
+/// asked for `F8E4M3` and got `F32` files would find out from its disk.
+pub fn write_as<P: AsRef<Path>>(
+    path: P,
+    tensors: &[(&str, &[usize], &[f32])],
+    metadata: &BTreeMap<String, String>,
+    dtype: Dtype,
+) -> Result<(), NetworkError> {
+    let path = path.as_ref();
+    let width = match dtype {
+        Dtype::F32 => 4,
+        Dtype::Bf16 => 2,
+        other => {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "{other:?} is read but not written"
+            )));
+        }
+    };
+    let mut header = serde_json::Map::new();
+    if !metadata.is_empty() {
+        header.insert(
+            "__metadata__".into(),
+            serde_json::Value::Object(
+                metadata
+                    .iter()
+                    .map(|(key, value)| (key.clone(), serde_json::Value::from(value.clone())))
+                    .collect(),
+            ),
+        );
+    }
+
+    let mut offset = 0u64;
+    for (name, shape, values) in tensors {
+        let expected: usize = shape.iter().product();
+        if expected != values.len() {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "{name}: a {shape:?} tensor holds {expected} values, not {}",
+                values.len()
+            )));
+        }
+        let end = offset + (values.len() * width) as u64;
+        let entry = serde_json::json!({
+            "dtype": format!("{dtype:?}").to_uppercase(),
+            "shape": shape,
+            "data_offsets": [offset, end],
+        });
+        if header.insert((*name).to_string(), entry).is_some() {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "{name} appears twice in one checkpoint"
+            )));
+        }
+        offset = end;
+    }
+
+    let mut header = serde_json::to_vec(&serde_json::Value::Object(header))?;
+    // The format asks for the tensor bytes to start eight-byte aligned, and
+    // the readers that enforce it accept trailing whitespace inside the JSON.
+    header.resize(header.len().next_multiple_of(8), b' ');
+
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&(header.len() as u64).to_le_bytes())?;
+    writer.write_all(&header)?;
+    for (_, _, values) in tensors {
+        // A value at a time rather than a `Vec<u8>` of the whole tensor, so a
+        // 400 MB parameter does not need 400 MB of scratch to be written.
+        for value in *values {
+            match dtype {
+                Dtype::Bf16 => writer.write_all(&to_bf16(*value).to_le_bytes())?,
+                _ => writer.write_all(&value.to_le_bytes())?,
+            }
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// The top sixteen bits of an `f32`, rounded to nearest with ties to even.
+///
+/// Truncating instead would bias every value towards zero, which over a whole
+/// tensor is a systematic shift rather than noise.
+fn to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() {
+        // Keep it a NaN rather than letting the rounding carry it to infinity.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
 /// Writes a float checkpoint, for tests elsewhere in the crate that need a file
 /// to read a model out of.
 #[cfg(test)]
@@ -491,27 +639,11 @@ pub(crate) fn write_checkpoint(
     path: &std::path::Path,
     tensors: &BTreeMap<String, (Vec<usize>, Vec<f32>)>,
 ) {
-    let mut header = String::from("{");
-    let mut body = Vec::new();
-    for (name, (shape, values)) in tensors {
-        let start = body.len();
-        for value in values {
-            body.extend_from_slice(&value.to_le_bytes());
-        }
-        if header.len() > 1 {
-            header.push(',');
-        }
-        header.push_str(&format!(
-            "\"{name}\":{{\"dtype\":\"F32\",\"shape\":{shape:?},\"data_offsets\":[{start},{}]}}",
-            body.len()
-        ));
-    }
-    header.push('}');
-
-    let mut file = (header.len() as u64).to_le_bytes().to_vec();
-    file.extend_from_slice(header.as_bytes());
-    file.extend_from_slice(&body);
-    std::fs::write(path, file).unwrap();
+    let flat: Vec<(&str, &[usize], &[f32])> = tensors
+        .iter()
+        .map(|(name, (shape, values))| (name.as_str(), &shape[..], &values[..]))
+        .collect();
+    write(path, &flat, &BTreeMap::new()).unwrap();
 }
 
 #[cfg(test)]
@@ -629,6 +761,22 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A run killed while writing a shard leaves a valid header over a short
+    /// data section. It has to be refused where it is opened, not where some
+    /// later read walks off the end.
+    #[test]
+    fn a_file_cut_short_after_its_header_is_refused() {
+        let path = scratch("st_truncated.safetensors");
+        write(
+            &path,
+            r#"{"weight":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]}}"#,
+            &[0u8; 12],
+        );
+        let error = SafeTensors::open(&path).unwrap_err().to_string();
+        assert!(error.contains("promises 24 bytes"), "{error}");
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn a_three_dimensional_tensor_is_not_a_matrix_but_still_reads() {
         let path = scratch("st_conv.safetensors");
@@ -683,5 +831,99 @@ mod tests {
             ShardedSafeTensors::open(directory.join("model-00001-of-00002.safetensors")).unwrap();
         assert_eq!(single.tensor("a.weight").unwrap().0, vec![1.0, 2.0]);
         std::fs::remove_dir_all(&directory).ok();
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rusting-brain-{name}-{}.safetensors",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn what_is_written_is_what_is_read_back() {
+        let path = scratch("writer");
+        let flat = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        write(
+            &path,
+            &[
+                ("first", &[2, 3][..], &flat[..]),
+                ("second", &[6][..], &flat[..]),
+            ],
+            &BTreeMap::from([("step".to_string(), "7".to_string())]),
+        )
+        .unwrap();
+
+        // The format asks for the tensor bytes to start eight-byte aligned.
+        let bytes = std::fs::read(&path).unwrap();
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        assert_eq!(header_len % 8, 0, "header padded to an eight-byte boundary");
+
+        let mut file = SafeTensors::open(&path).unwrap();
+        assert_eq!(file.metadata().get("step").map(String::as_str), Some("7"));
+        assert_eq!(file.info("first").unwrap().shape, vec![2, 3]);
+        assert_eq!(file.tensor("second").unwrap().0, flat);
+        let matrix = file.matrix("first").unwrap();
+        assert_eq!((matrix.rows, matrix.cols), (2, 3));
+        assert_eq!(matrix.data, flat);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bfloat16_halves_the_file_and_rounds_to_nearest() {
+        let path = scratch("bf16");
+        // Exactly halfway between the two bfloat16 values either side of 1.0,
+        // so ties-to-even has to pick 1.0 rather than carrying upwards.
+        let tie = f32::from_bits(0x3f80_8000);
+        let values = [1.0f32, -2.5, 0.0, tie];
+        write_as(
+            &path,
+            &[("w", &[4][..], &values[..])],
+            &BTreeMap::new(),
+            Dtype::Bf16,
+        )
+        .unwrap();
+
+        let mut file = SafeTensors::open(&path).unwrap();
+        assert_eq!(file.info("w").unwrap().dtype, Dtype::Bf16);
+        assert_eq!(file.info("w").unwrap().end, 8, "two bytes per value");
+        assert_eq!(file.tensor("w").unwrap().0, [1.0, -2.5, 0.0, 1.0]);
+
+        assert!(write_as(&path, &[], &BTreeMap::new(), Dtype::I32).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_shape_that_does_not_match_its_values_is_refused() {
+        let path = scratch("bad-shape");
+        let error = write(
+            &path,
+            &[("w", &[2, 3][..], &[1.0f32][..])],
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("holds 6 values, not 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_name_is_refused() {
+        let path = scratch("duplicate");
+        let values = [1.0f32];
+        let error = write(
+            &path,
+            &[("w", &[1][..], &values[..]), ("w", &[1][..], &values[..])],
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("appears twice"), "{error}");
+        std::fs::remove_file(&path).ok();
     }
 }

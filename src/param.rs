@@ -243,6 +243,25 @@ impl Param {
         Ok((&self.moment1, &self.moment2))
     }
 
+    /// The Adam moments as they stand on the host, without consulting a
+    /// device.
+    ///
+    /// [`Param::moments`] is the accessor to reach for. This one exists for a
+    /// caller that has already refreshed a whole model and now wants to borrow
+    /// every parameter at once, which the `&mut self` there rules out.
+    pub(crate) fn host_moments(&self) -> (&Matrix, &Matrix) {
+        (&self.moment1, &self.moment2)
+    }
+
+    /// Whether a device mirror is present, in which case the device owns the
+    /// weights and writing to `value` on the host would be discarded.
+    pub(crate) fn is_on_device(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        return self.device.is_some();
+        #[cfg(not(feature = "cuda"))]
+        return false;
+    }
+
     /// Restores moments saved by an earlier run, uploading them when the
     /// parameter is already resident on a device.
     pub fn set_moments(

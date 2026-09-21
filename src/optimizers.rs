@@ -4,6 +4,7 @@
 //! model on every step. Assigning a fresh one with a new learning rate is all
 //! a warmup or cosine schedule needs to do.
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -188,6 +189,89 @@ impl Schedule {
         let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
         self.peak * (self.floor + (1.0 - self.floor) * cosine)
     }
+}
+
+/// The training-step trio: a global gradient norm, the optimizer step, and the
+/// clipped step that combines them.
+///
+/// Every model in the crate accumulates gradients into a flat list of
+/// [`Param`]s and then applies exactly this sequence. Two copies of gradient
+/// clipping that drift apart is the kind of bug that shows up as a flat loss
+/// curve six hours into a run and nowhere else, so there is one copy and the
+/// models delegate to it.
+///
+/// ```
+/// # use rusting_brain::optimizers::{Optimizer, step_clipped};
+/// # use rusting_brain::param::Param;
+/// # use rusting_brain::matrix::Matrix;
+/// let mut weight = Param::zeros(1, 2);
+/// weight.grad = Matrix::from_vec(1, 2, vec![3.0, 4.0]);
+/// let norm = step_clipped(&mut [&mut weight], &Optimizer::adam(1e-2), 1, 1.0, 1.0)?;
+/// assert!((norm - 5.0).abs() < 1e-6);
+/// # Ok::<(), rusting_brain::NetworkError>(())
+/// ```
+use crate::param::Param;
+
+/// The L2 norm of the accumulated gradients, over every parameter at once.
+///
+/// Worth logging on its own: a run that is about to diverge shows it in this
+/// number one or two steps before the loss moves.
+pub fn grad_norm(params: &mut [&mut Param]) -> Result<f32, crate::network::NetworkError> {
+    let mut total = 0.0;
+    for param in params.iter() {
+        total += param.grad_sum_squares()?;
+    }
+    Ok(total.sqrt() as f32)
+}
+
+/// Applies the optimizer to every parameter.
+///
+/// `scale` divides the accumulated gradient, so a caller that ran several
+/// batches before stepping passes `1.0 / batches`.
+pub fn apply_step(params: &mut [&mut Param], optimizer: &Optimizer, step: usize, scale: f32) {
+    if params.iter().any(|param| param.is_on_device()) {
+        // One stream, one cuBLAS handle: the launches would serialize anyway,
+        // and a rayon pool around them only adds contention.
+        for param in params.iter_mut() {
+            param.step(optimizer, step, scale);
+        }
+        return;
+    }
+    params
+        .par_iter_mut()
+        .for_each(|param| param.step(optimizer, step, scale));
+}
+
+/// [`apply_step`] with the gradients clipped to a global norm of `max_norm`
+/// first, and the pre-clip norm returned for logging.
+///
+/// Clipping is a uniform rescale of every gradient, and `scale` already
+/// multiplies every gradient uniformly, so this folds the clip into that factor
+/// rather than rewriting the gradient buffers.
+pub fn step_clipped(
+    params: &mut [&mut Param],
+    optimizer: &Optimizer,
+    step: usize,
+    scale: f32,
+    max_norm: f32,
+) -> Result<f32, crate::network::NetworkError> {
+    let norm = grad_norm(params)?;
+    let clip = match norm > max_norm && norm > 0.0 {
+        true => max_norm / norm,
+        false => 1.0,
+    };
+    apply_step(params, optimizer, step, scale * clip);
+    Ok(norm)
+}
+
+pub fn zero_grad(params: &mut [&mut Param]) {
+    if params.iter().any(|param| param.is_on_device()) {
+        for param in params.iter_mut() {
+            param.zero_grad();
+        }
+        return;
+    }
+    params.par_iter_mut().for_each(|param| param.zero_grad());
 }
 
 #[cfg(test)]

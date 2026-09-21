@@ -149,15 +149,21 @@ __device__ __forceinline__ float warp_sum(float v){
   for(int o=16;o>0;o>>=1)v+=__shfl_down_sync(0xffffffff,v,o);
   return __shfl_sync(0xffffffff,v,0);
 }
-// Causal softmax in place, plus the one log-sum-exp per query the backward
-// pass needs to rebuild these same probabilities. Writing that number here is
-// what lets the forward cache hold a few kilobytes per layer instead of the
-// whole probability matrix.
-extern "C" __global__ void causal_softmax_lse(float*s,float*lse,int rows,int seq_len){
+// Row softmax in place, plus the one log-sum-exp per query the backward pass
+// needs to rebuild these same probabilities. Writing that number here is what
+// lets the forward cache hold a few kilobytes per layer instead of the whole
+// probability matrix.
+//
+// `causal` masks each query to the keys at or before it, which is what a
+// decoder wants. Cross-attention clears the flag: it has two independent
+// lengths and every query sees every key, so `cols` is the key count rather
+// than the query count and the row index carries no position at all.
+extern "C" __global__ void attention_softmax_lse(float*s,float*lse,int rows,int cols,int causal){
   int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
   int stride=gridDim.x*warps;
   for(int i=blockIdx.x*warps+threadIdx.x/WARP;i<rows;i+=stride){
-    int vis=i%seq_len+1;float*row=s+(size_t)i*seq_len;
+    int seq_len=cols;
+    int vis=causal?i%cols+1:cols;float*row=s+(size_t)i*seq_len;
     float m=-3.0e38f;for(int j=lane;j<vis;j+=WARP)m=fmaxf(m,row[j]);
     m=warp_max(m);
     float part=0.f;for(int j=lane;j<vis;j+=WARP){float e=__expf(row[j]-m);row[j]=e;part+=e;}
@@ -167,11 +173,12 @@ extern "C" __global__ void causal_softmax_lse(float*s,float*lse,int rows,int seq
     for(int j=vis+lane;j<seq_len;j+=WARP)row[j]=0.f;
   }
 }
-extern "C" __global__ void causal_softmax_bwd(float*g,const float*p,int rows,int seq_len){
+extern "C" __global__ void attention_softmax_bwd(float*g,const float*p,int rows,int cols,int causal){
   int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
   int stride=gridDim.x*warps;
   for(int i=blockIdx.x*warps+threadIdx.x/WARP;i<rows;i+=stride){
-    int vis=i%seq_len+1;float*gr=g+(size_t)i*seq_len;const float*pr=p+(size_t)i*seq_len;
+    int seq_len=cols;
+    int vis=causal?i%cols+1:cols;float*gr=g+(size_t)i*seq_len;const float*pr=p+(size_t)i*seq_len;
     float part=0.f;for(int j=lane;j<vis;j+=WARP)part+=pr[j]*gr[j];
     float dot=warp_sum(part);
     for(int j=lane;j<vis;j+=WARP)gr[j]=pr[j]*(gr[j]-dot);
@@ -182,12 +189,12 @@ extern "C" __global__ void causal_softmax_bwd(float*g,const float*p,int rows,int
 // log-sum-exp. The forward pass kept only that one number per query, so the
 // backward pass pays an exponential per element instead of a second reduction,
 // and the probability matrix lives only for the length of one block's backward.
-extern "C" __global__ void causal_probs_from_lse(
-    float*s,const float*lse,int rows,int seq_len){
+extern "C" __global__ void attention_probs_from_lse(
+    float*s,const float*lse,int rows,int cols,int causal){
   int i=blockIdx.x*blockDim.x+threadIdx.x;
-  if(i>=rows*seq_len)return;
-  int r=i/seq_len,c=i-r*seq_len;
-  s[i]=c<=r%seq_len?__expf(s[i]-lse[r]):0.f;
+  if(i>=rows*cols)return;
+  int r=i/cols,c=i-r*cols;
+  s[i]=(!causal||c<=r%cols)?__expf(s[i]-lse[r]):0.f;
 }
 
 // Gate and up share an input and a shape, so they are one GEMM at twice the
@@ -205,6 +212,32 @@ extern "C" __global__ void swiglu_fwd(void*h,const float*gu,int rows,int width,i
 extern "C" __global__ void swiglu_bwd(void*ggu,const float*gu,const float*gh,int rows,int width,int narrow){int i=blockIdx.x*blockDim.x+threadIdx.x;
  if((width&3)==0){int q=width>>2;if(i>=rows*q)return;int r=i/q;size_t b=(size_t)r*2*q+(i-r*q);const float4*s=(const float4*)gu;float4 g=s[b],u=s[b+q],p=((const float4*)gh)[i];float4 dg,du;silu_mul_grad(g.x,u.x,p.x,dg.x,du.x);silu_mul_grad(g.y,u.y,p.y,dg.y,du.y);silu_mul_grad(g.z,u.z,p.z,dg.z,du.z);silu_mul_grad(g.w,u.w,p.w,dg.w,du.w);store_act4(ggu,b,dg,narrow);store_act4(ggu,b+q,du,narrow);return;}
  if(i>=rows*width)return;int r=i/width;size_t b=(size_t)r*2*width+(i-r*width);float dg,du;silu_mul_grad(gu[b],gu[b+width],gh[i],dg,du);store_act(ggu,b,dg,narrow);store_act(ggu,b+width,du,narrow);}
+// AdaLN, in the shape `src/adaln.rs` describes: the conditioning is one row
+// per sequence and every token of that sequence reads it. A row of `triple` is
+// `[shift, scale, gate]`, each `cols` wide, so the gate the residual below
+// needs is the same buffer at offset `2 * cols` rather than a tensor of its
+// own.
+extern "C" __global__ void adaln_modulate(float*out,const float*x,const float*triple,int rows,int cols,int seq_len){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*cols)return;int r=i/cols,c=i-r*cols;
+ const float*t=triple+(size_t)(r/seq_len)*3*cols;out[i]=x[i]*(1.f+t[cols+c])+t[c];}
+// The shift and scale gradients are sums over a sequence's tokens, so they land
+// with atomics: the whole conditioning gradient is one zeroed buffer that every
+// sub-layer of every block accumulates into, and it is downloaded once.
+extern "C" __global__ void adaln_modulate_bwd(float*gx,float*gt,const float*gy,const float*x,const float*triple,int rows,int cols,int seq_len){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*cols)return;int r=i/cols,c=i-r*cols;
+ size_t base=(size_t)(r/seq_len)*3*cols;float u=gy[i];
+ gx[i]=u*(1.f+triple[base+cols+c]);
+ atomicAdd(&gt[base+c],u);atomicAdd(&gt[base+cols+c],u*x[i]);}
+// `out = residual + gate * branch`, the other half of an AdaLN sub-layer.
+extern "C" __global__ void gate_residual_fwd(float*out,const float*residual,const float*branch,const float*triple,int rows,int cols,int seq_len){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*cols)return;int r=i/cols,c=i-r*cols;
+ out[i]=residual[i]+triple[(size_t)(r/seq_len)*3*cols+2*cols+c]*branch[i];}
+// `dL/dresidual` is the upstream gradient unchanged, so it is not written: the
+// caller already holds that buffer.
+extern "C" __global__ void gate_residual_bwd(float*gb,float*gt,const float*branch,const float*triple,const float*gout,int rows,int cols,int seq_len){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*cols)return;int r=i/cols,c=i-r*cols;
+ size_t gate=(size_t)(r/seq_len)*3*cols+2*cols+c;float u=gout[i];
+ gb[i]=u*triple[gate];atomicAdd(&gt[gate],u*branch[i]);}
 extern "C" __global__ void softmax_lse(float*p,float*lse,const float*x,int rows,int cols){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;const float*src=x+(size_t)r*cols;float*dst=p+(size_t)r*cols;float m=-3.0e38f;for(int c=0;c<cols;c++)m=fmaxf(m,src[c]);float sum=0;for(int c=0;c<cols;c++){float e=expf(src[c]-m);dst[c]=e;sum+=e;}lse[r]=m+logf(sum);if(sum>0)for(int c=0;c<cols;c++)dst[c]/=sum;}
 extern "C" __global__ void topk_gate(int*expert_of,float*gate_of,const float*p,const int*valid,int rows,int experts,int top_k){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;int base=r*top_k;if(valid!=0&&valid[r]==0){for(int k=0;k<top_k;k++){expert_of[base+k]=-1;gate_of[base+k]=0;}return;}const float*row=p+(size_t)r*experts;float total=0;for(int k=0;k<top_k;k++){int best=-1;for(int e=0;e<experts;e++){int taken=0;for(int j=0;j<k;j++)if(expert_of[base+j]==e)taken=1;if(taken)continue;if(best<0||row[e]>row[best])best=e;}expert_of[base+k]=best;gate_of[base+k]=row[best];total+=row[best];}if(total>0)for(int k=0;k<top_k;k++)gate_of[base+k]/=total;}
 extern "C" __global__ void gather_scale_rows(float*out,const float*src,const unsigned int*rows_of,const float*scale,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*width)return;int r=i/width;int c=i%width;out[i]=scale[r]*src[(size_t)rows_of[r]*width+c];}

@@ -818,7 +818,7 @@ mod tests {
         let mut host = FlowTransformer::new(tiny(), &mut rng).unwrap();
         host.set_optimizer(crate::optimizers::Optimizer::adam(3e-3));
         let mut device = host.clone();
-        device.to_cuda(0, 0).unwrap();
+        device.to_cuda_with_precision(0, 0, false).unwrap();
 
         let config = *host.config();
         let clean = rows(config.latents, config.latent_dim, 20);

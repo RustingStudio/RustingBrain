@@ -264,20 +264,18 @@ pub fn noise(rows: usize, cols: usize, seed: Option<u64>) -> Matrix {
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_entropy(),
     };
-    // Box-Muller: two uniforms into two normals, and `rand` without the
-    // distributions feature has no normal of its own.
-    let mut data = Vec::with_capacity(rows * cols);
-    while data.len() < rows * cols {
-        let first: f32 = rng.gen_range(f32::MIN_POSITIVE..1.0);
-        let second: f32 = rng.gen_range(0.0..1.0);
-        let radius = (-2.0 * first.ln()).sqrt();
-        let angle = std::f32::consts::TAU * second;
-        data.push(radius * angle.cos());
-        if data.len() < rows * cols {
-            data.push(radius * angle.sin());
-        }
-    }
+    let data = (0..rows * cols).map(|_| gaussian(&mut rng)).collect();
     Matrix::from_vec(rows, cols, data)
+}
+
+/// One standard normal sample.
+///
+/// Box-Muller, because `rand` without the distributions feature has no normal
+/// of its own and this is cheaper than the feature.
+pub fn gaussian<R: Rng>(rng: &mut R) -> f32 {
+    let first: f32 = rng.gen_range(f32::MIN_POSITIVE..1.0);
+    let second: f32 = rng.gen_range(0.0..1.0);
+    (-2.0 * first.ln()).sqrt() * (std::f32::consts::TAU * second).cos()
 }
 
 /// Runs the whole loop and returns the latents it ends on.
@@ -548,6 +546,9 @@ mod tests {
     fn the_ancestral_solver_repeats_on_a_seed_and_wanders_without_one() {
         let target = vec![0.5, -0.25, 1.0, 0.0];
         let start = Matrix::from_vec(1, 4, vec![2.0, -3.0, 0.5, 1.5]);
+        // The path, not the destination: this model names the image exactly,
+        // so every run lands on it whatever noise was put back along the way.
+        // What the seed decides is the route.
         let run = |seed: Option<u64>| {
             let mut model = Straight {
                 target: target.clone(),
@@ -559,21 +560,26 @@ mod tests {
                 seed,
                 ..SamplingConfig::default()
             };
-            sample(
+            let mut route = Vec::new();
+            let landed = sample(
                 &mut model,
                 Scheduler::ddim(),
                 start.clone(),
                 &config,
-                |_, _| true,
+                |_, latents| {
+                    route.extend_from_slice(&latents.data);
+                    true
+                },
             )
-            .unwrap()
+            .unwrap();
+            (route, landed)
         };
 
-        assert_eq!(run(Some(7)).data, run(Some(7)).data);
-        assert_ne!(run(Some(7)).data, run(Some(8)).data);
+        assert_eq!(run(Some(7)).0, run(Some(7)).0);
+        assert_ne!(run(Some(7)).0, run(Some(8)).0);
         // The noise it puts back is gone by the end, so it still lands on the
         // image rather than near it.
-        for (value, target) in run(Some(7)).data.iter().zip(&target) {
+        for (value, target) in run(Some(7)).1.data.iter().zip(&target) {
             assert!((value - target).abs() < 0.05, "{value} vs {target}");
         }
     }
