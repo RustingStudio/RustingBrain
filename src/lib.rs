@@ -100,18 +100,23 @@
 
 pub mod accelerator;
 pub mod activations;
+pub mod adaln;
 pub mod attention;
 pub mod batch;
 pub mod causal_lm_loss;
+pub mod checkpoint;
 pub mod clip;
 pub mod conv;
 pub mod dataset;
 pub mod diffusion;
 pub mod embedding;
 pub mod ffn;
+pub mod flow_transformer;
+pub mod gltf;
 pub mod losses;
 pub mod masked_lm;
 pub mod matrix;
+pub mod mesh;
 pub mod mmdit;
 pub mod moe;
 pub mod network;
@@ -124,6 +129,8 @@ pub mod rope;
 pub mod safetensors;
 pub mod sampling;
 pub mod serialization;
+pub mod shape_vae;
+pub mod shards;
 pub mod t5;
 pub mod text_encoder;
 pub mod token_file;
@@ -133,6 +140,7 @@ pub mod transformer_block;
 pub mod unet;
 pub mod vae;
 pub mod vision;
+pub mod vit_encoder;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_flash;
@@ -141,9 +149,15 @@ pub mod cuda_image;
 #[cfg(feature = "cuda")]
 pub mod cuda_training;
 #[cfg(feature = "cuda")]
+pub(crate) mod gpu_cross;
+#[cfg(feature = "cuda")]
+pub(crate) mod gpu_flow;
+#[cfg(feature = "cuda")]
 pub(crate) mod gpu_matrix;
 #[cfg(feature = "cuda")]
 pub(crate) mod gpu_model;
+#[cfg(feature = "cuda")]
+pub(crate) mod gpu_shape;
 #[cfg(feature = "cuda")]
 pub mod gpu_test;
 #[cfg(feature = "cuda")]
@@ -159,9 +173,14 @@ pub use accelerator::{
     estimate_tensor_memory_mib,
 };
 pub use activations::Activation;
-pub use attention::{KvCache, MultiHeadAttention};
+pub use adaln::{
+    AdaLayerNorm, AdaLnCache, Modulation, ModulationCache, TimestepCache, TimestepEmbedding,
+    gate_residual, gate_residual_backward,
+};
+pub use attention::{CrossAttentionCache, KvCache, MultiHeadAttention};
 pub use batch::{Layout, TokenBatch};
 pub use causal_lm_loss::{CausalLmLoss, TotalLoss, causal_lm_loss, causal_lm_loss_batch};
+pub use checkpoint::{load as load_checkpoint, save as save_checkpoint};
 pub use clip::{ClipTextConfig, ClipTextEncoder};
 pub use conv::{Conv2d, FeatureMap, GroupNorm, pixel_shuffle, pixel_unshuffle, upsample_nearest};
 #[cfg(feature = "cuda")]
@@ -172,11 +191,16 @@ pub use dataset::{
 pub use diffusion::{Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_from};
 pub use embedding::Embedding;
 pub use ffn::{GeluMlp, SwiGlu};
+pub use flow_transformer::{
+    FlowConfig, FlowDenoiser, FlowTransformer, flow_match_target, sample_timesteps,
+};
+pub use gltf::Glb;
 #[cfg(feature = "cuda")]
 pub use gpu_transformer::GpuContext;
 pub use losses::Loss;
 pub use masked_lm::{MaskedBatch, masked_lm_loss};
 pub use matrix::Matrix;
+pub use mesh::{Bvh, Mesh, QuerySampling, Transform, marching_tetrahedra};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_training::{MetalTrainingSession, metal_doctor};
 pub use mmdit::{Conditioning, Dit, DitConfig};
@@ -194,6 +218,8 @@ pub use pipeline::{
 pub use rope::Rope;
 pub use safetensors::{Dtype, SafeTensors, ShardedSafeTensors, TensorInfo};
 pub use sampling::Sampler;
+pub use shape_vae::{ShapeVae, ShapeVaeConfig, fourier_features};
+pub use shards::{Batch, BatchConfig, BatchStream, Corpus, Example, Shards};
 pub use t5::{T5Config, T5Encoder};
 pub use text_encoder::{TextEncoder, TextEncoderConfig};
 pub use token_file::{TokenFile, TokenStream};
@@ -206,3 +232,6 @@ pub use transformer_block::{FeedForward, TransformerBlock};
 pub use unet::{Unet, UnetConfig};
 pub use vae::{VaeConfig, VaeDecoder, VaeEncoder, to_rgb8};
 pub use vision::{VisionTransformer, VitConfig};
+#[cfg(feature = "images")]
+pub use vit_encoder::read_image;
+pub use vit_encoder::{CLIP_MEAN, CLIP_STD, VitEncoder, VitEncoderConfig, composite_rgba};
