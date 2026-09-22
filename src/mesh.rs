@@ -190,10 +190,14 @@ impl Mesh {
                 ),
                 Some("vt") => {
                     let u = fields.next().and_then(|f| f.parse().ok());
-                    let v = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0.0);
+                    let v: f32 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0.0);
+                    // An .obj counts v up from the bottom of the image, glTF
+                    // counts it down from the top. Whatever reads `uvs` back
+                    // cannot tell which file they came from, so both readers
+                    // hand it the same convention: glTF's.
                     uvs.push([
                         u.ok_or_else(|| complain("a texture coordinate needs a u"))?,
-                        v,
+                        1.0 - v,
                     ]);
                 }
                 Some("f") => {
@@ -1384,6 +1388,20 @@ mod tests {
         let mesh = Mesh::read_obj(&path).unwrap();
         assert_eq!(mesh.indices.len(), 2, "a quad is two triangles");
         assert_eq!(mesh.positions.len(), 4);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_obj_texture_coordinate_is_flipped_into_the_gltf_convention() {
+        let path =
+            std::env::temp_dir().join(format!("rusting-brain-uv-{}.obj", std::process::id()));
+        std::fs::write(
+            &path,
+            "v 0 0 0\nv 1 0 0\nv 1 1 0\nvt 0 0\nvt 1 0.25\nvt 1 1\nf 1/1 2/2 3/3\n",
+        )
+        .unwrap();
+        let mesh = Mesh::read_obj(&path).unwrap();
+        assert_eq!(mesh.uvs, vec![[0.0, 1.0], [1.0, 0.75], [1.0, 0.0]]);
         std::fs::remove_file(&path).ok();
     }
 
