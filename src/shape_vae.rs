@@ -22,8 +22,10 @@
 //! let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0);
 //! let model = ShapeVae::new(ShapeVaeConfig::default(), &mut rng)?;
 //!
-//! let (mean, _log_variance) = model.encode(&surface)?;   // [latents, latent_dim]
-//! let distances = model.decode(&mean, &queries, 65_536)?; // one per query point
+//! // A draw from the posterior, not its mean: a draw is the only kind of
+//! // latent the decoder has ever been trained to answer for. See `encode`.
+//! let latent = model.encode_sample(&surface, &mut rng)?;  // [latents, latent_dim]
+//! let distances = model.decode(&latent, &queries, 65_536)?; // one per query point
 //! # let _ = distances;
 //! # Ok(())
 //! # }
@@ -412,9 +414,40 @@ impl ShapeVae {
     /// `[latents, latent_dim]`.
     ///
     /// `surface` is `[points, 6]`: a position and its outward normal.
+    ///
+    /// # The mean is not what the decoder was trained on
+    ///
+    /// Every training step decodes a *draw* from this distribution, never its
+    /// mean, so the decoder has only ever seen latents with the posterior's
+    /// noise on them. The mean sits in the middle of that cloud, in a spot no
+    /// training step ever visited, and the reconstruction from it is visibly
+    /// worse: on the reference model at 24,000 steps the posterior is wide —
+    /// sigma around 0.53 against a mean magnitude of 0.23 — and reconstructing
+    /// from the mean gives a clamped L1 of 0.029 where a draw gives 0.0025, an
+    /// order of magnitude.
+    ///
+    /// So reconstruction goes through [`ShapeVae::encode_sample`]. Reach for
+    /// the mean when the question is about the distribution itself — measuring
+    /// how wide it is, feeding a flow model that learns to produce means, or
+    /// checking a KL term — not when the answer is a mesh.
     pub fn encode(&self, surface: &Matrix) -> Result<(Matrix, Matrix), NetworkError> {
         let (mean, log_variance, _) = self.encode_train(surface)?;
         Ok((mean, log_variance))
+    }
+
+    /// One latent drawn from the posterior, which is what the decoder was
+    /// trained to read.
+    ///
+    /// [`ShapeVae::encode`] followed by [`ShapeVae::sample`], in the order a
+    /// training step does it. This is the call for reconstructing a shape: see
+    /// the warning on `encode` for what the mean costs instead.
+    pub fn encode_sample(
+        &self,
+        surface: &Matrix,
+        rng: &mut StdRng,
+    ) -> Result<Matrix, NetworkError> {
+        let (mean, log_variance) = self.encode(surface)?;
+        Ok(Self::sample(&mean, &log_variance, rng).0)
     }
 
     /// The same, keeping what the backward pass needs.
@@ -422,7 +455,7 @@ impl ShapeVae {
         &self,
         surface: &Matrix,
     ) -> Result<(Matrix, Matrix, EncoderCache), NetworkError> {
-        if surface.cols != 6 {
+        if surface.cols != 6 || surface.rows == 0 {
             return Err(NetworkError::InvalidConfig(format!(
                 "a surface point is a position and a normal, so [n, 6] was wanted and this is [{}, {}]",
                 surface.rows, surface.cols
@@ -481,6 +514,36 @@ impl ShapeVae {
                     hidden,
                     normed,
                 })),
+            },
+        ))
+    }
+
+    /// Encodes a packed CUDA batch with the same number of surface points in
+    /// every shape. Rows stay grouped by shape in both returned matrices.
+    ///
+    /// Packing turns the batch into one set of projection GEMMs and batched
+    /// attention launches. The ordinary host path intentionally remains
+    /// shape-at-a-time; call this only after [`to_cuda`](Self::to_cuda).
+    #[cfg(feature = "cuda")]
+    pub fn encode_train_batch(
+        &self,
+        surface: &Matrix,
+        shapes: usize,
+    ) -> Result<(Matrix, Matrix, EncoderCache), NetworkError> {
+        if surface.cols != 6 {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a surface point is a position and a normal, so [n, 6] was wanted and this is [{}, {}]",
+                surface.rows, surface.cols
+            )));
+        }
+        let context = self.device_context()?;
+        let (mean, log_variance, cache) =
+            crate::gpu_shape::encode_train_batch(self, &context, surface, shapes)?;
+        Ok((
+            mean,
+            log_variance,
+            EncoderCache {
+                inner: EncoderCached::Device(Box::new(cache)),
             },
         ))
     }
@@ -643,6 +706,32 @@ impl ShapeVae {
         self.decode_chunk(latent, &kv, queries)
     }
 
+    /// Decodes a packed CUDA batch with equal query counts per shape.
+    /// Latent and query rows must both be contiguous by shape.
+    #[cfg(feature = "cuda")]
+    pub fn decode_train_batch(
+        &self,
+        latent: &Matrix,
+        queries: &Matrix,
+        shapes: usize,
+    ) -> Result<(Vec<f32>, DecoderCache), NetworkError> {
+        if queries.cols != 3 || queries.rows == 0 {
+            return Err(NetworkError::InvalidConfig(format!(
+                "query points are 3-D, so [n, 3] was wanted and this is [{}, {}]",
+                queries.rows, queries.cols
+            )));
+        }
+        let context = self.device_context()?;
+        let (distances, cache) =
+            crate::gpu_shape::decode_train_batch(self, &context, latent, queries, shapes)?;
+        Ok((
+            distances,
+            DecoderCache {
+                inner: DecoderCached::Device(Box::new(cache)),
+            },
+        ))
+    }
+
     /// The colour at each point of a decoded chunk, `[n, 3]`.
     ///
     /// The distance and the colour share everything but the last projection,
@@ -797,8 +886,7 @@ impl ShapeVae {
         memory_budget_mib: usize,
         mixed_precision: bool,
     ) -> Result<(), NetworkError> {
-        let context =
-            crate::gpu_transformer::GpuContext::with_precision(device, mixed_precision)?;
+        let context = crate::gpu_transformer::GpuContext::with_precision(device, mixed_precision)?;
         crate::gpu_shape::to_cuda(self, &context, memory_budget_mib)?;
         self.device = Some(context);
         Ok(())
@@ -1086,6 +1174,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("[4, 5]"), "{error}");
+    }
+
+    #[test]
+    fn encoding_a_sample_draws_around_the_mean_and_repeats_for_a_seed() {
+        let mut rng = StdRng::seed_from_u64(12);
+        let model = ShapeVae::new(tiny(), &mut rng).unwrap();
+        let surface = rows(16, 6, 2);
+
+        let (mean, log_variance) = model.encode(&surface).unwrap();
+        let first = model
+            .encode_sample(&surface, &mut StdRng::seed_from_u64(1))
+            .unwrap();
+        let again = model
+            .encode_sample(&surface, &mut StdRng::seed_from_u64(1))
+            .unwrap();
+        let other = model
+            .encode_sample(&surface, &mut StdRng::seed_from_u64(2))
+            .unwrap();
+
+        assert_eq!(first.rows, mean.rows);
+        assert_eq!(first.cols, mean.cols);
+        assert_eq!(first.data, again.data, "a seed repeats its draw");
+        assert_ne!(first.data, other.data, "another seed draws elsewhere");
+        assert_ne!(first.data, mean.data, "a draw is not the mean");
+
+        // Every draw sits within a few standard deviations of the mean.
+        for index in 0..mean.data.len() {
+            let sigma = (0.5 * log_variance.data[index]).exp();
+            let offset = (first.data[index] - mean.data[index]).abs();
+            assert!(offset < 6.0 * sigma, "{offset} against a sigma of {sigma}");
+        }
     }
 
     #[test]
