@@ -61,6 +61,8 @@ pub struct GpuContext {
     scale: CudaFunction,
     gather: CudaFunction,
     scatter: CudaFunction,
+    im2col_train: CudaFunction,
+    col2im_train: CudaFunction,
     /// The fused kernels the device-resident training path uses.
     pub(crate) model: crate::gpu_model::ModelKernels,
     /// The fused attention kernel, present only on Ampere and later. `None`
@@ -144,6 +146,8 @@ impl GpuContext {
             scale: get("scale_inplace")?,
             gather: get("gather_rows")?,
             scatter: get("scatter_rows_neg")?,
+            im2col_train: get("im2col_train")?,
+            col2im_train: get("col2im_train")?,
             model: crate::gpu_model::ModelKernels::load(&module)?,
             flash: crate::cuda_flash::flash_kernels(device, &context),
             rope: Mutex::new(None),
@@ -209,6 +213,82 @@ impl GpuContext {
         self.stream
             .alloc_zeros::<f32>(len)
             .map_err(cuda_alloc_err("device allocation", len * 4))
+    }
+
+    /// One row per output pixel, holding every input value that pixel's kernel
+    /// reads, built on the device from a device-resident input.
+    ///
+    /// `input` is `[batch * height * width, channels]`; the result is
+    /// `[batch * out_height * out_width, channels * kernel * kernel]`. The
+    /// column matrix is the largest buffer a convolution touches -- nine times
+    /// the input for a 3x3 kernel -- and this is what keeps it from crossing
+    /// the bus twice per layer.
+    pub(crate) fn im2col(
+        &self,
+        input: &CudaSlice<f32>,
+        shape: &crate::conv::ConvGeometry,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut columns = self.zeros(shape.column_elements())?;
+        self.launch_conv(
+            &self.im2col_train,
+            &mut columns,
+            input,
+            shape,
+            "im2col kernel",
+        )?;
+        Ok(columns)
+    }
+
+    /// The transpose of [`GpuContext::im2col`]: column gradients summed back
+    /// onto the input pixels the patches overlapped on.
+    pub(crate) fn col2im(
+        &self,
+        columns: &CudaSlice<f32>,
+        shape: &crate::conv::ConvGeometry,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut grad = self.zeros(shape.input_elements())?;
+        self.launch_conv(
+            &self.col2im_train,
+            &mut grad,
+            columns,
+            shape,
+            "col2im kernel",
+        )?;
+        Ok(grad)
+    }
+
+    /// Both kernels take the same arguments and are launched over their own
+    /// destination, so they share one launch.
+    fn launch_conv(
+        &self,
+        kernel: &CudaFunction,
+        destination: &mut CudaSlice<f32>,
+        source: &CudaSlice<f32>,
+        shape: &crate::conv::ConvGeometry,
+        stage: &'static str,
+    ) -> Result<(), NetworkError> {
+        let elements = destination.len();
+        let dimensions = [
+            shape.batch,
+            shape.channels,
+            shape.height,
+            shape.width,
+            shape.kernel,
+            shape.stride,
+            shape.padding,
+            shape.out_height,
+            shape.out_width,
+        ]
+        .map(|value| value as i32);
+        unsafe {
+            let mut launch = self.stream.launch_builder(kernel);
+            launch.arg(destination).arg(source);
+            for value in &dimensions {
+                launch.arg(value);
+            }
+            launch.launch(cfg(elements)).map_err(cuda_err(stage))?;
+        }
+        Ok(())
     }
 
     /// Softmaxed attention weights per head plus the merged head outputs.
@@ -560,6 +640,86 @@ impl DeviceParam {
         })();
         self.context.guard(result, ());
         output
+    }
+
+    /// [`DeviceParam::matmul_rhs_transposed`] for an operand that is already on
+    /// the device and a result that stays there.
+    ///
+    /// `input[rows, cols] . value^T -> [rows, self.rows]`.
+    pub(crate) fn matmul_rhs_transposed_device(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut output = self.context.zeros(rows * self.rows)?;
+        gemm_rhs_transposed(
+            &self.context,
+            input,
+            self.cols,
+            &self.value,
+            self.cols,
+            &mut output,
+            self.rows,
+            rows,
+            self.rows,
+            self.cols,
+            1.0,
+            0.0,
+        )?;
+        Ok(output)
+    }
+
+    /// [`DeviceParam::matmul`] for a device-resident operand and result.
+    ///
+    /// `input[rows, self.rows] . value -> [rows, cols]`.
+    pub(crate) fn matmul_device(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut output = self.context.zeros(rows * self.cols)?;
+        gemm_plain(
+            &self.context,
+            input,
+            self.rows,
+            &self.value,
+            self.cols,
+            &mut output,
+            self.cols,
+            rows,
+            self.cols,
+            self.rows,
+            1.0,
+            0.0,
+        )?;
+        Ok(output)
+    }
+
+    /// [`DeviceParam::accumulate_grad`] for operands that are already resident.
+    pub(crate) fn accumulate_grad_device(
+        &mut self,
+        grad_output: &CudaSlice<f32>,
+        input: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), NetworkError> {
+        if self.frozen {
+            return Ok(());
+        }
+        let beta = self.grad_beta();
+        gemm_lhs_transposed(
+            &self.context,
+            grad_output,
+            self.rows,
+            input,
+            self.cols,
+            &mut self.negated_grad,
+            self.cols,
+            rows,
+            self.rows,
+            self.cols,
+            -1.0,
+            beta,
+        )
     }
 
     /// `output[tokens, cols] = input[tokens, rows] . value`.
