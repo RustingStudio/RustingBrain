@@ -827,93 +827,400 @@ pub fn marching_tetrahedra(
     bounds: ([f32; 3], [f32; 3]),
     iso: f32,
 ) -> Result<Mesh, NetworkError> {
-    if resolution < 2 {
-        return Err(NetworkError::InvalidConfig(
-            "a grid needs at least two samples along each axis".into(),
-        ));
-    }
-    let (low, high) = bounds;
-    let step: [f32; 3] =
-        std::array::from_fn(|axis| (high[axis] - low[axis]) / (resolution - 1) as f32);
-    let at = |x: usize, y: usize, z: usize| -> [f32; 3] {
-        [
-            low[0] + x as f32 * step[0],
-            low[1] + y as f32 * step[1],
-            low[2] + z as f32 * step[2],
-        ]
-    };
-
-    let plane = resolution * resolution;
+    let grid = Grid::new(resolution, bounds)?;
     let mut mesh = Mesh::default();
-    // Vertices are named by the grid edge they sit on, so two cells sharing an
-    // edge share the vertex and the result is watertight without an epsilon.
-    let mut welded: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut welded = HashMap::new();
     let mut previous: Option<Vec<f32>> = None;
 
     for z in 0..resolution {
-        let mut points = Matrix::new(plane, 3);
+        let mut points = Matrix::new(grid.plane, 3);
         for y in 0..resolution {
             for x in 0..resolution {
                 points
                     .row_mut(y * resolution + x)
-                    .copy_from_slice(&at(x, y, z));
+                    .copy_from_slice(&grid.at(x, y, z));
             }
         }
-        let values = field(&points)?;
-        if values.len() != plane {
-            return Err(NetworkError::InvalidTarget {
-                expected: plane,
-                actual: values.len(),
-            });
-        }
-
-        // Two slices at a time: a cell spans z and z + 1.
+        let values = grid.evaluate(&field, &points)?;
         if let Some(lower) = previous {
-            for y in 0..resolution - 1 {
-                for x in 0..resolution - 1 {
-                    // The eight corners, in the order CUBE_TETRAHEDRA indexes.
-                    let corners = [
-                        (x, y, z - 1),
-                        (x + 1, y, z - 1),
-                        (x + 1, y + 1, z - 1),
-                        (x, y + 1, z - 1),
-                        (x, y, z),
-                        (x + 1, y, z),
-                        (x + 1, y + 1, z),
-                        (x, y + 1, z),
-                    ];
-                    let value = |corner: usize| {
-                        let (cx, cy, _) = corners[corner];
-                        let index = cy * resolution + cx;
-                        match corner < 4 {
-                            true => lower[index],
-                            false => values[index],
-                        }
-                    };
-                    let identity = |corner: usize| {
-                        let (cx, cy, cz) = corners[corner];
-                        (cz * plane + cy * resolution + cx) as u32
-                    };
-
-                    for tetrahedron in CUBE_TETRAHEDRA {
-                        emit_tetrahedron(
-                            &mut mesh,
-                            &mut welded,
-                            iso,
-                            tetrahedron.map(|corner| {
-                                let (cx, cy, cz) = corners[corner];
-                                (identity(corner), at(cx, cy, cz), value(corner))
-                            }),
-                        );
-                    }
-                }
-            }
+            grid.emit_cells(&mut mesh, &mut welded, iso, z, &lower, &values);
         }
         previous = Some(values);
     }
 
     mesh.recompute_normals();
     Ok(mesh)
+}
+
+/// [`marching_tetrahedra`] with the empty space skipped, for a field that is
+/// expensive to evaluate.
+///
+/// The marcher itself costs almost nothing — two planes of values live at a
+/// time, so a `256³` grid holds 27 MB whatever the field is. What a high
+/// resolution costs is *calls*: `256³` is 16.7 million query points, and a
+/// decoder that answers a point in a few microseconds spends half an hour on
+/// them. Nearly all of those points are deep inside or far outside the shape,
+/// where there is nothing to find.
+///
+/// So this runs the grid twice. A coarse pass every `coarse` samples finds the
+/// cells the surface crosses; the fine pass evaluates only the points inside
+/// those cells and their immediate neighbours, and marches the fine cells whose
+/// eight corners it has. A sphere at `256³` with a `coarse` of 4 costs 1.6
+/// million query points instead of 16.7 million, and gives back the same mesh
+/// vertex for vertex.
+///
+/// The caveat is the one every hierarchical extractor has: a feature that fits
+/// entirely inside a coarse cell without crossing any of its corners is not
+/// seen, and the fine pass never looks there. `coarse` is the thickness of the
+/// thinnest wall this can find, in samples: 4 on a `256³` grid means a wall
+/// thinner than about 1/64 of the box may be missed. It is also what decides
+/// the saving, and the two pull the same way — a larger stride skips more
+/// coarse cells but each one drags in its 26 neighbours, so past about 4 the
+/// dilated cells start to overlap and the saving falls off. Use
+/// [`marching_tetrahedra`] when a thin wall matters more than the time.
+pub fn marching_tetrahedra_sparse(
+    field: impl Fn(&Matrix) -> Result<Vec<f32>, NetworkError> + Sync,
+    resolution: usize,
+    bounds: ([f32; 3], [f32; 3]),
+    iso: f32,
+    coarse: usize,
+) -> Result<Mesh, NetworkError> {
+    if coarse < 2 {
+        return Err(NetworkError::InvalidConfig(
+            "a coarse stride of one samples the whole grid twice; call \
+             marching_tetrahedra instead"
+                .into(),
+        ));
+    }
+    let grid = Grid::new(resolution, bounds)?;
+    let occupied = grid.coarse_pass(&field, iso, coarse)?;
+
+    let mut mesh = Mesh::default();
+    let mut welded = HashMap::new();
+    let mut previous: Option<Vec<f32>> = None;
+
+    for z in 0..resolution {
+        // A plane of values, `NaN` where the coarse pass said there is nothing
+        // to look at. A cell with a `NaN` corner is skipped rather than
+        // guessed at.
+        let mut values = vec![f32::NAN; grid.plane];
+        let mut wanted: Vec<usize> = Vec::new();
+        for y in 0..resolution {
+            for x in 0..resolution {
+                if occupied.holds(x, y, z) {
+                    wanted.push(y * resolution + x);
+                }
+            }
+        }
+        if !wanted.is_empty() {
+            let mut points = Matrix::new(wanted.len(), 3);
+            for (row, &index) in wanted.iter().enumerate() {
+                let (x, y) = (index % resolution, index / resolution);
+                points.row_mut(row).copy_from_slice(&grid.at(x, y, z));
+            }
+            let evaluated = grid.evaluate(&field, &points)?;
+            for (&index, value) in wanted.iter().zip(evaluated) {
+                values[index] = value;
+            }
+        }
+        if let Some(lower) = previous {
+            grid.emit_cells(&mut mesh, &mut welded, iso, z, &lower, &values);
+        }
+        previous = Some(values);
+    }
+
+    mesh.recompute_normals();
+    Ok(mesh)
+}
+
+/// The sample grid both marchers walk: where a sample sits, and how a cell
+/// between two planes becomes triangles.
+struct Grid {
+    resolution: usize,
+    plane: usize,
+    low: [f32; 3],
+    step: [f32; 3],
+}
+
+impl Grid {
+    fn new(resolution: usize, bounds: ([f32; 3], [f32; 3])) -> Result<Self, NetworkError> {
+        if resolution < 2 {
+            return Err(NetworkError::InvalidConfig(
+                "a grid needs at least two samples along each axis".into(),
+            ));
+        }
+        let (low, high) = bounds;
+        Ok(Self {
+            resolution,
+            plane: resolution * resolution,
+            low,
+            step: std::array::from_fn(|axis| (high[axis] - low[axis]) / (resolution - 1) as f32),
+        })
+    }
+
+    fn at(&self, x: usize, y: usize, z: usize) -> [f32; 3] {
+        [
+            self.low[0] + x as f32 * self.step[0],
+            self.low[1] + y as f32 * self.step[1],
+            self.low[2] + z as f32 * self.step[2],
+        ]
+    }
+
+    /// One call into the field, with the row count checked: a field that
+    /// answers a different number of points than it was asked would otherwise
+    /// silently shift every value onto the wrong grid corner.
+    fn evaluate(
+        &self,
+        field: &(impl Fn(&Matrix) -> Result<Vec<f32>, NetworkError> + Sync),
+        points: &Matrix,
+    ) -> Result<Vec<f32>, NetworkError> {
+        let values = field(points)?;
+        if values.len() != points.rows {
+            return Err(NetworkError::InvalidTarget {
+                expected: points.rows,
+                actual: values.len(),
+            });
+        }
+        Ok(values)
+    }
+
+    /// Marches every cell between plane `z - 1` and plane `z`, skipping the
+    /// ones a sparse pass left unevaluated.
+    fn emit_cells(
+        &self,
+        mesh: &mut Mesh,
+        welded: &mut HashMap<(u32, u32), u32>,
+        iso: f32,
+        z: usize,
+        lower: &[f32],
+        upper: &[f32],
+    ) {
+        let resolution = self.resolution;
+        for y in 0..resolution - 1 {
+            for x in 0..resolution - 1 {
+                // The eight corners, in the order CUBE_TETRAHEDRA indexes.
+                let corners = [
+                    (x, y, z - 1),
+                    (x + 1, y, z - 1),
+                    (x + 1, y + 1, z - 1),
+                    (x, y + 1, z - 1),
+                    (x, y, z),
+                    (x + 1, y, z),
+                    (x + 1, y + 1, z),
+                    (x, y + 1, z),
+                ];
+                let value = |corner: usize| {
+                    let (cx, cy, _) = corners[corner];
+                    let index = cy * resolution + cx;
+                    match corner < 4 {
+                        true => lower[index],
+                        false => upper[index],
+                    }
+                };
+                if (0..8).any(|corner| value(corner).is_nan()) {
+                    continue;
+                }
+
+                for tetrahedron in CUBE_TETRAHEDRA {
+                    emit_tetrahedron(
+                        mesh,
+                        welded,
+                        iso,
+                        tetrahedron.map(|corner| {
+                            let (cx, cy, cz) = corners[corner];
+                            let identity = (cz * self.plane + cy * resolution + cx) as u32;
+                            (identity, self.at(cx, cy, cz), value(corner))
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Walks the grid every `coarse` samples and reports which coarse cells the
+    /// surface passes through, each one grown by a cell in every direction so
+    /// that a fine cell inside a marked one always has all eight of its corners
+    /// evaluated.
+    fn coarse_pass(
+        &self,
+        field: &(impl Fn(&Matrix) -> Result<Vec<f32>, NetworkError> + Sync),
+        iso: f32,
+        coarse: usize,
+    ) -> Result<Occupancy, NetworkError> {
+        let cells = (self.resolution - 1).div_ceil(coarse);
+        let samples = cells + 1;
+        let sample_at = |index: usize| (index * coarse).min(self.resolution - 1);
+
+        let mut straddles = vec![false; cells * cells * cells];
+        let mut previous: Option<Vec<f32>> = None;
+        for k in 0..samples {
+            let mut points = Matrix::new(samples * samples, 3);
+            for j in 0..samples {
+                for i in 0..samples {
+                    points.row_mut(j * samples + i).copy_from_slice(&self.at(
+                        sample_at(i),
+                        sample_at(j),
+                        sample_at(k),
+                    ));
+                }
+            }
+            let values = self.evaluate(field, &points)?;
+            if let Some(lower) = previous {
+                for j in 0..cells {
+                    for i in 0..cells {
+                        let corners = [
+                            lower[j * samples + i],
+                            lower[j * samples + i + 1],
+                            lower[(j + 1) * samples + i],
+                            lower[(j + 1) * samples + i + 1],
+                            values[j * samples + i],
+                            values[j * samples + i + 1],
+                            values[(j + 1) * samples + i],
+                            values[(j + 1) * samples + i + 1],
+                        ];
+                        let inside = corners.iter().any(|&value| value < iso);
+                        let outside = corners.iter().any(|&value| value >= iso);
+                        if inside && outside {
+                            straddles[(k - 1) * cells * cells + j * cells + i] = true;
+                        }
+                    }
+                }
+            }
+            previous = Some(values);
+        }
+
+        Ok(Occupancy::dilated(straddles, cells, coarse))
+    }
+}
+
+/// Which coarse cells the fine pass has to look inside.
+struct Occupancy {
+    marked: Vec<bool>,
+    cells: usize,
+    coarse: usize,
+}
+
+impl Occupancy {
+    /// Grows every marked cell into its 26 neighbours. A fine cell sitting at
+    /// the edge of a marked coarse cell reaches one sample into the next one,
+    /// so without this its far corners would be `NaN` and the cell would be
+    /// dropped — a seam along every coarse boundary.
+    fn dilated(straddles: Vec<bool>, cells: usize, coarse: usize) -> Self {
+        let mut marked = vec![false; straddles.len()];
+        for k in 0..cells {
+            for j in 0..cells {
+                for i in 0..cells {
+                    marked[k * cells * cells + j * cells + i] = (-1i64..=1).any(|dk| {
+                        (-1i64..=1).any(|dj| {
+                            (-1i64..=1).any(|di| {
+                                let (ni, nj, nk) = (i as i64 + di, j as i64 + dj, k as i64 + dk);
+                                let inside = |value: i64| (0..cells as i64).contains(&value);
+                                inside(ni)
+                                    && inside(nj)
+                                    && inside(nk)
+                                    && straddles[nk as usize * cells * cells
+                                        + nj as usize * cells
+                                        + ni as usize]
+                            })
+                        })
+                    });
+                }
+            }
+        }
+        Self {
+            marked,
+            cells,
+            coarse,
+        }
+    }
+
+    /// Whether the fine sample at `(x, y, z)` is worth evaluating.
+    fn holds(&self, x: usize, y: usize, z: usize) -> bool {
+        let cell = |index: usize| (index / self.coarse).min(self.cells - 1);
+        self.marked[cell(z) * self.cells * self.cells + cell(y) * self.cells + cell(x)]
+    }
+}
+
+#[cfg(test)]
+mod sparse_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A sphere of radius 0.6, and a count of how many points it was asked for.
+    fn sphere(
+        radius: f32,
+        asked: &AtomicUsize,
+    ) -> impl Fn(&Matrix) -> Result<Vec<f32>, NetworkError> + Sync {
+        move |points: &Matrix| {
+            asked.fetch_add(points.rows, Ordering::Relaxed);
+            Ok((0..points.rows)
+                .map(|row| {
+                    let point = points.row(row);
+                    (point[0] * point[0] + point[1] * point[1] + point[2] * point[2]).sqrt()
+                        - radius
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn skipping_the_empty_space_gives_the_same_mesh_as_marching_all_of_it() {
+        let bounds = ([-1.0; 3], [1.0; 3]);
+        let dense_calls = AtomicUsize::new(0);
+        let dense = marching_tetrahedra(sphere(0.6, &dense_calls), 64, bounds, 0.0).unwrap();
+
+        let sparse_calls = AtomicUsize::new(0);
+        let sparse =
+            marching_tetrahedra_sparse(sphere(0.6, &sparse_calls), 64, bounds, 0.0, 4).unwrap();
+
+        assert!(!dense.indices.is_empty(), "the sphere crosses the grid");
+        assert_eq!(sparse.positions, dense.positions);
+        assert_eq!(sparse.indices, dense.indices);
+        assert_eq!(sparse.normals, dense.normals);
+        assert!(
+            sparse_calls.load(Ordering::Relaxed) * 2 < dense_calls.load(Ordering::Relaxed),
+            "the sparse pass asked for {} points against {}",
+            sparse_calls.load(Ordering::Relaxed),
+            dense_calls.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn a_shell_thinner_than_a_coarse_cell_needs_the_dense_marcher() {
+        // The documented caveat, pinned: a shell 1/64 of the box thick sits
+        // inside a coarse cell of 8 samples and the coarse pass steps over it.
+        let bounds = ([-1.0; 3], [1.0; 3]);
+        let shell = |points: &Matrix| -> Result<Vec<f32>, NetworkError> {
+            Ok((0..points.rows)
+                .map(|row| {
+                    let point = points.row(row);
+                    let radius =
+                        (point[0] * point[0] + point[1] * point[1] + point[2] * point[2]).sqrt();
+                    (radius - 0.6).abs() - 0.015
+                })
+                .collect())
+        };
+        let dense = marching_tetrahedra(shell, 64, bounds, 0.0).unwrap();
+        let sparse = marching_tetrahedra_sparse(shell, 64, bounds, 0.0, 8).unwrap();
+        assert!(!dense.indices.is_empty());
+        assert!(sparse.indices.len() < dense.indices.len());
+    }
+
+    #[test]
+    fn a_coarse_stride_of_one_is_refused() {
+        let asked = AtomicUsize::new(0);
+        let error =
+            marching_tetrahedra_sparse(sphere(0.6, &asked), 16, ([-1.0; 3], [1.0; 3]), 0.0, 1);
+        assert!(matches!(error, Err(NetworkError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn a_grid_of_one_sample_is_refused_by_both_marchers() {
+        let asked = AtomicUsize::new(0);
+        let bounds = ([-1.0; 3], [1.0; 3]);
+        assert!(marching_tetrahedra(sphere(0.6, &asked), 1, bounds, 0.0).is_err());
+        assert!(marching_tetrahedra_sparse(sphere(0.6, &asked), 1, bounds, 0.0, 4).is_err());
+    }
 }
 
 /// The six tetrahedra a cube is cut into, as corner indices. Every one of them
