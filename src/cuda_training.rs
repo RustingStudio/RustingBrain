@@ -449,6 +449,43 @@ pub(crate) fn cuda_err<E: std::fmt::Display>(
     move |e| NetworkError::Cuda(format!("{stage} failed: {e}"))
 }
 
+/// As [`cuda_err`], for a call that asks the driver for `bytes` of device
+/// memory.
+///
+/// A driver out-of-memory becomes [`NetworkError::CudaOutOfMemory`], which a
+/// caller can match on to retry with a smaller batch. Every other failure keeps
+/// its [`NetworkError::Cuda`], because nothing about it says a smaller
+/// allocation would have worked.
+pub(crate) fn cuda_alloc_err<E: std::fmt::Display>(
+    stage: &'static str,
+    bytes: usize,
+) -> impl FnOnce(E) -> NetworkError {
+    move |e| {
+        let message = e.to_string();
+        if !is_out_of_memory(&message) {
+            return NetworkError::Cuda(format!("{stage} failed: {e}"));
+        }
+        NetworkError::CudaOutOfMemory {
+            requested_mib: bytes.div_ceil(MIB),
+            free_mib: cudarc::runtime::result::get_mem_info()
+                .map(|(free, _)| free / MIB)
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Whether a driver error is the one that says the allocation did not fit.
+///
+/// Matched on the text because cudarc's error types differ between the driver
+/// and the runtime API and both reach this crate; the spelling is the driver's
+/// own `CUDA_ERROR_OUT_OF_MEMORY` and the runtime's `cudaErrorMemoryAllocation`.
+fn is_out_of_memory(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("out_of_memory")
+        || lowered.contains("out of memory")
+        || lowered.contains("memoryallocation")
+}
+
 /// nvrtc compilation of [`KERNELS`] costs a few hundred milliseconds and the
 /// source never varies, so a campaign running dozens of sessions compiles once.
 fn kernel_ptx() -> Result<&'static Ptx, NetworkError> {

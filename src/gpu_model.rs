@@ -23,7 +23,7 @@
 //! expert sees the tokens routed to it from the *whole* batch in one GEMM.
 
 use crate::batch::TokenBatch;
-use crate::cuda_training::{cfg, cuda_err};
+use crate::cuda_training::{cfg, cuda_alloc_err, cuda_err};
 use crate::ffn::SwiGlu;
 use crate::gpu_transformer::{
     DeviceParam, GpuContext, act_lhs_transposed, act_plain, act_rhs_transposed,
@@ -333,7 +333,7 @@ impl Gpu<'_> {
         self.context
             .stream
             .alloc_zeros::<f32>(len.max(1))
-            .map_err(cuda_err("device allocation"))
+            .map_err(cuda_alloc_err("device allocation", len.max(1) * 4))
     }
 
     /// An allocation whose contents are whatever the driver last left there.
@@ -344,13 +344,13 @@ impl Gpu<'_> {
     /// chunked LM head alone cost more than every memcpy in a step combined.
     pub(crate) fn uninit(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {
         unsafe { self.context.stream.alloc::<f32>(len.max(1)) }
-            .map_err(cuda_err("device allocation"))
+            .map_err(cuda_alloc_err("device allocation", len.max(1) * 4))
     }
 
     /// [`Gpu::uninit`] for a BF16 buffer.
     pub(crate) fn uninit_bf16(&self, len: usize) -> Result<CudaSlice<bf16>, NetworkError> {
         unsafe { self.context.stream.alloc::<bf16>(len.max(1)) }
-            .map_err(cuda_err("device allocation"))
+            .map_err(cuda_alloc_err("device allocation", len.max(1) * 2))
     }
 
     /// [`Gpu::uninit`] for a GEMM operand of `len` elements, which the very
@@ -361,7 +361,10 @@ impl Gpu<'_> {
                 .stream
                 .alloc::<u8>(len.max(1) * Act::element(narrow))
         }
-        .map_err(cuda_err("device allocation"))?;
+        .map_err(cuda_alloc_err(
+            "device allocation",
+            len.max(1) * Act::element(narrow),
+        ))?;
         Ok(Act { bytes, narrow, len })
     }
 
@@ -465,24 +468,24 @@ impl Gpu<'_> {
     }
 
     pub(crate) fn upload(&self, data: &[f32]) -> Result<CudaSlice<f32>, NetworkError> {
-        self.context
-            .stream
-            .clone_htod(data)
-            .map_err(cuda_err("host to device copy"))
+        self.context.stream.clone_htod(data).map_err(cuda_alloc_err(
+            "host to device copy",
+            std::mem::size_of_val(data),
+        ))
     }
 
     pub(crate) fn upload_indices(&self, data: &[u32]) -> Result<CudaSlice<u32>, NetworkError> {
-        self.context
-            .stream
-            .clone_htod(data)
-            .map_err(cuda_err("host to device copy"))
+        self.context.stream.clone_htod(data).map_err(cuda_alloc_err(
+            "host to device copy",
+            std::mem::size_of_val(data),
+        ))
     }
 
     pub(crate) fn upload_flags(&self, data: &[i32]) -> Result<CudaSlice<i32>, NetworkError> {
-        self.context
-            .stream
-            .clone_htod(data)
-            .map_err(cuda_err("host to device copy"))
+        self.context.stream.clone_htod(data).map_err(cuda_alloc_err(
+            "host to device copy",
+            std::mem::size_of_val(data),
+        ))
     }
 
     pub(crate) fn download(&self, source: &CudaSlice<f32>) -> Result<Vec<f32>, NetworkError> {
@@ -515,10 +518,10 @@ impl Gpu<'_> {
     }
 
     pub(crate) fn upload_signed(&self, data: &[i32]) -> Result<CudaSlice<i32>, NetworkError> {
-        self.context
-            .stream
-            .clone_htod(data)
-            .map_err(cuda_err("host to device copy"))
+        self.context.stream.clone_htod(data).map_err(cuda_alloc_err(
+            "host to device copy",
+            std::mem::size_of_val(data),
+        ))
     }
 
     pub(crate) fn download_signed(
@@ -3648,6 +3651,26 @@ mod tests {
                 (a - b).abs() <= tolerance,
                 "{label}[{index}]: {a} on the device vs {b} on the host"
             );
+        }
+    }
+
+    #[test]
+    fn an_allocation_that_cannot_fit_says_out_of_memory_rather_than_cuda() {
+        let Some(context) = cuda_or_skip() else {
+            return;
+        };
+        let gpu = Gpu { context: &context };
+        // Four tebibytes: larger than any card, so the driver refuses it
+        // without disturbing whatever else is resident.
+        match gpu.zeros(1 << 40) {
+            Err(NetworkError::CudaOutOfMemory {
+                requested_mib,
+                free_mib,
+            }) => {
+                assert_eq!(requested_mib, 4 * 1024 * 1024);
+                assert!(free_mib > 0, "a working device reports some free memory");
+            }
+            other => panic!("expected an out-of-memory error, got {other:?}"),
         }
     }
 
