@@ -46,6 +46,14 @@ pub enum NetworkError {
         estimated_mib: usize,
         budget_mib: usize,
     },
+    #[error(
+        "CUDA is out of memory: an allocation of {requested_mib} MiB failed with \
+         {free_mib} MiB free"
+    )]
+    CudaOutOfMemory {
+        requested_mib: usize,
+        free_mib: usize,
+    },
     #[error("invalid CUDA checkpoint: {0}")]
     InvalidCudaCheckpoint(String),
     #[error(

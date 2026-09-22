@@ -47,7 +47,7 @@
 
 use crate::clip::{ClipTextEncoder, Norm};
 use crate::conv::{Conv2d, Dense, FeatureMap, GroupNorm};
-use crate::cuda_training::{cfg, cuda_err, device_context};
+use crate::cuda_training::{cfg, cuda_alloc_err, cuda_err, device_context};
 use crate::gpu_transformer::{GpuContext, act_plain, act_rhs_transposed};
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
@@ -523,8 +523,9 @@ impl ImageGpu {
     /// written by the kernel that follows.
     fn uninit(&self, rows: usize, cols: usize) -> Result<Tensor, NetworkError> {
         Ok(Tensor {
-            data: unsafe { self.context.stream.alloc::<f16>((rows * cols).max(1)) }
-                .map_err(cuda_err("device allocation"))?,
+            data: unsafe { self.context.stream.alloc::<f16>((rows * cols).max(1)) }.map_err(
+                cuda_alloc_err("device allocation", (rows * cols).max(1) * 2),
+            )?,
             rows,
             cols,
         })
@@ -561,7 +562,10 @@ impl ImageGpu {
                 .context
                 .stream
                 .clone_htod(&narrowed)
-                .map_err(cuda_err("host to device copy"))?,
+                .map_err(cuda_alloc_err(
+                    "host to device copy",
+                    std::mem::size_of_val(&narrowed[..]),
+                ))?,
             rows,
             cols,
         })

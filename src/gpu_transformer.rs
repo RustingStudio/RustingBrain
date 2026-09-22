@@ -28,7 +28,7 @@
 //!   [`NetworkError::Cuda`]. Nothing falls back to the CPU silently.
 
 use crate::activations::softmax;
-use crate::cuda_training::{cfg, cuda_err, device_context};
+use crate::cuda_training::{cfg, cuda_alloc_err, cuda_err, device_context};
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::optimizers::Optimizer;
@@ -189,9 +189,10 @@ impl GpuContext {
     }
 
     pub(crate) fn upload(&self, matrix: &Matrix) -> Result<CudaSlice<f32>, NetworkError> {
-        self.stream
-            .clone_htod(&matrix.data)
-            .map_err(cuda_err("host to device copy"))
+        self.stream.clone_htod(&matrix.data).map_err(cuda_alloc_err(
+            "host to device copy",
+            std::mem::size_of_val(&matrix.data[..]),
+        ))
     }
 
     pub(crate) fn download(
@@ -207,7 +208,7 @@ impl GpuContext {
     pub(crate) fn zeros(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {
         self.stream
             .alloc_zeros::<f32>(len)
-            .map_err(cuda_err("device allocation"))
+            .map_err(cuda_alloc_err("device allocation", len * 4))
     }
 
     /// Softmaxed attention weights per head plus the merged head outputs.
