@@ -68,6 +68,55 @@ extern "C" __global__ void mse_sum(float *out,const float*y,const float*t,int n)
 extern "C" __global__ void mse_epoch_sum(float *out,const float*y,const float*t,int n,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=y[i]-t[i];atomicAdd(out,z*z*scale);}}
 extern "C" __global__ void gather_rows(float*out,const float*all,const unsigned int*order,int start,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*width){int r=i/width,c=i%width;out[i]=all[order[start+r]*width+c];}}
 extern "C" __global__ void scale_inplace(float*g,int n,float s){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)g[i]*=s;}
+
+// im2col and its transpose for a trainable convolution, in FP32.
+//
+// `crate::cuda_image` has an FP16 im2col for inference; this pair is the
+// training one, so it keeps the precision the optimizer needs and it has the
+// scatter half that a backward pass needs. Layout: the input is
+// `[batch * height * width, channels]` with the channel fastest, and a column
+// row holds `(ky * kernel + kx) * channels + channel`, which is the ordering
+// the weight `[out_channels, in_channels * kernel * kernel]` was trained in.
+extern "C" __global__ void im2col_train(float*columns,const float*input,
+    int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
+  long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  long long patch=(long long)channels*kernel*kernel;
+  long long total=(long long)batch*out_h*out_w*patch;
+  if(idx>=total)return;
+  long long row=idx/patch,off=idx%patch;
+  int c=(int)(off%channels);long long t=off/channels;
+  int kx=(int)(t%kernel),ky=(int)(t/kernel);
+  int plane=out_h*out_w;
+  int b=(int)(row/plane),rem=(int)(row%plane);
+  int oy=rem/out_w,ox=rem%out_w;
+  int y=oy*stride+ky-pad,x=ox*stride+kx-pad;
+  float v=0.f;
+  if(y>=0&&y<height&&x>=0&&x<width)v=input[(((long long)b*height+y)*width+x)*channels+c];
+  columns[idx]=v;
+}
+// One thread per input element, gathering every column entry that read it.
+// A scatter would need atomics and would not be reproducible run to run; this
+// costs kernel*kernel reads per element and is deterministic.
+extern "C" __global__ void col2im_train(float*grad,const float*columns,
+    int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
+  long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  long long total=(long long)batch*height*width*channels;
+  if(idx>=total)return;
+  int c=(int)(idx%channels);long long p=idx/channels;
+  int x=(int)(p%width);long long q=p/width;
+  int y=(int)(q%height);int b=(int)(q/height);
+  long long patch=(long long)channels*kernel*kernel;
+  float s=0.f;
+  for(int ky=0;ky<kernel;ky++){
+    int sy=y+pad-ky;if(sy<0||sy%stride)continue;int oy=sy/stride;if(oy>=out_h)continue;
+    for(int kx=0;kx<kernel;kx++){
+      int sx=x+pad-kx;if(sx<0||sx%stride)continue;int ox=sx/stride;if(ox>=out_w)continue;
+      long long row=((long long)b*out_h+oy)*out_w+ox;
+      s+=columns[row*patch+(long long)(ky*kernel+kx)*channels+c];
+    }
+  }
+  grad[idx]=s;
+}
 extern "C" __global__ void scatter_rows_neg(float*grad,const float*upstream,const unsigned int*rows_of,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*width){int r=i/width,c=i%width;atomicAdd(&grad[rows_of[r]*width+c],-upstream[i]);}}
 
 // The transformer path's fused kernels. Everything a decoder layer does

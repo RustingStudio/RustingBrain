@@ -182,7 +182,10 @@ pub use batch::{Layout, TokenBatch};
 pub use causal_lm_loss::{CausalLmLoss, TotalLoss, causal_lm_loss, causal_lm_loss_batch};
 pub use checkpoint::{load as load_checkpoint, save as save_checkpoint};
 pub use clip::{ClipTextConfig, ClipTextEncoder};
-pub use conv::{Conv2d, FeatureMap, GroupNorm, pixel_shuffle, pixel_unshuffle, upsample_nearest};
+pub use conv::{
+    Conv2d, ConvCache, ConvGeometry, FeatureMap, GroupNorm, ImageBatch, TrainableConv2d,
+    pixel_shuffle, pixel_unshuffle, upsample_nearest,
+};
 #[cfg(feature = "cuda")]
 pub use cuda_training::{CudaDoctorReport, CudaTrainingSession, CudaTrainingStats, cuda_doctor};
 pub use dataset::{

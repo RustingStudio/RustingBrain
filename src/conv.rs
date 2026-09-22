@@ -17,12 +17,37 @@
 //! [`crate::param::Param`]s and have no backward pass. Hosting a published
 //! decoder is a forward pass; training one is a different project.
 //!
-//! NOTE: no backward pass and no CUDA. Both are additive — `Param` and a
-//! device buffer can replace the plain `Matrix` without changing the shapes —
-//! and neither is needed to run a checkpoint someone else trained.
+//! NOTE: [`Conv2d`] has no backward pass and no CUDA. Both are additive —
+//! `Param` and a device buffer can replace the plain `Matrix` without changing
+//! the shapes — and neither is needed to run a checkpoint someone else trained.
+//!
+//! # Training a convolution
+//!
+//! [`TrainableConv2d`] is the other half: a batched convolution whose weight
+//! and bias are [`Param`](crate::param::Param)s, with a backward pass and a
+//! device path. It is a separate type rather than a mode of [`Conv2d`] because
+//! the two want different layouts. A published checkpoint stores
+//! `[out, in, kh, kw]`, which flattens to a column ordered channel-slowest, and
+//! that is what [`Conv2d`] reads. A trained weight is only ever read by the
+//! code that wrote it, so [`TrainableConv2d`] orders its columns
+//! channel-fastest over an [`ImageBatch`] of `[batch * height * width,
+//! channels]` rows, which is the layout the rest of an image training stack
+//! already holds its activations in and which makes im2col one contiguous copy
+//! per pixel.
+//!
+//! The decision behind the device path, since the alternative was to publish
+//! `im2col`/`col2im` for an outside crate to drive: a convolution's column
+//! matrix is `kernel * kernel` times its input — 452 MiB for one 3x3 layer over
+//! 96 channels of 256x256 at batch 2 — and a caller that drove the pair itself
+//! would still have to hand the columns to the GEMM across the bus. Owning both
+//! sides here means the columns are built on the device and consumed there, and
+//! only the activation and its gradient cross, which is the nine-fold
+//! difference the layer's cost is made of.
 
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
+use crate::param::{Linear, Param};
+use rand::rngs::StdRng;
 use rayon::prelude::*;
 
 /// An image-shaped buffer: channels, then rows, then columns, which is the
@@ -358,6 +383,441 @@ impl Conv2d {
     }
 }
 
+/// A batch of image-shaped activations, one row per pixel.
+///
+/// `[batch * height * width, channels]`, which is what makes a convolution a
+/// matrix multiply and an activation function a pass over a slice. [`Conv2d`]'s
+/// [`FeatureMap`] is the other arrangement, channel-major and unbatched,
+/// because that is the one a published checkpoint's decoder is written against.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageBatch {
+    pub batch: usize,
+    pub height: usize,
+    pub width: usize,
+    pub tokens: Matrix,
+}
+
+impl ImageBatch {
+    pub fn new(batch: usize, height: usize, width: usize, channels: usize) -> Self {
+        Self {
+            batch,
+            height,
+            width,
+            tokens: Matrix::new(batch * height * width, channels),
+        }
+    }
+
+    /// Wraps rows that are already one pixel each.
+    pub fn from_tokens(batch: usize, height: usize, width: usize, tokens: Matrix) -> Self {
+        debug_assert_eq!(tokens.rows, batch * height * width);
+        Self {
+            batch,
+            height,
+            width,
+            tokens,
+        }
+    }
+
+    pub fn channels(&self) -> usize {
+        self.tokens.cols
+    }
+
+    /// Pixels in one sample.
+    pub fn pixels(&self) -> usize {
+        self.height * self.width
+    }
+
+    /// A zeroed map of the same size with a different channel count.
+    pub fn like(&self, channels: usize) -> Self {
+        Self::new(self.batch, self.height, self.width, channels)
+    }
+
+    /// One pixel's channels.
+    pub fn pixel(&self, sample: usize, y: usize, x: usize) -> &[f32] {
+        self.tokens.row((sample * self.height + y) * self.width + x)
+    }
+
+    pub fn pixel_mut(&mut self, sample: usize, y: usize, x: usize) -> &mut [f32] {
+        let row = (sample * self.height + y) * self.width + x;
+        self.tokens.row_mut(row)
+    }
+
+    /// Adds another map of the same shape in place.
+    pub fn add(&mut self, other: &ImageBatch) {
+        debug_assert_eq!(self.tokens.data.len(), other.tokens.data.len());
+        for (slot, value) in self.tokens.data.iter_mut().zip(&other.tokens.data) {
+            *slot += value;
+        }
+    }
+}
+
+/// Everything `im2col` and `col2im` need to know about one convolution, which
+/// is what the device kernels take as their arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvGeometry {
+    pub batch: usize,
+    pub channels: usize,
+    pub height: usize,
+    pub width: usize,
+    pub kernel: usize,
+    pub stride: usize,
+    pub padding: usize,
+    pub out_height: usize,
+    pub out_width: usize,
+}
+
+impl ConvGeometry {
+    /// Values in the input map.
+    pub fn input_elements(&self) -> usize {
+        self.batch * self.height * self.width * self.channels
+    }
+
+    /// Values in the column matrix: `kernel * kernel` times the output's
+    /// pixels times the input's channels.
+    pub fn column_elements(&self) -> usize {
+        self.batch * self.out_height * self.out_width * self.patch()
+    }
+
+    /// Values in one column row.
+    pub fn patch(&self) -> usize {
+        self.channels * self.kernel * self.kernel
+    }
+
+    /// Output pixels across the whole batch, which is the column matrix's row
+    /// count and the GEMM's.
+    pub fn rows(&self) -> usize {
+        self.batch * self.out_height * self.out_width
+    }
+}
+
+/// A two-dimensional convolution that trains.
+///
+/// The weight is a [`Linear`] over `im2col` columns, so the matrix multiply,
+/// the weight gradient and the input gradient are the ones the crate already
+/// has, on the host and on a device alike. See the module documentation for why
+/// this is not a mode of [`Conv2d`].
+#[derive(Clone, Debug)]
+pub struct TrainableConv2d {
+    /// `[out_channels, in_channels * kernel * kernel]`.
+    pub weight: Linear,
+    /// `[1, out_channels]`.
+    pub bias: Param,
+    in_channels: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+}
+
+/// What [`TrainableConv2d::backward`] needs from the forward pass.
+///
+/// The columns are the largest thing a convolution holds, so the cache keeps
+/// them wherever the forward pass built them: on the host, or on the device,
+/// where they never have to cross the bus at all.
+pub struct ConvCache {
+    columns: Columns,
+    shape: ConvGeometry,
+}
+
+enum Columns {
+    Host(Matrix),
+    #[cfg(feature = "cuda")]
+    Device(cudarc::driver::CudaSlice<f32>),
+}
+
+impl std::fmt::Debug for ConvCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConvCache")
+            .field("shape", &self.shape)
+            .finish()
+    }
+}
+
+impl TrainableConv2d {
+    /// A `kernel x kernel` convolution, padded to keep the resolution when
+    /// `stride` is one.
+    pub fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel: usize,
+        stride: usize,
+        rng: &mut StdRng,
+    ) -> Result<Self, NetworkError> {
+        if kernel == 0 || stride == 0 || in_channels == 0 || out_channels == 0 {
+            return Err(NetworkError::InvalidConfig(
+                "a convolution needs a non-zero kernel, stride and channel count".into(),
+            ));
+        }
+        let fan_in = in_channels * kernel * kernel;
+        Ok(Self {
+            weight: Linear {
+                weight: Param::he_uniform(out_channels, fan_in, fan_in, rng),
+                lora: None,
+            },
+            bias: Param::zeros(1, out_channels),
+            in_channels,
+            kernel,
+            stride,
+            padding: kernel / 2,
+        })
+    }
+
+    /// [`TrainableConv2d::new`] with the weight set to zero, which is how a
+    /// residual branch's last convolution starts so the block begins as the
+    /// identity.
+    pub fn zeroed(
+        in_channels: usize,
+        out_channels: usize,
+        kernel: usize,
+        rng: &mut StdRng,
+    ) -> Result<Self, NetworkError> {
+        let mut conv = Self::new(in_channels, out_channels, kernel, 1, rng)?;
+        conv.weight.weight = Param::zeros(out_channels, in_channels * kernel * kernel);
+        Ok(conv)
+    }
+
+    pub fn out_channels(&self) -> usize {
+        self.bias.value.cols
+    }
+
+    pub fn in_channels(&self) -> usize {
+        self.in_channels
+    }
+
+    pub fn output_size(&self, height: usize, width: usize) -> (usize, usize) {
+        let size = |length: usize| {
+            (length + 2 * self.padding).saturating_sub(self.kernel) / self.stride + 1
+        };
+        (size(height), size(width))
+    }
+
+    /// The geometry of this convolution over an input of the given size.
+    pub fn geometry(&self, batch: usize, height: usize, width: usize) -> ConvGeometry {
+        let (out_height, out_width) = self.output_size(height, width);
+        ConvGeometry {
+            batch,
+            channels: self.in_channels,
+            height,
+            width,
+            kernel: self.kernel,
+            stride: self.stride,
+            padding: self.padding,
+            out_height,
+            out_width,
+        }
+    }
+
+    /// Moves the weight and the bias onto a device a caller already opened.
+    /// Every later [`TrainableConv2d::forward`] and
+    /// [`TrainableConv2d::backward`] then builds its columns and runs its GEMMs
+    /// there, and only the activation and its gradient cross the bus.
+    pub fn to_cuda_on(&mut self, device: &crate::param::CudaDevice) -> Result<(), NetworkError> {
+        self.weight.to_cuda_on(device)?;
+        self.bias.to_cuda_on(device)
+    }
+
+    /// Brings the weight and the bias back to the host.
+    pub fn to_cpu(&mut self) -> Result<(), NetworkError> {
+        self.weight.to_cpu()?;
+        self.bias.to_cpu()
+    }
+
+    pub fn forward(&self, input: &ImageBatch) -> Result<(ImageBatch, ConvCache), NetworkError> {
+        if input.channels() != self.in_channels {
+            return Err(NetworkError::InvalidConfig(format!(
+                "this convolution reads {} channels and was given {}",
+                self.in_channels,
+                input.channels()
+            )));
+        }
+        let shape = self.geometry(input.batch, input.height, input.width);
+        #[cfg(feature = "cuda")]
+        if self.weight.weight.device.is_some() {
+            return self.forward_on_device(input, shape);
+        }
+        let columns = self.im2col(input, &shape);
+        let mut tokens = self.weight.forward(&columns);
+        self.add_bias(&mut tokens);
+        Ok((
+            ImageBatch::from_tokens(input.batch, shape.out_height, shape.out_width, tokens),
+            ConvCache {
+                columns: Columns::Host(columns),
+                shape,
+            },
+        ))
+    }
+
+    /// Accumulates the weight and bias gradients and returns `dL/dinput`.
+    pub fn backward(
+        &mut self,
+        cache: &ConvCache,
+        grad_output: &ImageBatch,
+    ) -> Result<ImageBatch, NetworkError> {
+        match &cache.columns {
+            Columns::Host(columns) => {
+                self.accumulate_bias_grad(&grad_output.tokens);
+                let grad_columns = self.weight.backward(columns, &grad_output.tokens);
+                Ok(self.col2im(&grad_columns, &cache.shape))
+            }
+            #[cfg(feature = "cuda")]
+            Columns::Device(columns) => self.backward_on_device(columns, &cache.shape, grad_output),
+        }
+    }
+
+    /// The forward pass with the columns built and consumed on the device.
+    #[cfg(feature = "cuda")]
+    fn forward_on_device(
+        &self,
+        input: &ImageBatch,
+        shape: ConvGeometry,
+    ) -> Result<(ImageBatch, ConvCache), NetworkError> {
+        let device = self
+            .weight
+            .weight
+            .device
+            .as_ref()
+            .expect("the caller checked residency");
+        let context = device.context();
+        let resident_input = context.upload(&input.tokens)?;
+        let columns = context.im2col(&resident_input, &shape)?;
+        let product = device.matmul_rhs_transposed_device(&columns, shape.rows())?;
+        let mut tokens = Matrix::new(shape.rows(), self.out_channels());
+        context.download(&product, &mut tokens)?;
+        self.add_bias(&mut tokens);
+        Ok((
+            ImageBatch::from_tokens(input.batch, shape.out_height, shape.out_width, tokens),
+            ConvCache {
+                columns: Columns::Device(columns),
+                shape,
+            },
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn backward_on_device(
+        &mut self,
+        columns: &cudarc::driver::CudaSlice<f32>,
+        shape: &ConvGeometry,
+        grad_output: &ImageBatch,
+    ) -> Result<ImageBatch, NetworkError> {
+        self.accumulate_bias_grad(&grad_output.tokens);
+        let device = self
+            .weight
+            .weight
+            .device
+            .as_mut()
+            .expect("a device-resident cache means a device-resident weight");
+        let context = device.context().clone();
+        let resident_grad = context.upload(&grad_output.tokens)?;
+        device.accumulate_grad_device(&resident_grad, columns, shape.rows())?;
+        let grad_columns = device.matmul_device(&resident_grad, shape.rows())?;
+        let grad_input = context.col2im(&grad_columns, shape)?;
+        let mut tokens = Matrix::new(shape.batch * shape.height * shape.width, shape.channels);
+        context.download(&grad_input, &mut tokens)?;
+        Ok(ImageBatch::from_tokens(
+            shape.batch,
+            shape.height,
+            shape.width,
+            tokens,
+        ))
+    }
+
+    fn add_bias(&self, tokens: &mut Matrix) {
+        let bias = &self.bias.value.data;
+        tokens.data.par_chunks_mut(tokens.cols).for_each(|row| {
+            for (value, bias) in row.iter_mut().zip(bias) {
+                *value += bias;
+            }
+        });
+    }
+
+    /// The bias gradient is the upstream gradient summed over every pixel.
+    ///
+    /// Always on the host: it is one pass over a buffer that is already here,
+    /// and the bias is one value per output channel rather than one per weight.
+    fn accumulate_bias_grad(&mut self, grad_output: &Matrix) {
+        if self.bias.is_frozen() {
+            return;
+        }
+        for row in 0..grad_output.rows {
+            for (slot, value) in self.bias.grad.data.iter_mut().zip(grad_output.row(row)) {
+                *slot += value;
+            }
+        }
+    }
+
+    pub fn params_mut(&mut self) -> Vec<&mut Param> {
+        let mut params = self.weight.params_mut();
+        params.push(&mut self.bias);
+        params
+    }
+
+    /// `[batch * out_height * out_width, in_channels * kernel * kernel]`, one
+    /// row per output pixel.
+    fn im2col(&self, input: &ImageBatch, shape: &ConvGeometry) -> Matrix {
+        let patch = shape.patch();
+        let mut columns = Matrix::new(shape.rows(), patch);
+        let (kernel, stride, padding) = (self.kernel, self.stride, self.padding);
+        let channels = self.in_channels;
+        columns
+            .data
+            .par_chunks_mut(patch)
+            .enumerate()
+            .for_each(|(index, row)| {
+                let plane = shape.out_height * shape.out_width;
+                let (sample, rest) = (index / plane, index % plane);
+                let (out_y, out_x) = (rest / shape.out_width, rest % shape.out_width);
+                for ky in 0..kernel {
+                    let y = (out_y * stride + ky) as isize - padding as isize;
+                    if y < 0 || y as usize >= input.height {
+                        continue;
+                    }
+                    for kx in 0..kernel {
+                        let x = (out_x * stride + kx) as isize - padding as isize;
+                        if x < 0 || x as usize >= input.width {
+                            continue;
+                        }
+                        let source = input.pixel(sample, y as usize, x as usize);
+                        let offset = (ky * kernel + kx) * channels;
+                        row[offset..offset + channels].copy_from_slice(source);
+                    }
+                }
+            });
+        columns
+    }
+
+    /// The transpose of [`TrainableConv2d::im2col`]: gradients scattered back
+    /// and summed where the patches overlapped.
+    fn col2im(&self, columns: &Matrix, shape: &ConvGeometry) -> ImageBatch {
+        let mut grad = ImageBatch::new(shape.batch, shape.height, shape.width, self.in_channels);
+        for sample in 0..shape.batch {
+            for out_y in 0..shape.out_height {
+                for out_x in 0..shape.out_width {
+                    let row =
+                        columns.row((sample * shape.out_height + out_y) * shape.out_width + out_x);
+                    for ky in 0..self.kernel {
+                        let y = (out_y * self.stride + ky) as isize - self.padding as isize;
+                        if y < 0 || y as usize >= shape.height {
+                            continue;
+                        }
+                        for kx in 0..self.kernel {
+                            let x = (out_x * self.stride + kx) as isize - self.padding as isize;
+                            if x < 0 || x as usize >= shape.width {
+                                continue;
+                            }
+                            let offset = (ky * self.kernel + kx) * self.in_channels;
+                            let target = grad.pixel_mut(sample, y as usize, x as usize);
+                            for channel in 0..self.in_channels {
+                                target[channel] += row[offset + channel];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        grad
+    }
+}
+
 /// Normalization over groups of channels, which is what an image model uses
 /// where a language model uses [`crate::norm::RmsNorm`].
 ///
@@ -533,6 +993,239 @@ pub fn pixel_unshuffle(map: &FeatureMap, factor: usize) -> Result<FeatureMap, Ne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimizers::Optimizer;
+    use rand::SeedableRng;
+
+    /// A deterministic batch of activations, spread either side of zero.
+    fn noise(
+        batch: usize,
+        height: usize,
+        width: usize,
+        channels: usize,
+        seed: usize,
+    ) -> ImageBatch {
+        let data = (0..batch * height * width * channels)
+            .map(|index| (((index * 37 + seed * 11) % 197) as f32 / 98.0) - 1.0)
+            .collect();
+        ImageBatch::from_tokens(
+            batch,
+            height,
+            width,
+            Matrix::from_vec(batch * height * width, channels, data),
+        )
+    }
+
+    /// Mean squared error against a fixed target, and its gradient.
+    fn mse(prediction: &ImageBatch, target: &ImageBatch) -> (f32, ImageBatch) {
+        let count = prediction.tokens.data.len() as f32;
+        let mut grad = prediction.like(prediction.channels());
+        let mut loss = 0.0;
+        for (index, (value, wanted)) in prediction
+            .tokens
+            .data
+            .iter()
+            .zip(&target.tokens.data)
+            .enumerate()
+        {
+            let difference = value - wanted;
+            loss += difference * difference / count;
+            grad.tokens.data[index] = 2.0 * difference / count;
+        }
+        (loss, grad)
+    }
+
+    /// One hundred Adam steps, returning the loss before each one.
+    fn loss_curve(
+        conv: &mut TrainableConv2d,
+        input: &ImageBatch,
+        target: &ImageBatch,
+        steps: usize,
+    ) -> Result<Vec<f32>, NetworkError> {
+        let optimizer = Optimizer::adam(1e-2);
+        let mut curve = Vec::with_capacity(steps);
+        for step in 1..=steps {
+            let (prediction, cache) = conv.forward(input)?;
+            let (loss, grad_output) = mse(&prediction, target);
+            curve.push(loss);
+            for param in conv.params_mut() {
+                param.zero_grad();
+            }
+            conv.backward(&cache, &grad_output)?;
+            for param in conv.params_mut() {
+                param.step(&optimizer, step, 1.0);
+            }
+        }
+        Ok(curve)
+    }
+
+    #[test]
+    fn a_trainable_convolution_matches_finite_differences() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let mut conv = TrainableConv2d::new(3, 4, 3, 1, &mut rng).unwrap();
+        let input = noise(2, 5, 6, 3, 1);
+        let target = noise(2, 5, 6, 4, 2);
+
+        let (prediction, cache) = conv.forward(&input).unwrap();
+        let (_, grad_output) = mse(&prediction, &target);
+        let grad_input = conv.backward(&cache, &grad_output).unwrap();
+
+        let epsilon = 1e-3;
+        for index in [0usize, 17, 43, 88] {
+            let mut moved = input.clone();
+            moved.tokens.data[index] += epsilon;
+            let (up, _) = conv.forward(&moved).unwrap();
+            moved.tokens.data[index] -= 2.0 * epsilon;
+            let (down, _) = conv.forward(&moved).unwrap();
+            let numerical = (mse(&up, &target).0 - mse(&down, &target).0) / (2.0 * epsilon);
+            let analytic = grad_input.tokens.data[index];
+            assert!(
+                (numerical - analytic).abs() < 1e-3,
+                "dL/dinput[{index}]: {analytic} against {numerical} by finite difference"
+            );
+        }
+
+        for index in [0usize, 7, 26] {
+            let mut moved = conv.clone();
+            moved.weight.weight.value.data[index] += epsilon;
+            let up = mse(&moved.forward(&input).unwrap().0, &target).0;
+            moved.weight.weight.value.data[index] -= 2.0 * epsilon;
+            let down = mse(&moved.forward(&input).unwrap().0, &target).0;
+            let numerical = (up - down) / (2.0 * epsilon);
+            let analytic = conv.weight.weight.grad.data[index];
+            assert!(
+                (numerical - analytic).abs() < 1e-3,
+                "dL/dweight[{index}]: {analytic} against {numerical} by finite difference"
+            );
+        }
+    }
+
+    #[test]
+    fn training_a_convolution_drives_its_loss_down() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        let mut conv = TrainableConv2d::new(8, 8, 3, 1, &mut rng).unwrap();
+        let input = noise(1, 8, 8, 8, 9);
+        let target = noise(1, 8, 8, 8, 10);
+        let curve = loss_curve(&mut conv, &input, &target, 20).unwrap();
+        assert!(
+            curve[19] < curve[0] / 4.0,
+            "twenty Adam steps went from {} to {}",
+            curve[0],
+            curve[19]
+        );
+    }
+
+    #[test]
+    fn a_strided_convolution_shrinks_the_map_and_still_reaches_every_pixel() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let mut conv = TrainableConv2d::new(2, 3, 3, 2, &mut rng).unwrap();
+        let input = noise(1, 8, 8, 2, 3);
+        let (output, cache) = conv.forward(&input).unwrap();
+        assert_eq!((output.height, output.width), (4, 4));
+
+        let grad_output = noise(1, 4, 4, 3, 4);
+        let grad_input = conv.backward(&cache, &grad_output).unwrap();
+        assert_eq!(grad_input.tokens.rows, input.tokens.rows);
+        assert!(
+            grad_input.tokens.data.iter().any(|value| *value != 0.0),
+            "a stride of two still reads most of the input"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_or_skip() -> Option<crate::param::CudaDevice> {
+        match crate::cuda_training::cuda_doctor(0, 4096) {
+            Ok(_) => Some(crate::param::CudaDevice::new(0, 4096).expect("the CUDA doctor passed")),
+            Err(NetworkError::Cuda(message))
+                if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
+            {
+                None
+            }
+            Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
+        }
+    }
+
+    /// The acceptance test for the device path: a 96-channel 3x3 convolution
+    /// over a 64x64 map trains on the device and its loss curve follows the
+    /// host's for a hundred steps.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_convolution_trained_on_the_device_follows_the_hosts_loss_curve() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(29);
+        let mut host = TrainableConv2d::new(96, 96, 3, 1, &mut rng).unwrap();
+        let mut resident = host.clone();
+        let input = noise(1, 64, 64, 96, 7);
+        let target = noise(1, 64, 64, 96, 8);
+
+        let on_host = loss_curve(&mut host, &input, &target, 100).unwrap();
+        resident.to_cuda_on(&device).unwrap();
+        let on_device = loss_curve(&mut resident, &input, &target, 100).unwrap();
+
+        assert!(
+            on_host[99] < on_host[0] / 2.0,
+            "the host path has to be learning"
+        );
+        for (step, (a, b)) in on_host.iter().zip(&on_device).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4 + 1e-3 * a.abs(),
+                "step {step}: {a} on the host against {b} on the device"
+            );
+        }
+
+        // And the weights themselves agree, not only the losses they produced.
+        resident.to_cpu().unwrap();
+        for (index, (a, b)) in host
+            .weight
+            .weight
+            .value
+            .data
+            .iter()
+            .zip(&resident.weight.weight.value.data)
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "weight[{index}]: {a} on the host against {b} on the device"
+            );
+        }
+    }
+
+    /// The host path is unchanged by a device being present, which is what
+    /// makes the parity test above meaningful.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn im2col_on_the_device_builds_the_same_columns_as_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(13);
+        let conv = TrainableConv2d::new(5, 7, 3, 2, &mut rng).unwrap();
+        let input = noise(2, 9, 11, 5, 6);
+        let shape = conv.geometry(input.batch, input.height, input.width);
+        let expected = conv.im2col(&input, &shape);
+
+        let context = device.context();
+        let resident = context.upload(&input.tokens).unwrap();
+        let columns = context.im2col(&resident, &shape).unwrap();
+        let mut actual = Matrix::new(expected.rows, expected.cols);
+        context.download(&columns, &mut actual).unwrap();
+        assert_eq!(actual.data, expected.data);
+
+        // col2im is its transpose, so scattering the columns back has to match
+        // the host's scatter exactly too.
+        let scattered = context.col2im(&columns, &shape).unwrap();
+        let mut actual = Matrix::new(input.tokens.rows, input.tokens.cols);
+        context.download(&scattered, &mut actual).unwrap();
+        let expected = conv.col2im(&expected, &shape);
+        for (index, (a, b)) in actual.data.iter().zip(&expected.tokens.data).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "col2im[{index}]: {a} on the device against {b} on the host"
+            );
+        }
+    }
 
     fn ramp(channels: usize, height: usize, width: usize) -> FeatureMap {
         let data = (0..channels * height * width)
