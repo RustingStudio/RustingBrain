@@ -59,7 +59,19 @@ name = "text_to_image"
 required-features = ["images"]
 
 [[example]]
+name = "vit_tokens"
+required-features = ["images"]
+
+[[example]]
+name = "image_to_3d"
+required-features = ["images"]
+
+[[example]]
 name = "cuda_training_smoke"
+required-features = ["cuda"]
+
+[[example]]
+name = "profile_shape"
 required-features = ["cuda"]
 
 [[example]]

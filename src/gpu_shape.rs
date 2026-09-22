@@ -21,17 +21,19 @@
 //! attention it feeds, and moving it would need a kernel plus a second copy of
 //! the layout. Move it when a profile says the host is the ceiling.
 //!
-//! # Shapes, not batches
+//! # Packed batches
 //!
-//! One call is one shape, as on the host: [`ShapeVae::encode_train`] takes a
-//! single point cloud. The device could pack a batch into `sequences`, but the
-//! host API would have to grow a batched entry point for it. NOTE: this
-//! leaves the per-step launch count proportional to the batch size. Pack the
-//! batch when the profile says the launches, not the GEMMs, are the cost.
+//! The ordinary API still accepts one shape, but the training driver packs
+//! short equal-sized point clouds: they become independent `sequences` inside
+//! one set of projection and attention launches. Very large query sets remain
+//! shape-at-a-time because their combined attention workspace costs more than
+//! the saved launches.
 //!
 //! # Precision
 //!
-//! FP32 throughout, following [`crate::gpu_cross`].
+//! Master weights, buffers and accumulators stay FP32. By default, cuBLAS
+//! rounds GEMM multiplier inputs for BF16 tensor-core kernels; parity tests opt
+//! back into the exact FP32 path.
 
 use crate::gpu_cross::{self, CrossCache, CrossShape};
 use crate::gpu_model::{Act, Gpu, SwiGluCache, backward_swiglu, forward_swiglu};
@@ -189,13 +191,15 @@ fn block_forward(
     gpu: &Gpu<'_>,
     block: &Block,
     hidden: CudaSlice<f32>,
-    rows: usize,
+    sequence_len: usize,
+    sequences: usize,
     width: usize,
 ) -> Result<(CudaSlice<f32>, GpuBlockCache), NetworkError> {
+    let rows = sequence_len * sequences;
     let shape = CrossShape {
-        q_len: rows,
-        kv_len: rows,
-        sequences: 1,
+        q_len: sequence_len,
+        kv_len: sequence_len,
+        sequences,
     };
     let attention_norm = normalize(gpu, &block.attention_norm, hidden, rows, width)?;
     // Queries and keys are the same activations here, which is what makes
@@ -232,9 +236,11 @@ fn block_backward(
     grad_output: &CudaSlice<f32>,
     grad_norms: &mut CudaSlice<f32>,
     at: usize,
-    rows: usize,
+    sequence_len: usize,
+    sequences: usize,
     width: usize,
 ) -> Result<CudaSlice<f32>, NetworkError> {
+    let rows = sequence_len * sequences;
     let grad_branch = gpu.narrowed(&grad_output.slice(..), rows * width, false)?;
     let mut grad_normed = gpu.uninit(rows * width)?;
     backward_swiglu(
@@ -282,6 +288,7 @@ pub(crate) struct GpuEncoderCache {
     encoder_norm: Normed,
     to_moments: Projection,
     points: usize,
+    sequences: usize,
 }
 
 /// [`ShapeVae::encode_train`] with everything but the features on the device.
@@ -290,19 +297,40 @@ pub(crate) fn encode_train(
     context: &Arc<GpuContext>,
     surface: &Matrix,
 ) -> Result<(Matrix, Matrix, GpuEncoderCache), NetworkError> {
+    encode_train_batch(model, context, surface, 1)
+}
+
+/// Batched [`encode_train`]. Every sequence has the same number of surface
+/// points and produces one contiguous block of latent rows.
+pub(crate) fn encode_train_batch(
+    model: &ShapeVae,
+    context: &Arc<GpuContext>,
+    surface: &Matrix,
+    sequences: usize,
+) -> Result<(Matrix, Matrix, GpuEncoderCache), NetworkError> {
+    if sequences == 0 || surface.rows == 0 || surface.rows % sequences != 0 {
+        return Err(NetworkError::InvalidConfig(format!(
+            "{} surface rows cannot be split across {sequences} shapes",
+            surface.rows
+        )));
+    }
     let gpu = Gpu { context };
     let config = *model.config();
     let (latents, width) = (config.latents, config.d_model);
 
     let features = model.surface_features(surface)?;
-    let points = features.rows;
+    let points = features.rows / sequences;
+    let feature_rows = features.rows;
     let features = gpu.upload(&features.data)?;
     let surface_in = Projection::new(&gpu, &model.surface_in)?;
-    let tokens = surface_in.forward(&gpu, &bytes(&features), points)?;
+    let tokens = surface_in.forward(&gpu, &bytes(&features), feature_rows)?;
 
     // The learned queries are the whole compression: however many surface
     // points came in, exactly `latents` rows come out.
-    let queries = gpu.upload(&model.latent_queries.value.data)?;
+    let repeated_queries: Vec<f32> = (0..sequences)
+        .flat_map(|_| model.latent_queries.value.data.iter().copied())
+        .collect();
+    let queries = gpu.upload(&repeated_queries)?;
     let (crossed, cross) = gpu_cross::forward(
         &gpu,
         &model.read_surface,
@@ -311,23 +339,24 @@ pub(crate) fn encode_train(
         CrossShape {
             q_len: latents,
             kv_len: points,
-            sequences: 1,
+            sequences,
         },
     )?;
     let mut hidden = crossed;
-    gpu.add(&mut hidden, &queries, 0, latents * width, true)?;
+    let latent_rows = sequences * latents;
+    gpu.add(&mut hidden, &queries, 0, latent_rows * width, true)?;
 
     let mut blocks = Vec::with_capacity(model.blocks.len());
     for block in &model.blocks {
-        let (output, cache) = block_forward(&gpu, block, hidden, latents, width)?;
+        let (output, cache) = block_forward(&gpu, block, hidden, latents, sequences, width)?;
         hidden = output;
         blocks.push(cache);
     }
 
-    let encoder_norm = normalize(&gpu, &model.encoder_norm, hidden, latents, width)?;
+    let encoder_norm = normalize(&gpu, &model.encoder_norm, hidden, latent_rows, width)?;
     let to_moments = Projection::new(&gpu, &model.to_moments)?;
-    let moments = to_moments.forward(&gpu, &encoder_norm.normed.all(), latents)?;
-    let moments = Matrix::from_vec(latents, 2 * config.latent_dim, gpu.download(&moments)?);
+    let moments = to_moments.forward(&gpu, &encoder_norm.normed.all(), latent_rows)?;
+    let moments = Matrix::from_vec(latent_rows, 2 * config.latent_dim, gpu.download(&moments)?);
     let (mean, log_variance) = split(&moments);
 
     Ok((
@@ -340,6 +369,7 @@ pub(crate) fn encode_train(
             encoder_norm,
             to_moments,
             points,
+            sequences,
         },
     ))
 }
@@ -355,6 +385,7 @@ pub(crate) fn encode_backward(
     let gpu = Gpu { context };
     let config = *model.config();
     let (latents, width) = (config.latents, config.d_model);
+    let latent_rows = latents * cache.sequences;
 
     // One buffer for every norm scale in the stack, downloaded once at the end:
     // a download in the middle of the pass drains the stream.
@@ -368,7 +399,7 @@ pub(crate) fn encode_backward(
         &mut model.to_moments,
         &bytes(&grad_moments),
         &cache.encoder_norm.normed.all(),
-        latents,
+        latent_rows,
     )?;
     let mut grad = denormalize(
         &gpu,
@@ -376,7 +407,7 @@ pub(crate) fn encode_backward(
         &grad_normed,
         &mut grad_norms.slice_mut(..width),
         None,
-        latents,
+        latent_rows,
         width,
     )?;
 
@@ -391,6 +422,7 @@ pub(crate) fn encode_backward(
             &mut grad_norms,
             width + 2 * index * width,
             latents,
+            cache.sequences,
             width,
         )?;
     }
@@ -399,7 +431,7 @@ pub(crate) fn encode_backward(
         gpu_cross::backward(&gpu, &mut model.read_surface, &cache.cross, &grad)?;
     // The queries sit on the residual path, so they take both shares.
     let mut grad_queries = grad_queries;
-    gpu.add(&mut grad_queries, &grad, 0, latents * width, true)?;
+    gpu.add(&mut grad_queries, &grad, 0, latent_rows * width, true)?;
 
     // The projection wants its weight gradient; its input gradient is the
     // gradient with respect to the surface points, which nothing reads.
@@ -408,14 +440,16 @@ pub(crate) fn encode_backward(
         &bytes(&grad_tokens),
         &bytes(&cache.features),
         false,
-        cache.points,
+        cache.points * cache.sequences,
     )?;
 
     let grad_queries = gpu.download(&grad_queries)?;
     let scales = gpu.download(&grad_norms)?;
     if !model.latent_queries.is_frozen() {
-        for (slot, value) in model.latent_queries.grad.data.iter_mut().zip(&grad_queries) {
-            *slot += value;
+        for sequence in grad_queries.chunks_exact(latents * width) {
+            for (slot, value) in model.latent_queries.grad.data.iter_mut().zip(sequence) {
+                *slot += value;
+            }
         }
     }
     Gpu::accumulate_host_grad(&mut model.encoder_norm.weight, &scales[..width]);
@@ -444,6 +478,7 @@ pub(crate) struct GpuDecoderCache {
     head: Projection,
     color_head: Projection,
     rows: usize,
+    sequences: usize,
 }
 
 /// [`ShapeVae::decode_train`] on the device, for one chunk of query points.
@@ -453,22 +488,43 @@ pub(crate) fn decode_train(
     latent: &Matrix,
     queries: &Matrix,
 ) -> Result<(Vec<f32>, GpuDecoderCache), NetworkError> {
+    decode_train_batch(model, context, latent, queries, 1)
+}
+
+/// Batched [`decode_train`]. Latents and queries are grouped into the same
+/// number of equal-sized sequences.
+pub(crate) fn decode_train_batch(
+    model: &ShapeVae,
+    context: &Arc<GpuContext>,
+    latent: &Matrix,
+    queries: &Matrix,
+    sequences: usize,
+) -> Result<(Vec<f32>, GpuDecoderCache), NetworkError> {
     let gpu = Gpu { context };
     let config = *model.config();
     let (latents, width) = (config.latents, config.d_model);
-    if latent.rows != latents || latent.cols != config.latent_dim {
+    if sequences == 0
+        || latent.rows != sequences * latents
+        || latent.cols != config.latent_dim
+        || queries.rows == 0
+        || queries.rows % sequences != 0
+    {
         return Err(NetworkError::InvalidConfig(format!(
-            "the latent is [{}, {}] and this model's is [{}, {}]",
-            latent.rows, latent.cols, latents, config.latent_dim
+            "the batch has {} latent rows and {} query rows for {sequences} shapes; expected {} latent rows and equal query counts",
+            latent.rows,
+            queries.rows,
+            sequences * latents,
         )));
     }
 
     let latent_device = gpu.upload(&latent.data)?;
     let from_latent = Projection::new(&gpu, &model.from_latent)?;
-    let kv = from_latent.forward(&gpu, &bytes(&latent_device), latents)?;
+    let latent_rows = sequences * latents;
+    let kv = from_latent.forward(&gpu, &bytes(&latent_device), latent_rows)?;
 
     let features = fourier_features(queries, config.frequencies)?;
     let rows = features.rows;
+    let query_rows = rows / sequences;
     let features = gpu.upload(&features.data)?;
     let query_in = Projection::new(&gpu, &model.query_in)?;
     let embedded = query_in.forward(&gpu, &bytes(&features), rows)?;
@@ -479,9 +535,9 @@ pub(crate) fn decode_train(
         &embedded.slice(..),
         &kv.slice(..),
         CrossShape {
-            q_len: rows,
+            q_len: query_rows,
             kv_len: latents,
-            sequences: 1,
+            sequences,
         },
     )?;
     let mut residual = crossed;
@@ -521,6 +577,7 @@ pub(crate) fn decode_train(
             head,
             color_head: Projection::new(&gpu, &model.color_head)?,
             rows,
+            sequences,
         },
     ))
 }
@@ -547,6 +604,7 @@ pub(crate) fn decode_backward(
     let gpu = Gpu { context };
     let config = *model.config();
     let (latents, width, rows) = (config.latents, config.d_model, cache.rows);
+    let latent_rows = latents * cache.sequences;
     if grad_distances.len() != rows {
         return Err(NetworkError::InvalidConfig(format!(
             "{rows} query points were decoded and {} gradients came back",
@@ -637,9 +695,9 @@ pub(crate) fn decode_backward(
         &mut model.from_latent,
         &bytes(&grad_kv),
         &bytes(&cache.latent),
-        latents,
+        latent_rows,
     )?;
-    let grad_latent = Matrix::from_vec(latents, config.latent_dim, gpu.download(&grad_latent)?);
+    let grad_latent = Matrix::from_vec(latent_rows, config.latent_dim, gpu.download(&grad_latent)?);
 
     let scales = gpu.download(&grad_norms)?;
     Gpu::accumulate_host_grad(&mut model.decoder_norm.weight, &scales[..width]);
@@ -831,6 +889,87 @@ mod tests {
                 &param.grad.data,
                 host,
                 1e-4,
+            );
+        }
+    }
+
+    /// Packing shapes must only change launch geometry, not sequence
+    /// boundaries or the gradients accumulated for shared parameters.
+    #[test]
+    fn a_packed_batch_matches_sequential_device_steps_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+
+        let mut rng = StdRng::seed_from_u64(31);
+        let base = ShapeVae::new(tiny(), &mut rng).unwrap();
+        let mut sequential = base.clone();
+        let mut packed = base;
+        sequential.to_cuda_with_precision(0, 0, false).unwrap();
+        packed.to_cuda_with_precision(0, 0, false).unwrap();
+
+        let shapes = 2;
+        let points = 20;
+        let query_rows = 12;
+        let surface = rows(shapes * points, 6, 32);
+        let queries = rows(shapes * query_rows, 3, 33);
+        let upstream: Vec<f32> = (0..shapes * query_rows)
+            .map(|i| ((i * 7) % 11) as f32 / 13.0)
+            .collect();
+
+        let mut sequential_mean = Vec::new();
+        let mut sequential_distances = Vec::new();
+        for shape in 0..shapes {
+            let take = |matrix: &Matrix, rows: usize| {
+                Matrix::from_vec(
+                    rows,
+                    matrix.cols,
+                    matrix.data[shape * rows * matrix.cols..(shape + 1) * rows * matrix.cols]
+                        .to_vec(),
+                )
+            };
+            let (mean, _, encoder) = sequential.encode_train(&take(&surface, points)).unwrap();
+            let (distance, decoder) = sequential
+                .decode_train(&mean, &take(&queries, query_rows))
+                .unwrap();
+            let grad_latent = sequential
+                .decode_backward(
+                    &decoder,
+                    &upstream[shape * query_rows..(shape + 1) * query_rows],
+                )
+                .unwrap();
+            let zero = Matrix::new(mean.rows, mean.cols);
+            sequential
+                .encode_backward(&encoder, &grad_latent, &zero)
+                .unwrap();
+            sequential_mean.extend(mean.data);
+            sequential_distances.extend(distance);
+        }
+
+        let (mean, _, encoder) = packed.encode_train_batch(&surface, shapes).unwrap();
+        let (distances, decoder) = packed.decode_train_batch(&mean, &queries, shapes).unwrap();
+        let grad_latent = packed.decode_backward(&decoder, &upstream).unwrap();
+        let zero = Matrix::new(mean.rows, mean.cols);
+        packed
+            .encode_backward(&encoder, &grad_latent, &zero)
+            .unwrap();
+
+        assert_close("packed means", &mean.data, &sequential_mean, 1e-4);
+        assert_close("packed distances", &distances, &sequential_distances, 1e-4);
+
+        sequential.to_cpu().unwrap();
+        packed.to_cpu().unwrap();
+        let expected: Vec<Vec<f32>> = sequential
+            .params_mut()
+            .iter()
+            .map(|param| param.grad.data.clone())
+            .collect();
+        for (index, (param, expected)) in packed.params_mut().iter().zip(&expected).enumerate() {
+            assert_close(
+                &format!("packed gradient {index}"),
+                &param.grad.data,
+                expected,
+                2e-4,
             );
         }
     }
