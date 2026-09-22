@@ -540,6 +540,13 @@ impl DeviceParam {
         self.context.download(&self.value, target)
     }
 
+    /// Replaces the resident weights, for a caller that computed new ones on
+    /// the host — restoring a snapshot, or standing an averaged weight in.
+    pub(crate) fn upload_value(&mut self, value: &Matrix) -> Result<(), NetworkError> {
+        self.value = self.context.upload(value)?;
+        Ok(())
+    }
+
     /// The Adam moments, for a training run that persists optimizer state so a
     /// resumed run does not restart the optimizer from zero.
     pub(crate) fn download_moments(

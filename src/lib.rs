@@ -109,6 +109,7 @@ pub mod clip;
 pub mod conv;
 pub mod dataset;
 pub mod diffusion;
+pub mod ema;
 pub mod embedding;
 pub mod ffn;
 pub mod flow_transformer;
@@ -192,6 +193,7 @@ pub use dataset::{
     BatchCursor, BatchSource, Dataset, DatasetBatch, DatasetStream, JsonlStream, Standardizer,
 };
 pub use diffusion::{Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_from};
+pub use ema::Ema;
 pub use embedding::Embedding;
 pub use ffn::{GeluMlp, SwiGlu};
 pub use flow_transformer::{
