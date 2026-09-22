@@ -206,7 +206,9 @@ pub use gpu_transformer::GpuContext;
 pub use losses::Loss;
 pub use masked_lm::{MaskedBatch, masked_lm_loss};
 pub use matrix::Matrix;
-pub use mesh::{Bvh, Mesh, QuerySampling, Transform, marching_tetrahedra};
+pub use mesh::{
+    Bvh, Mesh, QuerySampling, Transform, marching_tetrahedra, marching_tetrahedra_sparse,
+};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_training::{MetalTrainingSession, metal_doctor};
 pub use mmdit::{Conditioning, Dit, DitConfig};
