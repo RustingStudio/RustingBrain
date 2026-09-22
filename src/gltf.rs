@@ -31,7 +31,10 @@ pub struct Glb {
 
 const MAGIC: u32 = 0x4654_6C67;
 const JSON_CHUNK: u32 = 0x4E4F_534A;
-const BINARY_CHUNK: u32 = 0x0000_4E42;
+const BINARY_CHUNK: u32 = 0x004E_4942;
+/// What this writer emitted before: the four bytes `BIN\0` read as two. Files
+/// written then are still read, because nothing else about them was wrong.
+const LEGACY_BINARY_CHUNK: u32 = 0x0000_4E42;
 
 impl Glb {
     /// Reads a `.glb` file.
@@ -71,7 +74,7 @@ impl Glb {
                 .ok_or_else(|| NetworkError::InvalidDataset("a chunk runs past the file".into()))?;
             match kind {
                 JSON_CHUNK => json = Some(serde_json::from_slice::<Value>(chunk)?),
-                BINARY_CHUNK => binary = chunk.to_vec(),
+                BINARY_CHUNK | LEGACY_BINARY_CHUNK => binary = chunk.to_vec(),
                 // Unknown chunk types are to be skipped, says the format.
                 _ => {}
             }
