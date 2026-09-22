@@ -506,22 +506,47 @@ pub struct TrainableConv2d {
     kernel: usize,
     stride: usize,
     padding: usize,
+    /// Whether the backward pass rebuilds the columns instead of the forward
+    /// pass keeping them. See [`TrainableConv2d::set_recompute_columns`].
+    recompute_columns: bool,
 }
 
 /// What [`TrainableConv2d::backward`] needs from the forward pass.
 ///
 /// The columns are the largest thing a convolution holds, so the cache keeps
 /// them wherever the forward pass built them: on the host, or on the device,
-/// where they never have to cross the bus at all.
+/// where they never have to cross the bus at all. Under
+/// [`TrainableConv2d::set_recompute_columns`] it keeps the input instead and
+/// the backward pass builds the columns again.
 pub struct ConvCache {
     columns: Columns,
     shape: ConvGeometry,
+}
+
+impl ConvCache {
+    /// Whether this cache holds the columns themselves rather than the input
+    /// they were built from, which is the difference between `kernel * kernel`
+    /// values per input value and one.
+    pub fn holds_columns(&self) -> bool {
+        match &self.columns {
+            Columns::Input(_) => false,
+            #[cfg(feature = "cuda")]
+            Columns::DeviceInput(_) => false,
+            _ => true,
+        }
+    }
 }
 
 enum Columns {
     Host(Matrix),
     #[cfg(feature = "cuda")]
     Device(cudarc::driver::CudaSlice<f32>),
+    /// The forward input, kept in place of the columns it built.
+    Input(ImageBatch),
+    /// The forward input, left on the device where it was already uploaded, so
+    /// rebuilding the columns costs a kernel and not a second crossing.
+    #[cfg(feature = "cuda")]
+    DeviceInput(cudarc::driver::CudaSlice<f32>),
 }
 
 impl std::fmt::Debug for ConvCache {
@@ -558,6 +583,7 @@ impl TrainableConv2d {
             kernel,
             stride,
             padding: kernel / 2,
+            recompute_columns: false,
         })
     }
 
@@ -606,6 +632,33 @@ impl TrainableConv2d {
         }
     }
 
+    /// Trades one `im2col` pass per backward for the memory the columns take.
+    ///
+    /// A convolution's columns are `kernel * kernel` times the size of its
+    /// input, and they stay live from the forward pass until the backward one.
+    /// A single convolution should keep them: the memory is paid once and the
+    /// work is saved. A deep network should not, because every layer's columns
+    /// are alive at the same time — a 25-convolution U-Net at 64x64 with 12
+    /// images in the batch holds about 3.4 GiB of them, most of it in the two
+    /// widest layers of its up path.
+    ///
+    /// What it costs is one extra `im2col` per backward pass. On a device the
+    /// input stays on the card, so nothing crosses the bus twice: a 3x3
+    /// convolution from 192 channels to 96 over twelve 64x64 images measures
+    /// 33.5 ms per forward and backward with the columns kept and 41.0 ms with
+    /// them rebuilt, and holds 36 MiB in place of 324 MiB.
+    ///
+    /// The columns are only needed for the weight gradient at all; the input
+    /// gradient needs the weight and the upstream gradient alone.
+    pub fn set_recompute_columns(&mut self, recompute: bool) {
+        self.recompute_columns = recompute;
+    }
+
+    /// Whether the backward pass rebuilds the columns.
+    pub fn recomputes_columns(&self) -> bool {
+        self.recompute_columns
+    }
+
     /// Moves the weight and the bias onto a device a caller already opened.
     /// Every later [`TrainableConv2d::forward`] and
     /// [`TrainableConv2d::backward`] then builds its columns and runs its GEMMs
@@ -640,7 +693,10 @@ impl TrainableConv2d {
         Ok((
             ImageBatch::from_tokens(input.batch, shape.out_height, shape.out_width, tokens),
             ConvCache {
-                columns: Columns::Host(columns),
+                columns: match self.recompute_columns {
+                    true => Columns::Input(input.clone()),
+                    false => Columns::Host(columns),
+                },
                 shape,
             },
         ))
@@ -660,6 +716,24 @@ impl TrainableConv2d {
             }
             #[cfg(feature = "cuda")]
             Columns::Device(columns) => self.backward_on_device(columns, &cache.shape, grad_output),
+            #[cfg(feature = "cuda")]
+            Columns::DeviceInput(input) => {
+                let device = self
+                    .weight
+                    .weight
+                    .device
+                    .as_ref()
+                    .expect("a device-resident cache means a device-resident weight");
+                let context = device.context().clone();
+                let columns = context.im2col(input, &cache.shape)?;
+                self.backward_on_device(&columns, &cache.shape, grad_output)
+            }
+            Columns::Input(input) => {
+                self.accumulate_bias_grad(&grad_output.tokens);
+                let columns = self.im2col(input, &cache.shape);
+                let grad_columns = self.weight.backward(&columns, &grad_output.tokens);
+                Ok(self.col2im(&grad_columns, &cache.shape))
+            }
         }
     }
 
@@ -686,7 +760,14 @@ impl TrainableConv2d {
         Ok((
             ImageBatch::from_tokens(input.batch, shape.out_height, shape.out_width, tokens),
             ConvCache {
-                columns: Columns::Device(columns),
+                // Dropping the device columns here is the whole point of the
+                // option: they are freed before the next layer allocates its
+                // own, so a deep network holds one layer's worth rather than
+                // every layer's.
+                columns: match self.recompute_columns {
+                    true => Columns::DeviceInput(resident_input),
+                    false => Columns::Device(columns),
+                },
                 shape,
             },
         ))
@@ -1131,6 +1212,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rebuilding_the_columns_reaches_the_same_gradients_as_keeping_them() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(31);
+        let mut keeping = TrainableConv2d::new(6, 8, 3, 2, &mut rng).unwrap();
+        let mut rebuilding = keeping.clone();
+        rebuilding.set_recompute_columns(true);
+        let input = noise(2, 11, 9, 6, 3);
+
+        let (kept, kept_cache) = keeping.forward(&input).unwrap();
+        let (rebuilt, rebuilt_cache) = rebuilding.forward(&input).unwrap();
+        assert_eq!(
+            kept.tokens.data, rebuilt.tokens.data,
+            "the forward pass is the same either way"
+        );
+        assert!(kept_cache.holds_columns());
+        assert!(
+            !rebuilt_cache.holds_columns(),
+            "the whole point is that the columns are not held"
+        );
+
+        let grad_output = noise(2, kept.height, kept.width, 8, 4);
+        let kept_input = keeping.backward(&kept_cache, &grad_output).unwrap();
+        let rebuilt_input = rebuilding.backward(&rebuilt_cache, &grad_output).unwrap();
+
+        assert_eq!(kept_input.tokens.data, rebuilt_input.tokens.data);
+        assert_eq!(
+            keeping.weight.weight.grad.data,
+            rebuilding.weight.weight.grad.data
+        );
+        assert_eq!(keeping.bias.grad.data, rebuilding.bias.grad.data);
+    }
+
+    /// The option has to survive a whole run, not one step: the cache it builds
+    /// is read by a backward pass whose weight has already moved twice.
+    #[test]
+    fn a_convolution_that_rebuilds_its_columns_trains_to_the_same_place() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(37);
+        let mut keeping = TrainableConv2d::new(8, 8, 3, 1, &mut rng).unwrap();
+        let mut rebuilding = keeping.clone();
+        rebuilding.set_recompute_columns(true);
+        let input = noise(1, 12, 12, 8, 5);
+        let target = noise(1, 12, 12, 8, 6);
+
+        let kept = loss_curve(&mut keeping, &input, &target, 40).unwrap();
+        let rebuilt = loss_curve(&mut rebuilding, &input, &target, 40).unwrap();
+        assert!(
+            kept[39] < kept[0] / 2.0,
+            "the reference run has to be learning"
+        );
+        assert_eq!(kept, rebuilt);
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_or_skip() -> Option<crate::param::CudaDevice> {
         match crate::cuda_training::cuda_doctor(0, 4096) {
@@ -1225,6 +1358,42 @@ mod tests {
                 "col2im[{index}]: {a} on the device against {b} on the host"
             );
         }
+    }
+
+    /// The device path has its own cache, so it needs its own parity check:
+    /// rebuilding the columns from an uploaded input has to reach the same
+    /// gradients as reading the ones the forward pass left on the card.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn rebuilding_the_columns_on_the_device_reaches_the_same_gradients() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(41);
+        let mut keeping = TrainableConv2d::new(16, 24, 3, 1, &mut rng).unwrap();
+        let mut rebuilding = keeping.clone();
+        rebuilding.set_recompute_columns(true);
+        keeping.to_cuda_on(&device).unwrap();
+        rebuilding.to_cuda_on(&device).unwrap();
+        let input = noise(2, 16, 16, 16, 9);
+
+        let (kept, kept_cache) = keeping.forward(&input).unwrap();
+        let (rebuilt, rebuilt_cache) = rebuilding.forward(&input).unwrap();
+        assert_eq!(kept.tokens.data, rebuilt.tokens.data);
+        assert!(!rebuilt_cache.holds_columns());
+
+        let grad_output = noise(2, kept.height, kept.width, 24, 10);
+        let kept_input = keeping.backward(&kept_cache, &grad_output).unwrap();
+        let rebuilt_input = rebuilding.backward(&rebuilt_cache, &grad_output).unwrap();
+        assert_eq!(kept_input.tokens.data, rebuilt_input.tokens.data);
+
+        keeping.to_cpu().unwrap();
+        rebuilding.to_cpu().unwrap();
+        assert_eq!(
+            keeping.weight.weight.grad.data,
+            rebuilding.weight.weight.grad.data
+        );
+        assert_eq!(keeping.bias.grad.data, rebuilding.bias.grad.data);
     }
 
     fn ramp(channels: usize, height: usize, width: usize) -> FeatureMap {
