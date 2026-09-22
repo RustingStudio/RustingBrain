@@ -5,8 +5,26 @@
 //! transformer layers are a deeper tree of modules, so they carry their
 //! gradient and optimizer state next to the weight instead and store the plain
 //! derivative `dL/dw`, which the update rule subtracts.
+//!
+//! # Putting weights on a device
+//!
+//! [`Param::to_cuda`] moves one parameter, and a model of two hundred
+//! parameters wants one device context, not two hundred. The way to get that
+//! here is [`CudaDevice`]: an opaque handle a caller builds once and passes to
+//! [`Param::to_cuda_on`] or [`Linear::to_cuda_on`] for every weight in turn.
+//!
+//! A handle, rather than a builder taking `&mut [&mut Param]`, because a model
+//! is a tree: its weights live in nested structs and a caller reaches them by
+//! walking that tree, not by collecting every one of them into a slice first.
+//! Borrowing them all at once to hand to a builder means either a
+//! `params_mut()` on every module or a borrow that outlives the walk. A handle
+//! is `&`-shared, so it rides along the walk and each module moves its own
+//! weights. It also gives the budget somewhere to live: the handle keeps a
+//! running total of what it has put on the device and refuses the parameter
+//! that would cross the budget, which a per-parameter budget cannot do.
 
 use crate::matrix::Matrix;
+use crate::network::NetworkError;
 use crate::optimizers::Optimizer;
 use rand::{Rng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -53,6 +71,115 @@ pub struct Param {
     /// Not serialized: it is a property of a run, not of the weights.
     #[serde(skip)]
     fake_quantize: bool,
+}
+
+/// A device, held open so many parameters can share one context.
+///
+/// Building a [`crate::gpu_transformer::GpuContext`] costs a CUDA stream, a
+/// cuBLAS handle and a module lookup per kernel, so a model moves onto the
+/// device through one of these rather than one context per weight. See the
+/// module documentation for why this is a handle and not a builder.
+///
+/// Fails closed: without the `cuda` feature [`CudaDevice::new`] returns
+/// [`NetworkError::CudaFeatureDisabled`] rather than leaving the weights on the
+/// host and saying nothing.
+#[derive(Debug)]
+pub struct CudaDevice {
+    #[cfg(feature = "cuda")]
+    context: std::sync::Arc<crate::gpu_transformer::GpuContext>,
+    /// Zero means no budget, matching
+    /// [`TransformerLm::to_cuda`](crate::transformer::TransformerLm::to_cuda).
+    budget_mib: usize,
+    reserved_bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl CudaDevice {
+    /// Opens `device` and holds it. `memory_budget_mib` of zero means no
+    /// budget; otherwise the handle refuses the parameter that would take its
+    /// running total past the budget.
+    ///
+    /// The budget counts what the parameters themselves take. Activations,
+    /// workspaces and the driver's own overhead are not in it, so a budget set
+    /// to the whole card will still run out of memory.
+    pub fn new(device: usize, memory_budget_mib: usize) -> Result<Self, NetworkError> {
+        #[cfg(feature = "cuda")]
+        {
+            Ok(Self {
+                context: crate::gpu_transformer::GpuContext::new(device)?,
+                budget_mib: memory_budget_mib,
+                reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (device, memory_budget_mib);
+            Err(NetworkError::CudaFeatureDisabled)
+        }
+    }
+
+    /// As [`CudaDevice::new`], but cuBLAS runs its GEMMs on the tensor cores in
+    /// TF32. See
+    /// [`TransformerBuilder::mixed_precision`](crate::transformer::TransformerBuilder::mixed_precision)
+    /// for what that costs in accuracy.
+    pub fn with_mixed_precision(
+        device: usize,
+        memory_budget_mib: usize,
+    ) -> Result<Self, NetworkError> {
+        #[cfg(feature = "cuda")]
+        {
+            Ok(Self {
+                context: crate::gpu_transformer::GpuContext::with_precision(device, true)?,
+                budget_mib: memory_budget_mib,
+                reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (device, memory_budget_mib);
+            Err(NetworkError::CudaFeatureDisabled)
+        }
+    }
+
+    /// The budget this handle was opened with, in MiB. Zero means no budget.
+    pub fn budget_mib(&self) -> usize {
+        self.budget_mib
+    }
+
+    /// What the parameters moved through this handle so far take on the
+    /// device, in MiB.
+    pub fn reserved_mib(&self) -> usize {
+        self.reserved_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .div_ceil(1024 * 1024)
+    }
+
+    /// Gives back the room a parameter took when it moves back to the host, so
+    /// a handle that moves a model on and off the device does not drift up to
+    /// its budget.
+    #[cfg(feature = "cuda")]
+    fn release(&self, bytes: usize) {
+        self.reserved_bytes
+            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Books `bytes` against the budget, or refuses before anything is
+    /// allocated.
+    #[cfg(feature = "cuda")]
+    fn reserve(&self, bytes: usize) -> Result<(), NetworkError> {
+        let total = bytes
+            + self
+                .reserved_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        let estimated_mib = total.div_ceil(1024 * 1024);
+        if self.budget_mib > 0 && estimated_mib > self.budget_mib {
+            self.release(bytes);
+            return Err(NetworkError::CudaMemoryBudget {
+                estimated_mib,
+                budget_mib: self.budget_mib,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl From<Matrix> for Param {
@@ -191,6 +318,79 @@ impl Param {
             return;
         }
         self.grad.zeros();
+    }
+
+    /// What this parameter takes on a device: the weight, and unless it is
+    /// frozen its gradient and both Adam moments.
+    #[cfg(feature = "cuda")]
+    fn device_bytes(&self) -> usize {
+        let buffers = if self.frozen { 1 } else { 4 };
+        self.value.data.len() * 4 * buffers
+    }
+
+    /// Moves the parameter onto `device` and keeps it there until
+    /// [`Param::to_cpu`].
+    ///
+    /// While it is resident the device owns the weights: the host `value`,
+    /// `grad` and moments are stale, and [`Linear::forward`] and
+    /// [`Linear::backward`] run their GEMMs on the device.
+    ///
+    /// A model with more than one parameter should open a [`CudaDevice`] once
+    /// and use [`Param::to_cuda_on`] instead; this builds a context, and a
+    /// context per weight is the thing that makes a two-hundred-parameter model
+    /// slow to start.
+    ///
+    /// Fails closed: built without the `cuda` feature this returns
+    /// [`NetworkError::CudaFeatureDisabled`] rather than staying on the host
+    /// and saying nothing.
+    pub fn to_cuda(
+        &mut self,
+        device: usize,
+        memory_budget_mib: usize,
+    ) -> Result<(), crate::network::NetworkError> {
+        self.to_cuda_on(&CudaDevice::new(device, memory_budget_mib)?)
+    }
+
+    /// [`Param::to_cuda`] onto a device a caller already opened.
+    pub fn to_cuda_on(&mut self, device: &CudaDevice) -> Result<(), crate::network::NetworkError> {
+        if self.quantized.is_some() {
+            return Err(crate::network::NetworkError::UnsupportedCuda(
+                "a quantized parameter on a device: the device path trains in FP32 and the \
+                 int8 weights cannot be recovered"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if self.device.is_some() {
+                return Ok(());
+            }
+            let bytes = self.device_bytes();
+            device.reserve(bytes)?;
+            if let Err(error) = self.move_to_cuda(&device.context) {
+                device.release(bytes);
+                return Err(error);
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device;
+            Err(crate::network::NetworkError::CudaFeatureDisabled)
+        }
+    }
+
+    /// Copies the weights and gradient back from the device and drops the
+    /// mirror. A parameter that was never on a device is left alone.
+    pub fn to_cpu(&mut self) -> Result<(), crate::network::NetworkError> {
+        #[cfg(feature = "cuda")]
+        {
+            self.move_to_cpu()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Ok(())
+        }
     }
 
     /// Uploads the parameter and keeps it resident until [`Param::move_to_cpu`].
@@ -586,6 +786,38 @@ impl Linear {
         grad_input
     }
 
+    /// Moves the whole projection onto `device`: the base weight and, when one
+    /// is attached, both LoRA factors. There is no bias to move; every
+    /// projection here is bias-free.
+    ///
+    /// After this [`Linear::forward`] and [`Linear::backward`] run their GEMMs
+    /// on the device. As [`Param::to_cuda`], a model of more than one
+    /// projection should open a [`CudaDevice`] once and use
+    /// [`Linear::to_cuda_on`].
+    pub fn to_cuda(
+        &mut self,
+        device: usize,
+        memory_budget_mib: usize,
+    ) -> Result<(), crate::network::NetworkError> {
+        self.to_cuda_on(&CudaDevice::new(device, memory_budget_mib)?)
+    }
+
+    /// [`Linear::to_cuda`] onto a device a caller already opened.
+    pub fn to_cuda_on(&mut self, device: &CudaDevice) -> Result<(), crate::network::NetworkError> {
+        for param in self.params_mut() {
+            param.to_cuda_on(device)?;
+        }
+        Ok(())
+    }
+
+    /// Brings the projection and its adapter back to the host.
+    pub fn to_cpu(&mut self) -> Result<(), crate::network::NetworkError> {
+        for param in self.params_mut() {
+            param.to_cpu()?;
+        }
+        Ok(())
+    }
+
     pub fn params_mut(&mut self) -> Vec<&mut Param> {
         let mut params = vec![&mut self.weight];
         if let Some(lora) = &mut self.lora {
@@ -599,6 +831,128 @@ impl Linear {
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    /// Same contract as the other CUDA tests: no device means the test reports
+    /// success without running, a broken device is a failure.
+    #[cfg(feature = "cuda")]
+    fn cuda_or_skip(budget_mib: usize) -> Option<CudaDevice> {
+        match crate::cuda_training::cuda_doctor(0, budget_mib) {
+            Ok(_) => Some(CudaDevice::new(0, budget_mib).expect("the CUDA doctor passed")),
+            Err(NetworkError::Cuda(message))
+                if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
+            {
+                None
+            }
+            Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_projection_on_the_device_matches_the_host_forward_and_backward() {
+        let Some(device) = cuda_or_skip(1024) else {
+            return;
+        };
+        let mut rng = StdRng::seed_from_u64(7);
+        let host = Linear::new(24, 16, &mut rng);
+        let mut resident = host.clone();
+
+        let input = Matrix::from_vec(
+            5,
+            24,
+            (0..5 * 24).map(|i| (i % 13) as f32 / 7.0 - 0.8).collect(),
+        );
+        let grad_output = Matrix::from_vec(
+            5,
+            16,
+            (0..5 * 16).map(|i| (i % 11) as f32 / 5.0 - 1.1).collect(),
+        );
+
+        resident
+            .to_cuda_on(&device)
+            .expect("the move to the device");
+        assert!(resident.weight.is_on_device());
+        assert_eq!(device.reserved_mib(), 1, "24 x 16 floats, four buffers");
+
+        let expected = host.forward(&input);
+        let actual = resident.forward(&input);
+        assert_eq!((actual.rows, actual.cols), (expected.rows, expected.cols));
+        for (index, (a, b)) in actual.data.iter().zip(&expected.data).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "forward[{index}]: {a} on the device vs {b} on the host"
+            );
+        }
+
+        let mut host = host;
+        let expected = host.backward(&input, &grad_output);
+        let actual = resident.backward(&input, &grad_output);
+        for (index, (a, b)) in actual.data.iter().zip(&expected.data).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "dL/dinput[{index}]: {a} on the device vs {b} on the host"
+            );
+        }
+
+        resident.to_cpu().expect("the move back to the host");
+        assert!(!resident.weight.is_on_device());
+        for (index, (a, b)) in resident
+            .weight
+            .grad
+            .data
+            .iter()
+            .zip(&host.weight.grad.data)
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "dL/dweight[{index}]: {a} on the device vs {b} on the host"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_budget_smaller_than_the_weights_refuses_the_move() {
+        let Some(device) = cuda_or_skip(1) else {
+            return;
+        };
+        // One MiB holds 262,144 floats; four buffers over 512 x 512 is four
+        // times that.
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut linear = Linear::new(512, 512, &mut rng);
+        assert!(matches!(
+            linear.to_cuda_on(&device),
+            Err(NetworkError::CudaMemoryBudget { budget_mib: 1, .. })
+        ));
+        assert!(
+            !linear.weight.is_on_device(),
+            "a refused move leaves the host copy live"
+        );
+        assert_eq!(device.reserved_mib(), 0, "a refused move books nothing");
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn moving_a_parameter_to_a_device_without_the_feature_is_refused() {
+        let mut param = Param::zeros(4, 4);
+        assert!(matches!(
+            param.to_cuda(0, 0),
+            Err(NetworkError::CudaFeatureDisabled)
+        ));
+        assert!(matches!(
+            CudaDevice::new(0, 0),
+            Err(NetworkError::CudaFeatureDisabled)
+        ));
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut linear = Linear::new(4, 4, &mut rng);
+        assert!(matches!(
+            linear.to_cuda(0, 0),
+            Err(NetworkError::CudaFeatureDisabled)
+        ));
+        // The host path is untouched by a refused move.
+        assert!(linear.to_cpu().is_ok());
+    }
 
     #[test]
     fn a_lion_step_moves_by_the_learning_rate_and_updates_the_moment_after() {

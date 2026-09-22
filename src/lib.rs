@@ -211,7 +211,7 @@ pub use network::{
 };
 pub use norm::RmsNorm;
 pub use optimizers::{Optimizer, Schedule};
-pub use param::{Linear, Lora, Param};
+pub use param::{CudaDevice, Linear, Lora, Param};
 pub use pipeline::{
     DynamicShift, ImageDenoiser, ImagePipeline, PipelineConfig, PooledEncoder, PromptEncoder,
 };
