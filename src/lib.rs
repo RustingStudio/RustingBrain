@@ -126,6 +126,7 @@ pub mod optimizers;
 pub mod param;
 pub mod pipeline;
 pub mod quantized;
+pub mod rng;
 pub mod rope;
 pub mod safetensors;
 pub mod sampling;
@@ -220,6 +221,7 @@ pub use param::{CudaDevice, Linear, Lora, Param};
 pub use pipeline::{
     DynamicShift, ImageDenoiser, ImagePipeline, PipelineConfig, PooledEncoder, PromptEncoder,
 };
+pub use rng::RunRng;
 pub use rope::Rope;
 pub use safetensors::{Dtype, SafeTensors, ShardedSafeTensors, TensorInfo};
 pub use sampling::Sampler;
