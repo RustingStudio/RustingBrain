@@ -1855,8 +1855,41 @@ impl Mesh {
     /// a texture atlas, and inventing a coordinate for the merged one would be
     /// worse than admitting there isn't one.
     pub fn simplify(&mut self, target_faces: usize) -> usize {
+        self.collapse_edges(target_faces, f32::INFINITY).0
+    }
+
+    /// Collapses edges for as long as the quadric error stays under
+    /// `max_error`, and returns the face count it finished on together with the
+    /// largest error it accepted.
+    ///
+    /// This is [`Mesh::simplify`] asking the other question. A face target says
+    /// how big the mesh may be and lets the error land where it lands, which is
+    /// the wrong way round for a pipeline that extracted the mesh from a field
+    /// and wants it as small as it can be *without* visibly moving the surface.
+    /// Given a bound, this collapses the cheap edges — a flat region, a
+    /// redundant row of vertices along a plane — and stops at the first edge
+    /// that would cost more than the bound.
+    ///
+    /// The units are the metric's, not the world's: an error is a sum of
+    /// squared distances to the planes around the edge, each weighted by the
+    /// area of the face it came from. So it scales with the mesh, and the way
+    /// to pick a bound is to simplify one representative mesh to a face count
+    /// that looks right and use the largest error that run reports. The second
+    /// return value is there for exactly that.
+    ///
+    /// Everything else matches [`Mesh::simplify`]: the same metric, the same
+    /// refusal to fold a face over, normals recomputed, UVs dropped.
+    pub fn simplify_within(&mut self, max_error: f32) -> (usize, f32) {
+        self.collapse_edges(0, max_error)
+    }
+
+    /// The collapse loop both entry points run: cheapest edge first, stopping
+    /// at `target_faces` or at the first collapse over `max_error`, whichever
+    /// comes first.
+    fn collapse_edges(&mut self, target_faces: usize, max_error: f32) -> (usize, f32) {
+        let mut worst = 0.0f32;
         if self.indices.len() <= target_faces {
-            return self.indices.len();
+            return (self.indices.len(), worst);
         }
 
         let mut positions = self.positions.clone();
@@ -1927,6 +1960,12 @@ impl Mesh {
             if [stamps[from], stamps[into]] != collapse.stamps {
                 continue;
             }
+            // The queue is ordered by error, so the first live collapse that
+            // costs more than the bound is also the cheapest one left.
+            let error = f32::from_bits(collapse.key);
+            if error > max_error {
+                break;
+            }
             // A collapse that turns a face inside out is a fold, and a folded
             // mesh is worse than a coarse one.
             // NOTE: a refused edge is dropped rather than re-priced, so an
@@ -1945,6 +1984,7 @@ impl Mesh {
                 continue;
             }
 
+            worst = worst.max(error);
             positions[into] = collapse.position;
             quadrics[into] = add_quadric(quadrics[into], quadrics[from]);
             vertex_alive[from] = false;
@@ -1995,7 +2035,7 @@ impl Mesh {
         }
 
         self.compact(positions, faces, face_alive);
-        self.indices.len()
+        (self.indices.len(), worst)
     }
 
     /// Rebuilds the mesh from the surviving faces, dropping orphaned vertices.
@@ -2209,6 +2249,61 @@ mod simplify_tests {
         let (low, high) = mesh.bounds();
         assert_eq!(low, [0.0, 0.0, 0.0]);
         assert_eq!(high, [1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn an_error_bound_removes_the_flat_interior_and_keeps_the_shape() {
+        // A flat sheet: every interior collapse is free, so a bound of nothing
+        // at all still takes the mesh down to its corners.
+        let mut sheet = grid(6);
+        let (faces, worst) = sheet.simplify_within(1e-6);
+        assert_eq!(faces, 2, "a flat sheet costs nothing to simplify");
+        assert!(worst < 1e-6, "the worst collapse taken was {worst}");
+
+        // A sphere is curved everywhere, so the same bound buys much less.
+        let mut curved = sphere(24);
+        let before = curved.indices.len();
+        let (faces, worst) = curved.simplify_within(1e-6);
+        assert!(faces < before, "{before} to {faces}");
+        assert!(worst <= 1e-6);
+        for point in &curved.positions {
+            let distance = (length(*point) - 0.8).abs();
+            assert!(distance < 0.02, "{point:?} sits {distance} off the surface");
+        }
+    }
+
+    #[test]
+    fn a_looser_bound_reaches_a_smaller_mesh_and_says_what_it_cost() {
+        let mut tight = sphere(24);
+        let (tight_faces, tight_worst) = tight.simplify_within(1e-6);
+        let mut loose = sphere(24);
+        let (loose_faces, loose_worst) = loose.simplify_within(1e-3);
+
+        assert!(
+            loose_faces < tight_faces,
+            "a looser bound should collapse more: {loose_faces} against {tight_faces}"
+        );
+        assert!(loose_worst > tight_worst);
+        assert!(
+            loose_worst <= 1e-3,
+            "the bound was not exceeded: {loose_worst}"
+        );
+    }
+
+    #[test]
+    fn a_bound_of_zero_takes_only_the_collapses_that_cost_nothing() {
+        // A marched sphere carries rows of vertices that sit exactly on the
+        // plane of their neighbours, which the metric prices at zero. Those go;
+        // nothing that moves the surface does.
+        let mut mesh = sphere(20);
+        let before = mesh.indices.len();
+        let (faces, worst) = mesh.simplify_within(0.0);
+        assert!(faces < before, "{before} to {faces}");
+        assert_eq!(worst, 0.0);
+        for point in &mesh.positions {
+            let distance = (length(*point) - 0.8).abs();
+            assert!(distance < 0.01, "{point:?} sits {distance} off the surface");
+        }
     }
 
     #[test]
