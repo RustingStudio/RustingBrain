@@ -488,6 +488,33 @@ impl Param {
         Ok(())
     }
 
+    /// Replaces the weights, uploading them when the parameter is resident on
+    /// a device.
+    ///
+    /// The shape has to match: a weight is wired into a forward pass by its
+    /// dimensions, and a caller that meant to reshape wants a new parameter,
+    /// not this. Used by [`Ema::swap_in`](crate::ema::Ema::swap_in) to stand an
+    /// averaged weight in the live one's place.
+    pub fn set_value(&mut self, value: Matrix) -> Result<(), crate::network::NetworkError> {
+        if self.quantized.is_some() {
+            return Err(crate::network::NetworkError::InvalidConfig(
+                "a quantized parameter holds bytes, not weights, and cannot be assigned".into(),
+            ));
+        }
+        if value.rows != self.value.rows || value.cols != self.value.cols {
+            return Err(crate::network::NetworkError::InvalidConfig(format!(
+                "this parameter is {}x{} but the new value is {}x{}",
+                self.value.rows, self.value.cols, value.rows, value.cols
+            )));
+        }
+        self.value = value;
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &mut self.device {
+            device.upload_value(&self.value)?;
+        }
+        Ok(())
+    }
+
     /// The sum of the squared gradient entries, for a caller building a global
     /// gradient norm across every parameter.
     ///
