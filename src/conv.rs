@@ -634,19 +634,27 @@ impl TrainableConv2d {
 
     /// Trades one `im2col` pass per backward for the memory the columns take.
     ///
-    /// A convolution's columns are `kernel * kernel` times the size of its
-    /// input, and they stay live from the forward pass until the backward one.
-    /// A single convolution should keep them: the memory is paid once and the
-    /// work is saved. A deep network should not, because every layer's columns
-    /// are alive at the same time — a 25-convolution U-Net at 64x64 with 12
-    /// images in the batch holds about 3.4 GiB of them, most of it in the two
-    /// widest layers of its up path.
+    /// One convolution's columns are
+    ///
+    /// ```text
+    /// batch * out_height * out_width * in_channels * kernel * kernel * 4 bytes
+    /// ```
+    ///
+    /// which is `kernel * kernel` times its input, and they stay live from the
+    /// forward pass until the backward one. A single convolution should keep
+    /// them: the memory is paid once and the work is saved. A network should
+    /// weigh it layer by layer, because every layer's columns are alive at
+    /// once, and the total is what bounds the batch. Put the batch, the
+    /// resolution and the channel count of the widest few layers through the
+    /// formula above before deciding; in a deep net the sum is usually larger
+    /// than the weights and the optimizer moments together.
     ///
     /// What it costs is one extra `im2col` per backward pass. On a device the
-    /// input stays on the card, so nothing crosses the bus twice: a 3x3
-    /// convolution from 192 channels to 96 over twelve 64x64 images measures
-    /// 33.5 ms per forward and backward with the columns kept and 41.0 ms with
-    /// them rebuilt, and holds 36 MiB in place of 324 MiB.
+    /// input stays on the card, so nothing crosses the bus twice. Worked
+    /// example, on an RTX 3060: a 3x3 convolution from 192 channels to 96 over
+    /// twelve 64x64 images measures 33.5 ms per forward and backward with the
+    /// columns kept and 41.0 ms with them rebuilt, and the formula gives the
+    /// 324 MiB it stops holding against the 36 MiB of input it holds instead.
     ///
     /// The columns are only needed for the weight gradient at all; the input
     /// gradient needs the weight and the upstream gradient alone.
