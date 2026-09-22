@@ -18,8 +18,9 @@
 //! `--cuda <device>` moves both stages onto a CUDA device, with the crate
 //! built `--features cuda`: stage one's projections and attentions through
 //! [`rusting_brain::gpu_shape`], stage two's transformer blocks through
-//! `gpu_flow`. Stage one still walks one shape at a time, so the device sees
-//! one point cloud per launch rather than a packed batch.
+//! `gpu_flow`. Stage one packs short equal-sized point clouds so a batch shares
+//! projection, attention and synchronization launches; large query sets stay
+//! shape-at-a-time to bound the attention workspace.
 //!
 //! The autoencoder is frozen during stage two: it is only asked to encode, and
 //! its gradients are never touched. That is what makes the latent space a
@@ -37,13 +38,14 @@
 //! it measured, and the scale is written into the checkpoint so
 //! `image_to_3d` divides by the same number.
 //!
-//! NOTE: CPU, one shape at a time inside a batch. `ShapeVae::encode` takes
-//! one shape's points, the batch is a loop around it, and the gradients
-//! accumulate across the loop before a single step. Batching the encoder means
-//! a padded set-attention, which is the GPU stage's problem, not this one's.
+//! The CPU path remains one shape at a time inside a batch. CUDA batches are
+//! uniform because the corpus sampler already selects the same point counts
+//! for every shape, so no padding or mask is needed.
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+#[cfg(feature = "cuda")]
+use rusting_brain::Batch;
 use rusting_brain::{
     BatchConfig, BatchStream, Corpus, FlowConfig, FlowTransformer, Matrix, Optimizer, ShapeVae,
     ShapeVaeConfig, losses, optimizers,
@@ -160,63 +162,79 @@ fn train_vae(
         let points = batch.surface.rows / count;
         let queries = batch.queries.rows / count;
 
-        for index in 0..count {
-            let surface = slice(&batch.surface, index, points);
-            let (mean, log_variance, cache) = model.encode_train(&surface)?;
-            let (latent, noise) = ShapeVae::sample(&mean, &log_variance, rng);
+        // Packing helps the ordinary 4K-query training shape, but at 16K
+        // queries the larger attention workspace is slower and batch eight can
+        // exceed a 12 GiB card. Keep that workload shape-at-a-time.
+        let cuda_batch = model.on_device() && queries <= 4096;
+        #[cfg(feature = "cuda")]
+        if cuda_batch {
+            let (loss, kl, color) = train_vae_cuda_batch(args, &mut model, &batch, rng)?;
+            // The packed losses are means across the batch; the reporting
+            // accumulator below historically stores a sum over examples.
+            reconstruction += loss * count as f32;
+            divergence += kl * count as f32;
+            tint += color * count as f32;
+        }
 
-            let (prediction, decoded) =
-                model.decode_train(&latent, &slice(&batch.queries, index, queries))?;
-            let target = &batch.distances[index * queries..(index + 1) * queries];
-            let (loss, grad) = losses::clamped_l1(&prediction, target, args.clamp);
-            let (kl, grad_mean, grad_log_variance) =
-                losses::kl_divergence(&mean.data, &log_variance.data);
-            reconstruction += loss;
-            divergence += kl;
+        if !cuda_batch {
+            for index in 0..count {
+                let surface = slice(&batch.surface, index, points);
+                let (mean, log_variance, cache) = model.encode_train(&surface)?;
+                let (latent, noise) = ShapeVae::sample(&mean, &log_variance, rng);
 
-            let mut grad_latent = model.decode_backward(&decoded, &grad)?;
+                let (prediction, decoded) =
+                    model.decode_train(&latent, &slice(&batch.queries, index, queries))?;
+                let target = &batch.distances[index * queries..(index + 1) * queries];
+                let (loss, grad) = losses::clamped_l1(&prediction, target, args.clamp);
+                let (kl, grad_mean, grad_log_variance) =
+                    losses::kl_divergence(&mean.data, &log_variance.data);
+                reconstruction += loss;
+                divergence += kl;
 
-            // The colour targets sit on the surface points, not the distance
-            // queries, so the colour head trains on a second short decode.
-            // The loader's points are already in random order, so the first
-            // `--color-points` of them are a random draw.
-            if let Some(colors) = &batch.colors
-                && args.color > 0.0
-                && args.color_points > 0
-            {
-                let wanted = args.color_points.min(points);
-                let positions = positions(&surface, wanted);
-                let targets = head_rows(&slice(colors, index, points), wanted);
-                let (_, decoded) = model.decode_train(&latent, &positions)?;
+                let mut grad_latent = model.decode_backward(&decoded, &grad)?;
 
-                let predicted = model.colors(&decoded)?;
-                let mut grad = predicted.clone();
-                let scale = args.color / predicted.data.len() as f32;
-                for (slot, target) in grad.data.iter_mut().zip(&targets.data) {
-                    let error = *slot - target;
-                    tint += error * error / predicted.data.len() as f32;
-                    *slot = 2.0 * scale * error;
+                // The colour targets sit on the surface points, not the distance
+                // queries, so the colour head trains on a second short decode.
+                // The loader's points are already in random order, so the first
+                // `--color-points` of them are a random draw.
+                if let Some(colors) = &batch.colors
+                    && args.color > 0.0
+                    && args.color_points > 0
+                {
+                    let wanted = args.color_points.min(points);
+                    let positions = positions(&surface, wanted);
+                    let targets = head_rows(&slice(colors, index, points), wanted);
+                    let (_, decoded) = model.decode_train(&latent, &positions)?;
+
+                    let predicted = model.colors(&decoded)?;
+                    let mut grad = predicted.clone();
+                    let scale = args.color / predicted.data.len() as f32;
+                    for (slot, target) in grad.data.iter_mut().zip(&targets.data) {
+                        let error = *slot - target;
+                        tint += error * error / predicted.data.len() as f32;
+                        *slot = 2.0 * scale * error;
+                    }
+
+                    let from_colors = model.decode_backward_colored(
+                        &decoded,
+                        &vec![0.0; positions.rows],
+                        Some(&grad),
+                    )?;
+                    for (slot, value) in grad_latent.data.iter_mut().zip(&from_colors.data) {
+                        *slot += value;
+                    }
                 }
 
-                let from_colors = model.decode_backward_colored(
-                    &decoded,
-                    &vec![0.0; positions.rows],
-                    Some(&grad),
-                )?;
-                for (slot, value) in grad_latent.data.iter_mut().zip(&from_colors.data) {
-                    *slot += value;
+                let (mut into_mean, mut into_log_variance) =
+                    ShapeVae::sample_backward(&grad_latent, &log_variance, &noise);
+                for (slot, value) in into_mean.data.iter_mut().zip(&grad_mean) {
+                    *slot += args.kl * value;
                 }
+                for (slot, value) in into_log_variance.data.iter_mut().zip(&grad_log_variance) {
+                    *slot += args.kl * value;
+                }
+                model.encode_backward(&cache, &into_mean, &into_log_variance)?;
             }
-
-            let (mut into_mean, mut into_log_variance) =
-                ShapeVae::sample_backward(&grad_latent, &log_variance, &noise);
-            for (slot, value) in into_mean.data.iter_mut().zip(&grad_mean) {
-                *slot += args.kl * value;
-            }
-            for (slot, value) in into_log_variance.data.iter_mut().zip(&grad_log_variance) {
-                *slot += args.kl * value;
-            }
-            model.encode_backward(&cache, &into_mean, &into_log_variance)?;
         }
 
         step += 1;
@@ -252,6 +270,71 @@ fn train_vae(
         }
     }
     Ok(())
+}
+
+/// One packed device step. Packing is important here: the old loop launched
+/// and synchronized the whole encoder and decoder once per shape.
+#[cfg(feature = "cuda")]
+fn train_vae_cuda_batch(
+    args: &Args,
+    model: &mut ShapeVae,
+    batch: &Batch,
+    rng: &mut StdRng,
+) -> Result<(f32, f32, f32), Box<dyn std::error::Error>> {
+    let count = batch.len();
+    let points = batch.surface.rows / count;
+    let (mean, log_variance, encoder) = model.encode_train_batch(&batch.surface, count)?;
+    let (latent, noise) = ShapeVae::sample(&mean, &log_variance, rng);
+
+    let (prediction, decoded) = model.decode_train_batch(&latent, &batch.queries, count)?;
+    let (reconstruction, mut grad) = losses::clamped_l1(&prediction, &batch.distances, args.clamp);
+    let (divergence, mut grad_mean, mut grad_log_variance) =
+        losses::kl_divergence(&mean.data, &log_variance.data);
+    // The shape-at-a-time path accumulates one mean-loss gradient per example
+    // and lets the optimizer divide by the batch. Re-expand this packed mean
+    // so gradient clipping and the optimizer see the same summed gradient.
+    let batch_scale = count as f32;
+    grad.iter_mut().for_each(|value| *value *= batch_scale);
+    grad_mean.iter_mut().for_each(|value| *value *= batch_scale);
+    grad_log_variance
+        .iter_mut()
+        .for_each(|value| *value *= batch_scale);
+    let mut grad_latent = model.decode_backward(&decoded, &grad)?;
+
+    let mut tint = 0.0;
+    if let Some(colors) = &batch.colors
+        && args.color > 0.0
+        && args.color_points > 0
+    {
+        let wanted = args.color_points.min(points);
+        let positions = packed_prefix_rows(&batch.surface, count, points, wanted, 3);
+        let targets = packed_prefix_rows(colors, count, points, wanted, 3);
+        let (_, decoded) = model.decode_train_batch(&latent, &positions, count)?;
+        let predicted = model.colors(&decoded)?;
+        let mut grad = predicted.clone();
+        let scale = args.color * batch_scale / predicted.data.len() as f32;
+        for (slot, target) in grad.data.iter_mut().zip(&targets.data) {
+            let error = *slot - target;
+            tint += error * error / predicted.data.len() as f32;
+            *slot = 2.0 * scale * error;
+        }
+        let from_colors =
+            model.decode_backward_colored(&decoded, &vec![0.0; positions.rows], Some(&grad))?;
+        for (slot, value) in grad_latent.data.iter_mut().zip(&from_colors.data) {
+            *slot += value;
+        }
+    }
+
+    let (mut into_mean, mut into_log_variance) =
+        ShapeVae::sample_backward(&grad_latent, &log_variance, &noise);
+    for (slot, value) in into_mean.data.iter_mut().zip(&grad_mean) {
+        *slot += args.kl * value;
+    }
+    for (slot, value) in into_log_variance.data.iter_mut().zip(&grad_log_variance) {
+        *slot += args.kl * value;
+    }
+    model.encode_backward(&encoder, &into_mean, &into_log_variance)?;
+    Ok((reconstruction, divergence, tint))
 }
 
 fn train_flow(
@@ -319,13 +402,18 @@ fn train_flow(
 
         let mut clean = Matrix::new(count * shape.latents, shape.latent_dim);
         for index in 0..count {
-            // The mean, not a sample: the decoder is frozen, so the target is
-            // the one latent it was trained to answer for this shape.
-            let (mean, _) = vae.encode(&slice(&batch.surface, index, points))?;
+            // A draw from the posterior, not its mean. Every autoencoder step
+            // decoded a draw, so a draw is the only kind of latent the frozen
+            // decoder has ever answered for. The posterior is wide enough for
+            // that to matter — sigma about twice the magnitude of the mean —
+            // and the mean reconstructs at clamped L1 0.029 against 0.0025 for
+            // a draw, so a flow trained towards the mean would be aiming at the
+            // one latent the decoder is worst at.
+            let latent = vae.encode_sample(&slice(&batch.surface, index, points), rng)?;
             let width = shape.latents * shape.latent_dim;
             for (slot, value) in clean.data[index * width..(index + 1) * width]
                 .iter_mut()
-                .zip(&mean.data)
+                .zip(&latent.data)
             {
                 *slot = value * args.latent_scale;
             }
@@ -391,6 +479,26 @@ fn head_rows(matrix: &Matrix, rows: usize) -> Matrix {
         matrix.cols,
         matrix.data[..rows * matrix.cols].to_vec(),
     )
+}
+
+/// The first `wanted` rows from every equally sized example in a packed batch.
+/// `cols` may select a prefix, which drops normals from surface rows.
+#[cfg(feature = "cuda")]
+fn packed_prefix_rows(
+    matrix: &Matrix,
+    examples: usize,
+    rows_per_example: usize,
+    wanted: usize,
+    cols: usize,
+) -> Matrix {
+    let mut data = Vec::with_capacity(examples * wanted * cols);
+    for example in 0..examples {
+        let first = example * rows_per_example;
+        for row in first..first + wanted {
+            data.extend_from_slice(&matrix.row(row)[..cols]);
+        }
+    }
+    Matrix::from_vec(examples * wanted, cols, data)
 }
 
 /// The positions of the first `rows` surface points, dropping the normals.

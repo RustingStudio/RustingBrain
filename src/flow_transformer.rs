@@ -780,8 +780,7 @@ impl FlowTransformer {
         memory_budget_mib: usize,
         mixed_precision: bool,
     ) -> Result<(), NetworkError> {
-        let context =
-            crate::gpu_transformer::GpuContext::with_precision(device, mixed_precision)?;
+        let context = crate::gpu_transformer::GpuContext::with_precision(device, mixed_precision)?;
         crate::gpu_flow::to_cuda(self, &context, memory_budget_mib)?;
         self.device = Some(context);
         Ok(())
