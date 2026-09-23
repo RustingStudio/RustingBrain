@@ -1987,6 +1987,14 @@ mod tests {
         if !cuda_or_skip() {
             return;
         }
+        // Both masks: the bidirectional kernels walk every key tile and mask
+        // only the ragged tail, which is a different loop bound in each kernel.
+        for bidirectional in [false, true] {
+            fused_attention_forward_parity(bidirectional);
+        }
+    }
+
+    fn fused_attention_forward_parity(bidirectional: bool) {
         let model = || {
             TransformerLm::builder()
                 .vocab_size(32)
@@ -1999,6 +2007,7 @@ mod tests {
                 .optimizer(Optimizer::adam(1e-2))
                 .seed(99)
                 .mixed_precision(true)
+                .bidirectional(bidirectional)
                 .build()
                 .unwrap()
         };
@@ -2036,11 +2045,12 @@ mod tests {
         let (fused_error, split_error) = (error(&fused_logits), error(&split_logits));
         assert!(
             fused_error <= 2.0 * split_error,
-            "the fused path is {fused_error} from the host where the three-kernel path is {split_error}"
+            "bidirectional {bidirectional}: the fused path is {fused_error} from the host \
+             where the three-kernel path is {split_error}"
         );
         assert!(
             fused_error < 1e-2,
-            "both device paths drifted: {fused_error}"
+            "bidirectional {bidirectional}: both device paths drifted: {fused_error}"
         );
     }
 
@@ -2053,6 +2063,12 @@ mod tests {
         if !cuda_or_skip() {
             return;
         }
+        for bidirectional in [false, true] {
+            fused_attention_backward_parity(bidirectional);
+        }
+    }
+
+    fn fused_attention_backward_parity(bidirectional: bool) {
         let model = || {
             TransformerLm::builder()
                 .vocab_size(32)
@@ -2065,6 +2081,7 @@ mod tests {
                 .optimizer(Optimizer::sgd(1.0))
                 .seed(99)
                 .mixed_precision(true)
+                .bidirectional(bidirectional)
                 .build()
                 .unwrap()
         };
@@ -2112,7 +2129,8 @@ mod tests {
         let (fused_error, split_error) = (error(&fused_logits), error(&split_logits));
         assert!(
             fused_error <= 2.0 * split_error,
-            "the fused path is {fused_error} from the host where the three-kernel path is {split_error}"
+            "bidirectional {bidirectional}: the fused path is {fused_error} from the host \
+             where the three-kernel path is {split_error}"
         );
         // A second bound, in case both paths break the same way. A full
         // gradient-descent step at a rate of 1 moves logits of this shape by
@@ -2120,7 +2138,7 @@ mod tests {
         // device paths about 0.04 from the host afterwards.
         assert!(
             fused_error < 0.1,
-            "both device paths drifted: {fused_error}"
+            "bidirectional {bidirectional}: both device paths drifted: {fused_error}"
         );
     }
 }
