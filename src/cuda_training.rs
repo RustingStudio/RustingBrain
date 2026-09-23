@@ -64,6 +64,7 @@ extern "C" __global__ void act_derivative(float*d,const float*a,int n,int act){i
 extern "C" __global__ void grad_b(float*g,const float*d,int batch,int out){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<out){float s=0;for(int b=0;b<batch;b++)s+=d[b*out+i];g[i]=s/(float)batch;}}
 extern "C" __global__ void sgd(float*x,const float*g,int n,float lr){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)x[i]+=lr*g[i];}
 extern "C" __global__ void adam(float*x,const float*g,float*m,float*v,int n,float lr,float b1,float b2,float eps,float c1,float c2,float wd){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float q=g[i];float mi=b1*m[i]+(1-b1)*q;float vi=b2*v[i]+(1-b2)*q*q;m[i]=mi;v[i]=vi;x[i]-=lr*wd*x[i];x[i]+=lr*(mi/c1)/(sqrtf(vi/c2)+eps);}}
+extern "C" __global__ void lion(float*x,const float*g,float*m,int n,float lr,float b1,float b2,float wd){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float q=g[i];float u=b1*m[i]+(1-b1)*q;m[i]=b2*m[i]+(1-b2)*q;x[i]-=lr*wd*x[i];x[i]+=lr*(float)((u>0)-(u<0));}}
 extern "C" __global__ void mse_sum(float *out,const float*y,const float*t,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=y[i]-t[i];atomicAdd(out,z*z/(float)n);}}
 extern "C" __global__ void mse_epoch_sum(float *out,const float*y,const float*t,int n,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=y[i]-t[i];atomicAdd(out,z*z*scale);}}
 extern "C" __global__ void gather_rows(float*out,const float*all,const unsigned int*order,int start,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*width){int r=i/width,c=i%width;out[i]=all[order[start+r]*width+c];}}
@@ -577,6 +578,7 @@ struct Kernels {
     grad_b: CudaFunction,
     sgd: CudaFunction,
     adam: CudaFunction,
+    lion: CudaFunction,
     mse_epoch_sum: CudaFunction,
     gather_rows: CudaFunction,
 }
@@ -595,6 +597,7 @@ impl Kernels {
             grad_b: get("grad_b")?,
             sgd: get("sgd")?,
             adam: get("adam")?,
+            lion: get("lion")?,
             mse_epoch_sum: get("mse_epoch_sum")?,
             gather_rows: get("gather_rows")?,
         })
@@ -1337,11 +1340,7 @@ impl State {
         let (f, adam) = match net.optimizer.clone() {
             Optimizer::Sgd { .. } => (&self.kernels.sgd, false),
             Optimizer::Adam { .. } => (&self.kernels.adam, true),
-            Optimizer::Lion { .. } => {
-                return Err(NetworkError::UnsupportedCuda(
-                    "the Lion optimizer, which has no device kernel".into(),
-                ));
-            }
+            Optimizer::Lion { .. } => (&self.kernels.lion, false),
         };
         if adam {
             net.adam_step += 1;
@@ -1410,6 +1409,39 @@ impl State {
                         .arg(&no_decay)
                         .launch(cfg(nb))
                         .map_err(cuda_err("Adam update kernel"))?;
+                } else if let Optimizer::Lion {
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    weight_decay,
+                } = net.optimizer
+                {
+                    // Lion keeps one moment, the one Adam calls `m`.
+                    let no_decay = 0.0f32;
+                    self.stream
+                        .launch_builder(f)
+                        .arg(&mut l.w)
+                        .arg(&l.gw)
+                        .arg(&mut l.mw)
+                        .arg(&(nw as i32))
+                        .arg(&learning_rate)
+                        .arg(&beta1)
+                        .arg(&beta2)
+                        .arg(&weight_decay)
+                        .launch(cfg(nw))
+                        .map_err(cuda_err("Lion update kernel"))?;
+                    self.stream
+                        .launch_builder(f)
+                        .arg(&mut l.b)
+                        .arg(&l.gb)
+                        .arg(&mut l.mb)
+                        .arg(&(nb as i32))
+                        .arg(&learning_rate)
+                        .arg(&beta1)
+                        .arg(&beta2)
+                        .arg(&no_decay)
+                        .launch(cfg(nb))
+                        .map_err(cuda_err("Lion update kernel"))?;
                 }
             }
         }
@@ -1687,6 +1719,11 @@ mod tests {
     #[test]
     fn cuda_adam_weight_decay_one_batch_update_matches_cpu_or_skips_without_device() {
         assert_update_parity(Optimizer::adam_with_weight_decay(0.01, 0.01), 2e-5);
+    }
+
+    #[test]
+    fn cuda_lion_one_batch_update_matches_cpu_or_skips_without_device() {
+        assert_update_parity(Optimizer::lion_with_weight_decay(0.01, 0.1), 2e-5);
     }
 
     /// This deliberately exercises the failure mode that a one-layer/one-batch

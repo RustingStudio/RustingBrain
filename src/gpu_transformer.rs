@@ -57,6 +57,7 @@ pub struct GpuContext {
     /// rather than BF16 and the accumulator is FP16 too.
     pub(crate) half_accumulate: bool,
     adam: CudaFunction,
+    lion: CudaFunction,
     sgd: CudaFunction,
     scale: CudaFunction,
     gather: CudaFunction,
@@ -142,6 +143,7 @@ impl GpuContext {
             mixed_precision,
             half_accumulate: false,
             adam: get("adam")?,
+            lion: get("lion")?,
             sgd: get("sgd")?,
             scale: get("scale_inplace")?,
             gather: get("gather_rows")?,
@@ -906,11 +908,27 @@ impl DeviceParam {
                             .map_err(cuda_err("Adam update kernel"))?;
                     }
                 }
-                Optimizer::Lion { .. } => {
-                    return Err(NetworkError::UnsupportedCuda(
-                        "the Lion optimizer, which has no device kernel".into(),
-                    ));
-                }
+                // Like Adam's here, the moment averages the negated gradient.
+                Optimizer::Lion {
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    weight_decay,
+                } => unsafe {
+                    self.context
+                        .stream
+                        .launch_builder(&self.context.lion)
+                        .arg(&mut self.value)
+                        .arg(&self.negated_grad)
+                        .arg(&mut self.moment1)
+                        .arg(&(elements as i32))
+                        .arg(&learning_rate)
+                        .arg(&beta1)
+                        .arg(&beta2)
+                        .arg(&weight_decay)
+                        .launch(cfg(elements))
+                        .map_err(cuda_err("Lion update kernel"))?;
+                },
             }
             self.grad_dirty = false;
             Ok(())
@@ -1777,6 +1795,39 @@ mod tests {
 
         assert!((host.lm_loss - device.lm_loss).abs() < 1e-3);
         assert!((host.auxiliary_loss - device.auxiliary_loss).abs() < 1e-4);
+        for (index, (device_param, host_param)) in
+            gpu.params_mut().iter().zip(cpu.params_mut()).enumerate()
+        {
+            assert_close(
+                &format!("parameter {index}"),
+                &device_param.value.data,
+                &host_param.value.data,
+                1e-3,
+            );
+        }
+    }
+
+    /// Lion moves every weight by exactly the learning rate, so a sign taken
+    /// the wrong way round is off by twice that, far outside the band.
+    #[test]
+    fn a_lion_step_on_the_device_matches_the_host_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let mut cpu = tiny()
+            .optimizer(Optimizer::lion_with_weight_decay(1e-2, 0.1))
+            .build()
+            .unwrap();
+        let mut gpu = cpu.clone();
+        gpu.to_cuda(0, 8192).unwrap();
+        let batch = [vec![3u32, 8, 1, 5, 2, 7], vec![9, 4, 4, 0, 11, 6]];
+
+        for _ in 0..2 {
+            cpu.train_step(&batch).unwrap();
+            gpu.train_step(&batch).unwrap();
+        }
+        gpu.sync_from_device().unwrap();
+
         for (index, (device_param, host_param)) in
             gpu.params_mut().iter().zip(cpu.params_mut()).enumerate()
         {
