@@ -191,7 +191,8 @@ pub use conv::{
 #[cfg(feature = "cuda")]
 pub use cuda_training::{CudaDoctorReport, CudaTrainingSession, CudaTrainingStats, cuda_doctor};
 pub use dataset::{
-    BatchCursor, BatchSource, Dataset, DatasetBatch, DatasetStream, JsonlStream, Standardizer,
+    Augment, BatchCursor, BatchSource, Dataset, DatasetBatch, DatasetStream, JsonlStream,
+    Standardizer,
 };
 pub use diffusion::{Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_from};
 pub use ema::Ema;

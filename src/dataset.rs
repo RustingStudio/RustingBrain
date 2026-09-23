@@ -611,8 +611,8 @@ impl Dataset {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
-    /// NOTE: flips only, and the whole dataset at once. Random crops and
-    /// rotations want a per-epoch batch-yielding loader, which this is not.
+    /// This doubles the dataset once, up front. Random crops and rotations,
+    /// which want a fresh draw every epoch, are [`Augment`].
     pub fn flip_horizontal(&mut self, width: usize) -> Result<(), NetworkError> {
         if width == 0 {
             return Err(NetworkError::InvalidDataset(
@@ -1087,6 +1087,190 @@ impl BatchSource for DatasetStream<'_> {
     }
 }
 
+/// Random crops and rotations, drawn afresh for every batch of every epoch.
+///
+/// Wraps any [`BatchSource`] of images in the flat layout
+/// [`from_image_folder`](Dataset::from_image_folder) produces — plane after
+/// plane, each plane row-major — and hands out a transformed copy of each
+/// batch. The targets pass through untouched.
+///
+/// The crop is the padded crop small-image training uses: the image moves by
+/// up to `padding` pixels in each direction and the uncovered border reads as
+/// zero. The rotation turns it about its centre by up to `degrees` either
+/// way, sampled bilinearly. Both are one inverse mapping, so an image that is
+/// shifted and turned is resampled once rather than twice.
+///
+/// With a seed, the draws for an epoch depend only on that seed and the epoch
+/// index, as the shuffle of a [`DatasetStream`] does, so a resumed run sees
+/// the same images.
+///
+/// ```
+/// # use rusting_brain::{Augment, BatchSource, Dataset, TrainConfig};
+/// let mut dataset = Dataset::new(vec![vec![1.0; 16]], vec![vec![1.0]]);
+/// let config = TrainConfig { batch_size: 1, shuffle: false, ..Default::default() };
+/// let mut augmented = Augment::new(dataset.stream(&config), 1, 4, 4)?
+///     .random_crop(1)
+///     .random_rotation(15.0)
+///     .seed(7);
+/// augmented.start_epoch(0)?;
+/// let batch = augmented.next_batch()?.unwrap();
+/// assert_eq!(batch.inputs[0].len(), 16);
+/// assert_eq!(batch.targets[0], vec![1.0]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub struct Augment<S> {
+    source: S,
+    channels: usize,
+    height: usize,
+    width: usize,
+    padding: usize,
+    degrees: f32,
+    seed: Option<u64>,
+    rng: StdRng,
+    inputs: Vec<Vec<f32>>,
+}
+
+impl<S: BatchSource> Augment<S> {
+    /// Wraps `source`, whose rows are `channels` planes of `height` by `width`.
+    /// Nothing is transformed until a crop or a rotation is asked for.
+    pub fn new(
+        source: S,
+        channels: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<Self, NetworkError> {
+        if channels == 0 || height == 0 || width == 0 {
+            return Err(NetworkError::InvalidDataset(format!(
+                "an image of {channels} channels of {height}x{width} has no pixels to augment"
+            )));
+        }
+        Ok(Self {
+            source,
+            channels,
+            height,
+            width,
+            padding: 0,
+            degrees: 0.0,
+            seed: None,
+            rng: StdRng::from_entropy(),
+            inputs: Vec::new(),
+        })
+    }
+
+    /// Shifts each image by up to `padding` pixels along each axis.
+    pub fn random_crop(mut self, padding: usize) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    /// Turns each image by up to `degrees` either way.
+    pub fn random_rotation(mut self, degrees: f32) -> Self {
+        self.degrees = degrees.abs();
+        self
+    }
+
+    /// Makes the draws repeat, epoch by epoch.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+}
+
+/// Writes `row`, an image of `channels` planes of `height` by `width`,
+/// shifted by `(shift_x, shift_y)` and turned by `angle` radians, into `out`.
+fn transform(
+    (channels, height, width): (usize, usize, usize),
+    row: &[f32],
+    out: &mut [f32],
+    (shift_x, shift_y): (f32, f32),
+    angle: f32,
+) {
+    let (sin, cos) = angle.sin_cos();
+    let centre_x = (width as f32 - 1.0) / 2.0;
+    let centre_y = (height as f32 - 1.0) / 2.0;
+    let plane = height * width;
+    let pixel = |channel: usize, x: isize, y: isize| {
+        if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+            0.0
+        } else {
+            row[channel * plane + y as usize * width + x as usize]
+        }
+    };
+    for y in 0..height {
+        for x in 0..width {
+            // Where this output pixel comes from: undo the shift, then the
+            // turn about the centre.
+            let dx = x as f32 - shift_x - centre_x;
+            let dy = y as f32 - shift_y - centre_y;
+            let source_x = cos * dx + sin * dy + centre_x;
+            let source_y = -sin * dx + cos * dy + centre_y;
+            let (left, top) = (source_x.floor(), source_y.floor());
+            let (fx, fy) = (source_x - left, source_y - top);
+            let (left, top) = (left as isize, top as isize);
+            for channel in 0..channels {
+                out[channel * plane + y * width + x] = (1.0 - fy)
+                    * ((1.0 - fx) * pixel(channel, left, top) + fx * pixel(channel, left + 1, top))
+                    + fy * ((1.0 - fx) * pixel(channel, left, top + 1)
+                        + fx * pixel(channel, left + 1, top + 1));
+            }
+        }
+    }
+}
+
+impl<S: BatchSource> BatchSource for Augment<S> {
+    fn next_batch(&mut self) -> Result<Option<DatasetBatch<'_>>, NetworkError> {
+        use rand::Rng;
+        let Some(batch) = self.source.next_batch()? else {
+            return Ok(None);
+        };
+        let size = self.channels * self.height * self.width;
+        let mut inputs = std::mem::take(&mut self.inputs);
+        inputs.resize_with(batch.inputs.len(), Vec::new);
+        for (row, out) in batch.inputs.iter().zip(&mut inputs) {
+            if row.len() != size {
+                return Err(NetworkError::InvalidDataset(format!(
+                    "a row of {} values is not {} channels of {}x{}",
+                    row.len(),
+                    self.channels,
+                    self.height,
+                    self.width
+                )));
+            }
+            let padding = self.padding as i64;
+            let shift_x = self.rng.gen_range(-padding..=padding) as f32;
+            let shift_y = self.rng.gen_range(-padding..=padding) as f32;
+            let angle = if self.degrees > 0.0 {
+                self.rng
+                    .gen_range(-self.degrees..=self.degrees)
+                    .to_radians()
+            } else {
+                0.0
+            };
+            out.resize(size, 0.0);
+            transform(
+                (self.channels, self.height, self.width),
+                row,
+                out,
+                (shift_x, shift_y),
+                angle,
+            );
+        }
+        self.inputs = inputs;
+        Ok(Some(DatasetBatch {
+            inputs: &self.inputs,
+            targets: batch.targets,
+        }))
+    }
+
+    fn start_epoch(&mut self, epoch: usize) -> Result<(), NetworkError> {
+        self.rng = match self.seed {
+            Some(seed) => StdRng::seed_from_u64(seed.wrapping_add(epoch as u64)),
+            None => StdRng::from_entropy(),
+        };
+        self.source.start_epoch(epoch)
+    }
+}
+
 /// A JSONL file read one batch at a time, from [`JsonlStream::open`].
 ///
 /// Every line is an object holding an input field and a target field, each one
@@ -1244,6 +1428,7 @@ impl BatchSource for JsonlStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TrainConfig;
 
     /// A `.npy` file built by hand, byte for byte as `numpy.save` writes one:
     /// magic, version 1, a u16 header length, then the dict padded to a
@@ -1627,5 +1812,97 @@ mod tests {
         assert_eq!(rgb.inputs[1], vec![1.0; 12]);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A quarter turn of a 3x3 image lands every pixel on its rotated place.
+    #[test]
+    fn a_quarter_turn_moves_every_pixel_to_its_rotated_place() {
+        let image: Vec<f32> = (0..9).map(|value| value as f32).collect();
+        let mut out = vec![0.0; 9];
+        transform(
+            (1, 3, 3),
+            &image,
+            &mut out,
+            (0.0, 0.0),
+            std::f32::consts::FRAC_PI_2,
+        );
+        // Output (x, y) reads source (y, 2 - x): the top row takes the left
+        // column, bottom to top.
+        let expected = [6.0, 3.0, 0.0, 7.0, 4.0, 1.0, 8.0, 5.0, 2.0];
+        for (got, want) in out.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-5, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_crop_shifts_by_whole_pixels_and_fills_the_border_with_zero() {
+        let image: Vec<f32> = (1..=32).map(|value| value as f32).collect(); // 2 planes of 4x4
+        let mut dataset = Dataset::new(vec![image.clone(); 20], vec![vec![5.0]; 20]);
+        let config = TrainConfig {
+            batch_size: 20,
+            shuffle: false,
+            ..Default::default()
+        };
+        let mut augmented = Augment::new(dataset.stream(&config), 2, 4, 4)
+            .unwrap()
+            .random_crop(2)
+            .seed(3);
+        augmented.start_epoch(0).unwrap();
+        let batch = augmented.next_batch().unwrap().unwrap();
+        assert_eq!(batch.targets, vec![vec![5.0]; 20]);
+
+        let mut shifts = std::collections::HashSet::new();
+        for row in batch.inputs {
+            let shift = (-2..=2)
+                .flat_map(|sy| (-2..=2).map(move |sx| (sx, sy)))
+                .find(|&(sx, sy)| {
+                    (0..32).all(|index| {
+                        let (channel, y, x) = (index / 16, (index / 4) % 4, index % 4);
+                        let (from_x, from_y) = (x as i32 - sx, y as i32 - sy);
+                        let want = if (0..4).contains(&from_x) && (0..4).contains(&from_y) {
+                            image[channel * 16 + from_y as usize * 4 + from_x as usize]
+                        } else {
+                            0.0
+                        };
+                        row[index] == want
+                    })
+                })
+                .unwrap_or_else(|| panic!("{row:?} is not a shifted copy"));
+            shifts.insert(shift);
+        }
+        assert!(shifts.len() > 1, "twenty draws all took one shift");
+    }
+
+    #[test]
+    fn a_seeded_augment_repeats_an_epoch_and_varies_between_epochs() {
+        let image: Vec<f32> = (0..16).map(|value| value as f32).collect();
+        let mut dataset = Dataset::new(vec![image; 4], vec![vec![0.0]; 4]);
+        let config = TrainConfig {
+            batch_size: 4,
+            shuffle: false,
+            ..Default::default()
+        };
+        let mut augmented = Augment::new(dataset.stream(&config), 1, 4, 4)
+            .unwrap()
+            .random_crop(1)
+            .random_rotation(20.0)
+            .seed(11);
+        let mut epoch = |index| {
+            augmented.start_epoch(index).unwrap();
+            augmented.next_batch().unwrap().unwrap().inputs.to_vec()
+        };
+        let first = epoch(0);
+        assert_eq!(first, epoch(0));
+        assert_ne!(first, epoch(1));
+    }
+
+    #[test]
+    fn an_augment_rejects_a_row_of_the_wrong_size() {
+        let mut dataset = Dataset::new(vec![vec![0.0; 15]], vec![vec![0.0]]);
+        let config = TrainConfig::default();
+        let mut augmented = Augment::new(dataset.stream(&config), 1, 4, 4).unwrap();
+        augmented.start_epoch(0).unwrap();
+        assert!(augmented.next_batch().is_err());
+        assert!(Augment::new(dataset.stream(&config), 0, 4, 4).is_err());
     }
 }
