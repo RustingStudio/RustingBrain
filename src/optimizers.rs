@@ -32,8 +32,8 @@ pub enum Optimizer {
     /// because the optimizer is a value that can be swapped between steps, so
     /// the memory Lion saves elsewhere is not saved here.
     ///
-    /// CPU only: neither the CUDA nor the Metal path has a kernel for it, and
-    /// both report that rather than quietly taking an Adam step.
+    /// The CPU and CUDA paths run it. Metal has no kernel for it and reports
+    /// that rather than quietly taking an Adam step.
     Lion {
         learning_rate: f32,
         beta1: f32,
