@@ -1,4 +1,4 @@
-//! Fused causal attention for the Ampere tensor cores.
+//! Fused attention for the Ampere tensor cores, causal or bidirectional.
 //!
 //! The three-kernel attention path in [`crate::gpu_model`] writes a whole
 //! `[seq_len, seq_len]` score matrix to global memory, reads it back for the
@@ -301,7 +301,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
     float* __restrict__ lse,
     int seq_len, int qkv_width, int query_width,
     int key_base, int value_base, int group,
-    int lse_head_stride, float scale)
+    int lse_head_stride, float scale, int causal)
 {
   extern __shared__ unsigned short smem[];
   unsigned short* ks = smem;                      // [key][dim]
@@ -348,7 +348,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
   float m_a=NEG_INF, m_b=NEG_INF, l_a=0.f, l_b=0.f;
 
   // Causal: query tile `qt` sees key tiles 0..qt and nothing beyond.
-  for (int kt=0; kt<=qt; ++kt) {
+  // Bidirectional: every query tile sees every key tile.
+  const int last = causal ? qt : ((seq_len + 63) >> 6) - 1;
+  for (int kt=0; kt<=last; ++kt) {
     __syncthreads();
     // One element a thread, not two: the value tile is stored transposed, and
     // measured, the wider load does not pay for the extra shared-memory bank
@@ -385,16 +387,17 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
       }
     }
 
-    // Only the tile on the diagonal is partly masked, and only it can hold
-    // keys past the end of a sequence whose length is not a multiple of 64.
-    if (kt == qt) {
+    // Only the last tile is partly masked - the diagonal under a causal mask,
+    // the end of the sequence without one - and only it can hold keys past
+    // the end of a sequence whose length is not a multiple of 64.
+    if (kt == last) {
       #pragma unroll
       for (int n=0;n<8;++n) {
         int key = kt*64 + n*8 + t*2;
-        if (key   > row_a || key   >= seq_len) s[n][0]=NEG_INF;
-        if (key+1 > row_a || key+1 >= seq_len) s[n][1]=NEG_INF;
-        if (key   > row_b || key   >= seq_len) s[n][2]=NEG_INF;
-        if (key+1 > row_b || key+1 >= seq_len) s[n][3]=NEG_INF;
+        if ((causal && key   > row_a) || key   >= seq_len) s[n][0]=NEG_INF;
+        if ((causal && key+1 > row_a) || key+1 >= seq_len) s[n][1]=NEG_INF;
+        if ((causal && key   > row_b) || key   >= seq_len) s[n][2]=NEG_INF;
+        if ((causal && key+1 > row_b) || key+1 >= seq_len) s[n][3]=NEG_INF;
       }
     }
 
@@ -509,7 +512,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
     unsigned short* __restrict__ grad_qkv,
     int seq_len, int qkv_width, int query_width,
     int key_base, int value_base, int group,
-    int lse_head_stride, float scale)
+    int lse_head_stride, float scale, int causal)
 {
   extern __shared__ unsigned short smem[];
   unsigned short* ks = smem;                        // [key][dim]
@@ -563,7 +566,8 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
     #pragma unroll
     for (int i=0;i<4;++i) acc[n][i]=0.f;
 
-  for (int ktile=0; ktile<=qt; ++ktile) {
+  const int last = causal ? qt : ((seq_len + 63) >> 6) - 1;
+  for (int ktile=0; ktile<=last; ++ktile) {
     __syncthreads();
     for (int i = threadIdx.x*2; i < 64*FA_D; i += 256) {
       int r = i >> 6, c = i & 63;
@@ -600,14 +604,14 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
       }
     }
 
-    if (ktile == qt) {
+    if (ktile == last) {
       #pragma unroll
       for (int n=0;n<8;++n) {
         int key = ktile*64 + n*8 + t*2;
-        if (key   > row_a || key   >= seq_len) s[n][0]=NEG_INF;
-        if (key+1 > row_a || key+1 >= seq_len) s[n][1]=NEG_INF;
-        if (key   > row_b || key   >= seq_len) s[n][2]=NEG_INF;
-        if (key+1 > row_b || key+1 >= seq_len) s[n][3]=NEG_INF;
+        if ((causal && key   > row_a) || key   >= seq_len) s[n][0]=NEG_INF;
+        if ((causal && key+1 > row_a) || key+1 >= seq_len) s[n][1]=NEG_INF;
+        if ((causal && key   > row_b) || key   >= seq_len) s[n][2]=NEG_INF;
+        if ((causal && key+1 > row_b) || key+1 >= seq_len) s[n][3]=NEG_INF;
       }
     }
 
@@ -667,7 +671,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
     unsigned short* __restrict__ grad_qkv,
     int seq_len, int qkv_width, int query_width,
     int key_base, int value_base, int group,
-    int lse_head_stride, float scale)
+    int lse_head_stride, float scale, int causal)
 {
   extern __shared__ unsigned short smem[];
   unsigned short* qs  = smem;                       // [query][dim]
@@ -719,7 +723,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
     for (int i=0;i<4;++i) { dk[n][i]=0.f; dv[n][i]=0.f; }
 
   for (int hq = kvh*group; hq < (kvh+1)*group; ++hq) {
-    for (int it = jt; it < tiles; ++it) {
+    for (int it = causal ? jt : 0; it < tiles; ++it) {
       __syncthreads();
       for (int i = threadIdx.x*2; i < 64*FA_D; i += 256) {
         int r = i >> 6, c = i & 63;
@@ -772,10 +776,10 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
         int q0 = it*64 + col, q1 = q0 + 1;
         float l0 = lse_s[col], l1 = lse_s[col+1];
         float d0 = del_s[col], d1 = del_s[col+1];
-        float p0 = (q0 >= key_a && q0 < seq_len) ? __expf(st[n][0]*scale-l0) : 0.f;
-        float p1 = (q1 >= key_a && q1 < seq_len) ? __expf(st[n][1]*scale-l1) : 0.f;
-        float p2 = (q0 >= key_b && q0 < seq_len) ? __expf(st[n][2]*scale-l0) : 0.f;
-        float p3 = (q1 >= key_b && q1 < seq_len) ? __expf(st[n][3]*scale-l1) : 0.f;
+        float p0 = ((!causal || q0 >= key_a) && q0 < seq_len) ? __expf(st[n][0]*scale-l0) : 0.f;
+        float p1 = ((!causal || q1 >= key_a) && q1 < seq_len) ? __expf(st[n][1]*scale-l1) : 0.f;
+        float p2 = ((!causal || q0 >= key_b) && q0 < seq_len) ? __expf(st[n][2]*scale-l0) : 0.f;
+        float p3 = ((!causal || q1 >= key_b) && q1 < seq_len) ? __expf(st[n][3]*scale-l1) : 0.f;
         st[n][0]=p0; st[n][1]=p1; st[n][2]=p2; st[n][3]=p3;
         dpt[n][0]=p0*(dpt[n][0]-d0); dpt[n][1]=p1*(dpt[n][1]-d1);
         dpt[n][2]=p2*(dpt[n][2]-d0); dpt[n][3]=p3*(dpt[n][3]-d1);

@@ -1262,14 +1262,6 @@ impl TransformerLm {
     #[cfg(feature = "cuda")]
     pub fn to_cuda(&mut self, device: usize, memory_budget_mib: usize) -> Result<(), NetworkError> {
         self.check_not_quantized("move to a device")?;
-        if !self.config.causal {
-            return Err(NetworkError::InvalidConfig(
-                "a bidirectional model cannot move to a device: the flash-attention kernel \
-                 masks every key after the query, so the device would train a different model \
-                 than the host"
-                    .into(),
-            ));
-        }
         let counts = self.config.parameter_counts();
         // Value, gradient and the two Adam moments, all FP32 - except under a
         // LoRA adapter, where the frozen base carries its value alone and the
@@ -1441,8 +1433,7 @@ impl TransformerLm {
     /// The model must be bidirectional, which is what
     /// [`TransformerBuilder::bidirectional`] makes it: with a causal mask a
     /// masked position reads nothing after itself, so most of the objective's
-    /// signal is not there to learn from. CPU only, since a bidirectional model
-    /// cannot move to a device.
+    /// signal is not there to learn from.
     ///
     /// ```no_run
     /// # use rusting_brain::{MaskedBatch, TransformerLm};

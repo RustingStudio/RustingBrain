@@ -135,6 +135,7 @@ pub(crate) struct FlashShape {
     pub(crate) query_width: usize,
     pub(crate) key_base: usize,
     pub(crate) value_base: usize,
+    pub(crate) causal: bool,
 }
 
 /// RoPE's `cos` and `sin` tables on the device.
@@ -884,6 +885,7 @@ impl Gpu<'_> {
                 .arg(&(shape.group as i32))
                 .arg(&(shape.rows as i32))
                 .arg(&scale)
+                .arg(&i32::from(shape.causal))
                 .launch(config)
                 .map_err(cuda_err("fused attention kernel"))?;
         }
@@ -959,6 +961,7 @@ impl Gpu<'_> {
                     .arg(&(shape.group as i32))
                     .arg(&(shape.rows as i32))
                     .arg(&scale)
+                    .arg(&i32::from(shape.causal))
                     .launch(config)
                     .map_err(cuda_err("fused attention backward kernel"))
             }
@@ -1983,6 +1986,7 @@ fn forward_block(
     let heads = attention.num_heads();
     let kv_heads = attention.num_kv_heads();
     let head_dim = attention.head_dim();
+    let causal = attention.is_causal();
     let scale = (head_dim as f32).sqrt().recip();
     let query_width = heads * head_dim;
 
@@ -2070,6 +2074,7 @@ fn forward_block(
         query_width,
         key_base,
         value_base,
+        causal,
     };
     let mut log_sum_exp = gpu.uninit(heads * rows)?;
     // Only the fused kernel knows how to write a narrow `merged`; the batched
@@ -2111,7 +2116,7 @@ fn forward_block(
             &mut log_sum_exp,
             heads * sequences * seq_len,
             seq_len,
-            true,
+            causal,
         )?;
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
@@ -3035,6 +3040,7 @@ fn backward_attention(
     let heads = attention.num_heads();
     let kv_heads = attention.num_kv_heads();
     let head_dim = attention.head_dim();
+    let causal = attention.is_causal();
     let group = heads / kv_heads;
     let scale = (head_dim as f32).sqrt().recip();
     let query_width = heads * head_dim;
@@ -3092,6 +3098,7 @@ fn backward_attention(
             query_width,
             key_base,
             value_base,
+            causal,
         };
         let mut delta = gpu.uninit(heads * rows)?;
         // Every column of `grad_qkv` is written rather than accumulated: the
@@ -3145,7 +3152,7 @@ fn backward_attention(
             &cache.log_sum_exp,
             heads * sequences * seq_len,
             seq_len,
-            true,
+            causal,
         )?;
 
         // Every head overwrites its own slice of `grad_scores`, so the buffer does
@@ -3211,7 +3218,7 @@ fn backward_attention(
             &probabilities,
             heads * sequences * seq_len,
             seq_len,
-            true,
+            causal,
         )?;
 
         for head in 0..heads {
