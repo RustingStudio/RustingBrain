@@ -149,33 +149,46 @@ pub(crate) struct DeviceRope {
     max_seq_len: usize,
 }
 
-/// What [`backward`] needs from [`forward`], all of it device-resident.
-pub(crate) struct GpuCache {
+/// What the backward pass over a stack of blocks needs from its forward pass,
+/// all of it device-resident.
+pub(crate) struct GpuStack {
     rows: usize,
     seq_len: usize,
     sequences: usize,
-    ids: CudaSlice<u32>,
     valid_tokens: usize,
     blocks: Vec<BlockCache>,
-    final_input: CudaSlice<f32>,
-    final_inverse_rms: CudaSlice<f32>,
-    final_weight: CudaSlice<f32>,
-    final_output: Act,
     auxiliary_loss: f32,
 }
 
-impl std::fmt::Debug for GpuCache {
+impl std::fmt::Debug for GpuStack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuCache")
+        f.debug_struct("GpuStack")
             .field("rows", &self.rows)
             .field("seq_len", &self.seq_len)
             .finish()
     }
 }
 
+/// What [`backward`] needs from [`forward`]: the block stack's cache, plus the
+/// token ids and the final norm around it.
+pub(crate) struct GpuCache {
+    stack: GpuStack,
+    ids: CudaSlice<u32>,
+    final_input: CudaSlice<f32>,
+    final_inverse_rms: CudaSlice<f32>,
+    final_weight: CudaSlice<f32>,
+    final_output: Act,
+}
+
+impl std::fmt::Debug for GpuCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.stack.fmt(f)
+    }
+}
+
 impl GpuCache {
     pub(crate) fn auxiliary_loss(&self) -> f32 {
-        self.auxiliary_loss
+        self.stack.auxiliary_loss
     }
 }
 
@@ -1872,8 +1885,9 @@ pub(crate) fn forward(
 ) -> Result<(Matrix, GpuCache), NetworkError> {
     let cache = forward_hidden(model, context, batch)?;
     let gpu = Gpu { context };
-    let logits = gpu.linear(head_of(model)?, &cache.final_output.wide(), cache.rows)?;
-    let logits = gpu.matrix(&logits, cache.rows, model.embedding.vocab_size())?;
+    let rows = cache.stack.rows;
+    let logits = gpu.linear(head_of(model)?, &cache.final_output.wide(), rows)?;
+    let logits = gpu.matrix(&logits, rows, model.embedding.vocab_size())?;
     Ok((logits, cache))
 }
 
@@ -1920,24 +1934,16 @@ fn forward_hidden(
         d_model,
     )?;
 
-    let mut blocks = Vec::with_capacity(model.blocks.len());
-    let mut auxiliary_loss = 0.0;
-
-    for block in &model.blocks {
-        let (output, cache) = forward_block(
-            &gpu,
-            block,
-            hidden,
-            &valid,
-            valid_tokens,
-            rows,
-            seq_len,
-            sequences,
-            &mut auxiliary_loss,
-        )?;
-        blocks.push(cache);
-        hidden = output;
-    }
+    let (hidden, stack) = forward_stack(
+        &gpu,
+        &model.blocks,
+        hidden,
+        &valid,
+        valid_tokens,
+        rows,
+        seq_len,
+        sequences,
+    )?;
 
     let final_weight = gpu.upload(&model.final_norm.weight.value.data)?;
     // The head narrows its own operands, so the last norm stays FP32.
@@ -1952,18 +1958,165 @@ fn forward_hidden(
     )?;
 
     Ok(GpuCache {
-        rows,
-        seq_len,
-        sequences,
+        stack,
         ids,
-        valid_tokens,
-        blocks,
         final_input: hidden,
         final_inverse_rms,
         final_weight,
         final_output,
-        auxiliary_loss,
     })
+}
+
+/// Every block in order over `hidden`, returning the last block's output.
+#[allow(clippy::too_many_arguments)]
+fn forward_stack(
+    gpu: &Gpu<'_>,
+    blocks: &[TransformerBlock],
+    mut hidden: CudaSlice<f32>,
+    valid: &CudaSlice<i32>,
+    valid_tokens: usize,
+    rows: usize,
+    seq_len: usize,
+    sequences: usize,
+) -> Result<(CudaSlice<f32>, GpuStack), NetworkError> {
+    let mut caches = Vec::with_capacity(blocks.len());
+    let mut auxiliary_loss = 0.0;
+    for block in blocks {
+        let (output, cache) = forward_block(
+            gpu,
+            block,
+            hidden,
+            valid,
+            valid_tokens,
+            rows,
+            seq_len,
+            sequences,
+            &mut auxiliary_loss,
+        )?;
+        caches.push(cache);
+        hidden = output;
+    }
+    Ok((
+        hidden,
+        GpuStack {
+            rows,
+            seq_len,
+            sequences,
+            valid_tokens,
+            blocks: caches,
+            auxiliary_loss,
+        },
+    ))
+}
+
+/// A stack of blocks whose input and output are hidden states on the host
+/// rather than token ids and logits: a vision transformer's, whose patch
+/// projection, norm, pooling and head are small enough to stay there.
+///
+/// Every row is a real position, so nothing is masked out.
+pub(crate) fn stack_forward(
+    blocks: &[TransformerBlock],
+    context: &Arc<GpuContext>,
+    input: &Matrix,
+    seq_len: usize,
+) -> Result<(Matrix, GpuStack), NetworkError> {
+    let gpu = Gpu { context };
+    let rows = input.rows;
+    let valid = gpu.upload_flags(&vec![1; rows])?;
+    let hidden = gpu.upload(&input.data)?;
+    let (hidden, stack) = forward_stack(
+        &gpu,
+        blocks,
+        hidden,
+        &valid,
+        rows,
+        rows,
+        seq_len,
+        rows / seq_len,
+    )?;
+    Ok((gpu.matrix(&hidden, rows, input.cols)?, stack))
+}
+
+/// The backward half of [`stack_forward`]: accumulates every block's weight
+/// and norm gradients and returns `dL/dinput` on the host.
+pub(crate) fn stack_backward(
+    blocks: &mut [TransformerBlock],
+    context: &Arc<GpuContext>,
+    stack: &GpuStack,
+    grad_output: &Matrix,
+) -> Result<Matrix, NetworkError> {
+    let gpu = Gpu { context };
+    let rows = stack.rows;
+    let d_model = grad_output.cols;
+    if grad_output.rows != rows {
+        return Err(NetworkError::InvalidInput {
+            expected: rows,
+            actual: grad_output.rows,
+        });
+    }
+    let grad = gpu.upload(&grad_output.data)?;
+    // What the final norm's backward would have handed the top block: its own
+    // operand copy in whichever precision that block's feed forward reads.
+    let grad_act = match stack_operand(stack, blocks.len().checked_sub(1)) {
+        Some(narrow) => Some(gpu.narrowed(&grad.slice(..), rows * d_model, narrow)?),
+        None => None,
+    };
+    // Slot 0 is the final norm's, which this stack does not have.
+    let mut grad_norms = gpu.zeros(norm_slots(blocks.len()) * d_model)?;
+    let grad = backward_stack(&gpu, blocks, stack, grad, grad_act, &mut grad_norms)?;
+    let values = gpu.download(&grad_norms)?;
+    accumulate_block_norms(blocks, &values, d_model);
+    gpu.matrix(&grad, rows, d_model)
+}
+
+/// The gradient a norm hands down is a GEMM operand for the layer below it,
+/// so the norm writes that operand copy itself. Which precision it wants is
+/// the receiving feed forward's; a routed one takes FP32 and narrows the
+/// shared expert's operand on its own, so it asks for no copy at all.
+fn stack_operand(stack: &GpuStack, index: Option<usize>) -> Option<bool> {
+    stack
+        .blocks
+        .get(index?)
+        .and_then(|block| match &block.feed_forward {
+            FfnCache::Dense(_) => Some(block.feed_forward_normed.is_narrow()),
+            FfnCache::Moe(_) => None,
+        })
+}
+
+/// Every block from the top down, returning `dL/dinput` of the bottom one.
+fn backward_stack(
+    gpu: &Gpu<'_>,
+    blocks: &mut [TransformerBlock],
+    stack: &GpuStack,
+    mut grad_hidden: CudaSlice<f32>,
+    mut grad_hidden_act: Option<Act>,
+    grad_norms: &mut CudaSlice<f32>,
+) -> Result<CudaSlice<f32>, NetworkError> {
+    for (index, (block, block_cache)) in blocks.iter_mut().zip(&stack.blocks).enumerate().rev() {
+        (grad_hidden, grad_hidden_act) = backward_block(
+            gpu,
+            block,
+            block_cache,
+            &grad_hidden,
+            grad_hidden_act.as_ref(),
+            stack_operand(stack, index.checked_sub(1)),
+            stack,
+            grad_norms,
+            index,
+        )?;
+    }
+    Ok(grad_hidden)
+}
+
+/// Adds the downloaded norm-scale gradients to each block's host-resident
+/// norm weights.
+fn accumulate_block_norms(blocks: &mut [TransformerBlock], values: &[f32], d_model: usize) {
+    let at = |slot: usize| &values[slot * d_model..(slot + 1) * d_model];
+    for (index, block) in blocks.iter_mut().enumerate() {
+        let (attention, feed_forward) = norm_slot(index);
+        Gpu::accumulate_host_grad(&mut block.attention_norm.weight, at(attention));
+        Gpu::accumulate_host_grad(&mut block.feed_forward_norm.weight, at(feed_forward));
+    }
 }
 
 /// One decoder block: pre-norm attention, then a pre-norm feed-forward, both
@@ -2487,7 +2640,7 @@ pub(crate) fn backward(
     grad_logits: &Matrix,
 ) -> Result<(), NetworkError> {
     let gpu = Gpu { context };
-    let rows = cache.rows;
+    let rows = cache.stack.rows;
     let d_model = model.config.d_model;
 
     if grad_logits.rows != rows {
@@ -2552,7 +2705,7 @@ pub(crate) fn train_step(
 
     let cache = forward_hidden(model, context, batch)?;
     let gpu = Gpu { context };
-    let rows = cache.rows;
+    let rows = cache.stack.rows;
     let d_model = model.config.d_model;
 
     let targets = gpu.upload_signed(&targets)?;
@@ -2615,7 +2768,7 @@ pub(crate) fn train_step(
     // and the backward pass does not need the value.
     backward_from_final(model, context, &cache, &grad_final)?;
     let lm_loss = gpu.download(&loss)?[0] / predicted as f32;
-    Ok((lm_loss, cache.auxiliary_loss))
+    Ok((lm_loss, cache.stack.auxiliary_loss))
 }
 
 /// The LM head run in BF16, behind [`crate::TransformerBuilder::mixed_precision`].
@@ -2847,27 +3000,14 @@ fn backward_from_final(
     grad_final: &CudaSlice<f32>,
 ) -> Result<(), NetworkError> {
     let gpu = Gpu { context };
-    let rows = cache.rows;
+    let rows = cache.stack.rows;
     let d_model = model.config.d_model;
 
     // Every RMSNorm scale gradient in the model, in one buffer: slot 0 is the
     // final norm, then two slots per block. See [`Gpu::accumulate_host_grad`]
     // for why they are not downloaded where they are produced.
     let mut grad_norms = gpu.zeros(norm_slots(model.blocks.len()) * d_model)?;
-    // The gradient a norm hands down is a GEMM operand for the layer below it,
-    // so the norm writes that operand copy itself. Which precision it wants is
-    // the receiving feed forward's; a routed one takes FP32 and narrows the
-    // shared expert's operand on its own, so it asks for no copy at all.
-    let operand = |index: usize| {
-        cache
-            .blocks
-            .get(index)
-            .and_then(|block| match &block.feed_forward {
-                FfnCache::Dense(_) => Some(block.feed_forward_normed.is_narrow()),
-                FfnCache::Moe(_) => None,
-            })
-    };
-    let (mut grad_hidden, mut grad_hidden_act) = gpu.rmsnorm_backward(
+    let (grad_hidden, grad_hidden_act) = gpu.rmsnorm_backward(
         &cache.final_input,
         grad_final,
         &cache.final_weight,
@@ -2875,26 +3015,18 @@ fn backward_from_final(
         &mut grad_norms.slice_mut(0..d_model),
         grad_final,
         false,
-        model.blocks.len().checked_sub(1).and_then(operand),
+        stack_operand(&cache.stack, model.blocks.len().checked_sub(1)),
         rows,
         d_model,
     )?;
-
-    for (index, (block, block_cache)) in
-        model.blocks.iter_mut().zip(&cache.blocks).enumerate().rev()
-    {
-        (grad_hidden, grad_hidden_act) = backward_block(
-            &gpu,
-            block,
-            block_cache,
-            &grad_hidden,
-            grad_hidden_act.as_ref(),
-            index.checked_sub(1).and_then(operand),
-            cache,
-            &mut grad_norms,
-            index,
-        )?;
-    }
+    let grad_hidden = backward_stack(
+        &gpu,
+        &mut model.blocks,
+        &cache.stack,
+        grad_hidden,
+        grad_hidden_act,
+        &mut grad_norms,
+    )?;
 
     {
         let embedding = model.embedding.weight.device.as_mut().ok_or_else(|| {
@@ -2918,13 +3050,8 @@ fn backward_from_final(
     // The one host round trip of the backward pass, after everything else is
     // enqueued.
     let values = gpu.download(&grad_norms)?;
-    let at = |slot: usize| &values[slot * d_model..(slot + 1) * d_model];
-    Gpu::accumulate_host_grad(&mut model.final_norm.weight, at(0));
-    for (index, block) in model.blocks.iter_mut().enumerate() {
-        let (attention, feed_forward) = norm_slot(index);
-        Gpu::accumulate_host_grad(&mut block.attention_norm.weight, at(attention));
-        Gpu::accumulate_host_grad(&mut block.feed_forward_norm.weight, at(feed_forward));
-    }
+    Gpu::accumulate_host_grad(&mut model.final_norm.weight, &values[..d_model]);
+    accumulate_block_norms(&mut model.blocks, &values, d_model);
     Ok(())
 }
 
@@ -2946,7 +3073,7 @@ fn backward_block(
     grad_output: &CudaSlice<f32>,
     grad_output_act: Option<&Act>,
     output_operand: Option<bool>,
-    batch: &GpuCache,
+    batch: &GpuStack,
     grad_norms: &mut CudaSlice<f32>,
     index: usize,
 ) -> Result<(CudaSlice<f32>, Option<Act>), NetworkError> {
@@ -3030,7 +3157,7 @@ fn backward_attention(
     block: &mut TransformerBlock,
     cache: &BlockCache,
     grad_output: &Act,
-    batch: &GpuCache,
+    batch: &GpuStack,
 ) -> Result<CudaSlice<f32>, NetworkError> {
     let rows = batch.rows;
     let seq_len = batch.seq_len;

@@ -114,6 +114,9 @@ pub struct VitCache {
     blocks: Vec<TransformerBlockCache>,
     final_input: Matrix,
     pooled: Matrix,
+    /// Set when the blocks ran on a device, in which case `blocks` is empty.
+    #[cfg(feature = "cuda")]
+    device: Option<std::sync::Arc<crate::gpu_model::GpuStack>>,
 }
 
 impl VitCache {
@@ -138,6 +141,10 @@ pub struct VisionTransformer {
     pub optimizer: Optimizer,
     #[serde(default)]
     optimizer_step: usize,
+    /// Set by [`VisionTransformer::to_cuda`]. Never serialized.
+    #[cfg(feature = "cuda")]
+    #[serde(skip)]
+    device: Option<std::sync::Arc<crate::gpu_transformer::GpuContext>>,
 }
 
 impl VisionTransformer {
@@ -190,6 +197,8 @@ impl VisionTransformer {
             head: Linear::new(config.d_model, config.num_classes, &mut rng),
             optimizer: Optimizer::adam(3e-4),
             optimizer_step: 0,
+            #[cfg(feature = "cuda")]
+            device: None,
             config,
         })
     }
@@ -248,6 +257,19 @@ impl VisionTransformer {
         let patches = self.patchify(images)?;
         let mut hidden = self.patch.forward(&patches);
 
+        #[cfg(feature = "cuda")]
+        if let Some(context) = &self.device {
+            let (hidden, stack) = crate::gpu_model::stack_forward(
+                &self.blocks,
+                context,
+                &hidden,
+                self.config.num_patches(),
+            )?;
+            let (logits, mut cache) = self.head_forward(patches, Vec::new(), hidden);
+            cache.device = Some(std::sync::Arc::new(stack));
+            return Ok((logits, cache));
+        }
+
         let layout = Layout {
             seq_len: Some(self.config.num_patches()),
             valid: None,
@@ -259,19 +281,30 @@ impl VisionTransformer {
             blocks.push(cache);
         }
 
+        Ok(self.head_forward(patches, blocks, hidden))
+    }
+
+    /// The norm, the pooling and the head over the last block's output.
+    fn head_forward(
+        &self,
+        patches: Matrix,
+        blocks: Vec<TransformerBlockCache>,
+        hidden: Matrix,
+    ) -> (Matrix, VitCache) {
         let normed = self.norm.forward(&hidden);
         let pooled = self.mean_pool(&normed);
         let logits = self.head.forward(&pooled);
-
-        Ok((
+        (
             logits,
             VitCache {
                 patches,
                 blocks,
                 final_input: hidden,
                 pooled,
+                #[cfg(feature = "cuda")]
+                device: None,
             },
-        ))
+        )
     }
 
     /// Logits alone, for inference.
@@ -342,6 +375,18 @@ impl VisionTransformer {
         }
 
         let mut grad_hidden = self.norm.backward(&cache.final_input, &grad_normed);
+        #[cfg(feature = "cuda")]
+        if let Some(stack) = &cache.device {
+            let context = self.device.clone().ok_or_else(|| {
+                NetworkError::Cuda(
+                    "the cache is from a device pass but the model is on the host".into(),
+                )
+            })?;
+            grad_hidden =
+                crate::gpu_model::stack_backward(&mut self.blocks, &context, stack, &grad_hidden)?;
+            self.patch.backward(&cache.patches, &grad_hidden);
+            return Ok(());
+        }
         for (block, block_cache) in self.blocks.iter_mut().zip(&cache.blocks).rev() {
             grad_hidden = block.backward(block_cache, &grad_hidden)?;
         }
@@ -479,18 +524,61 @@ impl VisionTransformer {
     }
 
     pub fn zero_grad(&mut self) {
-        self.params_mut()
-            .par_iter_mut()
-            .for_each(|param| param.zero_grad());
+        crate::optimizers::zero_grad(&mut self.params_mut());
     }
 
     pub fn step(&mut self) {
         self.optimizer_step += 1;
         let step = self.optimizer_step;
         let optimizer = self.optimizer.clone();
-        self.params_mut()
-            .par_iter_mut()
-            .for_each(|param| param.step(&optimizer, step, 1.0));
+        crate::optimizers::apply_step(&mut self.params_mut(), &optimizer, step, 1.0);
+    }
+
+    /// Moves the blocks' projections onto CUDA device `device`, where
+    /// [`forward_train`](Self::forward_train) and [`backward`](Self::backward)
+    /// then run the block stack. The patch projection, the norms, the pooling
+    /// and the head stay on the host: they are one small matmul each, and the
+    /// stack is the rest of the step.
+    ///
+    /// `mixed_precision` rounds the matmul operands to BF16, which is also what
+    /// lets a 64-wide head take the fused attention kernel. Call
+    /// [`sync_from_device`](Self::sync_from_device) before saving.
+    #[cfg(feature = "cuda")]
+    pub fn to_cuda(&mut self, device: usize, mixed_precision: bool) -> Result<(), NetworkError> {
+        let context = crate::gpu_transformer::GpuContext::with_precision(device, mixed_precision)?;
+        for block in &mut self.blocks {
+            for linear in block.linears_mut() {
+                for param in linear.params_mut() {
+                    param.move_to_cuda(&context)?;
+                }
+            }
+        }
+        self.device = Some(context);
+        Ok(())
+    }
+
+    /// Copies every device parameter back and releases the device buffers.
+    #[cfg(feature = "cuda")]
+    pub fn to_cpu(&mut self) -> Result<(), NetworkError> {
+        for param in self.params_mut() {
+            param.move_to_cpu()?;
+        }
+        if let Some(context) = self.device.take() {
+            context.check()?;
+        }
+        Ok(())
+    }
+
+    /// Refreshes the host copies of the device parameters, keeping residency.
+    #[cfg(feature = "cuda")]
+    pub fn sync_from_device(&mut self) -> Result<(), NetworkError> {
+        for param in self.params_mut() {
+            param.sync_from_device()?;
+        }
+        match &self.device {
+            Some(context) => context.check(),
+            None => Ok(()),
+        }
     }
 
     pub fn params_mut(&mut self) -> Vec<&mut Param> {
@@ -740,5 +828,80 @@ mod tests {
             loaded.forward(&images).unwrap().data,
             model.forward(&images).unwrap().data
         );
+    }
+
+    /// One SGD step on the device against the same step on the host.
+    ///
+    /// 100 patches is more than one 64-wide attention tile and not a multiple
+    /// of it, so the fused kernel's bidirectional loop and its ragged tail are
+    /// both exercised. FP32 takes the three-kernel attention and measured
+    /// 1.4e-6 from the host on logits up to 2.2; BF16 with a 64-wide head
+    /// takes the fused kernels and measured 1.4e-2. A causal mask where the
+    /// model has none puts the FP32 run 1.8 away.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_device_step_matches_the_host_or_skips_without_device() {
+        if crate::gpu_transformer::GpuContext::new(0).is_err() {
+            return;
+        }
+        let config = VitConfig {
+            image_size: 40,
+            patch_size: 4,
+            channels: 1,
+            d_model: 128,
+            n_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 64,
+            d_ff: 128,
+            num_classes: 3,
+            ..VitConfig::default()
+        };
+        let count = 3;
+        let pixels: Vec<f32> = (0..count * config.image_len())
+            .map(|index| ((index * 37 % 101) as f32 / 101.0) - 0.5)
+            .collect();
+        let images = Matrix::from_vec(count, config.image_len(), pixels);
+        let labels = [0u32, 1, 2];
+        let model = || {
+            VisionTransformer::new(config)
+                .unwrap()
+                .with_optimizer(Optimizer::sgd(0.5))
+        };
+
+        let mut host = model();
+        host.train_step(&images, &labels).unwrap();
+        let expected = host.forward(&images).unwrap();
+
+        for (mixed_precision, band) in [(false, 1e-4), (true, 3e-2)] {
+            let mut device = model();
+            device.to_cuda(0, mixed_precision).unwrap();
+            device.train_step(&images, &labels).unwrap();
+            let logits = device.forward(&images).unwrap();
+            let error = logits
+                .data
+                .iter()
+                .zip(&expected.data)
+                .map(|(device, host)| (device - host).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                error < band,
+                "mixed precision {mixed_precision}: the device is {error} from the host"
+            );
+
+            // The trained weights come back with the model.
+            device.to_cpu().unwrap();
+            let back = device.forward(&images).unwrap();
+            let moved = back
+                .data
+                .iter()
+                .zip(&expected.data)
+                .map(|(device, host)| (device - host).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                moved < band,
+                "after to_cpu the model is {moved} from the host"
+            );
+        }
     }
 }
