@@ -407,11 +407,14 @@ impl Param {
         context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
     ) -> Result<(), crate::network::NetworkError> {
         if self.device.is_none() {
-            self.device = Some(crate::gpu_transformer::DeviceParam::new(
+            let mut device = crate::gpu_transformer::DeviceParam::new(
                 context.clone(),
                 &self.value,
                 self.frozen,
-            )?);
+            )?;
+            // The optimizer carries on where the host left it.
+            device.upload_moments(&self.moment1, &self.moment2)?;
+            self.device = Some(device);
         }
         Ok(())
     }
@@ -422,6 +425,7 @@ impl Param {
         if let Some(device) = self.device.take() {
             device.download_value(&mut self.value)?;
             device.download_grad(&mut self.grad)?;
+            device.download_moments(&mut self.moment1, &mut self.moment2)?;
         }
         Ok(())
     }
