@@ -551,6 +551,9 @@ impl DeviceParam {
 
     /// The Adam moments, for a training run that persists optimizer state so a
     /// resumed run does not restart the optimizer from zero.
+    ///
+    /// The first moment averages the negated gradient here, so it is negated
+    /// on the way out and on the way in to read the same as the host's.
     pub(crate) fn download_moments(
         &self,
         first: &mut Matrix,
@@ -560,6 +563,7 @@ impl DeviceParam {
             return Ok(());
         }
         self.context.download(&self.moment1, first)?;
+        first.data.iter_mut().for_each(|value| *value = -*value);
         self.context.download(&self.moment2, second)
     }
 
@@ -572,9 +576,15 @@ impl DeviceParam {
         if self.frozen {
             return Ok(());
         }
-        self.moment1 = self.context.upload(first)?;
-        self.moment2 = self.context.upload(second)?;
-        Ok(())
+        let negated: Vec<f32> = first.data.iter().map(|value| -value).collect();
+        self.context
+            .stream
+            .memcpy_htod(&negated, &mut self.moment1)
+            .map_err(cuda_err("host to device copy"))?;
+        self.context
+            .stream
+            .memcpy_htod(&second.data, &mut self.moment2)
+            .map_err(cuda_err("host to device copy"))
     }
 
     /// The L2 norm of this parameter's gradient, computed on the device.
@@ -1801,6 +1811,38 @@ mod tests {
             assert_close(
                 &format!("parameter {index}"),
                 &device_param.value.data,
+                &host_param.value.data,
+                1e-3,
+            );
+        }
+    }
+
+    /// Adam's moments cross with the weights in both directions, so a run
+    /// that moves mid-training takes the steps it would have taken in place.
+    #[test]
+    fn adam_moments_survive_a_move_each_way_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let mut host = tiny().build().unwrap();
+        let mut moved = host.clone();
+        let batch = [vec![3u32, 8, 1, 5, 2, 7], vec![9, 4, 4, 0, 11, 6]];
+
+        host.train_step(&batch).unwrap();
+        moved.train_step(&batch).unwrap();
+        moved.to_cuda(0, 8192).unwrap();
+        host.train_step(&batch).unwrap();
+        moved.train_step(&batch).unwrap();
+        moved.to_cpu().unwrap();
+        host.train_step(&batch).unwrap();
+        moved.train_step(&batch).unwrap();
+
+        for (index, (moved_param, host_param)) in
+            moved.params_mut().iter().zip(host.params_mut()).enumerate()
+        {
+            assert_close(
+                &format!("parameter {index}"),
+                &moved_param.value.data,
                 &host_param.value.data,
                 1e-3,
             );
