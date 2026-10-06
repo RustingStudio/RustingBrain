@@ -248,6 +248,11 @@ pub fn apply_step(params: &mut [&mut Param], optimizer: &Optimizer, step: usize,
 /// Clipping is a uniform rescale of every gradient, and `scale` already
 /// multiplies every gradient uniformly, so this folds the clip into that factor
 /// rather than rewriting the gradient buffers.
+///
+/// A norm that is NaN or infinite skips the step: the gradients are cleared
+/// and the parameters and optimizer moments are left as they were, because
+/// one non-finite update would poison both for the rest of the run. The norm
+/// is still returned, so the caller sees the skip.
 pub fn step_clipped(
     params: &mut [&mut Param],
     optimizer: &Optimizer,
@@ -256,6 +261,10 @@ pub fn step_clipped(
     max_norm: f32,
 ) -> Result<f32, crate::network::NetworkError> {
     let norm = grad_norm(params)?;
+    if !norm.is_finite() {
+        zero_grad(params);
+        return Ok(norm);
+    }
     let clip = match norm > max_norm && norm > 0.0 {
         true => max_norm / norm,
         false => 1.0,

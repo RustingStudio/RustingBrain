@@ -665,10 +665,21 @@ impl FlowTransformer {
     /// Applies the optimizer with the gradients clipped to a global norm, and
     /// returns the pre-clip norm.
     pub fn step_clipped(&mut self, scale: f32, max_norm: f32) -> Result<f32, NetworkError> {
-        self.optimizer_step += 1;
-        let step = self.optimizer_step;
+        let step = self.optimizer_step + 1;
         let optimizer = self.optimizer.clone();
-        crate::optimizers::step_clipped(&mut self.params_mut(), &optimizer, step, scale, max_norm)
+        let norm = crate::optimizers::step_clipped(
+            &mut self.params_mut(),
+            &optimizer,
+            step,
+            scale,
+            max_norm,
+        )?;
+        // A skipped step does not count, so Adam's bias correction stays in
+        // line with the moments it has.
+        if norm.is_finite() {
+            self.optimizer_step = step;
+        }
+        Ok(norm)
     }
 
     pub fn zero_grad(&mut self) {
