@@ -47,7 +47,10 @@ fn stepping_and_replaying_never_allocate() {
     // The counter itself has to see an allocation, or a pass proves nothing.
     let before = allocations();
     std::hint::black_box(vec![0u8; 16]);
-    assert!(allocations() > before, "counting allocator is not installed");
+    assert!(
+        allocations() > before,
+        "counting allocator is not installed"
+    );
 
     let sim = SimConfig {
         lookback: 8,
@@ -68,7 +71,15 @@ fn stepping_and_replaying_never_allocate() {
     for step in 0..1000 {
         let action = Action::from_index(step % Action::COUNT);
         let info = env.step_into(action, &mut next_obs);
-        buffer.push(&obs, &body, action as usize, info.reward, &next_obs, &info.body, info.done);
+        buffer.push(
+            &obs,
+            &body,
+            action as usize,
+            info.reward,
+            &next_obs,
+            &info.body,
+            info.done,
+        );
         body = info.body;
         if info.done {
             body = env.reset_into(&mut next_obs);
