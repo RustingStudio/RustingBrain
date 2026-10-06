@@ -623,7 +623,6 @@ impl MultiHeadAttention {
         let group_size = self.group_size();
         let q_len = cache.q_len;
         let kv_len = cache.kv_len;
-        let sequences = cache.queries_in.rows / q_len;
 
         let grad_merged = self.output.backward(&cache.merged, grad_output);
 
@@ -636,111 +635,119 @@ impl MultiHeadAttention {
         // lies, and `grad_scores` is the only scratch. The one structural
         // difference is that the score block is `[q_len, kv_len]` rather than
         // square, so the two sides index with different lengths.
-        let mut grad_scores = vec![0.0f32; q_len * kv_len];
+        let (query_cols, kv_cols) = (grad_queries.cols, grad_keys.cols);
 
-        for head in 0..self.num_heads {
-            let probabilities = &cache.probabilities[head];
-            let query_base = head * head_dim;
-            let kv_base = (head / group_size) * head_dim;
+        // One task per sequence, every head inside it: each sequence owns its
+        // rows of the three gradients, so the tasks never write the same slot.
+        grad_queries
+            .data
+            .par_chunks_mut(q_len * query_cols)
+            .zip(grad_keys.data.par_chunks_mut(kv_len * kv_cols))
+            .zip(grad_values.data.par_chunks_mut(kv_len * kv_cols))
+            .enumerate()
+            .for_each(|(sequence, ((grad_queries, grad_keys), grad_values))| {
+                let mut grad_scores = vec![0.0f32; q_len * kv_len];
+                for head in 0..self.num_heads {
+                    let probabilities = &cache.probabilities[head];
+                    let query_base = head * head_dim;
+                    let kv_base = (head / group_size) * head_dim;
+                    let probability_offset = sequence * q_len * kv_len;
+                    let query_offset = sequence * q_len * cache.queries.cols + query_base;
+                    let merged_offset = sequence * q_len * grad_merged.cols + query_base;
+                    let key_offset = sequence * kv_len * cache.keys.cols + kv_base;
+                    let value_offset = sequence * kv_len * cache.values.cols + kv_base;
 
-            for sequence in 0..sequences {
-                let probability_offset = sequence * q_len * kv_len;
-                let query_offset = sequence * q_len * cache.queries.cols + query_base;
-                let merged_offset = sequence * q_len * grad_merged.cols + query_base;
-                let key_offset = sequence * kv_len * cache.keys.cols + kv_base;
-                let value_offset = sequence * kv_len * cache.values.cols + kv_base;
+                    unsafe {
+                        // dL/dprobability = dL/dmerged_head * V_head^T.
+                        matrixmultiply::sgemm(
+                            q_len,
+                            head_dim,
+                            kv_len,
+                            1.0,
+                            grad_merged.data.as_ptr().add(merged_offset),
+                            grad_merged.cols as isize,
+                            1,
+                            cache.values.data.as_ptr().add(value_offset),
+                            1,
+                            cache.values.cols as isize,
+                            0.0,
+                            grad_scores.as_mut_ptr(),
+                            kv_len as isize,
+                            1,
+                        );
 
-                unsafe {
-                    // dL/dprobability = dL/dmerged_head * V_head^T.
-                    matrixmultiply::sgemm(
-                        q_len,
-                        head_dim,
-                        kv_len,
-                        1.0,
-                        grad_merged.data.as_ptr().add(merged_offset),
-                        grad_merged.cols as isize,
-                        1,
-                        cache.values.data.as_ptr().add(value_offset),
-                        1,
-                        cache.values.cols as isize,
-                        0.0,
-                        grad_scores.as_mut_ptr(),
-                        kv_len as isize,
-                        1,
-                    );
+                        // dL/dV_head += P^T * dL/dmerged_head, accumulating
+                        // because `group_size` query heads share these columns.
+                        matrixmultiply::sgemm(
+                            kv_len,
+                            q_len,
+                            head_dim,
+                            1.0,
+                            probabilities.data.as_ptr().add(probability_offset),
+                            1,
+                            kv_len as isize,
+                            grad_merged.data.as_ptr().add(merged_offset),
+                            grad_merged.cols as isize,
+                            1,
+                            1.0,
+                            grad_values.as_mut_ptr().add(kv_base),
+                            kv_cols as isize,
+                            1,
+                        );
+                    }
 
-                    // dL/dV_head += P^T * dL/dmerged_head, accumulating because
-                    // `group_size` query heads share these columns.
-                    matrixmultiply::sgemm(
-                        kv_len,
-                        q_len,
-                        head_dim,
-                        1.0,
-                        probabilities.data.as_ptr().add(probability_offset),
-                        1,
-                        kv_len as isize,
-                        grad_merged.data.as_ptr().add(merged_offset),
-                        grad_merged.cols as isize,
-                        1,
-                        1.0,
-                        grad_values.data.as_mut_ptr().add(value_offset),
-                        grad_values.cols as isize,
-                        1,
-                    );
-                }
+                    // Softmax backward, in place. Nothing is masked here, so
+                    // every entry of the block takes part.
+                    for position in 0..q_len {
+                        let weights =
+                            &probabilities.data[probability_offset + position * kv_len..][..kv_len];
+                        let row = &mut grad_scores[position * kv_len..][..kv_len];
+                        let dot: f32 = weights.iter().zip(row.iter()).map(|(p, g)| p * g).sum();
+                        for (slot, &weight) in row.iter_mut().zip(weights) {
+                            *slot = weight * (*slot - dot) * scale;
+                        }
+                    }
 
-                // Softmax backward, in place. Nothing is masked here, so every
-                // entry of the block takes part.
-                for position in 0..q_len {
-                    let weights =
-                        &probabilities.data[probability_offset + position * kv_len..][..kv_len];
-                    let row = &mut grad_scores[position * kv_len..][..kv_len];
-                    let dot: f32 = weights.iter().zip(row.iter()).map(|(p, g)| p * g).sum();
-                    for (slot, &weight) in row.iter_mut().zip(weights) {
-                        *slot = weight * (*slot - dot) * scale;
+                    unsafe {
+                        // dL/dQ_head += dL/dscore * K_head.
+                        matrixmultiply::sgemm(
+                            q_len,
+                            kv_len,
+                            head_dim,
+                            1.0,
+                            grad_scores.as_ptr(),
+                            kv_len as isize,
+                            1,
+                            cache.keys.data.as_ptr().add(key_offset),
+                            cache.keys.cols as isize,
+                            1,
+                            1.0,
+                            grad_queries.as_mut_ptr().add(query_base),
+                            query_cols as isize,
+                            1,
+                        );
+
+                        // dL/dK_head += dL/dscore^T * Q_head, accumulating for
+                        // the same grouped-query reason as the value gradient.
+                        matrixmultiply::sgemm(
+                            kv_len,
+                            q_len,
+                            head_dim,
+                            1.0,
+                            grad_scores.as_ptr(),
+                            1,
+                            kv_len as isize,
+                            cache.queries.data.as_ptr().add(query_offset),
+                            cache.queries.cols as isize,
+                            1,
+                            1.0,
+                            grad_keys.as_mut_ptr().add(kv_base),
+                            kv_cols as isize,
+                            1,
+                        );
                     }
                 }
-
-                unsafe {
-                    // dL/dQ_head += dL/dscore * K_head.
-                    matrixmultiply::sgemm(
-                        q_len,
-                        kv_len,
-                        head_dim,
-                        1.0,
-                        grad_scores.as_ptr(),
-                        kv_len as isize,
-                        1,
-                        cache.keys.data.as_ptr().add(key_offset),
-                        cache.keys.cols as isize,
-                        1,
-                        1.0,
-                        grad_queries.data.as_mut_ptr().add(query_offset),
-                        grad_queries.cols as isize,
-                        1,
-                    );
-
-                    // dL/dK_head += dL/dscore^T * Q_head, accumulating for the
-                    // same grouped-query reason as the value gradient.
-                    matrixmultiply::sgemm(
-                        kv_len,
-                        q_len,
-                        head_dim,
-                        1.0,
-                        grad_scores.as_ptr(),
-                        1,
-                        kv_len as isize,
-                        cache.queries.data.as_ptr().add(query_offset),
-                        cache.queries.cols as isize,
-                        1,
-                        1.0,
-                        grad_keys.data.as_mut_ptr().add(key_offset),
-                        grad_keys.cols as isize,
-                        1,
-                    );
-                }
-            }
-        }
+            });
 
         // No inverse rotation: `forward_train_cross` applied none.
         let grad_queries_in = self.query.backward(&cache.queries_in, &grad_queries);
@@ -811,33 +818,37 @@ impl MultiHeadAttention {
         let query_base = head * head_dim;
         let kv_base = (head / self.group_size()) * head_dim;
         let scale = self.scale();
-        let sequences = queries.rows / q_len;
 
+        // One task per sequence. A caller that attends across a handful of
+        // positions per pixel packs thousands of short sequences, and a
+        // serial loop of tiny `sgemm` calls leaves every other core idle.
         let mut scores = Matrix::new(queries.rows, kv_len);
-        for sequence in 0..sequences {
-            let query_offset = sequence * q_len * queries.cols + query_base;
-            let key_offset = sequence * kv_len * keys.cols + kv_base;
-            let score_offset = sequence * q_len * kv_len;
-
-            unsafe {
-                matrixmultiply::sgemm(
-                    q_len,
-                    head_dim,
-                    kv_len,
-                    scale,
-                    queries.data.as_ptr().add(query_offset),
-                    queries.cols as isize,
-                    1,
-                    keys.data.as_ptr().add(key_offset),
-                    1,
-                    keys.cols as isize,
-                    0.0,
-                    scores.data.as_mut_ptr().add(score_offset),
-                    kv_len as isize,
-                    1,
-                );
-            }
-        }
+        scores
+            .data
+            .par_chunks_mut(q_len * kv_len)
+            .enumerate()
+            .for_each(|(sequence, block)| {
+                let query_offset = sequence * q_len * queries.cols + query_base;
+                let key_offset = sequence * kv_len * keys.cols + kv_base;
+                unsafe {
+                    matrixmultiply::sgemm(
+                        q_len,
+                        head_dim,
+                        kv_len,
+                        scale,
+                        queries.data.as_ptr().add(query_offset),
+                        queries.cols as isize,
+                        1,
+                        keys.data.as_ptr().add(key_offset),
+                        1,
+                        keys.cols as isize,
+                        0.0,
+                        block.as_mut_ptr(),
+                        kv_len as isize,
+                        1,
+                    );
+                }
+            });
 
         scores.data.par_chunks_mut(kv_len).for_each(softmax);
 
@@ -857,10 +868,15 @@ impl MultiHeadAttention {
         let head_dim = self.head_dim;
         let query_base = head * head_dim;
         let kv_base = (head / self.group_size()) * head_dim;
-        let sequences = probabilities.rows / q_len;
+        let cols = merged.cols;
 
-        for sequence in 0..sequences {
-            unsafe {
+        // A sequence's rows of `merged` are one contiguous block, so each task
+        // owns the block it writes.
+        merged
+            .data
+            .par_chunks_mut(q_len * cols)
+            .enumerate()
+            .for_each(|(sequence, block)| unsafe {
                 matrixmultiply::sgemm(
                     q_len,
                     kv_len,
@@ -876,15 +892,11 @@ impl MultiHeadAttention {
                     values.cols as isize,
                     1,
                     1.0,
-                    merged
-                        .data
-                        .as_mut_ptr()
-                        .add(sequence * q_len * merged.cols + query_base),
-                    merged.cols as isize,
+                    block.as_mut_ptr().add(query_base),
+                    cols as isize,
                     1,
                 );
-            }
-        }
+            });
     }
 
     /// Every projection in this layer, for uploading to a device or quantizing.
