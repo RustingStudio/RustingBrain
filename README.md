@@ -581,9 +581,11 @@ cargo run --release --example cuda_benchmark --features cuda
 
 ## Scope
 
-Decoder-only transformers, dense feed-forward networks and transformer
-text-to-image models, on one machine. Convolutions exist for the image
-autoencoder's sake and are inference-only, with no backward pass. Encoder-decoder
+Decoder-only and bidirectional transformers, vision transformers, dense
+feed-forward networks, transformer and UNet text-to-image models, image-to-3D,
+and a small reinforcement-learning agent, on one machine. `Conv2d` hosts
+published image autoencoders and is inference-only; `TrainableConv2d` has a
+backward pass and a CUDA path. Encoder-decoder
 models, multi-GPU and distributed training are not implemented and are not
 planned.
 
