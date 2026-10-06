@@ -2,7 +2,7 @@
 
 use super::Tensor;
 use super::buffer::BatchData;
-use super::loss::{bellman_targets, td_huber_loss};
+use super::loss::{double_bellman_targets, td_huber_loss};
 use super::market_sim::Action;
 use super::modulation::{GainCache, InteroceptiveCore, add_column_sums, temperature};
 use super::state::AccountBody;
@@ -115,7 +115,7 @@ impl QNetwork {
     }
 }
 
-/// A DQN agent with a target network.
+/// A Double DQN agent with a target network.
 pub struct InteroceptiveAgent {
     pub config: AgentConfig,
     pub online: QNetwork,
@@ -186,13 +186,16 @@ impl InteroceptiveAgent {
         Action::from_index(best)
     }
 
-    /// One DQN update against the target network. Returns the Huber loss.
+    /// One Double DQN update: the online network picks the next action and
+    /// the target network scores it. Returns the Huber loss.
     pub fn train_step(&mut self, batch: &BatchData) -> f32 {
+        let next_online = self.online.forward(&batch.next_obs, &batch.next_body).q;
         let next_q = self.target.forward(&batch.next_obs, &batch.next_body).q;
         let mut targets = vec![0.0; batch.len()];
-        bellman_targets(
+        double_bellman_targets(
             &batch.rewards,
             &batch.dones,
+            &next_online,
             &next_q,
             self.config.gamma,
             &mut targets,

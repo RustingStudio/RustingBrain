@@ -35,6 +35,29 @@ pub fn bellman_targets(
     }
 }
 
+/// Double DQN: `y = r + gamma * (1 - done) * Q_target(s', b', argmax_a Q_online(s', b', a))`.
+/// The online network picks the action and the target network scores it, which
+/// removes the upward bias of taking a max over noisy estimates.
+pub fn double_bellman_targets(
+    rewards: &[f32],
+    dones: &[f32],
+    next_q_online: &Matrix,
+    next_q_target: &Matrix,
+    gamma: f32,
+    out: &mut [f32],
+) {
+    for (i, y) in out.iter_mut().enumerate() {
+        let row = next_q_online.row(i);
+        let mut best = 0;
+        for (a, v) in row.iter().enumerate() {
+            if *v > row[best] {
+                best = a;
+            }
+        }
+        *y = rewards[i] + gamma * (1.0 - dones[i]) * next_q_target.row(i)[best];
+    }
+}
+
 /// Mean Huber loss (delta 1) between `Q(s, a_i)` and `targets`, with
 /// `dL/dQ` written into `grad`: non-zero only on the action taken.
 pub fn td_huber_loss(q: &Matrix, actions: &[usize], targets: &[f32], grad: &mut Matrix) -> f32 {
@@ -72,6 +95,13 @@ mod tests {
         let mut y = [0.0; 2];
         bellman_targets(&[1.0, 1.0], &[0.0, 1.0], &next_q, 0.5, &mut y);
         assert_eq!(y, [2.5, 1.0]);
+
+        // The online network prefers action 0 in row 0, so the target's 1.0
+        // is used rather than its maximum, 3.0.
+        let online = Matrix::from_vec(2, 2, vec![4.0, 0.0, 0.0, 1.0]);
+        let mut y2 = [0.0; 2];
+        double_bellman_targets(&[1.0, 1.0], &[0.0, 1.0], &online, &next_q, 0.5, &mut y2);
+        assert_eq!(y2, [1.5, 1.0]);
 
         let q = Matrix::from_vec(2, 2, vec![0.0, 2.0, 1.0, 9.0]);
         let mut grad = Matrix::new(2, 2);
