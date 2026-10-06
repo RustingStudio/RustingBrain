@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `interoceptive::backtest` scores the greedy policy over real candles, with
+  costs and without shocks: total return, per-step Sharpe, maximum drawdown
+  and liquidation, beside a buy-and-hold baseline. `walk_forward` makes the
+  train and test windows.
+
 ### Changed
 
 - CUDA tests that find no device print `skipped: no CUDA device`, and fail
