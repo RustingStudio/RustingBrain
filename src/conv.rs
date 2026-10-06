@@ -24,7 +24,7 @@
 //! # Training a convolution
 //!
 //! [`TrainableConv2d`] is the other half: a batched convolution whose weight
-//! and bias are [`Param`](crate::param::Param)s, with a backward pass and a
+//! and bias are [`Param`]s, with a backward pass and a
 //! device path. It is a separate type rather than a mode of [`Conv2d`] because
 //! the two want different layouts. A published checkpoint stores
 //! `[out, in, kh, kw]`, which flattens to a column ordered channel-slowest, and
@@ -1283,6 +1283,7 @@ mod tests {
             Err(NetworkError::Cuda(message))
                 if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
             {
+                crate::cuda_training::skip_without_cuda();
                 None
             }
             Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),

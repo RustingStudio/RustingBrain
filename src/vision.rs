@@ -4,7 +4,7 @@
 //! projection of `channels * patch * patch` pixels, the blocks are the same
 //! [`TransformerBlock`] a language model stacks, and the only thing a vision
 //! model needs that a decoder does not is bidirectional attention, which
-//! [`MultiHeadAttention::set_causal`] gives it: a patch in the top-left corner
+//! [`MultiHeadAttention::set_causal`](crate::MultiHeadAttention::set_causal) gives it: a patch in the top-left corner
 //! has to be able to read one in the bottom-right.
 //!
 //! Positions come from the same rotary embedding the language models use,
@@ -842,6 +842,7 @@ mod tests {
     #[test]
     fn a_device_step_matches_the_host_or_skips_without_device() {
         if crate::gpu_transformer::GpuContext::new(0).is_err() {
+            crate::cuda_training::skip_without_cuda();
             return;
         }
         let config = VitConfig {

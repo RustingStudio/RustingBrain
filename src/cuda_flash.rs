@@ -920,6 +920,7 @@ mod tests {
     #[test]
     fn the_fused_module_compiles_or_skips_without_device() {
         let Ok(context) = cudarc::driver::CudaContext::new(0) else {
+            crate::cuda_training::skip_without_cuda();
             return;
         };
         match context.compute_capability() {

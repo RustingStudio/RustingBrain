@@ -6,7 +6,7 @@
 //! attention score matmuls run on the device here, one host round trip per
 //! call, because the host operation that follows needs the values.
 //!
-//! Training does not take that path. [`crate::gpu_model`] keeps the
+//! Training does not take that path. `gpu_model` keeps the
 //! activations device-resident for a whole batched forward and backward and
 //! runs RoPE, RMSNorm, the causal softmax, SwiGLU and the MoE router as fused
 //! kernels, using the [`GpuContext`], [`DeviceParam`] and GEMM helpers defined
@@ -1564,6 +1564,7 @@ mod tests {
             Err(NetworkError::Cuda(message))
                 if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
             {
+                crate::cuda_training::skip_without_cuda();
                 false
             }
             Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),

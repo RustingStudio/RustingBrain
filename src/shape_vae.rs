@@ -895,7 +895,7 @@ impl ShapeVae {
     /// every later `encode_train`, `decode_train` and backward pass runs.
     ///
     /// The normalization scales, the latent queries and the distance bias stay
-    /// on the host, for the reason [`crate::gpu_shape`] gives. Fails closed: no
+    /// on the host, for the reason `gpu_shape` gives. Fails closed: no
     /// device is an error, never a silent fallback to the CPU.
     ///
     /// `memory_budget_mib` of 0 means no ceiling. The estimate it is checked

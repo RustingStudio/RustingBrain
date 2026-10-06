@@ -4,6 +4,10 @@
 
 ### Changed
 
+- CUDA tests that find no device print `skipped: no CUDA device`, and fail
+  instead when `RUSTING_BRAIN_REQUIRE_CUDA` is set, so a GPU run cannot pass
+  without running them. CI builds the docs with `-D warnings`.
+
 - `InteroceptiveAgent::train_step` uses Double DQN targets: the online
   network picks the next action and the target network scores it, which
   removes the overestimation of a plain max. `double_bellman_targets` is

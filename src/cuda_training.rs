@@ -486,6 +486,18 @@ pub struct CudaDoctorReport {
     pub kernel_available: bool,
 }
 
+/// Called by a CUDA test that found no device and is about to return early.
+/// A machine with a GPU sets `RUSTING_BRAIN_REQUIRE_CUDA=1`, so a test that
+/// should have run fails instead of passing without doing anything.
+#[cfg(test)]
+pub(crate) fn skip_without_cuda() {
+    assert!(
+        std::env::var_os("RUSTING_BRAIN_REQUIRE_CUDA").is_none(),
+        "RUSTING_BRAIN_REQUIRE_CUDA is set, but this test found no CUDA device"
+    );
+    eprintln!("skipped: no CUDA device");
+}
+
 pub fn cuda_doctor(
     device: usize,
     requested_budget_mib: usize,
@@ -1687,6 +1699,7 @@ mod tests {
             Err(NetworkError::Cuda(message))
                 if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
             {
+                skip_without_cuda();
                 false
             }
             Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),

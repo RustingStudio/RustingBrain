@@ -20,6 +20,14 @@ jobs:
       - run: cargo check --examples
       - run: cargo check --all-targets --features onnx
       - run: cargo check --all-targets --features cuda
+      # The features that carry most of the intra-doc links. `metal` is left
+      # out because it only builds on macOS.
+      - run: cargo doc --no-deps --features cuda,onnx,images
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # CI has no GPU, so every CUDA test skips. On a GPU machine, run
+      # `RUSTING_BRAIN_REQUIRE_CUDA=1 cargo test --features cuda` to make a
+      # skip fail instead.
 
   msrv:
     runs-on: ubuntu-latest
