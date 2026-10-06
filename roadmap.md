@@ -210,7 +210,8 @@ LoRA works on CPU and CUDA. What is left:
   stay frozen in int8.
 - **QLoRA**: an int8 or NF4 frozen base with BF16 adapters. This depends on
   D3.
-- Save and load an adapter on its own, without the base model.
+- ~~Save and load an adapter on its own, without the base model.~~ Already
+  existed: `TransformerLm::save_lora` and `load_lora`.
 
 ### B5. Load published LLaMA-family weights into `TransformerLm` — P1, M
 
@@ -329,7 +330,7 @@ exist already. What is missing:
 
 | # | Item | Priority | Effort | Notes |
 |---|---|---|---|---|
-| E1 | Weighted dataset mixing | P1 | S | Draw from N `TokenFile`s by weight, determined by the step number so that a resume is exact. Every real pretraining mix needs this. |
+| E1 | Weighted dataset mixing | P1 | S | **Done:** `TokenMix` in `src/token_file.rs`. Original plan: draw from N `TokenFile`s by weight, determined by the step number so that a resume is exact. Every real pretraining mix needs this. |
 | E2 | Parquet reader | P2 | M | Most public corpora on the Hub ship as Parquet. Put it behind a feature flag so the default build stays small. Read one column of text, a row group at a time. |
 | E3 | WebDataset (tar shards) | P2 | S | Image and text pairs for C6 training and for ViT. `tar` is a small crate, or about 100 lines by hand. |
 | E4 | Shuffled `chunk` windows | P3 | S | `src/token_file.rs:288` returns windows in file order. Evaluation wants that, so add it only if something else needs a shuffled full pass. |

@@ -234,7 +234,7 @@ pub use shape_vae::{ShapeVae, ShapeVaeConfig, fourier_features};
 pub use shards::{Batch, BatchConfig, BatchStream, Corpus, Example, Shards};
 pub use t5::{T5Config, T5Encoder};
 pub use text_encoder::{TextEncoder, TextEncoderConfig};
-pub use token_file::{TokenFile, TokenStream};
+pub use token_file::{TokenFile, TokenMix, TokenStream};
 pub use tokenizer::{Bpe, Unigram};
 pub use transformer::{
     Decoder, LoraConfig, ParameterCounts, Precision, TransformerBuilder, TransformerConfig,

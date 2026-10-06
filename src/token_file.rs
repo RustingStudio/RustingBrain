@@ -27,11 +27,95 @@
 
 use crate::batch::TokenBatch;
 use crate::network::NetworkError;
+use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+fn check_batch(sequences: usize, seq_len: usize) -> Result<(), NetworkError> {
+    if seq_len < 2 || sequences == 0 {
+        return Err(NetworkError::InvalidConfig(format!(
+            "a batch of {sequences} sequences of {seq_len} tokens has nothing to predict"
+        )));
+    }
+    Ok(())
+}
+
+/// The generator for one step's draws.
+///
+/// Mixing the step through a multiplier rather than seeding with it directly:
+/// consecutive seeds give `StdRng` streams that are unrelated in principle but
+/// neighbouring in practice, and this is cheaper than proving that does not
+/// matter.
+fn step_rng(seed: u64, step: u64) -> StdRng {
+    StdRng::seed_from_u64(seed ^ step.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// Several corpora drawn from by weight, the way a pretraining mix of web
+/// text, code and books is: each sequence of a batch picks its source, then
+/// a window inside it.
+///
+/// Like [`TokenFile::batch`], everything is drawn from the step number and
+/// the mix's own seed, so a resumed run sees the same batches. The seeds the
+/// files were opened with are not used.
+///
+/// ```no_run
+/// # use rusting_brain::{TokenFile, TokenMix};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut mix = TokenMix::new(
+///     vec![
+///         (TokenFile::open("web.bin", 0)?, 0.7),
+///         (TokenFile::open("code.bin", 0)?, 0.3),
+///     ],
+///     42,
+/// )?;
+/// let batch = mix.batch(0, 8, 512)?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct TokenMix {
+    files: Vec<TokenFile>,
+    weights: WeightedIndex<f64>,
+    seed: u64,
+}
+
+impl TokenMix {
+    /// Weights are relative and need not sum to one. A zero weight leaves a
+    /// source out; a negative one, or none above zero, is an error.
+    pub fn new(sources: Vec<(TokenFile, f64)>, seed: u64) -> Result<Self, NetworkError> {
+        let (files, weights): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
+        let weights = WeightedIndex::new(&weights).map_err(|error| {
+            NetworkError::InvalidConfig(format!("token mix weights {weights:?}: {error}"))
+        })?;
+        Ok(Self {
+            files,
+            weights,
+            seed,
+        })
+    }
+
+    /// `sequences` windows of `seq_len` tokens, drawn from `step`. See
+    /// [`TokenFile::batch`].
+    pub fn batch(
+        &mut self,
+        step: u64,
+        sequences: usize,
+        seq_len: usize,
+    ) -> Result<TokenBatch, NetworkError> {
+        check_batch(sequences, seq_len)?;
+        let mut rng = step_rng(self.seed, step);
+        let windows = (0..sequences)
+            .map(|_| {
+                let source = self.weights.sample(&mut rng);
+                self.files[source].window(&mut rng, seq_len)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        TokenBatch::new(&windows)
+    }
+}
 
 /// A memory-resident-free view of a pre-tokenized corpus on disk.
 #[derive(Debug)]
@@ -155,44 +239,30 @@ impl TokenFile {
         sequences: usize,
         seq_len: usize,
     ) -> Result<TokenBatch, NetworkError> {
-        if seq_len < 2 || sequences == 0 {
-            return Err(NetworkError::InvalidConfig(format!(
-                "a batch of {sequences} sequences of {seq_len} tokens has nothing to predict"
-            )));
-        }
+        check_batch(sequences, seq_len)?;
+        let mut rng = step_rng(self.seed, step);
+        let windows = (0..sequences)
+            .map(|_| self.window(&mut rng, seq_len))
+            .collect::<Result<Vec<_>, _>>()?;
+        TokenBatch::new(&windows)
+    }
+
+    /// One window of `seq_len` tokens at an offset drawn from `rng`.
+    fn window(&mut self, rng: &mut StdRng, seq_len: usize) -> Result<Vec<u32>, NetworkError> {
         if (seq_len as u64) > self.tokens {
             return Err(NetworkError::InvalidDataset(format!(
                 "a window of {seq_len} tokens does not fit in a corpus of {}",
                 self.tokens
             )));
         }
-
-        // Mixing the step through a multiplier rather than seeding with it
-        // directly: consecutive seeds give `StdRng` streams that are unrelated
-        // in principle but neighbouring in practice, and this is cheaper than
-        // proving that does not matter.
-        let mut rng = StdRng::seed_from_u64(self.seed ^ step.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let last = self.tokens - seq_len as u64;
-
+        let offset = rng.gen_range(0..=self.tokens - seq_len as u64);
         let mut window = vec![0u8; seq_len * 4];
-        let mut windows = Vec::with_capacity(sequences);
-        for _ in 0..sequences {
-            let offset = if last == 0 {
-                0
-            } else {
-                rng.gen_range(0..=last)
-            };
-            self.file.seek(SeekFrom::Start(offset * 4))?;
-            self.file.read_exact(&mut window)?;
-            windows.push(
-                window
-                    .chunks_exact(4)
-                    .map(|id| u32::from_le_bytes([id[0], id[1], id[2], id[3]]))
-                    .collect::<Vec<u32>>(),
-            );
-        }
-
-        TokenBatch::new(&windows)
+        self.file.seek(SeekFrom::Start(offset * 4))?;
+        self.file.read_exact(&mut window)?;
+        Ok(window
+            .chunks_exact(4)
+            .map(|id| u32::from_le_bytes([id[0], id[1], id[2], id[3]]))
+            .collect())
     }
 
     /// Consecutive, non-overlapping windows: batch `index` of a walk through
@@ -620,5 +690,74 @@ mod tests {
             Err(NetworkError::InvalidDataset(_))
         ));
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Two corpora told apart by their ids: the first holds `0..1000`, the
+    /// second `1000..2000`.
+    fn two_sources(name: &str, weights: [f64; 2]) -> (TokenMix, [std::path::PathBuf; 2]) {
+        let low = corpus(&format!("{name}_low"), 1_000);
+        let high = std::env::temp_dir().join(format!(
+            "rusting_brain_{name}_high_{}.bin",
+            std::process::id()
+        ));
+        TokenFile::write(&high, &(1_000..2_000).collect::<Vec<u32>>()).unwrap();
+        let mix = TokenMix::new(
+            vec![
+                (TokenFile::open(&low, 0).unwrap(), weights[0]),
+                (TokenFile::open(&high, 0).unwrap(), weights[1]),
+            ],
+            5,
+        )
+        .unwrap();
+        (mix, [low, high])
+    }
+
+    #[test]
+    fn a_mix_draws_each_source_in_proportion_to_its_weight() {
+        let (mut mix, paths) = two_sources("mix_ratio", [3.0, 1.0]);
+        let (mut low, mut total) = (0, 0);
+        for step in 0..200 {
+            let batch = mix.batch(step, 8, 16).unwrap();
+            for window in batch.ids().chunks_exact(16) {
+                // A window never straddles two sources.
+                assert_eq!(window[0] < 1_000, window[15] < 1_000);
+                assert!(window.windows(2).all(|pair| pair[1] == pair[0] + 1));
+                low += usize::from(window[0] < 1_000);
+                total += 1;
+            }
+        }
+        paths
+            .iter()
+            .for_each(|path| std::fs::remove_file(path).unwrap());
+        let share = low as f64 / total as f64;
+        assert!((share - 0.75).abs() < 0.04, "share {share}");
+    }
+
+    #[test]
+    fn a_mix_replays_the_same_batch_for_the_same_step() {
+        let (mut mix, paths) = two_sources("mix_replay", [1.0, 1.0]);
+        let first = mix.batch(9, 4, 16).unwrap().ids().to_vec();
+        let (mut reopened, more) = two_sources("mix_replay_again", [1.0, 1.0]);
+        let again = reopened.batch(9, 4, 16).unwrap().ids().to_vec();
+        let other = mix.batch(10, 4, 16).unwrap().ids().to_vec();
+        paths
+            .iter()
+            .chain(&more)
+            .for_each(|path| std::fs::remove_file(path).unwrap());
+        assert_eq!(first, again);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn a_mix_with_no_positive_weight_is_refused() {
+        let (_, paths) = two_sources("mix_refused", [1.0, 1.0]);
+        let open = |path| TokenFile::open(path, 0).unwrap();
+        let zero = TokenMix::new(vec![(open(&paths[0]), 0.0), (open(&paths[1]), 0.0)], 0);
+        let negative = TokenMix::new(vec![(open(&paths[0]), 1.0), (open(&paths[1]), -1.0)], 0);
+        let empty = TokenMix::new(Vec::new(), 0);
+        paths
+            .iter()
+            .for_each(|path| std::fs::remove_file(path).unwrap());
+        assert!(zero.is_err() && negative.is_err() && empty.is_err());
     }
 }
