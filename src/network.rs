@@ -48,7 +48,8 @@ pub enum NetworkError {
     },
     #[error(
         "CUDA is out of memory: an allocation of {requested_mib} MiB failed with \
-         {free_mib} MiB free"
+         {free_mib} MiB free across the whole device. One allocation needs one \
+         unfragmented block, so the free figure can be the larger of the two"
     )]
     CudaOutOfMemory {
         requested_mib: usize,
