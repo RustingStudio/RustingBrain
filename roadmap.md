@@ -221,14 +221,18 @@ RoPE scaling (B6) and a tokenizer round trip through `Bpe`.
 
 **Status: weights done.** `TransformerLm::load_hf` (`src/hf.rs`) reads LLaMA
 and Mistral checkpoints, single-file or sharded. It refuses biases (so Qwen2),
-per-head q/k norms, `rope_scaling` and a sliding window shorter than
-`max_seq_len`, instead of loading them wrong. Still open: `rope_scaling`
-(B6), `head_dim` 128 on the fast path (A3), and the tokenizer round trip.
+per-head q/k norms, YaRN or dynamic `rope_scaling` and a sliding window
+shorter than `max_seq_len`, instead of loading them wrong. Linear and llama3
+scaling load. Still open: `head_dim` 128 on the fast path (A3) and the
+tokenizer round trip.
 
 ### B6. Long context — P2, M
 
 - RoPE scaling: linear, NTK-aware and YaRN. B5 needs these to read published
-  configurations correctly.
+  configurations correctly. **Linear and llama3 done** (`RopeScaling`,
+  `TransformerConfig::rope_scaling`, read and written by `src/hf.rs`). YaRN
+  and dynamic NTK are still open: YaRN also scales attention logits, and
+  dynamic NTK rebuilds the tables per sequence length.
 - Sliding-window attention in the flash kernel (a mask on the tile loop).
 - Sequence packing with document masks in `TokenBatch`, so packed documents
   do not attend to each other.
@@ -343,7 +347,7 @@ exist already. What is missing:
 | F2 | Hugging Face config export | P1 | S | **Done:** `TransformerLm::save_hf` writes `config.json` and `model.safetensors`; a test reads them back through the separate `TextEncoder` LLaMA reader. Original plan: write a LLaMA-compatible `config.json` next to F1's output, so that `transformers` loads the result directly. This is the reverse of B5. |
 | F3 | GGUF export | P2 | M | Run trained models in llama.cpp and Ollama. Q8_0 first, because it maps to `Precision::Q8`. |
 | F4 | ONNX export for MoE | P3 | M | `save_onnx` covers dense networks and the dense LM. MoE needs dynamic routing in the graph, which ONNX handles poorly. Park it until someone asks. |
-| F5 | Checkpoint format version | P1 | S | Put a version field and a model-shape header in binary checkpoints, so that an old checkpoint fails with a clear error and not with garbage weights. Check first whether one already exists. |
+| F5 | Checkpoint format version | P1 | S | **Already existed:** every binary file starts with a versioned magic (`RBWTS001`, `RBOPT001`, `RBLOR001`, `RBEMA001`), `save_bin` stores the config as a JSON header, and `load_bin` checks the parameter count and every shape. Original plan: put a version field and a model-shape header in binary checkpoints, so that an old checkpoint fails with a clear error and not with garbage weights. Check first whether one already exists. |
 
 ---
 

@@ -21,8 +21,58 @@ pub struct Rope {
     head_dim: usize,
     max_seq_len: usize,
     base: f32,
+    scaling: Option<RopeScaling>,
     cos: Vec<f32>,
     sin: Vec<f32>,
+}
+
+/// How a model trained at one context length stretches its rotary angles to
+/// run at a longer one. Field names follow the `rope_scaling` entry of a
+/// Hugging Face `config.json`, so the value reads and writes there directly.
+///
+/// ponytail: no YaRN or dynamic NTK yet. YaRN also rescales attention logits,
+/// and dynamic NTK changes the tables with the sequence length; add them when
+/// a checkpoint that needs one is in reach.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "rope_type", rename_all = "lowercase")]
+pub enum RopeScaling {
+    /// Every position divided by `factor`.
+    Linear { factor: f32 },
+    /// Llama 3.1's scheme: channels that turn many times within the original
+    /// context keep their frequency, channels that turn less than once are
+    /// slowed by `factor`, and the band between blends the two.
+    Llama3 {
+        factor: f32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        original_max_position_embeddings: usize,
+    },
+}
+
+impl RopeScaling {
+    fn apply(self, frequency: f32) -> f32 {
+        match self {
+            Self::Linear { factor } => frequency / factor,
+            Self::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings,
+            } => {
+                let context = original_max_position_embeddings as f32;
+                let wavelength = 2.0 * std::f32::consts::PI / frequency;
+                if wavelength < context / high_freq_factor {
+                    frequency
+                } else if wavelength > context / low_freq_factor {
+                    frequency / factor
+                } else {
+                    let smooth = (context / wavelength - low_freq_factor)
+                        / (high_freq_factor - low_freq_factor);
+                    (1.0 - smooth) * frequency / factor + smooth * frequency
+                }
+            }
+        }
+    }
 }
 
 /// What a snapshot stores. The tables are a pure function of these three
@@ -34,6 +84,9 @@ pub struct RopeSpec {
     pub head_dim: usize,
     pub max_seq_len: usize,
     pub base: f32,
+    /// Absent in snapshots written before scaling existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<RopeScaling>,
 }
 
 impl From<Rope> for RopeSpec {
@@ -42,6 +95,7 @@ impl From<Rope> for RopeSpec {
             head_dim: rope.head_dim,
             max_seq_len: rope.max_seq_len,
             base: rope.base,
+            scaling: rope.scaling,
         }
     }
 }
@@ -50,7 +104,7 @@ impl TryFrom<RopeSpec> for Rope {
     type Error = NetworkError;
 
     fn try_from(spec: RopeSpec) -> Result<Self, Self::Error> {
-        Rope::new(spec.head_dim, spec.max_seq_len, spec.base)
+        Rope::scaled(spec.head_dim, spec.max_seq_len, spec.base, spec.scaling)
     }
 }
 
@@ -69,6 +123,16 @@ impl<'de> Deserialize<'de> for Rope {
 
 impl Rope {
     pub fn new(head_dim: usize, max_seq_len: usize, base: f32) -> Result<Self, NetworkError> {
+        Self::scaled(head_dim, max_seq_len, base, None)
+    }
+
+    /// [`Rope::new`] with the angles stretched by `scaling`.
+    pub fn scaled(
+        head_dim: usize,
+        max_seq_len: usize,
+        base: f32,
+        scaling: Option<RopeScaling>,
+    ) -> Result<Self, NetworkError> {
         if head_dim == 0 || head_dim % 2 != 0 {
             return Err(NetworkError::InvalidConfig(format!(
                 "rope head_dim must be even and non-zero, got {head_dim}"
@@ -76,12 +140,17 @@ impl Rope {
         }
 
         let half = head_dim / 2;
+        let frequencies: Vec<f32> = (0..half)
+            .map(|channel| {
+                let frequency = base.powf(-2.0 * channel as f32 / head_dim as f32);
+                scaling.map_or(frequency, |scaling| scaling.apply(frequency))
+            })
+            .collect();
         let mut cos = Vec::with_capacity(max_seq_len * half);
         let mut sin = Vec::with_capacity(max_seq_len * half);
 
         for position in 0..max_seq_len {
-            for channel in 0..half {
-                let frequency = base.powf(-2.0 * channel as f32 / head_dim as f32);
+            for &frequency in &frequencies {
                 let angle = position as f32 * frequency;
                 cos.push(angle.cos());
                 sin.push(angle.sin());
@@ -92,6 +161,7 @@ impl Rope {
             head_dim,
             max_seq_len,
             base,
+            scaling,
             cos,
             sin,
         })
@@ -320,5 +390,66 @@ mod tests {
         // Only the three defining numbers are written out.
         assert!(!json.contains("cos"));
         assert_eq!(serde_json::from_str::<Rope>(&json).unwrap(), rope);
+    }
+
+    /// The angle one position turns channel pair `channel` by.
+    fn frequency(rope: &Rope, channel: usize) -> f32 {
+        let at = rope.head_dim() / 2 + channel;
+        rope.sin()[at].atan2(rope.cos()[at])
+    }
+
+    #[test]
+    fn linear_scaling_stretches_positions() {
+        let plain = Rope::new(8, 16, 10000.0).unwrap();
+        let scaled =
+            Rope::scaled(8, 16, 10000.0, Some(RopeScaling::Linear { factor: 4.0 })).unwrap();
+
+        // Position 8 under a factor of 4 is position 2 unscaled.
+        for channel in 0..4 {
+            assert!((scaled.cos()[8 * 4 + channel] - plain.cos()[2 * 4 + channel]).abs() < 1e-6);
+            assert!((scaled.sin()[8 * 4 + channel] - plain.sin()[2 * 4 + channel]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn llama3_scaling_keeps_fast_channels_and_slows_the_long_ones() {
+        // Llama 3.1's published settings.
+        let scaling = RopeScaling::Llama3 {
+            factor: 8.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192,
+        };
+        let plain = Rope::new(128, 2, 500_000.0).unwrap();
+        let scaled = Rope::scaled(128, 2, 500_000.0, Some(scaling)).unwrap();
+
+        assert_eq!(frequency(&scaled, 0), frequency(&plain, 0));
+        let last = 63;
+        assert!((frequency(&scaled, last) - frequency(&plain, last) / 8.0).abs() < 1e-12);
+        // In between the factor blends smoothly: never outside [f / 8, f] and
+        // still falling with the channel index, so no band jumps past another.
+        let mut previous = f32::INFINITY;
+        for channel in 0..64 {
+            let (f, original) = (frequency(&scaled, channel), frequency(&plain, channel));
+            assert!(
+                f <= original * 1.0001 && f >= original / 8.0 * 0.9999,
+                "channel {channel}"
+            );
+            assert!(f < previous, "channel {channel}");
+            previous = f;
+        }
+    }
+
+    #[test]
+    fn a_snapshot_keeps_its_scaling_and_an_old_one_has_none() {
+        let rope = Rope::scaled(8, 32, 10000.0, Some(RopeScaling::Linear { factor: 2.0 })).unwrap();
+        let json = serde_json::to_string(&rope).unwrap();
+        assert_eq!(serde_json::from_str::<Rope>(&json).unwrap(), rope);
+
+        let old = r#"{"head_dim":8,"max_seq_len":32,"base":10000.0}"#;
+        assert_eq!(
+            serde_json::from_str::<Rope>(old).unwrap(),
+            Rope::new(8, 32, 10000.0).unwrap()
+        );
     }
 }

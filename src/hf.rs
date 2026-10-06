@@ -9,11 +9,13 @@
 //! A model the layout cannot express is refused rather than approximated:
 //! mixture-of-experts layers, a GELU feed-forward, bidirectional attention,
 //! attached LoRA adapters (merge them first), and quantized weights. On the
-//! reading side, a checkpoint with biases, per-head query and key norms, rope
-//! scaling or a sliding window is refused for the same reason.
+//! reading side, a checkpoint with biases, per-head query and key norms, a
+//! rope scaling other than linear or llama3, or a sliding window is refused
+//! for the same reason.
 
 use crate::network::NetworkError;
 use crate::param::Param;
+use crate::rope::RopeScaling;
 use crate::safetensors::{self, ShardedSafeTensors};
 use crate::transformer::TransformerLm;
 use crate::transformer_block::FeedForward;
@@ -107,6 +109,7 @@ impl TransformerLm {
             "head_dim": config.head_dim,
             "max_position_embeddings": config.max_seq_len,
             "rope_theta": config.rope_base,
+            "rope_scaling": config.rope_scaling,
             "rms_norm_eps": config.rmsnorm_eps,
             "tie_word_embeddings": config.tie_embeddings,
             "hidden_act": "silu",
@@ -169,9 +172,26 @@ impl TransformerLm {
                 "model_type {model_type:?} is not a LLaMA-layout model"
             )));
         }
-        if !json["rope_scaling"].is_null() {
-            return Err(refuse("rope scaling"));
-        }
+        let rope_scaling = match &json["rope_scaling"] {
+            serde_json::Value::Null => None,
+            scaling => {
+                let mut scaling = scaling.clone();
+                // Older configs name the kind `type`.
+                if scaling.get("rope_type").is_none() {
+                    scaling["rope_type"] = scaling["type"].clone();
+                }
+                match scaling["rope_type"].as_str() {
+                    Some("default") => None,
+                    _ => Some(
+                        serde_json::from_value::<RopeScaling>(scaling).map_err(|error| {
+                            NetworkError::InvalidConfig(format!(
+                                "unsupported rope_scaling: {error}"
+                            ))
+                        })?,
+                    ),
+                }
+            }
+        };
         if json["attention_bias"].as_bool() == Some(true)
             || json["mlp_bias"].as_bool() == Some(true)
         {
@@ -204,6 +224,7 @@ impl TransformerLm {
             .moe_layers([])
             .max_seq_len(max_seq_len)
             .rope_base(float("rope_theta", 10_000.0))
+            .rope_scaling(rope_scaling)
             .rmsnorm_eps(float("rms_norm_eps", 1e-6))
             .tie_embeddings(json["tie_word_embeddings"].as_bool().unwrap_or(false))
             .build()?;
@@ -240,6 +261,7 @@ impl TransformerLm {
 mod tests {
     use crate::matrix::Matrix;
     use crate::network::NetworkError;
+    use crate::rope::RopeScaling;
     use crate::text_encoder::{TextEncoder, TextEncoderConfig};
     use crate::transformer::TransformerLm;
     use std::path::PathBuf;
@@ -251,7 +273,12 @@ mod tests {
     }
 
     fn tiny(tie: bool) -> TransformerLm {
+        tiny_scaled(tie, None)
+    }
+
+    fn tiny_scaled(tie: bool, scaling: Option<RopeScaling>) -> TransformerLm {
         let mut model = TransformerLm::builder()
+            .rope_scaling(scaling)
             .vocab_size(37)
             .d_model(32)
             .n_layers(2)
@@ -299,6 +326,43 @@ mod tests {
             assert_eq!(loaded.config.tie_embeddings, tie);
             assert_close(&logits(&loaded, &IDS), &logits(&model, &IDS), 0.0);
         }
+    }
+
+    #[test]
+    fn rope_scaling_survives_the_round_trip() {
+        // A context this short puts every channel in a different band.
+        let scaling = RopeScaling::Llama3 {
+            factor: 4.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8,
+        };
+        let dir = scratch("scaled");
+        let mut model = tiny_scaled(false, Some(scaling));
+        model.save_hf(&dir).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let loaded = TransformerLm::load_hf(&dir, 16).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(json["rope_scaling"]["rope_type"], "llama3");
+        assert_eq!(loaded.config.rope_scaling, Some(scaling));
+        assert_close(&logits(&loaded, &IDS), &logits(&model, &IDS), 0.0);
+    }
+
+    #[test]
+    fn an_unsupported_rope_scaling_is_refused() {
+        let dir = scratch("yarn");
+        tiny(false).save_hf(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
+        std::fs::write(&path, json.to_string()).unwrap();
+        let result = TransformerLm::load_hf(&dir, 16);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(result, Err(NetworkError::InvalidConfig(_))));
     }
 
     #[test]

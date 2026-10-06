@@ -10,7 +10,7 @@ use crate::network::NetworkError;
 use crate::norm::RmsNorm;
 use crate::optimizers::Optimizer;
 use crate::param::{Linear, Param};
-use crate::rope::Rope;
+use crate::rope::{Rope, RopeScaling};
 use crate::transformer_block::{FeedForward, TransformerBlock, TransformerBlockCache};
 use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,10 @@ pub struct TransformerConfig {
     pub shared_expert: bool,
     pub max_seq_len: usize,
     pub rope_base: f32,
+    /// Stretches the rotary angles past the length the weights were trained
+    /// at. Absent in checkpoints written before it existed.
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScaling>,
     pub rmsnorm_eps: f32,
     /// Reuses the embedding matrix as the output projection.
     pub tie_embeddings: bool,
@@ -115,6 +119,7 @@ impl Default for TransformerConfig {
             shared_expert: true,
             max_seq_len: 2048,
             rope_base: 10_000.0,
+            rope_scaling: None,
             rmsnorm_eps: 1e-6,
             tie_embeddings: true,
             causal: true,
@@ -349,6 +354,11 @@ impl TransformerBuilder {
         self
     }
 
+    pub fn rope_scaling(mut self, rope_scaling: Option<RopeScaling>) -> Self {
+        self.config.rope_scaling = rope_scaling;
+        self
+    }
+
     pub fn rmsnorm_eps(mut self, rmsnorm_eps: f32) -> Self {
         self.config.rmsnorm_eps = rmsnorm_eps;
         self
@@ -580,7 +590,12 @@ impl TransformerLm {
         let mut rng = builder
             .seed
             .map_or_else(StdRng::from_entropy, StdRng::seed_from_u64);
-        let rope = Rope::new(config.head_dim, config.max_seq_len, config.rope_base)?;
+        let rope = Rope::scaled(
+            config.head_dim,
+            config.max_seq_len,
+            config.rope_base,
+            config.rope_scaling,
+        )?;
 
         let embedding = Embedding::new(config.vocab_size, config.d_model, &mut rng);
         let mut blocks = Vec::with_capacity(config.n_layers);
