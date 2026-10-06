@@ -509,6 +509,18 @@ struct BinHeader {
     precision: Precision,
 }
 
+/// Writes `data` as little-endian bytes through a 16 KiB scratch buffer, so a
+/// checkpoint never holds a second full copy of its largest tensor.
+fn write_f32s(writer: &mut impl Write, data: &[f32]) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(4 * 4096);
+    for chunk in data.chunks(4096) {
+        bytes.clear();
+        bytes.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+        writer.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
 /// Rounds to the 255 levels int8 has, leaving -128 unused so the range stays
 /// symmetric around zero.
 fn quantize(value: f32, scale: f32) -> i8 {
@@ -1685,8 +1697,7 @@ impl TransformerLm {
             writer.write_all(&(first.rows as u64).to_le_bytes())?;
             writer.write_all(&(first.cols as u64).to_le_bytes())?;
             for matrix in [first, second] {
-                let bytes: Vec<u8> = matrix.data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                writer.write_all(&bytes)?;
+                write_f32s(&mut writer, &matrix.data)?;
             }
         }
         writer.flush()?;
@@ -1832,10 +1843,7 @@ impl TransformerLm {
             writer.write_all(&(value.rows as u64).to_le_bytes())?;
             writer.write_all(&(value.cols as u64).to_le_bytes())?;
             match precision {
-                Precision::F32 => {
-                    let bytes: Vec<u8> = value.data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    writer.write_all(&bytes)?;
-                }
+                Precision::F32 => write_f32s(&mut writer, &value.data)?,
                 Precision::Q8 => {
                     for row in value.data.chunks(value.cols.max(1)) {
                         let absmax = row.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
