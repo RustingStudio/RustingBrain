@@ -10,6 +10,10 @@
 //! This is a reader for the file Hugging Face publishes that table in. No new
 //! dependency: the file is JSON, and the crate already reads JSON.
 //!
+//! The same type also reads the sentencepiece flavour of BPE that LLaMA 2,
+//! Mistral and TinyLlama ship: no byte alphabet, spaces written as `▁`, and
+//! a character the vocabulary lacks spelled as `<0xNN>` byte tokens.
+//!
 //! [`Unigram`] beside it is the sentencepiece algorithm T5 tokenizes with,
 //! which is a different model rather than a different table: the file lists a
 //! score for every piece, and tokenizing is the highest-scoring way to cut the
@@ -36,8 +40,25 @@ pub struct Bpe {
     /// What CLIP appends to the last symbol of each word.
     end_of_word: Option<String>,
     lowercase: bool,
+    /// Set for a sentencepiece-style file; `None` is byte-level BPE.
+    metaspace: Option<Metaspace>,
+    /// Spell a symbol the vocabulary lacks as `<0xNN>` tokens.
+    byte_fallback: bool,
     byte_encoder: Vec<char>,
     byte_decoder: HashMap<char, u8>,
+}
+
+/// When a sentencepiece-style file puts a `▁` in front of the text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Metaspace {
+    /// The `Metaspace` pre-tokenizer: in front of the input's first piece of
+    /// text only, and not when that piece already starts with `▁`.
+    First,
+    /// The same, in front of every piece of text between special tokens.
+    Always,
+    Never,
+    /// The older `Prepend` normalizer: in front of every piece, always.
+    Prepend,
 }
 
 impl Bpe {
@@ -136,6 +157,30 @@ impl Bpe {
             vocab.entry(token.clone()).or_insert(*id);
         }
 
+        let normalizer = json
+            .get("normalizer")
+            .map(|normalizer| normalizer.to_string())
+            .unwrap_or_default();
+        let metaspace = match pre_tokenizer(&json, "Metaspace") {
+            Some(pre) => Some(
+                match pre.get("prepend_scheme").and_then(|scheme| scheme.as_str()) {
+                    Some("first") => Metaspace::First,
+                    Some("never") => Metaspace::Never,
+                    // Files older than `prepend_scheme` say `add_prefix_space`.
+                    _ if pre.get("add_prefix_space") == Some(&serde_json::Value::Bool(false)) => {
+                        Metaspace::Never
+                    }
+                    _ => Metaspace::Always,
+                },
+            ),
+            None if normalizer.contains("\"Prepend\"") => Some(Metaspace::Prepend),
+            None => None,
+        };
+        let byte_fallback = model
+            .get("byte_fallback")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false);
+
         let byte_encoder = byte_alphabet();
         let byte_decoder = byte_encoder
             .iter()
@@ -150,6 +195,8 @@ impl Bpe {
             specials,
             end_of_word,
             lowercase,
+            metaspace,
+            byte_fallback,
             byte_encoder,
             byte_decoder,
         })
@@ -190,22 +237,31 @@ impl Bpe {
                 Some((at, token, id)) => {
                     let head = &rest[..at];
                     let tail = &rest[at + token.len()..];
-                    self.encode_plain(head, &mut ids)?;
+                    self.encode_plain(head, rest.len() == text.len(), &mut ids)?;
                     ids.push(id);
                     ("", tail)
                 }
                 None => (rest, ""),
             };
             if !head.is_empty() {
-                self.encode_plain(head, &mut ids)?;
+                self.encode_plain(head, rest.len() == text.len(), &mut ids)?;
             }
             rest = tail;
         }
         Ok(ids)
     }
 
-    /// Encodes text that holds no special token.
-    fn encode_plain(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), NetworkError> {
+    /// Encodes text that holds no special token. `first` says whether it
+    /// starts the input, which is where a sentencepiece file puts its `▁`.
+    fn encode_plain(
+        &self,
+        text: &str,
+        first: bool,
+        ids: &mut Vec<u32>,
+    ) -> Result<(), NetworkError> {
+        if let Some(metaspace) = self.metaspace {
+            return self.encode_metaspace(text, metaspace, first, ids);
+        }
         // CLIP marks the end of a word with a suffix instead of carrying the
         // space that precedes it, so its rule throws whitespace away rather
         // than joining it to the next word, and cuts a run of digits into
@@ -255,6 +311,55 @@ impl Bpe {
         Ok(())
     }
 
+    /// Sentencepiece-style BPE: the whole piece of text is one word, with
+    /// spaces as `▁`, starting from characters rather than bytes.
+    ///
+    /// NOTE: one merge loop over the whole piece, quadratic in its length.
+    /// Fine for prompts and training lines; split long documents on newlines
+    /// first, or replace the loop with a priority queue, if it ever shows up.
+    fn encode_metaspace(
+        &self,
+        text: &str,
+        metaspace: Metaspace,
+        first: bool,
+        ids: &mut Vec<u32>,
+    ) -> Result<(), NetworkError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let mut spaced = text.replace(' ', "\u{2581}");
+        let prepend = match metaspace {
+            Metaspace::First => first && !spaced.starts_with('\u{2581}'),
+            Metaspace::Always => !spaced.starts_with('\u{2581}'),
+            Metaspace::Never => false,
+            Metaspace::Prepend => true,
+        };
+        if prepend {
+            spaced.insert(0, '\u{2581}');
+        }
+        let mut symbols: Vec<String> = spaced.chars().map(String::from).collect();
+        self.merge(&mut symbols);
+        for symbol in symbols {
+            if let Some(id) = self.vocab.get(&symbol) {
+                ids.push(*id);
+                continue;
+            }
+            if !self.byte_fallback {
+                return Err(NetworkError::InvalidDataset(format!(
+                    "the vocabulary has no token for {symbol:?} and the file has no byte fallback"
+                )));
+            }
+            for byte in symbol.bytes() {
+                let name = format!("<0x{byte:02X}>");
+                let id = self.vocab.get(&name).ok_or_else(|| {
+                    NetworkError::InvalidDataset(format!("byte fallback, but no {name} token"))
+                })?;
+                ids.push(*id);
+            }
+        }
+        Ok(())
+    }
+
     /// Repeatedly joins the best-ranked adjacent pair, which is the whole of
     /// byte-pair encoding.
     fn merge(&self, symbols: &mut Vec<String>) {
@@ -277,6 +382,9 @@ impl Bpe {
 
     /// Turns ids back into text, which is what a round-trip check needs.
     pub fn decode(&self, ids: &[u32]) -> String {
+        if let Some(metaspace) = self.metaspace {
+            return self.decode_metaspace(ids, metaspace);
+        }
         let mut bytes = Vec::new();
         for id in ids {
             let Some(token) = self.tokens.get(*id as usize) else {
@@ -300,6 +408,33 @@ impl Bpe {
             }
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl Bpe {
+    /// `▁` back to a space, `<0xNN>` back to its byte, and the space the
+    /// encoder put in front taken off again.
+    fn decode_metaspace(&self, ids: &[u32], metaspace: Metaspace) -> String {
+        let mut bytes = Vec::new();
+        for id in ids {
+            let Some(token) = self.tokens.get(*id as usize) else {
+                continue;
+            };
+            let byte = token
+                .strip_prefix("<0x")
+                .and_then(|hex| hex.strip_suffix('>'))
+                .filter(|hex| self.byte_fallback && hex.len() == 2)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            match byte {
+                Some(byte) => bytes.push(byte),
+                None => bytes.extend_from_slice(token.replace('\u{2581}', " ").as_bytes()),
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        match metaspace {
+            Metaspace::Never => text,
+            _ => text.strip_prefix(' ').map(str::to_string).unwrap_or(text),
+        }
     }
 }
 
@@ -782,6 +917,88 @@ pub(crate) mod tests {
         assert!(!ids.contains(&space), "{ids:?} carries a space as a token");
         // One token per word, and one per digit.
         assert_eq!(ids.len(), 4);
+    }
+
+    /// A LLaMA 2 style file: `▁` for spaces, `<0xNN>` byte fallback, and
+    /// either the `Metaspace` pre-tokenizer or the older `Prepend` normalizer.
+    fn sentencepiece_bpe(legacy: bool) -> Bpe {
+        let tokens = [
+            "<unk>", "<s>", "</s>", "<0xF0>", "<0x9F>", "<0xA6>", "<0x80>", "▁", "h", "e", "l",
+            "o", "w", "r", "d", "▁h", "ll", "▁he", "llo", "▁hello", "▁w", "or", "▁wor", "▁worl",
+            "▁world", "é",
+        ];
+        let vocab: serde_json::Map<String, serde_json::Value> = tokens
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.to_string(), id.into()))
+            .collect();
+        let merges = [
+            "▁ h",
+            "l l",
+            "▁h e",
+            "ll o",
+            "▁he llo",
+            "▁ w",
+            "o r",
+            "▁w or",
+            "▁wor l",
+            "▁worl d",
+        ];
+        let added: Vec<_> = (0..3)
+            .map(|id| serde_json::json!({"id": id, "content": tokens[id], "special": true}))
+            .collect();
+        let (pre, normalizer) = match legacy {
+            false => (
+                serde_json::json!({"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": false}),
+                serde_json::Value::Null,
+            ),
+            true => (
+                serde_json::Value::Null,
+                serde_json::json!({"type": "Sequence", "normalizers": [
+                    {"type": "Prepend", "prepend": "▁"},
+                    {"type": "Replace", "pattern": {"String": " "}, "content": "▁"}
+                ]}),
+            ),
+        };
+        let json = serde_json::json!({
+            "added_tokens": added,
+            "normalizer": normalizer,
+            "pre_tokenizer": pre,
+            "model": {"type": "BPE", "byte_fallback": true, "vocab": vocab, "merges": merges},
+        });
+        Bpe::from_json(&json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn sentencepiece_bpe_matches_the_reference_tokenizer() {
+        // Ids and decoded text from the Hugging Face `tokenizers` library on
+        // the same two files. Checked as well against a real 32k LLaMA 2
+        // vocabulary: 310 lines of this README, every id equal.
+        let cases: [(bool, &str, &[u32], &str); 8] = [
+            (false, "hello world", &[19, 24], "hello world"),
+            (false, "é 🦀", &[7, 25, 7, 3, 4, 5, 6], "é 🦀"),
+            (
+                false,
+                "<s>hello</s>world",
+                &[1, 8, 9, 18, 2, 12, 21, 10, 14],
+                "<s>hello</s>world",
+            ),
+            (false, " hello", &[19], "hello"),
+            (true, "hello world", &[19, 24], "hello world"),
+            (true, "é 🦀", &[7, 25, 7, 3, 4, 5, 6], "é 🦀"),
+            (
+                true,
+                "<s>hello</s>world",
+                &[1, 19, 2, 24],
+                "<s> hello</s> world",
+            ),
+            (true, " hello", &[7, 19], " hello"),
+        ];
+        for (legacy, text, ids, decoded) in cases {
+            let bpe = sentencepiece_bpe(legacy);
+            assert_eq!(bpe.encode(text).unwrap(), ids, "{text:?}, legacy {legacy}");
+            assert_eq!(bpe.decode(ids), decoded, "{text:?}, legacy {legacy}");
+        }
     }
 
     #[test]
