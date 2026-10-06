@@ -199,6 +199,16 @@ __device__ __forceinline__ float warp_sum(float v){
   for(int o=16;o>0;o>>=1)v+=__shfl_down_sync(0xffffffff,v,o);
   return __shfl_sync(0xffffffff,v,0);
 }
+// A row short enough to sit in registers is read once and written once instead
+// of streamed three times for the maximum, the exponential and the scale. Each
+// lane holds `SOFTMAX_ROW` of the row's values, so the bound is a register
+// budget rather than a shape: 512 columns at 32 lanes. A longer row falls back
+// to the streaming loop below, which is the same arithmetic over more passes.
+//
+// The shape decoder's cross-attention is exactly at the bound --- 512 latents
+// --- and its score matrix is the largest buffer in the step, so this is where
+// the three-pass version cost the most.
+#define SOFTMAX_ROW 16
 // Row softmax in place, plus the one log-sum-exp per query the backward pass
 // needs to rebuild these same probabilities. Writing that number here is what
 // lets the forward cache hold a few kilobytes per layer instead of the whole
@@ -214,6 +224,22 @@ extern "C" __global__ void attention_softmax_lse(float*s,float*lse,int rows,int 
   for(int i=blockIdx.x*warps+threadIdx.x/WARP;i<rows;i+=stride){
     int seq_len=cols;
     int vis=causal?i%cols+1:cols;float*row=s+(size_t)i*seq_len;
+    if(vis<=WARP*SOFTMAX_ROW){
+      float v[SOFTMAX_ROW];float m=-3.0e38f;
+      #pragma unroll
+      for(int k=0;k<SOFTMAX_ROW;k++){int j=lane+k*WARP;v[k]=j<vis?row[j]:-3.0e38f;m=fmaxf(m,v[k]);}
+      m=warp_max(m);
+      float part=0.f;
+      #pragma unroll
+      for(int k=0;k<SOFTMAX_ROW;k++){int j=lane+k*WARP;v[k]=j<vis?__expf(v[k]-m):0.f;part+=v[k];}
+      float sum=warp_sum(part);
+      if(lane==0)lse[i]=m+__logf(sum);
+      float inv=sum>0.f?1.f/sum:1.f;
+      #pragma unroll
+      for(int k=0;k<SOFTMAX_ROW;k++){int j=lane+k*WARP;if(j<vis)row[j]=v[k]*inv;}
+      for(int j=vis+lane;j<seq_len;j+=WARP)row[j]=0.f;
+      continue;
+    }
     float m=-3.0e38f;for(int j=lane;j<vis;j+=WARP)m=fmaxf(m,row[j]);
     m=warp_max(m);
     float part=0.f;for(int j=lane;j<vis;j+=WARP){float e=__expf(row[j]-m);row[j]=e;part+=e;}
@@ -229,6 +255,16 @@ extern "C" __global__ void attention_softmax_bwd(float*g,const float*p,int rows,
   for(int i=blockIdx.x*warps+threadIdx.x/WARP;i<rows;i+=stride){
     int seq_len=cols;
     int vis=causal?i%cols+1:cols;float*gr=g+(size_t)i*seq_len;const float*pr=p+(size_t)i*seq_len;
+    if(vis<=WARP*SOFTMAX_ROW){
+      float pv[SOFTMAX_ROW],gv[SOFTMAX_ROW];float part=0.f;
+      #pragma unroll
+      for(int k=0;k<SOFTMAX_ROW;k++){int j=lane+k*WARP;int in=j<vis;pv[k]=in?pr[j]:0.f;gv[k]=in?gr[j]:0.f;part+=pv[k]*gv[k];}
+      float dot=warp_sum(part);
+      #pragma unroll
+      for(int k=0;k<SOFTMAX_ROW;k++){int j=lane+k*WARP;if(j<vis)gr[j]=pv[k]*(gv[k]-dot);}
+      for(int j=vis+lane;j<seq_len;j+=WARP)gr[j]=0.f;
+      continue;
+    }
     float part=0.f;for(int j=lane;j<vis;j+=WARP)part+=pr[j]*gr[j];
     float dot=warp_sum(part);
     for(int j=lane;j<vis;j+=WARP)gr[j]=pr[j]*(gr[j]-dot);
