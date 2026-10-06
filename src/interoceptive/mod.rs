@@ -19,6 +19,7 @@
 //! [`InteroceptiveAgent::train_step`].
 
 pub mod agent;
+pub mod backtest;
 pub mod buffer;
 pub mod loss;
 pub mod market_sim;
@@ -29,6 +30,7 @@ pub mod trainer;
 pub mod trunk;
 
 pub use agent::{AgentConfig, InteroceptiveAgent, QNetwork};
+pub use backtest::{BacktestReport, EquityStats, backtest, walk_forward};
 pub use buffer::{BatchData, ReplayBuffer};
 pub use loss::{bellman_targets, double_bellman_targets, homeostatic_reward, td_huber_loss};
 pub use market_sim::{
