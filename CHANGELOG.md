@@ -1,6 +1,67 @@
 # Changelog
 
-## Unreleased
+## 3.0.0
+
+A major version because three public configuration structs gained fields, so
+a struct literal that names every field no longer compiles. Add the field, or
+build from `Default` with `..Default::default()` where the struct has one:
+
+- `TransformerConfig::rope_scaling` (`None` keeps the old behaviour).
+- `RopeSpec::scaling` (`None` keeps the old behaviour). `RopeSpec` has no
+  `Default`, so name the field.
+- `ShapeVaeConfig::free_bits` (`0.0` keeps the old behaviour).
+
+Nothing was removed or renamed. Checkpoints written by 2.x load unchanged:
+every new field defaults when it is missing from the file.
+
+### Added
+
+- `TransformerLm::save_hf` and `TransformerLm::load_hf` (`src/hf.rs`) write and
+  read the Hugging Face LLaMA layout, a `config.json` beside a
+  `model.safetensors`. `transformers` reads the export as `LlamaForCausalLM`.
+  The loader takes LLaMA and Mistral checkpoints, single-file or sharded, and
+  refuses what the layout cannot hold (biases, per-head q/k norms, MoE or GELU
+  layers, attached LoRA, quantized weights, YaRN or dynamic rope scaling, a
+  sliding window shorter than `max_seq_len`) instead of approximating it.
+- `RopeScaling`, with linear and Llama 3.1 (`llama3`) scaling, set through
+  `TransformerBuilder::rope_scaling`. It changes how the rotary tables are
+  built, so the CPU path, the CUDA upload and the ONNX export all use it.
+- `TokenMix` draws each batch from several `TokenFile`s by weight. Every draw
+  comes from the step number and the mix seed, so a resumed run sees the same
+  batches.
+- The `interoceptive` module: a DQN trading agent whose market trunk is gated
+  by a model of the account's own state, with a homeostatic reward. A test
+  holds its simulation and replay loop to zero heap allocations per step.
+- `DeviceVitEncoder` runs the CLIP vision tower on CUDA in batches.
+- `ShapeVaeConfig::free_bits`, a per-unit KL floor for
+  `losses::kl_divergence_free_bits`. The shape decoder's norms run in BF16,
+  and the device decode goes through `decode_train`, so chunked decoding works
+  on CUDA.
+
+### Fixed
+
+- `TrainableConv2d` trained its bias with a zero gradient on CUDA: the bias
+  lived on the device while its gradient landed on the host copy.
+
+### Changed
+
+- The cross-attention backward is split across sequences, and short softmax
+  rows stay in registers.
+- `save_bin` and `save_optimizer_state` stream each tensor through a fixed
+  16 KiB buffer instead of building a full byte copy of it.
+
+### Documentation
+
+- The CUDA out-of-memory error explains fragmentation.
+- `roadmap.md` plans the next releases. The README scope now covers
+  `Conv2d` and `TrainableConv2d` and lists the model types.
+- `Matrix::random` is documented as unseeded test filler.
+
+## 2.0.1 and 2.0.2
+
+These two releases shipped without their own changelog headings. Everything
+below up to 2.0.0 went out in one of them. The `ImagePipeline` changes
+described next were breaking and went out in 2.0.1, a patch release.
 
 Everything here is additive except the seams around `ImagePipeline`:
 `ImagePipeline::new` takes a `PromptEncoder` in place of a tokenizer and an
