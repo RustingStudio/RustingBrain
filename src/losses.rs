@@ -113,6 +113,44 @@ mod tests {
 /// assert_eq!(grad_log_variance, vec![0.0; 4]);
 /// ```
 pub fn kl_divergence(mean: &[f32], log_variance: &[f32]) -> (f32, Vec<f32>, Vec<f32>) {
+    kl_divergence_free_bits(mean, log_variance, 0.0)
+}
+
+/// [`kl_divergence`] with a per-unit floor, below which a latent unit is not
+/// charged for its divergence and receives no gradient from it.
+///
+/// A unit whose KL is under `floor_nats` contributes the floor to the reported
+/// value and nothing to either gradient, so the encoder is free to hold that
+/// unit wherever reconstruction wants it instead of being pulled back to the
+/// prior. This is the "free bits" of Kingma et al., and what it is for is
+/// posterior collapse: units the decoder has stopped reading drift to the
+/// prior, the KL term is happy, and the capacity is gone.
+///
+/// The unit here is one element of the latent grid, which is what
+/// `examples/kl_report.rs` counts as `active`. Read that report before
+/// choosing a floor: the floor only does something for units already under it,
+/// so a corpus whose units all sit well above the floor will not move, and the
+/// weight on the whole term is the knob that matters there instead.
+///
+/// ```
+/// # use rusting_brain::losses::{kl_divergence, kl_divergence_free_bits};
+/// let (mean, log_variance) = ([0.1, 2.0], [-0.05, 0.4]);
+/// // A floor of zero is the plain divergence, so a training loop can swap one
+/// // for the other.
+/// assert_eq!(
+///     kl_divergence_free_bits(&mean, &log_variance, 0.0).0,
+///     kl_divergence(&mean, &log_variance).0
+/// );
+/// // The quiet unit stops pulling; the loud one is untouched.
+/// let (_, grad_mean, _) = kl_divergence_free_bits(&mean, &log_variance, 0.05);
+/// assert_eq!(grad_mean[0], 0.0);
+/// assert_eq!(grad_mean[1], 1.0);
+/// ```
+pub fn kl_divergence_free_bits(
+    mean: &[f32],
+    log_variance: &[f32],
+    floor_nats: f32,
+) -> (f32, Vec<f32>, Vec<f32>) {
     assert_eq!(mean.len(), log_variance.len());
     let count = mean.len().max(1) as f32;
 
@@ -121,9 +159,16 @@ pub fn kl_divergence(mean: &[f32], log_variance: &[f32]) -> (f32, Vec<f32>, Vec<
     let mut grad_log_variance = Vec::with_capacity(mean.len());
     for (mean, log_variance) in mean.iter().zip(log_variance) {
         let variance = log_variance.exp();
-        value += 0.5 * (mean * mean + variance - 1.0 - log_variance);
-        grad_mean.push(mean / count);
-        grad_log_variance.push(0.5 * (variance - 1.0) / count);
+        let nats = 0.5 * (mean * mean + variance - 1.0 - log_variance);
+        if nats > floor_nats {
+            value += nats;
+            grad_mean.push(mean / count);
+            grad_log_variance.push(0.5 * (variance - 1.0) / count);
+        } else {
+            value += floor_nats;
+            grad_mean.push(0.0);
+            grad_log_variance.push(0.0);
+        }
     }
     (value / count, grad_mean, grad_log_variance)
 }
@@ -221,6 +266,37 @@ mod divergence_tests {
         // Half the squared shift, which is the mean's whole contribution.
         assert!((shifted - 0.5).abs() < 1e-6);
         assert!(widened > 0.0 && narrowed > 0.0);
+    }
+
+    #[test]
+    fn a_free_bits_floor_silences_the_units_under_it_and_nothing_else() {
+        // One unit at the prior, one far from it.
+        let (mean, log_variance) = ([0.0, 1.5], [0.0, 0.6]);
+        let (_, plain_mean, plain_log_variance) = kl_divergence(&mean, &log_variance);
+        let (value, grad_mean, grad_log_variance) =
+            kl_divergence_free_bits(&mean, &log_variance, 0.2);
+
+        // The quiet unit pays the floor and pulls on nothing.
+        assert_eq!(grad_mean[0], 0.0);
+        assert_eq!(grad_log_variance[0], 0.0);
+        // The loud unit is charged and pulls exactly as it did before.
+        assert_eq!(grad_mean[1], plain_mean[1]);
+        assert_eq!(grad_log_variance[1], plain_log_variance[1]);
+
+        // The reported value is the floor plus the loud unit, over two units.
+        let loud = 0.5 * (1.5 * 1.5 + 0.6f32.exp() - 1.0 - 0.6);
+        assert!((value - (0.2 + loud) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_floor_every_unit_clears_changes_nothing_but_the_reported_value() {
+        // The case a corpus with no collapsed units is in: every unit is well
+        // above the floor, so the floor is a no-op on the gradients.
+        let (mean, log_variance) = ([1.2, -0.9, 2.0], [0.5, 0.4, -0.7]);
+        let (_, plain_mean, plain_log_variance) = kl_divergence(&mean, &log_variance);
+        let (_, grad_mean, grad_log_variance) = kl_divergence_free_bits(&mean, &log_variance, 0.01);
+        assert_eq!(grad_mean, plain_mean);
+        assert_eq!(grad_log_variance, plain_log_variance);
     }
 
     #[test]
