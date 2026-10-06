@@ -4,6 +4,9 @@
 
 ### Added
 
+- `Bpe` tokenizes LLaMA 3 and Qwen2 files the way the reference does: their
+  split rule (digits in runs of up to three, or one for Qwen2,
+  case-insensitive contractions) and `ignore_merges`.
 - `Bpe` reads sentencepiece-style BPE files (LLaMA 2, Mistral, TinyLlama):
   `▁` for spaces and `<0xNN>` byte fallback, with the `Metaspace`
   pre-tokenizer or the older `Prepend` normalizer. Ids match the Hugging Face
@@ -23,6 +26,11 @@
   network picks the next action and the target network scores it, which
   removes the overestimation of a plain max. `double_bellman_targets` is
   public; `bellman_targets` is unchanged.
+
+### Fixed
+
+- `Bpe` no longer reads the empty `end_of_word_suffix` that Qwen files write
+  as a CLIP-style suffix, which had made every Qwen tokenization wrong.
 
 ## 3.0.0
 

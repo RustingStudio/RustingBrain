@@ -19,11 +19,13 @@
 //! score for every piece, and tokenizing is the highest-scoring way to cut the
 //! text into pieces that are in the list.
 //!
-//! NOTE: the pre-tokenizer is the GPT-2 split rule written as a state
-//! machine instead of the regular expression the reference uses, because the
-//! crate has no regular-expression engine and this rule is small enough to
-//! write out. Upgrade path if a checkpoint ever ships a different rule: read
-//! `pre_tokenizer` out of the file and dispatch on it.
+//! NOTE: the pre-tokenizers are the GPT-2 split rule and the LLaMA 3 /
+//! Qwen2 one, each written as a state machine instead of the regular
+//! expression the reference uses, because the crate has no regular-expression
+//! engine. A file whose `Split` regex is neither of the two published LLaMA 3
+//! variants gets the GPT-2 rule. The `NFC` normalizer Qwen files name is not
+//! applied either; text that is already NFC, which is most typed text, is
+//! unaffected.
 
 use crate::network::NetworkError;
 use std::collections::HashMap;
@@ -44,6 +46,11 @@ pub struct Bpe {
     metaspace: Option<Metaspace>,
     /// Spell a symbol the vocabulary lacks as `<0xNN>` tokens.
     byte_fallback: bool,
+    /// `Some(n)` splits words with the LLaMA 3 / Qwen2 rule, digits in runs of
+    /// up to `n`; `None` is the GPT-2 rule.
+    split_digits: Option<usize>,
+    /// A word that is already a token is emitted whole, without merging.
+    ignore_merges: bool,
     byte_encoder: Vec<char>,
     byte_decoder: HashMap<char, u8>,
 }
@@ -139,6 +146,8 @@ impl Bpe {
         let end_of_word = model
             .get("end_of_word_suffix")
             .and_then(|suffix| suffix.as_str())
+            // Qwen files write an empty suffix, which means none.
+            .filter(|suffix| !suffix.is_empty())
             .map(str::to_string);
         let lowercase = json
             .get("normalizer")
@@ -181,6 +190,27 @@ impl Bpe {
             .and_then(|flag| flag.as_bool())
             .unwrap_or(false);
 
+        // The rule is the regular expression in a `Split` pre-tokenizer. Only
+        // the two published variants of the LLaMA 3 rule are recognised; any
+        // other file keeps the GPT-2 split.
+        let split_digits = pre_tokenizer(&json, "Split")
+            .and_then(|split| {
+                split
+                    .get("pattern")?
+                    .get("Regex")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .and_then(|regex| match regex.as_str() {
+                LLAMA3_SPLIT => Some(3),
+                QWEN2_SPLIT => Some(1),
+                _ => None,
+            });
+        let ignore_merges = model
+            .get("ignore_merges")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false);
+
         let byte_encoder = byte_alphabet();
         let byte_decoder = byte_encoder
             .iter()
@@ -197,6 +227,8 @@ impl Bpe {
             lowercase,
             metaspace,
             byte_fallback,
+            split_digits,
+            ignore_merges,
             byte_encoder,
             byte_decoder,
         })
@@ -276,7 +308,10 @@ impl Bpe {
                     false => vec![word.to_string()],
                 })
                 .collect(),
-            false => pre_tokenize(text),
+            false => match self.split_digits {
+                Some(digits) => split_llama3(text, digits),
+                None => pre_tokenize(text),
+            },
         };
 
         for word in words {
@@ -288,6 +323,12 @@ impl Bpe {
                 .collect();
             if symbols.is_empty() {
                 continue;
+            }
+            if self.ignore_merges {
+                if let Some(id) = self.vocab.get(&symbols.concat()) {
+                    ids.push(*id);
+                    continue;
+                }
             }
             if let Some(suffix) = &self.end_of_word {
                 symbols
@@ -515,6 +556,78 @@ fn pre_tokenize(text: &str) -> Vec<String> {
         words.push(characters[start..index].iter().collect());
     }
 
+    words
+}
+
+const LLAMA3_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+const QWEN2_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// Splits text the way LLaMA 3 and Qwen2 do, which is [`LLAMA3_SPLIT`] tried
+/// alternative by alternative at each position. `digits` is the longest run
+/// of digits one word may hold.
+///
+/// NOTE: a letter is `char::is_alphabetic`, which is the Unicode
+/// Alphabetic property rather than the `\p{L}` category the reference uses.
+/// The two differ on some combining marks, such as Devanagari vowel signs.
+fn split_llama3(text: &str, digits: usize) -> Vec<String> {
+    const CONTRACTIONS: [&str; 7] = ["s", "t", "re", "ve", "m", "ll", "d"];
+    let c: Vec<char> = text.chars().collect();
+    let letter = |i: usize| c.get(i).is_some_and(|x| classify(*x) == Kind::Letter);
+    let number = |i: usize| c.get(i).is_some_and(|x| classify(*x) == Kind::Number);
+    let space = |i: usize| c.get(i).is_some_and(|x| x.is_whitespace());
+    let newline = |i: usize| matches!(c.get(i), Some('\r' | '\n'));
+    let other = |i: usize| c.get(i).is_some_and(|x| classify(*x) == Kind::Other);
+    let run = |mut i: usize, keep: &dyn Fn(usize) -> bool| {
+        while keep(i) {
+            i += 1;
+        }
+        i
+    };
+
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let end = 'end: {
+            if c[i] == '\'' {
+                let rest: String = c[i + 1..c.len().min(i + 3)]
+                    .iter()
+                    .collect::<String>()
+                    .to_lowercase();
+                if let Some(tail) = CONTRACTIONS.iter().find(|tail| rest.starts_with(**tail)) {
+                    break 'end i + 1 + tail.len();
+                }
+            }
+            // One leading character that is not a newline, a letter or a digit.
+            let start = if !newline(i) && !letter(i) && !number(i) {
+                i + 1
+            } else {
+                i
+            };
+            if letter(start) {
+                break 'end run(start, &letter);
+            }
+            if number(i) {
+                break 'end run(i, &number).min(i + digits);
+            }
+            let start = if c[i] == ' ' { i + 1 } else { i };
+            if other(start) {
+                break 'end run(run(start, &other), &newline);
+            }
+            let blank = run(i, &space);
+            if let Some(last) = (i..blank).rev().find(|j| newline(*j)) {
+                break 'end last + 1;
+            }
+            // Whitespace not followed by a word, so the last space of a run
+            // goes to the word after it.
+            if blank == c.len() || blank - i < 2 {
+                blank
+            } else {
+                blank - 1
+            }
+        };
+        words.push(c[i..end].iter().collect());
+        i = end;
+    }
     words
 }
 
@@ -999,6 +1112,53 @@ pub(crate) mod tests {
             assert_eq!(bpe.encode(text).unwrap(), ids, "{text:?}, legacy {legacy}");
             assert_eq!(bpe.decode(ids), decoded, "{text:?}, legacy {legacy}");
         }
+    }
+
+    #[test]
+    fn the_llama3_split_matches_the_reference_tokenizer() {
+        // Words from the Hugging Face `tokenizers` `Split` pre-tokenizer with
+        // the LLaMA 3 regex. Checked as well end to end against the real
+        // LLaMA 3 (128k) and Qwen-Image (151k) files: 474 lines of this
+        // README, this file and mixed-script text, every id and every decode
+        // equal.
+        let cases: [(&str, &[&str]); 3] = [
+            (
+                "I'M here, they'LL pay 1234567.",
+                &[
+                    "I", "'M", " here", ",", " they", "'LL", " pay", " ", "123", "456", "7", ".",
+                ],
+            ),
+            (
+                "\t\tx\n\n  a  b   c\r\nend   ",
+                &[
+                    "\t", "\tx", "\n\n", " ", " a", " ", " b", "  ", " c", "\r\n", "end", "   ",
+                ],
+            ),
+            ("$Hi #tag", &["$Hi", " #", "tag"]),
+        ];
+        for (text, words) in cases {
+            assert_eq!(split_llama3(text, 3), words, "{text:?}");
+        }
+        // Qwen2 cuts digits one at a time.
+        assert_eq!(split_llama3("x 1234", 1), ["x", " ", "1", "2", "3", "4"]);
+
+        // The rule and `ignore_merges` are read from the file, and an empty
+        // end-of-word suffix is no suffix.
+        let mut json: serde_json::Value =
+            serde_json::from_str(&tokenizer_json(&["a b"], &["ab", "abc"], None)).unwrap();
+        json["pre_tokenizer"] = serde_json::json!({"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "pattern": {"Regex": LLAMA3_SPLIT}, "behavior": "Isolated"},
+            {"type": "ByteLevel", "use_regex": false},
+        ]});
+        json["model"]["end_of_word_suffix"] = "".into();
+        let merged = Bpe::from_json(&json.to_string()).unwrap();
+        assert_eq!(merged.split_digits, Some(3));
+        let abc = merged.token_id("abc").unwrap();
+        assert_ne!(merged.encode("abc").unwrap(), [abc]);
+        json["model"]["ignore_merges"] = true.into();
+        let whole = Bpe::from_json(&json.to_string()).unwrap();
+        assert_eq!(whole.encode("abc").unwrap(), [abc]);
+        assert_eq!(whole.decode(&[abc]), "abc");
     }
 
     #[test]
