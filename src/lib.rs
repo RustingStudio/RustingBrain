@@ -114,6 +114,7 @@ pub mod embedding;
 pub mod ffn;
 pub mod flow_transformer;
 pub mod gltf;
+pub mod hf;
 pub mod interoceptive;
 pub mod losses;
 pub mod masked_lm;
