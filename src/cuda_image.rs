@@ -45,7 +45,7 @@
 //! convolutions are the only ones that skip im2col. Each of those is a
 //! measurable-if-profiled improvement rather than a correctness gap.
 
-use crate::clip::{ClipTextEncoder, Norm};
+use crate::clip::{ClipTextEncoder, Layer, Norm};
 use crate::conv::{Conv2d, Dense, FeatureMap, GroupNorm};
 use crate::cuda_training::{cfg, cuda_alloc_err, cuda_err, device_context};
 use crate::gpu_transformer::{GpuContext, act_plain, act_rhs_transposed};
@@ -53,6 +53,7 @@ use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::unet::{Projection, Unet};
 use crate::vae::VaeDecoder;
+use crate::vit_encoder::VitEncoder;
 use cudarc::cublas::{result as cublas, sys as cublas_sys, sys::cublasOperation_t};
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaView, DevicePtr, DevicePtrMut, LaunchConfig,
@@ -633,6 +634,16 @@ impl Tensor {
             lead: self.cols,
             rows: self.rows,
             cols: self.cols,
+        }
+    }
+
+    /// `rows` whole rows starting at row `first`: one sequence out of several
+    /// stacked into this buffer.
+    fn window(&self, first: usize, rows: usize) -> View<'_> {
+        View {
+            base: first * self.cols,
+            rows,
+            ..self.view()
         }
     }
 
@@ -2244,22 +2255,7 @@ impl std::fmt::Debug for DeviceClip {
 impl DeviceClip {
     pub fn upload(gpu: &Arc<ImageGpu>, encoder: &ClipTextEncoder) -> Result<Self, NetworkError> {
         Ok(Self {
-            layers: encoder
-                .layers
-                .iter()
-                .map(|layer| {
-                    Ok(DeviceClipLayer {
-                        attention_norm: upload_norm(gpu, &layer.attention_norm)?,
-                        query: upload_dense(gpu, &layer.query)?,
-                        key: upload_dense(gpu, &layer.key)?,
-                        value: upload_dense(gpu, &layer.value)?,
-                        output: upload_dense(gpu, &layer.output)?,
-                        mlp_norm: upload_norm(gpu, &layer.mlp_norm)?,
-                        mlp_in: upload_dense(gpu, &layer.mlp_in)?,
-                        mlp_out: upload_dense(gpu, &layer.mlp_out)?,
-                    })
-                })
-                .collect::<Result<_, NetworkError>>()?,
+            layers: upload_clip_layers(gpu, &encoder.layers)?,
             final_norm: upload_norm(gpu, &encoder.final_norm)?,
             heads: encoder.config().num_heads,
             eps: encoder.config().eps,
@@ -2286,24 +2282,175 @@ impl DeviceClip {
             if index == stop {
                 skipped = Some(gpu.download(&hidden)?);
             }
-            let normed = gpu.layer_norm(&layer.attention_norm, &hidden, self.eps)?;
-            let queries = gpu.dense(&layer.query, &normed)?;
-            let keys = gpu.dense(&layer.key, &normed)?;
-            let values = gpu.dense(&layer.value, &normed)?;
             // A text tower reads left to right, unlike everything else here.
-            let attended =
-                gpu.attention(queries.view(), keys.view(), values.view(), self.heads, true)?;
-            gpu.dense_add(&layer.output, &attended, &mut hidden)?;
-
-            let normed = gpu.layer_norm(&layer.mlp_norm, &hidden, self.eps)?;
-            let mut wide = gpu.dense(&layer.mlp_in, &normed)?;
-            gpu.activate(&mut wide, self.activation)?;
-            gpu.dense_add(&layer.mlp_out, &wide, &mut hidden)?;
+            let sequence = hidden.rows;
+            run_clip_layer(
+                gpu,
+                layer,
+                &mut hidden,
+                self.heads,
+                self.eps,
+                self.activation,
+                true,
+                sequence,
+            )?;
         }
 
         let normalized = gpu.layer_norm(&self.final_norm, &hidden, self.eps)?;
         let normalized = gpu.download(&normalized)?;
         Ok((skipped.unwrap_or_else(|| normalized.clone()), normalized))
+    }
+}
+
+fn upload_clip_layers(
+    gpu: &ImageGpu,
+    layers: &[Layer],
+) -> Result<Vec<DeviceClipLayer>, NetworkError> {
+    layers
+        .iter()
+        .map(|layer| {
+            Ok(DeviceClipLayer {
+                attention_norm: upload_norm(gpu, &layer.attention_norm)?,
+                query: upload_dense(gpu, &layer.query)?,
+                key: upload_dense(gpu, &layer.key)?,
+                value: upload_dense(gpu, &layer.value)?,
+                output: upload_dense(gpu, &layer.output)?,
+                mlp_norm: upload_norm(gpu, &layer.mlp_norm)?,
+                mlp_in: upload_dense(gpu, &layer.mlp_in)?,
+                mlp_out: upload_dense(gpu, &layer.mlp_out)?,
+            })
+        })
+        .collect()
+}
+
+/// One CLIP layer in place, the device twin of [`crate::clip::run_layer`].
+///
+/// `hidden` holds whole sequences of `sequence` rows stacked one after
+/// another. Everything but attention reads a row at a time, so it runs over the
+/// whole stack at once; attention runs over each sequence's window on its own,
+/// so no sequence sees another's tokens.
+#[allow(clippy::too_many_arguments)]
+fn run_clip_layer(
+    gpu: &ImageGpu,
+    layer: &DeviceClipLayer,
+    hidden: &mut Tensor,
+    heads: usize,
+    eps: f32,
+    activation: i32,
+    causal: bool,
+    sequence: usize,
+) -> Result<(), NetworkError> {
+    if sequence == 0 || hidden.rows % sequence != 0 {
+        return Err(NetworkError::InvalidConfig(format!(
+            "{} rows do not split into sequences of {sequence}",
+            hidden.rows
+        )));
+    }
+    let normed = gpu.layer_norm(&layer.attention_norm, hidden, eps)?;
+    let queries = gpu.dense(&layer.query, &normed)?;
+    let keys = gpu.dense(&layer.key, &normed)?;
+    let values = gpu.dense(&layer.value, &normed)?;
+    let attended = match hidden.rows == sequence {
+        true => gpu.attention(queries.view(), keys.view(), values.view(), heads, causal)?,
+        false => {
+            let mut attended = gpu.uninit(hidden.rows, queries.cols)?;
+            let width = sequence * queries.cols;
+            for first in (0..hidden.rows).step_by(sequence) {
+                let one = gpu.attention(
+                    queries.window(first, sequence),
+                    keys.window(first, sequence),
+                    values.window(first, sequence),
+                    heads,
+                    causal,
+                )?;
+                let start = first * queries.cols;
+                gpu.context
+                    .stream
+                    .memcpy_dtod(
+                        &one.data,
+                        &mut attended.data.slice_mut(start..start + width),
+                    )
+                    .map_err(cuda_err("device to device copy"))?;
+            }
+            attended
+        }
+    };
+    gpu.dense_add(&layer.output, &attended, hidden)?;
+
+    let normed = gpu.layer_norm(&layer.mlp_norm, hidden, eps)?;
+    let mut wide = gpu.dense(&layer.mlp_in, &normed)?;
+    gpu.activate(&mut wide, activation)?;
+    gpu.dense_add(&layer.mlp_out, &wide, hidden)
+}
+
+// ---------------------------------------------------------------------------
+// The CLIP image tower.
+// ---------------------------------------------------------------------------
+
+/// A CLIP image tower, resident on the device.
+pub struct DeviceVitEncoder {
+    gpu: Arc<ImageGpu>,
+    patch: DeviceDense,
+    pre_norm: DeviceNorm,
+    layers: Vec<DeviceClipLayer>,
+    post_norm: DeviceNorm,
+    heads: usize,
+    eps: f32,
+    activation: i32,
+}
+
+impl std::fmt::Debug for DeviceVitEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceVitEncoder").finish_non_exhaustive()
+    }
+}
+
+impl DeviceVitEncoder {
+    pub fn upload(gpu: &Arc<ImageGpu>, encoder: &VitEncoder) -> Result<Self, NetworkError> {
+        let config = encoder.config();
+        Ok(Self {
+            patch: upload_dense(gpu, &encoder.patch)?,
+            pre_norm: upload_norm(gpu, &encoder.pre_norm)?,
+            layers: upload_clip_layers(gpu, &encoder.layers)?,
+            post_norm: upload_norm(gpu, &encoder.post_norm)?,
+            heads: config.num_heads,
+            eps: config.eps,
+            activation: i32::from(config.quick_gelu) + 1,
+            gpu: gpu.clone(),
+        })
+    }
+
+    /// The tower over a stack of images, `tokens` rows each.
+    ///
+    /// `patches` is `[images * tokens, channels * patch * patch]`, every
+    /// image's flattened patches behind a zero row where its class token goes.
+    /// `embedding` is `[images * tokens, d_model]`: the class token and the
+    /// position table, which the patch projection lands on top of. Both are
+    /// built on the host, the same way [`DeviceClip`] leaves the embedding
+    /// gather there.
+    pub fn forward(
+        &self,
+        patches: &Matrix,
+        embedding: &Matrix,
+        tokens: usize,
+    ) -> Result<Matrix, NetworkError> {
+        let gpu = &self.gpu;
+        let mut hidden = gpu.upload_matrix(embedding)?;
+        gpu.dense_add(&self.patch, &gpu.upload_matrix(patches)?, &mut hidden)?;
+        let mut hidden = gpu.layer_norm(&self.pre_norm, &hidden, self.eps)?;
+        for layer in &self.layers {
+            run_clip_layer(
+                gpu,
+                layer,
+                &mut hidden,
+                self.heads,
+                self.eps,
+                self.activation,
+                false,
+                tokens,
+            )?;
+        }
+        gpu.download(&gpu.layer_norm(&self.post_norm, &hidden, self.eps)?)
     }
 }
 
@@ -2731,5 +2878,65 @@ mod tests {
             &expected_skipped.data,
             0.05,
         );
+    }
+
+    #[test]
+    fn a_whole_vit_tower_matches_the_host_or_skips_without_a_device() {
+        let Some(gpu) = device() else { return };
+        let path = std::env::temp_dir().join("rusting_brain_cuda_vit.safetensors");
+        crate::vit_encoder::tests::checkpoint(&path, false);
+        let mut tower =
+            VitEncoder::load(&path, "", crate::vit_encoder::tests::tiny(), Precision::F32)
+                .expect("a tower");
+        std::fs::remove_file(&path).ok();
+
+        let image = map(
+            tower.channels(),
+            tower.image_size(),
+            tower.image_size(),
+            0.27,
+        );
+        let expected = tower.encode(&image).expect("a host pass");
+        tower.attach_device(gpu).expect("an upload");
+        let actual = tower.encode(&image).expect("a device pass");
+
+        assert_eq!((actual.rows, actual.cols), (expected.rows, expected.cols));
+        assert_close("vit", &actual.data, &expected.data, 0.05);
+    }
+
+    #[test]
+    fn a_vit_batch_keeps_each_image_to_itself_or_skips_without_a_device() {
+        let Some(gpu) = device() else { return };
+        let path = std::env::temp_dir().join("rusting_brain_cuda_vit_batch.safetensors");
+        crate::vit_encoder::tests::checkpoint(&path, false);
+        let mut tower =
+            VitEncoder::load(&path, "", crate::vit_encoder::tests::tiny(), Precision::F32)
+                .expect("a tower");
+        std::fs::remove_file(&path).ok();
+
+        // Three different images. The host comparison has to allow for FP16,
+        // and this tiny tower is dominated by its norms, so a token that
+        // attended to another image moves by less than that allowance. The
+        // single-image device passes run the same kernels, so the batch has to
+        // match them far more tightly, and that is what catches the mixing.
+        let size = tower.image_size();
+        let images: Vec<_> = [0.0, 1.5, 3.0]
+            .into_iter()
+            .map(|seed| map(tower.channels(), size, size, seed))
+            .collect();
+        let expected: Vec<_> = images
+            .iter()
+            .map(|image| tower.encode(image).expect("a host pass"))
+            .collect();
+        tower.attach_device(gpu).expect("an upload");
+        let actual = tower.encode_batch(&images).expect("a device batch");
+
+        assert_eq!(actual.len(), expected.len());
+        for ((actual, expected), image) in actual.iter().zip(&expected).zip(&images) {
+            assert_eq!((actual.rows, actual.cols), (expected.rows, expected.cols));
+            assert_close("vit batch", &actual.data, &expected.data, 0.05);
+            let single = tower.encode(image).expect("a single device pass");
+            assert_close("vit batch beside one", &actual.data, &single.data, 0.002);
+        }
     }
 }

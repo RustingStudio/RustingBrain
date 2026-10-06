@@ -20,9 +20,9 @@
 //! `[d_model, channels * patch * patch]` and run through [`Dense`] instead of
 //! [`Conv2d`](crate::conv::Conv2d). Same arithmetic, no convolution.
 //!
-//! Inference only, and no device path: the tower runs once per image offline
-//! and its output is cached, so its throughput is not what the training loop
-//! waits on.
+//! Inference only. With the `cuda` feature, [`VitEncoder::attach_device`] moves
+//! the tower onto a card and [`VitEncoder::encode_batch`] runs many images as
+//! one stack there, which is what a corpus of a hundred thousand images needs.
 
 use crate::clip::{Layer, Norm, dense, norm, run_layer};
 use crate::conv::{Dense, FeatureMap};
@@ -59,15 +59,18 @@ impl Default for VitEncoderConfig {
 pub struct VitEncoder {
     config: VitEncoderConfig,
     /// `[d_model, channels * patch * patch]`, the convolution read flat.
-    patch: Dense,
+    pub(crate) patch: Dense,
     class_token: Vec<f32>,
     /// `[patches + 1, d_model]`.
     positions: Matrix,
-    pre_norm: Norm,
-    layers: Vec<Layer>,
-    post_norm: Norm,
+    pub(crate) pre_norm: Norm,
+    pub(crate) layers: Vec<Layer>,
+    pub(crate) post_norm: Norm,
     channels: usize,
     patch_size: usize,
+    /// The same weights on a CUDA device, when one was attached.
+    #[cfg(feature = "cuda")]
+    device: Option<crate::cuda_image::DeviceVitEncoder>,
 }
 
 impl VitEncoder {
@@ -176,7 +179,30 @@ impl VitEncoder {
             layers,
             channels,
             patch_size: patch_rows,
+            #[cfg(feature = "cuda")]
+            device: None,
         })
+    }
+
+    /// The configuration this tower was built for.
+    pub fn config(&self) -> &VitEncoderConfig {
+        &self.config
+    }
+
+    /// Uploads the tower to a CUDA device, and [`VitEncoder::encode`] and
+    /// [`VitEncoder::encode_batch`] run there from now on.
+    ///
+    /// The device computes in FP16, so its tokens differ slightly from the
+    /// host's. A failed upload leaves the tower on the CPU and returns the
+    /// error; a failure later, during a pass, is returned too and never falls
+    /// back to the CPU.
+    #[cfg(feature = "cuda")]
+    pub fn attach_device(
+        &mut self,
+        gpu: std::sync::Arc<crate::cuda_image::ImageGpu>,
+    ) -> Result<(), NetworkError> {
+        self.device = Some(crate::cuda_image::DeviceVitEncoder::upload(&gpu, self)?);
+        Ok(())
     }
 
     /// Side of the square image the tower expects, in pixels.
@@ -212,31 +238,12 @@ impl VitEncoder {
     /// per-channel `(pixel - mean) / std` over `[0, 1]` values; see
     /// [`CLIP_MEAN`] and [`CLIP_STD`].
     pub fn encode(&self, image: &FeatureMap) -> Result<Matrix, NetworkError> {
-        let size = self.image_size();
-        if image.channels != self.channels || image.height != size || image.width != size {
-            return Err(NetworkError::InvalidConfig(format!(
-                "the tower reads a {}x{size}x{size} image and this one is {}x{}x{}",
-                self.channels, image.channels, image.height, image.width
-            )));
+        #[cfg(feature = "cuda")]
+        if self.device.is_some() {
+            return Ok(self.encode_batch(std::slice::from_ref(image))?.remove(0));
         }
 
-        let patch = self.patch_size;
-        let grid = size / patch;
-        let mut flat = Matrix::new(grid * grid, self.patch.in_dim());
-        for row in 0..grid {
-            for column in 0..grid {
-                let target = flat.row_mut(row * grid + column);
-                for channel in 0..self.channels {
-                    for y in 0..patch {
-                        let source = (channel * size + row * patch + y) * size + column * patch;
-                        let start = (channel * patch + y) * patch;
-                        target[start..start + patch]
-                            .copy_from_slice(&image.data[source..source + patch]);
-                    }
-                }
-            }
-        }
-
+        let flat = self.flatten(image)?;
         let projected = self.patch.forward(&flat)?;
         let mut hidden = Matrix::new(self.positions.rows, self.d_model());
         hidden.row_mut(0).copy_from_slice(&self.class_token);
@@ -267,6 +274,71 @@ impl VitEncoder {
             )?;
         }
         Ok(self.post_norm.forward(&hidden, self.config.eps))
+    }
+
+    /// [`VitEncoder::encode`] over several images, one token matrix each.
+    ///
+    /// On the host this is a loop. On a device the images run as one stack,
+    /// `[images * tokens, d_model]`, so every projection is one GEMM over all
+    /// of them, and only attention is split per image. The whole slice is one
+    /// stack, so the caller picks the batch size by how many images it passes.
+    pub fn encode_batch(&self, images: &[FeatureMap]) -> Result<Vec<Matrix>, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(device) = self.device.as_ref().filter(|_| !images.is_empty()) {
+            let tokens = self.tokens();
+            let width = self.d_model();
+            let mut patches = Matrix::new(images.len() * tokens, self.patch.in_dim());
+            let mut embedding = Matrix::new(images.len() * tokens, width);
+            for (index, image) in images.iter().enumerate() {
+                let flat = self.flatten(image)?;
+                let first = index * tokens;
+                // Row `first` stays zero, so the class token gets no projection.
+                let start = (first + 1) * flat.cols;
+                patches.data[start..start + flat.data.len()].copy_from_slice(&flat.data);
+                let rows = first * width..(first + tokens) * width;
+                embedding.data[rows].copy_from_slice(&self.positions.data);
+                for (value, class) in embedding.row_mut(first).iter_mut().zip(&self.class_token) {
+                    *value += class;
+                }
+            }
+            let stacked = device.forward(&patches, &embedding, tokens)?;
+            return Ok(stacked
+                .data
+                .chunks_exact(tokens * width)
+                .map(|image| Matrix::from_vec(tokens, width, image.to_vec()))
+                .collect());
+        }
+        images.iter().map(|image| self.encode(image)).collect()
+    }
+
+    /// The image cut into patches, `[patches, channels * patch * patch]`, one
+    /// row per patch in row-major order.
+    fn flatten(&self, image: &FeatureMap) -> Result<Matrix, NetworkError> {
+        let size = self.image_size();
+        if image.channels != self.channels || image.height != size || image.width != size {
+            return Err(NetworkError::InvalidConfig(format!(
+                "the tower reads a {}x{size}x{size} image and this one is {}x{}x{}",
+                self.channels, image.channels, image.height, image.width
+            )));
+        }
+
+        let patch = self.patch_size;
+        let grid = size / patch;
+        let mut flat = Matrix::new(grid * grid, self.patch.in_dim());
+        for row in 0..grid {
+            for column in 0..grid {
+                let target = flat.row_mut(row * grid + column);
+                for channel in 0..self.channels {
+                    for y in 0..patch {
+                        let source = (channel * size + row * patch + y) * size + column * patch;
+                        let start = (channel * patch + y) * patch;
+                        target[start..start + patch]
+                            .copy_from_slice(&image.data[source..source + patch]);
+                    }
+                }
+            }
+        }
+        Ok(flat)
     }
 }
 
@@ -368,7 +440,7 @@ fn read_layer(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
@@ -381,7 +453,7 @@ mod tests {
     /// identity and the output is the embedding through the two norms. That
     /// gives the forward pass a reference to be checked against rather than
     /// only a shape.
-    fn checkpoint(path: &std::path::Path, identity_layers: bool) {
+    pub(crate) fn checkpoint(path: &std::path::Path, identity_layers: bool) {
         let mut tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
         let mut add = |name: String, shape: Vec<usize>, zero: bool| {
             let count = shape.iter().product::<usize>();
@@ -455,14 +527,14 @@ mod tests {
         ))
     }
 
-    fn tiny() -> VitEncoderConfig {
+    pub(crate) fn tiny() -> VitEncoderConfig {
         VitEncoderConfig {
             num_heads: 2,
             ..VitEncoderConfig::default()
         }
     }
 
-    fn ramp(size: usize) -> FeatureMap {
+    pub(crate) fn ramp(size: usize) -> FeatureMap {
         FeatureMap::from_vec(
             3,
             size,
