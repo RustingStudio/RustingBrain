@@ -4,6 +4,10 @@
 
 ### Added
 
+- `Bpe` reads sentencepiece-style BPE files (LLaMA 2, Mistral, TinyLlama):
+  `▁` for spaces and `<0xNN>` byte fallback, with the `Metaspace`
+  pre-tokenizer or the older `Prepend` normalizer. Ids match the Hugging Face
+  `tokenizers` library.
 - `interoceptive::backtest` scores the greedy policy over real candles, with
   costs and without shocks: total return, per-step Sharpe, maximum drawdown
   and liquidation, beside a buy-and-hold baseline. `walk_forward` makes the
