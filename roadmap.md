@@ -219,6 +219,12 @@ same tensors into a trainable `TransformerLm`, so a user can fine-tune a
 published model with B4. This needs A3 (`head_dim` 128 is the common case),
 RoPE scaling (B6) and a tokenizer round trip through `Bpe`.
 
+**Status: weights done.** `TransformerLm::load_hf` (`src/hf.rs`) reads LLaMA
+and Mistral checkpoints, single-file or sharded. It refuses biases (so Qwen2),
+per-head q/k norms, `rope_scaling` and a sliding window shorter than
+`max_seq_len`, instead of loading them wrong. Still open: `rope_scaling`
+(B6), `head_dim` 128 on the fast path (A3), and the tokenizer round trip.
+
 ### B6. Long context — P2, M
 
 - RoPE scaling: linear, NTK-aware and YaRN. B5 needs these to read published
@@ -333,8 +339,8 @@ exist already. What is missing:
 
 | # | Item | Priority | Effort | Notes |
 |---|---|---|---|---|
-| F1 | Write safetensors | P1 | S | `src/safetensors.rs` only reads. Writing lets a trained `TransformerLm` or LoRA adapter load in PyTorch, llama.cpp converters and the Hub. The format is a JSON header plus raw bytes. |
-| F2 | Hugging Face config export | P1 | S | Write a LLaMA-compatible `config.json` next to F1's output, so that `transformers` loads the result directly. This is the reverse of B5. |
+| F1 | Write safetensors | P1 | S | **Already existed:** `safetensors::write` and `write_as` (F32, BF16). Writing lets a trained `TransformerLm` or LoRA adapter load in PyTorch, llama.cpp converters and the Hub. The format is a JSON header plus raw bytes. |
+| F2 | Hugging Face config export | P1 | S | **Done:** `TransformerLm::save_hf` writes `config.json` and `model.safetensors`; a test reads them back through the separate `TextEncoder` LLaMA reader. Original plan: write a LLaMA-compatible `config.json` next to F1's output, so that `transformers` loads the result directly. This is the reverse of B5. |
 | F3 | GGUF export | P2 | M | Run trained models in llama.cpp and Ollama. Q8_0 first, because it maps to `Precision::Q8`. |
 | F4 | ONNX export for MoE | P3 | M | `save_onnx` covers dense networks and the dense LM. MoE needs dynamic routing in the graph, which ONNX handles poorly. Park it until someone asks. |
 | F5 | Checkpoint format version | P1 | S | Put a version field and a model-shape header in binary checkpoints, so that an old checkpoint fails with a clear error and not with garbage weights. Check first whether one already exists. |
