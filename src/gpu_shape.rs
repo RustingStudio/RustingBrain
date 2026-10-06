@@ -130,16 +130,33 @@ struct Normed {
     normed: Act,
 }
 
+/// `narrow` asks for the normed activation in BF16 rather than FP32.
+///
+/// It is only ever set for a norm whose output feeds a SwiGLU, because
+/// [`forward_swiglu`] reads the flag off the activation and runs its whole
+/// branch at the operand width it finds: the gate, the up and the down
+/// projection between them are about three quarters of the decode's
+/// arithmetic, and BF16 operands are what makes cuBLAS pick the kernel that
+/// takes twice the `k` per instruction. The cache also holds half as many
+/// bytes per row of it.
+///
+/// This is a real reduction in precision rather than a free one. The wide path
+/// under `mixed_precision` asks cuBLAS for `32F_FAST_16BF`, which is a hint the
+/// library may decline on a small GEMM, and it stores the activation itself at
+/// full width; a narrow buffer rounds unconditionally. So the flag follows
+/// `mixed_precision` and is never set on a norm whose consumer has not been
+/// measured at this width.
 fn normalize(
     gpu: &Gpu<'_>,
     norm: &RmsNorm,
     input: CudaSlice<f32>,
     rows: usize,
     width: usize,
+    narrow: bool,
 ) -> Result<Normed, NetworkError> {
     let weight = gpu.upload(&norm.weight.value.data)?;
     let (normed, inverse_rms, _) =
-        gpu.rmsnorm(&input, &weight, rows, width, norm.eps, false, false)?;
+        gpu.rmsnorm(&input, &weight, rows, width, norm.eps, narrow, false)?;
     Ok(Normed {
         input,
         weight,
@@ -201,7 +218,7 @@ fn block_forward(
         kv_len: sequence_len,
         sequences,
     };
-    let attention_norm = normalize(gpu, &block.attention_norm, hidden, rows, width)?;
+    let attention_norm = normalize(gpu, &block.attention_norm, hidden, rows, width, false)?;
     // Queries and keys are the same activations here, which is what makes
     // `gpu_cross` serve self-attention: the layer is built with the mask and
     // the rotary positions off, so the two paths are the same arithmetic.
@@ -210,7 +227,14 @@ fn block_forward(
     let mut residual = attended;
     gpu.add(&mut residual, &attention_norm.input, 0, rows * width, true)?;
 
-    let mlp_norm = normalize(gpu, &block.mlp_norm, residual, rows, width)?;
+    let mlp_norm = normalize(
+        gpu,
+        &block.mlp_norm,
+        residual,
+        rows,
+        width,
+        gpu.context.mixed_precision,
+    )?;
     // The down projection accumulates onto its destination, so the branch
     // starts at zero and the residual is added after it.
     let mut output = gpu.zeros(rows * width)?;
@@ -241,7 +265,11 @@ fn block_backward(
     width: usize,
 ) -> Result<CudaSlice<f32>, NetworkError> {
     let rows = sequence_len * sequences;
-    let grad_branch = gpu.narrowed(&grad_output.slice(..), rows * width, false)?;
+    let grad_branch = gpu.narrowed(
+        &grad_output.slice(..),
+        rows * width,
+        cache.mlp_norm.normed.is_narrow(),
+    )?;
     let mut grad_normed = gpu.uninit(rows * width)?;
     backward_swiglu(
         gpu,
@@ -353,7 +381,7 @@ pub(crate) fn encode_train_batch(
         blocks.push(cache);
     }
 
-    let encoder_norm = normalize(&gpu, &model.encoder_norm, hidden, latent_rows, width)?;
+    let encoder_norm = normalize(&gpu, &model.encoder_norm, hidden, latent_rows, width, false)?;
     let to_moments = Projection::new(&gpu, &model.to_moments)?;
     let moments = to_moments.forward(&gpu, &encoder_norm.normed.all(), latent_rows)?;
     let moments = Matrix::from_vec(latent_rows, 2 * config.latent_dim, gpu.download(&moments)?);
@@ -543,7 +571,14 @@ pub(crate) fn decode_train_batch(
     let mut residual = crossed;
     gpu.add(&mut residual, &embedded, 0, rows * width, true)?;
 
-    let decoder_norm = normalize(&gpu, &model.decoder_norm, residual, rows, width)?;
+    let decoder_norm = normalize(
+        &gpu,
+        &model.decoder_norm,
+        residual,
+        rows,
+        width,
+        gpu.context.mixed_precision,
+    )?;
     let mut hidden = gpu.zeros(rows * width)?;
     let mlp = forward_swiglu(
         &gpu,
@@ -554,7 +589,7 @@ pub(crate) fn decode_train_batch(
     )?;
     gpu.add(&mut hidden, &decoder_norm.input, 0, rows * width, true)?;
 
-    let head_norm = normalize(&gpu, &model.head_norm, hidden, rows, width)?;
+    let head_norm = normalize(&gpu, &model.head_norm, hidden, rows, width, false)?;
     let head = Projection::new(&gpu, &model.head)?;
     let distances = head.forward(&gpu, &head_norm.normed.all(), rows)?;
     let bias = model.head_bias.value.data[0];
@@ -653,7 +688,11 @@ pub(crate) fn decode_backward(
         width,
     )?;
 
-    let grad_branch = gpu.narrowed(&grad_hidden.slice(..), rows * width, false)?;
+    let grad_branch = gpu.narrowed(
+        &grad_hidden.slice(..),
+        rows * width,
+        cache.decoder_norm.normed.is_narrow(),
+    )?;
     let mut grad_normed = gpu.uninit(rows * width)?;
     backward_swiglu(
         &gpu,
@@ -794,6 +833,7 @@ mod tests {
             encoder_blocks: 2,
             frequencies: 2,
             eps: 1e-5,
+            free_bits: 0.0,
         }
     }
 
@@ -824,6 +864,59 @@ mod tests {
     /// has to reach the same numbers and the same gradients on both paths.
     #[test]
     fn a_step_matches_the_host_or_skips_without_device() {
+        step_parity(false, 1e-4);
+    }
+
+    /// The same step with reduced precision on, which is what
+    /// [`ShapeVae::to_cuda`] gives a real run.
+    ///
+    /// Under mixed precision the SwiGLU's operands are stored and handed to
+    /// cuBLAS as BF16, so the tolerance is the one eight mantissa bits earn
+    /// rather than the FP32 path's. It is loose here for a second reason: the
+    /// model is sixteen channels wide, its weights are random, and its colour
+    /// head ends in a sigmoid, so the sums cancel and a rounded operand arrives
+    /// magnified. The factor is the same one the FP32 run shows — that path
+    /// rounds about a thousand times less and lands about a thousand times
+    /// closer — so the two tolerances describe one model, not two behaviours.
+    /// What the test pins down is that the narrowed branch still computes the
+    /// same function: a flag that disagrees with the buffer it describes reads
+    /// those bytes at the wrong width, and that is garbage rather than a
+    /// rounder number.
+    #[test]
+    fn a_reduced_precision_step_tracks_the_host_or_skips_without_device() {
+        step_parity(true, 0.2);
+    }
+
+    /// `decode` is what marching a sampled shape calls, millions of points
+    /// at a time, so the device has to answer it too and in more than one
+    /// chunk.
+    #[test]
+    fn a_chunked_decode_matches_the_host_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let mut rng = StdRng::seed_from_u64(22);
+        let mut host = ShapeVae::new(tiny(), &mut rng).unwrap();
+        for param in host.params_mut() {
+            for value in &mut param.value.data {
+                *value += rng.gen_range(-0.3..0.3);
+            }
+        }
+        let mut device = host.clone();
+        device.to_cuda_with_precision(0, 0, false).unwrap();
+
+        let latent = rows(4, 3, 4);
+        let queries = rows(29, 3, 5);
+        let expected = host.decode(&latent, &queries, 8).unwrap();
+        let got = device.decode(&latent, &queries, 8).unwrap();
+        assert_close("distances", &got, &expected, 1e-4);
+
+        let expected = host.decode_colors(&latent, &queries, 8).unwrap();
+        let got = device.decode_colors(&latent, &queries, 8).unwrap();
+        assert_close("colours", got.as_flattened(), expected.as_flattened(), 1e-4);
+    }
+
+    fn step_parity(mixed_precision: bool, tolerance: f32) {
         if !cuda_or_skip() {
             return;
         }
@@ -860,18 +953,20 @@ mod tests {
         };
 
         let (host_mean, host_log_variance, host_distances, host_colors) = step(&mut host);
-        device.to_cuda_with_precision(0, 0, false).unwrap();
+        device
+            .to_cuda_with_precision(0, 0, mixed_precision)
+            .unwrap();
         let (mean, log_variance, distances, colors) = step(&mut device);
 
-        assert_close("mean", &mean.data, &host_mean.data, 1e-4);
+        assert_close("mean", &mean.data, &host_mean.data, tolerance);
         assert_close(
             "log_variance",
             &log_variance.data,
             &host_log_variance.data,
-            1e-4,
+            tolerance,
         );
-        assert_close("distances", &distances, &host_distances, 1e-4);
-        assert_close("colors", &colors.data, &host_colors.data, 1e-4);
+        assert_close("distances", &distances, &host_distances, tolerance);
+        assert_close("colors", &colors.data, &host_colors.data, tolerance);
 
         device.to_cpu().unwrap();
         let expected: Vec<Vec<f32>> = host
@@ -888,7 +983,7 @@ mod tests {
                 &format!("grad of parameter {index}"),
                 &param.grad.data,
                 host,
-                1e-4,
+                tolerance,
             );
         }
     }

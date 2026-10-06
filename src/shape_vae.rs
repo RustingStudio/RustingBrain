@@ -69,6 +69,17 @@ pub struct ShapeVaeConfig {
     /// cycles per unit, so this is the cap on the detail the field can hold.
     pub frequencies: usize,
     pub eps: f32,
+    /// The per-unit KL floor a training loop hands to
+    /// [`crate::losses::kl_divergence_free_bits`], in nats. Zero is the plain
+    /// divergence.
+    ///
+    /// The model itself never reads this. It lives on the config because the
+    /// config is what a checkpoint carries and what a resume compares, so a
+    /// run cannot silently continue under a different floor than it started
+    /// with. Old checkpoints, written before the field existed, load as zero
+    /// and so keep the behaviour they were trained with.
+    #[serde(default)]
+    pub free_bits: f32,
 }
 
 impl Default for ShapeVaeConfig {
@@ -83,6 +94,7 @@ impl Default for ShapeVaeConfig {
             encoder_blocks: 4,
             frequencies: 8,
             eps: 1e-5,
+            free_bits: 0.0,
         }
     }
 }
@@ -100,6 +112,12 @@ impl ShapeVaeConfig {
                 "a shape autoencoder needs at least one latent vector of at least one dimension"
                     .into(),
             ));
+        }
+        if !self.free_bits.is_finite() || self.free_bits < 0.0 {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a free-bits floor is a non-negative number of nats, got {}",
+                self.free_bits
+            )));
         }
         if self.head_dim % 2 != 0 {
             return Err(NetworkError::InvalidConfig(format!(
@@ -675,6 +693,14 @@ impl ShapeVae {
             // already bounded, and a second cache-free copy of it would be the
             // only thing here that could drift out of step with the backward
             // pass.
+            // On the device the same forward runs through `decode_train`,
+            // which is the one entry point `gpu_shape` has; the cache it keeps
+            // is freed with each chunk.
+            #[cfg(feature = "cuda")]
+            if self.device.is_some() {
+                distances.extend(self.decode_train(latent, &slice)?.0);
+                continue;
+            }
             let (chunk_distances, _) = self.decode_chunk(latent, &kv, &slice)?;
             distances.extend(chunk_distances);
         }
@@ -764,6 +790,13 @@ impl ShapeVae {
             let rows = chunk.min(points.rows - start);
             let slice =
                 Matrix::from_vec(rows, 3, points.data[start * 3..(start + rows) * 3].to_vec());
+            #[cfg(feature = "cuda")]
+            let (_, cache) = if self.device.is_some() {
+                self.decode_train(latent, &slice)?
+            } else {
+                self.decode_chunk(latent, &kv, &slice)?
+            };
+            #[cfg(not(feature = "cuda"))]
             let (_, cache) = self.decode_chunk(latent, &kv, &slice)?;
             let decoded = self.colors(&cache)?;
             colors.extend(decoded.data.chunks_exact(3).map(|c| [c[0], c[1], c[2]]));
@@ -1122,6 +1155,7 @@ mod tests {
             encoder_blocks: 1,
             frequencies: 2,
             eps: 1e-5,
+            free_bits: 0.0,
         }
     }
 
@@ -1205,6 +1239,24 @@ mod tests {
             let offset = (first.data[index] - mean.data[index]).abs();
             assert!(offset < 6.0 * sigma, "{offset} against a sigma of {sigma}");
         }
+    }
+
+    #[test]
+    fn a_checkpoint_written_before_the_free_bits_floor_existed_reads_as_zero() {
+        // The `config` metadata a checkpoint from before the field carries.
+        let older = r#"{"d_model":32,"latents":4,"latent_dim":8,"num_heads":2,
+            "head_dim":16,"d_ff":64,"encoder_blocks":1,"frequencies":2,"eps":1e-5}"#;
+        let config: ShapeVaeConfig = serde_json::from_str(older).unwrap();
+        assert_eq!(config.free_bits, 0.0, "an older run keeps its behaviour");
+
+        // And a floor that is not a number of nats is refused rather than
+        // silently trained under.
+        let mut broken = tiny();
+        broken.free_bits = -1.0;
+        assert!(matches!(
+            ShapeVae::new(broken, &mut StdRng::seed_from_u64(0)),
+            Err(NetworkError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -1644,6 +1696,7 @@ mod tests {
             encoder_blocks: 1,
             frequencies: 6,
             eps: 1e-5,
+            free_bits: 0.0,
         };
         let mut model = ShapeVae::new(config, &mut rng).unwrap();
         let optimizer = Optimizer::adam(3e-3);
