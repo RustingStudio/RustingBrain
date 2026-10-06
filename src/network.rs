@@ -356,7 +356,7 @@ const INFERENCE_CHUNK: usize = 512;
 
 /// Samples per rayon task in [`Network::train_batch_parallel`]. Backward is
 /// roughly three times the work of forward per sample, so a smaller chunk than
-/// [`INFERENCE_CHUNK`] still hides the task overhead while giving a typical
+/// `INFERENCE_CHUNK` still hides the task overhead while giving a typical
 /// 1024-sample batch enough pieces to fill every core of an M-series or
 /// desktop CPU.
 pub const GRADIENT_CHUNK: usize = 64;

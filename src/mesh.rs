@@ -556,7 +556,7 @@ impl<'a> Bvh<'a> {
     /// triangle, because a solid angle has no cutoff.
     ///
     /// NOTE: first-order only. Adding the second-order term would let
-    /// [`WINDING_BETA`] drop and the traversal stop sooner; the first order is
+    /// `WINDING_BETA` drop and the traversal stop sooner; the first order is
     /// what the paper shows is enough to classify points, which is all this is
     /// used for.
     pub fn winding_number(&self, query: [f32; 3]) -> f32 {

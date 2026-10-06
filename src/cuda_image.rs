@@ -1,6 +1,6 @@
 //! The device path for image generation: UNet, VAE decoder and CLIP tower.
 //!
-//! [`crate::gpu_model`] is the same idea for a language model — activations
+//! `gpu_model` is the same idea for a language model — activations
 //! stay in device buffers for a whole pass and the weights are uploaded once —
 //! but everything it fuses is transformer-shaped. An image model spends its
 //! time somewhere else: convolutions, group norm over pixels, nearest-neighbour
@@ -34,7 +34,7 @@
 //!   memory. On the device two bytes already fit.
 //! * **im2col happens here**, one chunk of output pixels at a time. The column
 //!   matrix for a 1024x1024 VAE layer is 2.4 GB if materialized whole, which is
-//!   more than the weights; chunking bounds it at [`COLUMN_BUDGET`] and costs
+//!   more than the weights; chunking bounds it at `COLUMN_BUDGET` and costs
 //!   one extra GEMM launch per chunk.
 //!
 //! The host keeps its own copy of every weight. That is what lets the parity
@@ -2473,7 +2473,7 @@ mod tests {
         match crate::cuda_training::cuda_doctor(0, 512) {
             Ok(_) => Some(ImageGpu::new(0).expect("a device that the doctor cleared")),
             Err(NetworkError::Cuda(message)) if message.contains("initialization") => {
-                eprintln!("skipped: no CUDA device");
+                crate::cuda_training::skip_without_cuda();
                 None
             }
             Err(error) => panic!("CUDA device present but unusable: {error}"),

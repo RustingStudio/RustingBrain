@@ -88,7 +88,7 @@
 //! ```
 //!
 //! Dense [`Network`]s use a separate device path,
-//! [`TrainingBackend::Cuda`], or [`metal_training`] on Apple Silicon.
+//! [`TrainingBackend::Cuda`], or `metal_training` on Apple Silicon.
 //!
 //! # Where to read next
 //!

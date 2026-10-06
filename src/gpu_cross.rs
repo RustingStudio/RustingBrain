@@ -543,6 +543,7 @@ mod tests {
             Err(NetworkError::Cuda(message))
                 if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
             {
+                crate::cuda_training::skip_without_cuda();
                 None
             }
             Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),

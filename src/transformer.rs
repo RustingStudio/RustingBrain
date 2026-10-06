@@ -1279,7 +1279,7 @@ impl TransformerLm {
     /// Training then runs entirely on the device:
     /// [`forward_batch`](TransformerLm::forward_batch) and
     /// [`backward`](TransformerLm::backward) dispatch to
-    /// [`crate::gpu_model`], which keeps activations in device buffers across
+    /// `gpu_model`, which keeps activations in device buffers across
     /// a whole layer and rounds trip to the host only for the token ids, the
     /// logits, `dL/dlogits`, the RMSNorm scales and one routing table per MoE
     /// layer. The norm weights stay host-resident, so they keep using the CPU

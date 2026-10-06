@@ -201,7 +201,7 @@ pub const UNROUTED: usize = usize::MAX;
 /// and the overflow passes through the residual unchanged. That trades a
 /// little quality for statically shaped per-expert buffers, which is what
 /// makes batched GPU dispatch and expert parallelism practical. Only
-/// [`MoeLayer::route`] and a drop mask in the scatter would have to change;
+/// `MoeLayer::route` and a drop mask in the scatter would have to change;
 /// nothing else here assumes the groups are unbounded.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MoeLayer {

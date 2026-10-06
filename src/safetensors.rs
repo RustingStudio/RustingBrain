@@ -535,7 +535,7 @@ pub fn write<P: AsRef<Path>>(
     write_as(path, tensors, metadata, Dtype::F32)
 }
 
-/// [`write`], at a chosen width.
+/// [`write()`], at a chosen width.
 ///
 /// `F32` and `Bf16` are the two that are written. Bfloat16 halves a file for
 /// three decimal digits of precision, which is the trade a cache of frozen
