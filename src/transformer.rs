@@ -1621,11 +1621,25 @@ impl TransformerLm {
     /// Clipping is a uniform rescale of every gradient, and `scale` already
     /// multiplies every gradient uniformly, so this folds the clip into that
     /// factor rather than rewriting the gradient buffers.
+    ///
+    /// A NaN or infinite norm skips the step and clears the gradients, and
+    /// the returned norm says so: check `norm.is_finite()` to count skips.
     pub fn step_clipped(&mut self, scale: f32, max_norm: f32) -> Result<f32, NetworkError> {
-        self.optimizer_step += 1;
-        let step = self.optimizer_step;
+        let step = self.optimizer_step + 1;
         let optimizer = self.optimizer.clone();
-        crate::optimizers::step_clipped(&mut self.params_mut(), &optimizer, step, scale, max_norm)
+        let norm = crate::optimizers::step_clipped(
+            &mut self.params_mut(),
+            &optimizer,
+            step,
+            scale,
+            max_norm,
+        )?;
+        // A skipped step does not count, so Adam's bias correction stays in
+        // line with the moments it has.
+        if norm.is_finite() {
+            self.optimizer_step = step;
+        }
+        Ok(norm)
     }
 
     pub fn zero_grad(&mut self) {
@@ -2176,6 +2190,23 @@ mod tests {
         let norm = model.grad_norm().unwrap();
         assert!(norm > 0.0);
         assert!((norm - expected.sqrt() as f32).abs() < 1e-5, "{norm}");
+    }
+
+    /// A poisoned gradient must not reach the weights or the step counter.
+    #[test]
+    fn a_non_finite_gradient_skips_the_step() {
+        let mut model = tiny().build().unwrap();
+        model.zero_grad();
+        model
+            .accumulate_step(&TokenBatch::new(&[[1u32, 2, 3, 4]]).unwrap())
+            .unwrap();
+        let before = model.blocks[0].attention.query.weight.value.clone();
+        model.blocks[0].attention.query.weight.grad.data[0] = f32::NAN;
+
+        assert!(model.step_clipped(1.0, 1.0).unwrap().is_nan());
+        assert_eq!(model.blocks[0].attention.query.weight.value, before);
+        assert_eq!(model.optimizer_step(), 0);
+        assert_eq!(model.grad_norm().unwrap(), 0.0);
     }
 
     /// Clipping to a norm the gradients already sit under must leave the step

@@ -29,6 +29,9 @@
 
 ### Fixed
 
+- `step_clipped` skips the update when the gradient norm is NaN or infinite
+  and clears the gradients, instead of writing NaN into the weights and the
+  optimizer moments. The returned norm shows the skip.
 - `Bpe` no longer reads the empty `end_of_word_suffix` that Qwen files write
   as a CLIP-style suffix, which had made every Qwen tokenization wrong.
 
