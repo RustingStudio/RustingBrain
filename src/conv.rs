@@ -667,13 +667,17 @@ impl TrainableConv2d {
         self.recompute_columns
     }
 
-    /// Moves the weight and the bias onto a device a caller already opened.
-    /// Every later [`TrainableConv2d::forward`] and
-    /// [`TrainableConv2d::backward`] then builds its columns and runs its GEMMs
-    /// there, and only the activation and its gradient cross the bus.
+    /// Moves the weight onto a device a caller already opened. Every later
+    /// [`TrainableConv2d::forward`] and [`TrainableConv2d::backward`] then
+    /// builds its columns and runs its GEMMs there, and only the activation
+    /// and its gradient cross the bus.
+    ///
+    /// The bias stays on the host: both its use and its gradient are host
+    /// passes over buffers already there. Moving it too left the device copy
+    /// owning the value while the gradient landed in the host copy, so the
+    /// optimizer stepped it with zero and it never trained.
     pub fn to_cuda_on(&mut self, device: &crate::param::CudaDevice) -> Result<(), NetworkError> {
-        self.weight.to_cuda_on(device)?;
-        self.bias.to_cuda_on(device)
+        self.weight.to_cuda_on(device)
     }
 
     /// Brings the weight and the bias back to the host.
