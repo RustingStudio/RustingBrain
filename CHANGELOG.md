@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `InteroceptiveAgent::train_step` uses Double DQN targets: the online
+  network picks the next action and the target network scores it, which
+  removes the overestimation of a plain max. `double_bellman_targets` is
+  public; `bellman_targets` is unchanged.
+
 ## 3.0.0
 
 A major version because three public configuration structs gained fields, so
