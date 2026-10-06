@@ -48,6 +48,11 @@ impl Matrix {
         }
     }
 
+    /// Filler for tests and benchmarks: uniform over `0..1` from `thread_rng`.
+    ///
+    /// Not a weight initializer. It ignores any seed, so two runs differ, and
+    /// every value is positive. Seeded, zero-centred weights come from
+    /// [`crate::param::Param::he_uniform`] or the `Network` builder's `seed`.
     pub fn random(rows: usize, cols: usize) -> Self {
         let mut rng = rand::thread_rng();
         let data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(0.0..1.0)).collect();
