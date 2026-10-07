@@ -4,6 +4,9 @@
 
 ### Added
 
+- `webdataset::WebDataset` reads WebDataset tar shards one sample at a
+  time: the members that share a key, such as `000017.jpg` and
+  `000017.txt`, come back together. No new dependency.
 - Prioritized replay for the interoceptive agent: build the trainer's buffer
   with `ReplayBuffer::prioritized` and it samples by TD error, weights the
   loss by importance (`InteroceptiveAgent::train_step_weighted`,
