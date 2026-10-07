@@ -4,6 +4,8 @@
 
 ### Added
 
+- `Bpe::train_json`: trains a byte-level BPE tokenizer on a text corpus and
+  writes a `tokenizer.json` that `Bpe::from_json` loads.
 - `TransformerLm::step_with_update_ratios`: one optimizer step that returns
   each parameter's update-to-weight ratio, for spotting a layer that steps
   too far or has stopped learning. Copies the weights to the host, so call
@@ -62,6 +64,9 @@
 
 ### Fixed
 
+- Byte-level BPE encoding no longer slows down quadratically on long text:
+  the GPT-2 pre-tokenizer copied the rest of the text at every character
+  (78,000 characters went from 617 ms to 1.4 ms).
 - LoRA training on CUDA works under mixed precision, the default. Folding the
   adapter into a BF16 weight asked cuBLAS for an FP32-to-BF16 GEMM it does
   not have, so every step failed with `CUBLAS_STATUS_NOT_SUPPORTED`; the test

@@ -521,6 +521,196 @@ impl Bpe {
     }
 }
 
+impl Bpe {
+    /// Trains a byte-level BPE tokenizer on `texts` and returns it as a
+    /// `tokenizer.json` in the Hugging Face format, which [`Bpe::from_json`]
+    /// reads.
+    ///
+    /// The vocabulary is `specials` first, then the 256 byte tokens, then
+    /// one token per merge until it holds `vocab_size` or no pair occurs
+    /// twice. Words are split with the GPT-2 rule, and a special token in the
+    /// text is a boundary that no merge crosses, as it is when encoding.
+    /// Ties between equally frequent pairs go to the lower pair of ids, so
+    /// the same corpus always trains the same file.
+    ///
+    /// ```
+    /// # use rusting_brain::Bpe;
+    /// let corpus = ["the cat sat on the mat", "the dog sat on the log"];
+    /// let json = Bpe::train_json(corpus, 300, &["<|endoftext|>"])?;
+    /// let bpe = Bpe::from_json(&json)?;
+    /// let ids = bpe.encode("the cat<|endoftext|>")?;
+    /// assert_eq!(bpe.decode(&ids), "the cat<|endoftext|>");
+    /// # Ok::<(), rusting_brain::NetworkError>(())
+    /// ```
+    pub fn train_json<S: AsRef<str>>(
+        texts: impl IntoIterator<Item = S>,
+        vocab_size: usize,
+        specials: &[&str],
+    ) -> Result<String, NetworkError> {
+        let mut tokens: Vec<String> = specials
+            .iter()
+            .map(|special| special.to_string())
+            .chain(byte_alphabet().iter().map(char::to_string))
+            .collect();
+        let mut vocab: HashMap<String, u32> = tokens
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), id as u32))
+            .collect();
+        if vocab.len() != tokens.len() || specials.iter().any(|special| special.is_empty()) {
+            return Err(NetworkError::InvalidConfig(
+                "special tokens must be distinct, non-empty and not single bytes".into(),
+            ));
+        }
+        if vocab_size < tokens.len() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a vocabulary of {vocab_size} cannot hold the 256 byte tokens and {} special tokens",
+                specials.len()
+            )));
+        }
+
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for text in texts {
+            let mut pieces = vec![text.as_ref()];
+            for special in specials {
+                pieces = pieces
+                    .iter()
+                    .flat_map(|piece| piece.split(special))
+                    .collect();
+            }
+            for word in pieces.into_iter().flat_map(pre_tokenize) {
+                *counts.entry(word).or_default() += 1;
+            }
+        }
+        let base = specials.len() as u32;
+        let mut words: Vec<(Vec<u32>, u64)> = counts
+            .into_iter()
+            .map(|(word, count)| (word.bytes().map(|byte| base + byte as u32).collect(), count))
+            .collect();
+
+        // Pair counts, the words each pair occurs in, and a heap of counts
+        // that goes stale as merges change them: an entry is live only if its
+        // count is still the pair's count.
+        let mut pairs: HashMap<(u32, u32), u64> = HashMap::new();
+        let mut occurs: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (index, (symbols, count)) in words.iter().enumerate() {
+            for pair in symbols.windows(2) {
+                *pairs.entry((pair[0], pair[1])).or_default() += count;
+                occurs.entry((pair[0], pair[1])).or_default().push(index);
+            }
+        }
+        let mut heap: BinaryHeap<(u64, Reverse<(u32, u32)>)> = pairs
+            .iter()
+            .map(|(&pair, &count)| (count, Reverse(pair)))
+            .collect();
+
+        let mut merges = Vec::new();
+        while tokens.len() < vocab_size {
+            let Some((count, Reverse(pair))) = heap.pop() else {
+                break;
+            };
+            if pairs.get(&pair) != Some(&count) {
+                continue;
+            }
+            if count < 2 {
+                break;
+            }
+            let merged = format!("{}{}", tokens[pair.0 as usize], tokens[pair.1 as usize]);
+            // Two different pairs can spell the same string; it keeps one id.
+            let id = *vocab.entry(merged.clone()).or_insert_with(|| {
+                tokens.push(merged);
+                tokens.len() as u32 - 1
+            });
+            merges.push(pair);
+
+            let mut touched = Vec::new();
+            let mut affected = occurs.remove(&pair).unwrap_or_default();
+            affected.dedup();
+            for index in affected {
+                let (symbols, count) = &mut words[index];
+                for old in symbols.windows(2) {
+                    let old = (old[0], old[1]);
+                    *pairs.get_mut(&old).expect("every pair is counted") -= *count;
+                    touched.push(old);
+                }
+                let mut joined = Vec::with_capacity(symbols.len());
+                let mut at = 0;
+                while at < symbols.len() {
+                    if at + 1 < symbols.len() && (symbols[at], symbols[at + 1]) == pair {
+                        joined.push(id);
+                        at += 2;
+                    } else {
+                        joined.push(symbols[at]);
+                        at += 1;
+                    }
+                }
+                *symbols = joined;
+                for new in symbols.windows(2) {
+                    let new = (new[0], new[1]);
+                    *pairs.entry(new).or_default() += *count;
+                    occurs.entry(new).or_default().push(index);
+                    touched.push(new);
+                }
+            }
+            touched.sort_unstable();
+            touched.dedup();
+            for pair in touched {
+                match pairs[&pair] {
+                    0 => {
+                        pairs.remove(&pair);
+                    }
+                    count => heap.push((count, Reverse(pair))),
+                }
+            }
+        }
+
+        let merges: Vec<[&str; 2]> = merges
+            .iter()
+            .map(|&(left, right)| {
+                [
+                    tokens[left as usize].as_str(),
+                    tokens[right as usize].as_str(),
+                ]
+            })
+            .collect();
+        let vocab: serde_json::Map<String, serde_json::Value> = tokens
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), id.into()))
+            .collect();
+        let added: Vec<serde_json::Value> = specials
+            .iter()
+            .enumerate()
+            .map(|(id, special)| {
+                serde_json::json!({
+                    "id": id, "content": special, "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": true
+                })
+            })
+            .collect();
+        let byte_level = serde_json::json!({
+            "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true
+        });
+        let json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added,
+            "normalizer": null,
+            "pre_tokenizer": byte_level,
+            "post_processor": null,
+            "decoder": byte_level,
+            "model": {
+                "type": "BPE", "dropout": null, "unk_token": null,
+                "continuing_subword_prefix": null, "end_of_word_suffix": null,
+                "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                "vocab": vocab, "merges": merges
+            }
+        });
+        Ok(json.to_string())
+    }
+}
+
 /// The GPT-2 byte alphabet: every byte gets a printable character, so text in
 /// any encoding survives the trip through a vocabulary of strings.
 fn byte_alphabet() -> Vec<char> {
@@ -549,11 +739,11 @@ fn pre_tokenize(text: &str) -> Vec<String> {
     let mut index = 0;
 
     while index < characters.len() {
-        let rest: String = characters[index..].iter().collect();
-        if let Some(contraction) = CONTRACTIONS
-            .iter()
-            .find(|contraction| rest.starts_with(**contraction))
-        {
+        let rest = &characters[index..];
+        if let Some(contraction) = CONTRACTIONS.iter().find(|contraction| {
+            let length = contraction.chars().count();
+            rest.len() >= length && rest[..length].iter().copied().eq(contraction.chars())
+        }) {
             words.push((*contraction).to_string());
             index += contraction.chars().count();
             continue;
@@ -1321,5 +1511,39 @@ pub(crate) mod tests {
             }
             assert_eq!(fast.concat(), text);
         }
+    }
+
+    #[test]
+    fn a_trained_tokenizer_loads_and_round_trips() {
+        let corpus = [
+            "the cat sat on the mat. the cat's hat",
+            "the dog sat on the log<|endoftext|>the end",
+        ];
+        let json = Bpe::train_json(corpus, 290, &["<|endoftext|>", "<pad>"]).unwrap();
+        assert_eq!(
+            json,
+            Bpe::train_json(corpus, 290, &["<|endoftext|>", "<pad>"]).unwrap()
+        );
+        let bpe = Bpe::from_json(&json).unwrap();
+        assert!(bpe.vocab_size() <= 290 && bpe.vocab_size() > 258);
+        assert_eq!(bpe.token_id("<|endoftext|>"), Some(0));
+        assert_eq!(bpe.token_id("<pad>"), Some(1));
+        // " the" is the most frequent word, so it is learned as one token.
+        let the = bpe.token_id("\u{120}the").unwrap();
+        assert_eq!(bpe.encode(" the").unwrap(), vec![the]);
+        // No merge crosses a special token.
+        assert!(bpe.token_id("<|endoftext|>the").is_none());
+        for text in ["the cat sat<|endoftext|><pad>", "unseen: naïve 東京 🦀"] {
+            assert_eq!(bpe.decode(&bpe.encode(text).unwrap()), text);
+        }
+    }
+
+    #[test]
+    fn training_refuses_a_vocabulary_too_small_or_a_repeated_special() {
+        assert!(Bpe::train_json(["a"], 256, &["<s>"]).is_err());
+        assert!(Bpe::train_json(["a"], 300, &["<s>", "<s>"]).is_err());
+        assert!(Bpe::train_json(["a"], 300, &["a"]).is_err());
+        let json = Bpe::train_json(["aaaa aaaa"], 257, &["<s>"]).unwrap();
+        assert_eq!(Bpe::from_json(&json).unwrap().vocab_size(), 257);
     }
 }

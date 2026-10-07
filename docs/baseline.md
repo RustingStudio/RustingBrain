@@ -566,3 +566,17 @@ After E8 (heap merge), same file and machine, load average about 3.8. The
 Not measured: another process held the GPU. The term adds one FP32 multiply
 to the head kernel's softmax scale and, when the weight is nonzero, one atomic
 per row. At the default weight of 0 the host path skips its extra pass.
+
+## Byte-level BPE pre-tokenizer (E7, 2026-10-07)
+
+CPU, release build, one run each. The contraction check built a `String` of
+the whole remaining text at every character. The text is
+"The cat's hat, isn't it? 42 cats sat.  " repeated 2,000 times (78,000
+characters, 28,000 words). The words are the same before and after; the
+tokenizer tests cover the split.
+
+| Characters | Before | After |
+|---:|---:|---:|
+| 78,000 | 617 ms | 1.42 ms |
+
+Training itself is not timed: there is no fixed corpus to compare against yet.
