@@ -43,15 +43,13 @@ fn main() {
         panic!("rebuild with --features cuda to benchmark the device path");
     }
 
-    let mut caches = model.new_kv_caches();
+    let mut decoder = model.decoder();
     let ids: Vec<u32> = (0..prompt).map(|t| (t * 17 % 32_000) as u32).collect();
-    model.forward_cached(&ids, &mut caches).unwrap();
+    decoder.feed(&ids).unwrap();
 
     let start = Instant::now();
     for t in 0..new_tokens {
-        model
-            .forward_cached(&[(t * 31 % 32_000) as u32], &mut caches)
-            .unwrap();
+        decoder.feed(&[(t * 31 % 32_000) as u32]).unwrap();
     }
     model.synchronize().unwrap();
     let elapsed = start.elapsed().as_secs_f64();

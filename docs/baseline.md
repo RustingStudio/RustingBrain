@@ -831,3 +831,16 @@ waiting on each device-to-host copy (`cuMemcpyDtoHAsync` totals 270 ms) and
 per-op event, allocation and launch calls. Each layer runs attention on the
 host cache, so every linear layer round-trips its activations. This is what
 C2's device-resident cache removes.
+
+## Device decode with a device KV cache (C2 step 2, 2026-10-07)
+
+Idle GPU, `bench_decode 512 128 cuda`, which now drives `Decoder`: 2.80, 2.60
+and 2.61 ms/token, best 384 tokens/s, up from 197 (1.95x). The host decode
+row was not re-measured: four `rustc` processes from another project held the
+CPU (1651-1813 tokens/s, load average 5-6), and the host path is the same
+`forward_cached` call as before.
+
+nsys over the whole run, per decoded token: about 2.0 ms of kernels, of which
+`cast_act` is 0.97 ms. That is `Gpu::pack` re-narrowing every weight to BF16
+on every call, the one note left in `decode_block`, `forward_swiglu` and
+`forward_moe`. Device-to-host copies fell from about 174 a token to about 19.
