@@ -27,6 +27,11 @@
 
 ### Added
 
+- `TransformerBuilder::checkpoint` and `TransformerLm::set_checkpoint` pick
+  blocks whose activations are recomputed in the backward pass on the device
+  instead of kept. With every block checkpointed, a 16 x 512 step on the
+  default model peaks at 1353 MiB instead of 2843 MiB and takes 23% longer.
+  `examples/checkpoint_memory.rs` measures both.
 - `TransformerLm::save_gguf`: writes a LLaMA-layout model as a GGUF file in
   F32 or Q8_0 for llama.cpp and Ollama, with query and key rows reordered for
   llama.cpp's rotary convention.

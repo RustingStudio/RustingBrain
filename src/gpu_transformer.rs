@@ -2139,6 +2139,55 @@ mod tests {
         }
     }
 
+    /// Recomputing both blocks in the backward pass, the routed one included,
+    /// must train exactly like keeping their activations.
+    #[test]
+    fn checkpointed_blocks_train_like_kept_ones_or_skip_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        for mixed in [false, true] {
+            let mut kept = tiny().mixed_precision(mixed).build().unwrap();
+            let mut recomputed = kept.clone();
+            recomputed.set_checkpoint([0, 1]);
+            kept.to_cuda(0, 8192).unwrap();
+            recomputed.to_cuda(0, 8192).unwrap();
+            let batch = [vec![3u32, 8, 1, 5, 2], vec![9, 4, 4, 0]];
+
+            for step in 0..3 {
+                let a = kept.train_step(&batch).unwrap();
+                let b = recomputed.train_step(&batch).unwrap();
+                assert!(
+                    (a.total() - b.total()).abs() < 1e-5,
+                    "mixed {mixed}, step {step}: {} recomputed vs {} kept",
+                    b.total(),
+                    a.total()
+                );
+            }
+            let batch = crate::batch::TokenBatch::new(&[vec![3u32, 8, 1, 5]]).unwrap();
+            let a = kept.forward_batch(&batch).unwrap().1.expert_loads();
+            let b = recomputed.forward_batch(&batch).unwrap().1.expert_loads();
+            assert_eq!(a.len(), 1);
+            assert_eq!(a, b);
+
+            kept.sync_from_device().unwrap();
+            recomputed.sync_from_device().unwrap();
+            for (index, (a, b)) in kept
+                .params_mut()
+                .iter()
+                .zip(recomputed.params_mut())
+                .enumerate()
+            {
+                assert_close(
+                    &format!("parameter {index}"),
+                    &b.value.data,
+                    &a.value.data,
+                    1e-4,
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_cached_decode_on_the_device_matches_the_host_or_skips_without_device() {
         if !cuda_or_skip() {
