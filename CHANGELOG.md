@@ -82,6 +82,8 @@
 
 ### Fixed
 
+- The device VAE decoder returns an error when an FP16 overflow leaves
+  non-finite values in the image, instead of a black image.
 - Byte-level BPE encoding no longer slows down quadratically on long text:
   the GPT-2 pre-tokenizer copied the rest of the text at every character
   (78,000 characters went from 617 ms to 1.4 ms).
