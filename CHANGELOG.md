@@ -25,6 +25,11 @@
 
 ### Added
 
+- `TransformerLm::batch_decoder(n)` returns a `BatchDecoder`, which decodes n
+  sequences in step and samples one token for each per `next`. On a device
+  model the n sequences share every weight read: the default model decodes
+  1994 tokens/s over 4 sequences and 9093 over 64, against 618 for one.
+  `bench_decode` takes the sequence count as an optional fourth argument.
 - `TransformerCache::expert_loads`: each MoE layer's share of routed tokens
   per expert, from a forward pass on the host or the GPU, for checking that
   routing on real data stays balanced.

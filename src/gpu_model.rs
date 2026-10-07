@@ -823,6 +823,7 @@ impl Gpu<'_> {
                 .arg(&(width as i32))
                 .arg(&(offset as i32))
                 .arg(&narrow)
+                .arg(&1i32)
                 .launch(cfg(elements))
                 .map_err(cuda_err("RoPE kernel"))?;
         }
@@ -3045,9 +3046,14 @@ fn head_chunk_rows(rows: usize, vocab: usize, logit_bytes: usize) -> usize {
 /// place. The query third is dead weight once its row is decoded, a third to a
 /// half more memory than keys and values alone; split the buffer if the cache
 /// ever has to hold long contexts for many sequences.
+///
+/// With several sequences the rows interleave position-major, row
+/// `position * sequences + sequence`, so one decode step's new rows are
+/// contiguous and the projection still writes them in place.
 pub(crate) struct DeviceKv {
     layers: Vec<CudaSlice<f32>>,
     length: usize,
+    sequences: usize,
     /// Every weight pack the decode has asked for. The model is borrowed for
     /// the decoder's life, so a pack never goes stale, and repacking on every
     /// token was half of a decode step's kernel time.
@@ -3061,9 +3067,10 @@ impl DeviceKv {
     pub(crate) fn new(
         model: &TransformerLm,
         context: &Arc<GpuContext>,
+        sequences: usize,
     ) -> Result<Self, NetworkError> {
         let gpu = Gpu { context };
-        let positions = model.config.max_seq_len;
+        let positions = model.config.max_seq_len * sequences;
         let layers = model
             .blocks
             .iter()
@@ -3077,6 +3084,7 @@ impl DeviceKv {
         Ok(Self {
             layers,
             length: 0,
+            sequences,
             packs: PackMemo::new(),
         })
     }
@@ -3087,8 +3095,12 @@ impl DeviceKv {
     }
 }
 
-/// Runs `ids` through the model against `kv` and returns the logits of the
-/// last of them, `[1, vocab_size]`, which is all a decoder samples from.
+/// Runs `ids` through the model against `kv` and returns the logits of each
+/// sequence's last position, `[sequences, vocab_size]`, which is all a decoder
+/// samples from.
+///
+/// `ids` holds the same number of new positions for every sequence of `kv`,
+/// position-major: `ids[position * sequences + sequence]`.
 ///
 /// Everything between the embedding gather and the logits stays on the
 /// device; the host cached path instead round-trips every projection.
@@ -3100,6 +3112,7 @@ pub(crate) fn decode(
 ) -> Result<Matrix, NetworkError> {
     let gpu = Gpu { context };
     let rows = ids.len();
+    let sequences = kv.sequences;
     let d_model = model.config.d_model;
     let vocab = model.embedding.vocab_size();
     for &id in ids {
@@ -3144,13 +3157,15 @@ pub(crate) fn decode(
     lend(&mut kv.packs, true)?;
     let blocks = (|| {
         for (block, cache) in model.blocks.iter().zip(&mut kv.layers) {
-            hidden = decode_block(&gpu, block, hidden, cache, kv.length, rows, &valid)?;
+            hidden = decode_block(
+                &gpu, block, hidden, cache, kv.length, sequences, rows, &valid,
+            )?;
         }
         Ok::<_, NetworkError>(hidden)
     })();
     lend(&mut kv.packs, false)?;
     let hidden = blocks?;
-    kv.length += rows;
+    kv.length += rows / sequences;
 
     let final_weight = gpu.upload(&model.final_norm.weight.value.data)?;
     let (final_output, _, _) = gpu.rmsnorm(
@@ -3162,19 +3177,22 @@ pub(crate) fn decode(
         false,
         false,
     )?;
-    let last = final_output.wide().slice((rows - 1) * d_model..);
-    let logits = gpu.linear(head_of(model)?, &last, 1)?;
-    gpu.matrix(&logits, 1, vocab)
+    // Position-major, so every sequence's last row sits in one block.
+    let last = final_output.wide().slice((rows - sequences) * d_model..);
+    let logits = gpu.linear(head_of(model)?, &last, sequences)?;
+    gpu.matrix(&logits, sequences, vocab)
 }
 
-/// [`forward_block`] for `rows` new positions after `offset` cached ones,
-/// without anything kept for a backward pass.
+/// [`forward_block`] for `rows` new rows, interleaved over `sequences`, after
+/// `offset` cached positions, without anything kept for a backward pass.
+#[allow(clippy::too_many_arguments)]
 fn decode_block(
     gpu: &Gpu<'_>,
     block: &TransformerBlock,
     input: CudaSlice<f32>,
     cache: &mut CudaSlice<f32>,
     offset: usize,
+    sequences: usize,
     rows: usize,
     valid: &CudaSlice<i32>,
 ) -> Result<CudaSlice<f32>, NetworkError> {
@@ -3189,7 +3207,11 @@ fn decode_block(
     let qkv_width = query_width + 2 * kv_width;
     let key_base = query_width;
     let value_base = query_width + kv_width;
-    let history = offset + rows;
+    let queries = rows / sequences;
+    let history = offset + queries;
+    let start = offset * sequences * qkv_width;
+    // One sequence's consecutive positions are `sequences` rows apart.
+    let row_stride = sequences * qkv_width;
     let narrow = gpu.context.mixed_precision;
 
     let attention_weight = gpu.upload(&block.attention_norm.weight.value.data)?;
@@ -3216,13 +3238,13 @@ fn decode_block(
         d_model,
         &normed.all(),
         narrow,
-        &mut cache.slice_mut(offset * qkv_width..),
+        &mut cache.slice_mut(start..),
         rows,
         0.0,
     )?;
 
-    // The tables are indexed by position, so starting them at `offset` rotates
-    // row `r` as position `offset + r`.
+    // The tables are indexed by position, so starting them at `offset` and
+    // dividing the row by `sequences` rotates row `r` as its position.
     let tables = gpu.rope_tables(&attention.rope)?;
     let half = head_dim / 2;
     for (count, base) in [(heads, 0), (kv_heads, key_base)] {
@@ -3231,41 +3253,48 @@ fn decode_block(
             gpu.context
                 .stream
                 .launch_builder(&gpu.context.model.rope)
-                .arg(&mut cache.slice_mut(offset * qkv_width..))
+                .arg(&mut cache.slice_mut(start..))
                 .arg(&tables.cos.slice(offset * half..))
                 .arg(&tables.sin.slice(offset * half..))
                 .arg(&(rows as i32))
                 .arg(&(count as i32))
                 .arg(&(head_dim as i32))
-                .arg(&(rows as i32))
+                .arg(&(queries as i32))
                 .arg(&1.0f32)
                 .arg(&(qkv_width as i32))
                 .arg(&(base as i32))
                 .arg(&0i32)
+                .arg(&(sequences as i32))
                 .launch(cfg(elements))
                 .map_err(cuda_err("RoPE kernel"))?;
         }
     }
 
-    // NOTE: one GEMM per head for scores and one for values, the
+    // NOTE: one batched GEMM per head for scores and one for values, the
     // three-kernel path at a single query row; a fused decode kernel is C1's.
+    // Scores are `[heads, sequences, queries, history]`.
     let group = heads / kv_heads;
-    let mut scores = gpu.uninit(heads * rows * history)?;
+    let block_scores = queries * history;
+    let mut scores = gpu.uninit(heads * sequences * block_scores)?;
     for head in 0..heads {
         let kv_base = (head / group) * head_dim;
-        gemm_rhs_transposed(
+        gemm_rhs_transposed_batched(
             gpu.context,
-            &cache.slice(offset * qkv_width + head * head_dim..),
-            qkv_width,
+            &cache.slice(start + head * head_dim..),
+            row_stride,
             &cache.slice(key_base + kv_base..),
-            qkv_width,
-            &mut scores.slice_mut(head * rows * history..),
+            row_stride,
+            &mut scores.slice_mut(head * sequences * block_scores..),
             history,
-            rows,
+            queries,
             history,
             head_dim,
             scale,
             0.0,
+            sequences,
+            qkv_width,
+            qkv_width,
+            block_scores,
         )?;
     }
     let mut log_sum_exp = gpu.uninit(heads * rows)?;
@@ -3275,7 +3304,7 @@ fn decode_block(
         heads * rows,
         history,
         true,
-        rows,
+        queries,
         offset,
     )?;
     let mut merged = gpu.act(rows * query_width, false)?;
@@ -3283,19 +3312,23 @@ fn decode_block(
         let mut wide = merged.wide_mut();
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
-            gemm_plain(
+            gemm_plain_batched(
                 gpu.context,
-                &scores.slice(head * rows * history..),
+                &scores.slice(head * sequences * block_scores..),
                 history,
                 &cache.slice(value_base + kv_base..),
-                qkv_width,
+                row_stride,
                 &mut wide.slice_mut(head * head_dim..),
-                query_width,
-                rows,
+                sequences * query_width,
+                queries,
                 head_dim,
                 history,
                 1.0,
                 0.0,
+                sequences,
+                block_scores,
+                qkv_width,
+                query_width,
             )?;
         }
     }

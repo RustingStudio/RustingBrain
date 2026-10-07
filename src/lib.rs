@@ -267,8 +267,8 @@ pub use text_encoder::{TextEncoder, TextEncoderConfig};
 pub use token_file::{TokenFile, TokenMix, TokenStream};
 pub use tokenizer::{Bpe, Unigram};
 pub use transformer::{
-    Decoder, LoraConfig, ParameterCounts, Precision, TransformerBuilder, TransformerConfig,
-    TransformerLm,
+    BatchDecoder, Decoder, LoraConfig, ParameterCounts, Precision, TransformerBuilder,
+    TransformerConfig, TransformerLm,
 };
 pub use transformer_block::{FeedForward, TransformerBlock};
 pub use unet::{Unet, UnetConfig};

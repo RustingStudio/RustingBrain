@@ -852,3 +852,20 @@ Idle GPU (CPU load average about 5), `bench_decode 512 128 cuda`: 1.82, 1.60,
 `cast_act` no longer appears; kernel time is 1.01 ms/token, of which the
 LM-head GEMV is 0.20 ms. The remaining 0.6 ms of the 1.6 ms step is launch
 and host overhead, which C1 (CUDA graphs) targets.
+
+## Batched device decode (C2 step 4, 2026-10-07)
+
+Idle GPU checked before and after every run (CPU load average about 2),
+`bench_decode 512 128 cuda <sequences>`, default model. Three runs each,
+ms per step and tokens/s over all sequences:
+
+| sequences | ms/step | tokens/s |
+|-----------|---------|----------|
+| 1  | 1.62, 1.62 (first run 2.42, warm-up) | 618 |
+| 4  | 2.01, 2.01, 2.02 | 1994 |
+| 16 | 3.08, 3.09, 3.09 | 5194 |
+| 64 | 7.04, 7.04, 7.05 | 9093 |
+
+One sequence is unchanged from step 3 (624). A step costs 0.39 ms more at 4
+sequences than at 1 and 5.4 ms more at 64, so the single-sequence step is
+almost all fixed launch overhead and weight reads.
