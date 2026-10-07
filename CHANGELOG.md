@@ -49,6 +49,10 @@
 
 ### Added
 
+- `cuda_mmdit::DeviceDit` runs the FLUX-style MMDiT denoiser on the device
+  with BF16 weights, FP32 residual streams and the fused attention kernel.
+  A small FLUX-shaped model over a 512x512 image takes about 16 ms a pass
+  against 1.27 s on the host. It is not yet wired into `ImagePipeline`.
 - `cuda_t5::DeviceT5` runs a gated T5 encoder (T5 1.1, the one FLUX and
   Stable Diffusion 3 read) on the device with BF16 weights and an FP32
   residual stream. A T5-base-sized encoder over 512 tokens takes about 29 ms
