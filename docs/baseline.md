@@ -616,3 +616,21 @@ and after this change.
 | 400 | 3.8325 | 3.7833 |
 | 499 | 3.1830 | 3.1844 |
 | Held-out | 4.9438 | 4.9239 |
+
+## CPU MoE pieces (D1, D2, 2026-10-07)
+
+Release build on the Ryzen 5 7600X, one `MoeLayer` with `d_model` 512, 8
+experts, top 2, expert width 640, and 2048 random token rows. Timed once in
+a temporary test, which was not committed. The forward and backward times
+spread by about 1.5x between runs; the two small pieces do not depend on
+that spread.
+
+| Piece | Time |
+|---|---:|
+| `forward_train` | 26-35 ms |
+| `backward` | 41-67 ms |
+| `softmax_rows` (mean of 100) | 91-95 µs |
+| `auxiliary_losses` (mean of 100) | 11 µs |
+
+Both D1 and D2 are rejected. Each touches only `[tokens, experts]`, which
+is about 1,000 times smaller than the expert GEMMs.
