@@ -138,6 +138,12 @@ pub(crate) struct FlashShape {
     pub(crate) causal: bool,
 }
 
+impl FlashShape {
+    fn head_dim(&self) -> usize {
+        self.query_width / self.heads
+    }
+}
+
 /// RoPE's `cos` and `sin` tables on the device.
 ///
 /// Every layer is built from the same [`Rope`] configuration, so one upload
@@ -895,8 +901,9 @@ impl Gpu<'_> {
                 shape.sequences as u32,
             ),
             block_dim: (crate::cuda_flash::THREADS, 1, 1),
-            shared_mem_bytes: crate::cuda_flash::SHARED_BYTES,
+            shared_mem_bytes: crate::cuda_flash::forward_shared_bytes(shape.head_dim()),
         };
+        let flash = flash.width(shape.head_dim());
         unsafe {
             self.context
                 .stream
@@ -942,6 +949,8 @@ impl Gpu<'_> {
         scale: f32,
     ) -> Result<(), NetworkError> {
         let tiles = shape.seq_len.div_ceil(crate::cuda_flash::TILE) as u32;
+        let head_dim = shape.head_dim();
+        let flash = flash.width(head_dim);
         let warps = shape.heads * shape.rows;
         unsafe {
             self.context
@@ -996,12 +1005,12 @@ impl Gpu<'_> {
         launch(
             &flash.grad_query,
             shape.heads as u32,
-            crate::cuda_flash::DQ_SHARED_BYTES,
+            crate::cuda_flash::dq_shared_bytes(head_dim),
         )?;
         launch(
             &flash.grad_key_value,
             (shape.heads / shape.group) as u32,
-            crate::cuda_flash::DKV_SHARED_BYTES,
+            crate::cuda_flash::dkv_shared_bytes(head_dim),
         )?;
         Ok(())
     }

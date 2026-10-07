@@ -775,3 +775,21 @@ changes `SwiGlu`'s public fields.
 No measurement. The guard is one pass over the downloaded image to look for
 non-finite values, which is a host-side scan of the output only; it adds no
 kernel and does not change the decode itself.
+
+## Flash attention at head width 128 (A3, 2026-10-07)
+
+Idle GPU (gnome-clocks only), `bench_train_step 4 1024 cuda <head_dim>`, the
+default model with its 512-wide attention cut into heads of the given width
+(2 KV heads), best of three:
+
+| Head width | Fused | Three-kernel path (`RUSTING_BRAIN_NO_FLASH`) |
+|---|---|---|
+| 64  | 53,315 tok/s | 33,066 tok/s |
+| 128 | 48,456 tok/s | 39,374 tok/s |
+
+Kernel time per step at 128 (nsys, four steps): `dkv` 8.66 ms, `dq` 7.21 ms,
+`fwd` 3.45 ms, `delta` 0.24 ms. At 64 the same build gives `dkv` 6.72, `dq`
+3.60 and `fwd` 2.59 ms, unchanged from `6f48659`. A first version that
+divided a signed index by the width raised `fwd_64` from 126 to 146
+registers and doubled its time; the unsigned divide restores the old counts.
+ptxas at 128: `fwd` 165 registers, `dq` 254, `dkv` 255 with 128 bytes spilled.

@@ -2185,7 +2185,7 @@ mod tests {
 
     /// The fused attention kernel against the three-kernel path it replaces.
     ///
-    /// It only runs on a head dimension of 64 under reduced precision, which no
+    /// It only runs on a head dimension of 64 or 128 under reduced precision, which no
     /// other test in this file uses, so without this one it is never executed.
     /// The sequence is 100 tokens: longer than one 64-wide tile, and not a
     /// multiple of it, so the run covers an off-diagonal tile, the masked
@@ -2200,18 +2200,19 @@ mod tests {
         }
         // Both masks: the bidirectional kernels walk every key tile and mask
         // only the ragged tail, which is a different loop bound in each kernel.
-        for bidirectional in [false, true] {
-            fused_attention_forward_parity(bidirectional);
+        // Both head widths the kernels are built for.
+        for (bidirectional, head_dim) in [(false, 64), (true, 64), (false, 128), (true, 128)] {
+            fused_attention_forward_parity(bidirectional, head_dim);
         }
     }
 
-    fn fused_attention_forward_parity(bidirectional: bool) {
+    fn fused_attention_forward_parity(bidirectional: bool, head_dim: usize) {
         let model = || {
             TransformerLm::builder()
                 .vocab_size(32)
                 .d_model(128)
                 .n_layers(2)
-                .heads(2, 1, 64)
+                .heads(2, 1, head_dim)
                 .d_ff(64)
                 .moe_layers([0usize; 0])
                 .max_seq_len(128)
@@ -2256,12 +2257,12 @@ mod tests {
         let (fused_error, split_error) = (error(&fused_logits), error(&split_logits));
         assert!(
             fused_error <= 2.0 * split_error,
-            "bidirectional {bidirectional}: the fused path is {fused_error} from the host \
+            "bidirectional {bidirectional}, head {head_dim}: the fused path is {fused_error} from the host \
              where the three-kernel path is {split_error}"
         );
         assert!(
             fused_error < 1e-2,
-            "bidirectional {bidirectional}: both device paths drifted: {fused_error}"
+            "bidirectional {bidirectional}, head {head_dim}: both device paths drifted: {fused_error}"
         );
     }
 
@@ -2274,18 +2275,18 @@ mod tests {
         if !cuda_or_skip() {
             return;
         }
-        for bidirectional in [false, true] {
-            fused_attention_backward_parity(bidirectional);
+        for (bidirectional, head_dim) in [(false, 64), (true, 64), (false, 128), (true, 128)] {
+            fused_attention_backward_parity(bidirectional, head_dim);
         }
     }
 
-    fn fused_attention_backward_parity(bidirectional: bool) {
+    fn fused_attention_backward_parity(bidirectional: bool, head_dim: usize) {
         let model = || {
             TransformerLm::builder()
                 .vocab_size(32)
                 .d_model(256)
                 .n_layers(2)
-                .heads(4, 2, 64)
+                .heads(4, 2, head_dim)
                 .d_ff(64)
                 .moe_layers([0usize; 0])
                 .max_seq_len(128)
@@ -2340,7 +2341,7 @@ mod tests {
         let (fused_error, split_error) = (error(&fused_logits), error(&split_logits));
         assert!(
             fused_error <= 2.0 * split_error,
-            "bidirectional {bidirectional}: the fused path is {fused_error} from the host \
+            "bidirectional {bidirectional}, head {head_dim}: the fused path is {fused_error} from the host \
              where the three-kernel path is {split_error}"
         );
         // A second bound, in case both paths break the same way. A full
@@ -2349,7 +2350,7 @@ mod tests {
         // device paths about 0.04 from the host afterwards.
         assert!(
             fused_error < 0.1,
-            "bidirectional {bidirectional}: both device paths drifted: {fused_error}"
+            "bidirectional {bidirectional}, head {head_dim}: both device paths drifted: {fused_error}"
         );
     }
 }

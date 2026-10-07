@@ -1,6 +1,6 @@
 //! Times `TransformerLm::train_step` on the default ~55M/36M parameter model.
 //!
-//! `cargo run --release --features cuda --example bench_train_step -- <batch> <seq_len> <cuda|cpu>`
+//! `cargo run --release --features cuda --example bench_train_step -- <batch> <seq_len> <cuda|cpu> [head_dim]`
 
 use rusting_brain::{Optimizer, TransformerLm};
 use std::time::Instant;
@@ -15,8 +15,14 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .unwrap_or(128);
     let device: bool = std::env::args().nth(3).map(|a| a == "cuda").unwrap_or(true);
+    // The same 512-wide attention cut into heads of this width, 64 by default.
+    let head_dim: usize = std::env::args()
+        .nth(4)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(64);
 
     let mut model = TransformerLm::builder()
+        .heads(512 / head_dim, 2, head_dim)
         .optimizer(Optimizer::adam(1e-4))
         .max_seq_len(seq_len.max(256))
         .seed(7)
