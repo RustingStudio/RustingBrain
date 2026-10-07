@@ -1,10 +1,11 @@
 //! Times cached single-token decode, the inference hot loop.
 //!
-//! `cargo run --release --example bench_decode -- <prompt_len> <new_tokens> [cuda|cpu] [sequences]`
+//! `cargo run --release --example bench_decode -- <prompt_len> <new_tokens> [cuda|cpu] [sequences] [int8]`
 //!
 //! The host run uses a small model; `cuda` decodes the default model on the
 //! device instead. `sequences` decodes that many in step, and tokens/s counts
-//! the tokens of all of them.
+//! the tokens of all of them. `int8` turns on
+//! [`TransformerLm::set_int8_decode`] for the device run.
 
 use rusting_brain::TransformerLm;
 use std::time::Instant;
@@ -39,8 +40,8 @@ fn main() {
             .d_ff(308)
             .moe_layers([])
     };
-    #[allow(unused_mut)]
     let mut model = builder.build().unwrap();
+    model.set_int8_decode(std::env::args().nth(5).is_some_and(|a| a == "int8"));
     if device {
         #[cfg(feature = "cuda")]
         model.to_cuda(0, 16384).unwrap();

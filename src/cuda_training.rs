@@ -305,6 +305,59 @@ extern "C" __global__ void decode_attention_merge(const float*partial,void*out,i
   for(int c=0;c<chunks;c++){const float*p=in+c*(head_dim+2);float w=__expf(p[0]-m);sum+=w*p[1];acc+=w*p[2+t];}
   store_act(out,(size_t)seq*query_width+head*head_dim+t,acc/sum,narrow);
 }
+// Weight-only int8 for device decode, the scheme `src/quantized.rs` uses on
+// the host: per row, `scale = absmax / 127` and `round(w / scale)` as int8.
+// One warp per row.
+extern "C" __global__ void quantize_rows_q8(const float*w,signed char*q,float*scales,int rows,int cols){
+  int row=(blockIdx.x*blockDim.x+threadIdx.x)/WARP,lane=threadIdx.x%WARP;
+  if(row>=rows)return;
+  const float*in=w+(size_t)row*cols;
+  float m=0.f;for(int k=lane;k<cols;k+=WARP)m=fmaxf(m,fabsf(in[k]));
+  for(int o=WARP/2;o>0;o>>=1)m=fmaxf(m,__shfl_xor_sync(0xffffffff,m,o));
+  float scale=m/127.f,inv=scale>0.f?1.f/scale:0.f;
+  for(int k=lane;k<cols;k+=WARP)q[(size_t)row*cols+k]=(signed char)fminf(fmaxf(rintf(in[k]*inv),-127.f),127.f);
+  if(lane==0)scales[row]=scale;
+}
+// `out = w * scale` per element, for a prompt, which takes the cuBLAS path.
+extern "C" __global__ void dequantize_q8(const signed char*q,const float*scales,void*out,int units,int inner,int narrow){
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)units*inner)return;
+  store_act(out,i,(float)q[i]*scales[i/inner],narrow);
+}
+// `y[r, n] = scales[n] * (x[r, ..] . q[n, ..]) + beta * y[r, n]`, one warp per
+// output unit. A lane reads 16 weights at a time and keeps them for up to
+// four rows of `x`, so a decode step reads each weight byte once. `inner` is a
+// multiple of 16; the caller sends other widths through `dequantize_q8`.
+#define Q8_ROWS 4
+extern "C" __global__ void gemv_q8(const signed char*q,const float*scales,const void*x,int narrow,float*y,int units,int inner,int rows,float beta){
+  int unit=(blockIdx.x*blockDim.x+threadIdx.x)/WARP,lane=threadIdx.x%WARP;
+  if(unit>=units)return;
+  const signed char*w=q+(size_t)unit*inner;
+  float scale=scales[unit];
+  for(int r0=0;r0<rows;r0+=Q8_ROWS){
+    int nr=min(Q8_ROWS,rows-r0);
+    float acc[Q8_ROWS]={0.f,0.f,0.f,0.f};
+    {
+      for(int k=lane*16;k<inner;k+=WARP*16){
+        int4 packed=*(const int4*)(w+k);const signed char*b=(const signed char*)&packed;
+        #pragma unroll
+        for(int j=0;j<Q8_ROWS;j++){if(j>=nr)break;size_t base=(size_t)(r0+j)*inner+k;float v[16];
+          if(narrow){const uint4*p=(const uint4*)((const unsigned short*)x+base);uint4 h[2]={p[0],p[1]};const unsigned short*u=(const unsigned short*)h;
+            #pragma unroll
+            for(int e=0;e<16;e++)v[e]=bf16_to_f32(u[e]);}
+          else{const float4*p=(const float4*)((const float*)x+base);
+            #pragma unroll
+            for(int e=0;e<4;e++){float4 f=p[e];v[4*e]=f.x;v[4*e+1]=f.y;v[4*e+2]=f.z;v[4*e+3]=f.w;}}
+          float a=0.f;
+          #pragma unroll
+          for(int e=0;e<16;e++)a+=v[e]*(float)b[e];
+          acc[j]+=a;}
+      }
+    }
+    #pragma unroll
+    for(int j=0;j<Q8_ROWS;j++){float a=acc[j];for(int o=WARP/2;o>0;o>>=1)a+=__shfl_xor_sync(0xffffffff,a,o);
+      if(lane==0&&j<nr){size_t i=(size_t)(r0+j)*units+unit;y[i]=beta==0.f?a*scale:a*scale+beta*y[i];}}
+  }
+}
 extern "C" __global__ void attention_softmax_bwd(float*g,const float*p,int rows,int cols,int causal){
   int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
   int stride=gridDim.x*warps;
