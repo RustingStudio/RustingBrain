@@ -862,6 +862,23 @@ impl Gpu<'_> {
         cols: usize,
         causal: bool,
     ) -> Result<(), NetworkError> {
+        self.attention_softmax(scores, lse, rows, cols, causal, cols, 0)
+    }
+
+    /// [`Gpu::softmax_lse`] over blocks of `queries` rows that follow `offset`
+    /// cached positions: under `causal`, row `q` of a block sees the first
+    /// `offset + q + 1` of its `cols` scores.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_softmax(
+        &self,
+        scores: &mut CudaSlice<f32>,
+        lse: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        causal: bool,
+        queries: usize,
+        offset: usize,
+    ) -> Result<(), NetworkError> {
         unsafe {
             self.context
                 .stream
@@ -871,6 +888,8 @@ impl Gpu<'_> {
                 .arg(&(rows as i32))
                 .arg(&(cols as i32))
                 .arg(&i32::from(causal))
+                .arg(&(queries as i32))
+                .arg(&(offset as i32))
                 .launch(warp_per_row_grid(rows))
                 .map_err(cuda_err("attention softmax kernel"))?;
         }
@@ -2987,6 +3006,270 @@ fn head_chunk_rows(rows: usize, vocab: usize, logit_bytes: usize) -> usize {
     // if a model ever wants a different trade against activation memory.
     const BUDGET_BYTES: usize = 256 << 20;
     (BUDGET_BYTES / (vocab * logit_bytes)).clamp(1, rows.max(1))
+}
+
+/// The device half of a [`Decoder`](crate::transformer::Decoder): every
+/// layer's projected rows for the positions decoded so far.
+///
+/// NOTE: a layer keeps whole `[query, key, value]` rows, so the projection
+/// GEMM writes straight into the cache and attention reads keys and values in
+/// place. The query third is dead weight once its row is decoded, a third to a
+/// half more memory than keys and values alone; split the buffer if the cache
+/// ever has to hold long contexts for many sequences.
+pub(crate) struct DeviceKv {
+    layers: Vec<CudaSlice<f32>>,
+    length: usize,
+}
+
+impl DeviceKv {
+    pub(crate) fn new(
+        model: &TransformerLm,
+        context: &Arc<GpuContext>,
+    ) -> Result<Self, NetworkError> {
+        let gpu = Gpu { context };
+        let positions = model.config.max_seq_len;
+        let layers = model
+            .blocks
+            .iter()
+            .map(|block| {
+                let attention = &block.attention;
+                let width =
+                    (attention.num_heads() + 2 * attention.num_kv_heads()) * attention.head_dim();
+                gpu.uninit(positions * width)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { layers, length: 0 })
+    }
+
+    /// Number of cached positions, the absolute position of the next token.
+    pub(crate) fn len(&self) -> usize {
+        self.length
+    }
+}
+
+/// Runs `ids` through the model against `kv` and returns the logits of the
+/// last of them, `[1, vocab_size]`, which is all a decoder samples from.
+///
+/// Everything between the embedding gather and the logits stays on the
+/// device; the host cached path instead round-trips every projection.
+pub(crate) fn decode(
+    model: &TransformerLm,
+    context: &Arc<GpuContext>,
+    ids: &[u32],
+    kv: &mut DeviceKv,
+) -> Result<Matrix, NetworkError> {
+    let gpu = Gpu { context };
+    let rows = ids.len();
+    let d_model = model.config.d_model;
+    let vocab = model.embedding.vocab_size();
+    for &id in ids {
+        if id as usize >= vocab {
+            return Err(NetworkError::TokenOutOfRange {
+                id,
+                vocab_size: vocab,
+            });
+        }
+    }
+
+    let embedding = model.embedding.weight.device.as_ref().ok_or_else(|| {
+        NetworkError::Cuda("the embedding table is not resident on the device".into())
+    })?;
+    let device_ids = gpu.upload_indices(ids)?;
+    let mut hidden = gpu.uninit(rows * d_model)?;
+    gpu.gather(
+        &mut hidden.slice_mut(..),
+        &embedding.value().slice(..),
+        &device_ids,
+        rows,
+        d_model,
+    )?;
+
+    let valid = gpu.upload_flags(&vec![1; rows])?;
+    for (block, cache) in model.blocks.iter().zip(&mut kv.layers) {
+        hidden = decode_block(&gpu, block, hidden, cache, kv.length, rows, &valid)?;
+    }
+    kv.length += rows;
+
+    let final_weight = gpu.upload(&model.final_norm.weight.value.data)?;
+    let (final_output, _, _) = gpu.rmsnorm(
+        &hidden,
+        &final_weight,
+        rows,
+        d_model,
+        model.final_norm.eps,
+        false,
+        false,
+    )?;
+    let last = final_output.wide().slice((rows - 1) * d_model..);
+    let logits = gpu.linear(head_of(model)?, &last, 1)?;
+    gpu.matrix(&logits, 1, vocab)
+}
+
+/// [`forward_block`] for `rows` new positions after `offset` cached ones,
+/// without anything kept for a backward pass.
+fn decode_block(
+    gpu: &Gpu<'_>,
+    block: &TransformerBlock,
+    input: CudaSlice<f32>,
+    cache: &mut CudaSlice<f32>,
+    offset: usize,
+    rows: usize,
+    valid: &CudaSlice<i32>,
+) -> Result<CudaSlice<f32>, NetworkError> {
+    let attention = &block.attention;
+    let d_model = attention.d_model();
+    let heads = attention.num_heads();
+    let kv_heads = attention.num_kv_heads();
+    let head_dim = attention.head_dim();
+    let scale = (head_dim as f32).sqrt().recip();
+    let query_width = heads * head_dim;
+    let kv_width = kv_heads * head_dim;
+    let qkv_width = query_width + 2 * kv_width;
+    let key_base = query_width;
+    let value_base = query_width + kv_width;
+    let history = offset + rows;
+    let narrow = gpu.context.mixed_precision;
+
+    let attention_weight = gpu.upload(&block.attention_norm.weight.value.data)?;
+    let (normed, _, residual) = gpu.rmsnorm(
+        &input,
+        &attention_weight,
+        rows,
+        d_model,
+        block.attention_norm.eps,
+        narrow,
+        true,
+    )?;
+    let mut residual = residual.expect("a norm asked for a duplicate returns one");
+
+    // NOTE: the weights are packed again on every call, as the training
+    // forward does; keep the packs in `DeviceKv` if a profile shows the copies.
+    let qkv_weights = gpu.pack(
+        &[&attention.query, &attention.key, &attention.value],
+        narrow,
+    )?;
+    gpu.linear_packed(
+        &qkv_weights.all(),
+        qkv_width,
+        d_model,
+        &normed.all(),
+        narrow,
+        &mut cache.slice_mut(offset * qkv_width..),
+        rows,
+        0.0,
+    )?;
+
+    // The tables are indexed by position, so starting them at `offset` rotates
+    // row `r` as position `offset + r`.
+    let tables = gpu.rope_tables(&attention.rope)?;
+    let half = head_dim / 2;
+    for (count, base) in [(heads, 0), (kv_heads, key_base)] {
+        let elements = rows * count * half;
+        unsafe {
+            gpu.context
+                .stream
+                .launch_builder(&gpu.context.model.rope)
+                .arg(&mut cache.slice_mut(offset * qkv_width..))
+                .arg(&tables.cos.slice(offset * half..))
+                .arg(&tables.sin.slice(offset * half..))
+                .arg(&(rows as i32))
+                .arg(&(count as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rows as i32))
+                .arg(&1.0f32)
+                .arg(&(qkv_width as i32))
+                .arg(&(base as i32))
+                .arg(&0i32)
+                .launch(cfg(elements))
+                .map_err(cuda_err("RoPE kernel"))?;
+        }
+    }
+
+    // NOTE: one GEMM per head for scores and one for values, the
+    // three-kernel path at a single query row; a fused decode kernel is C1's.
+    let group = heads / kv_heads;
+    let mut scores = gpu.uninit(heads * rows * history)?;
+    for head in 0..heads {
+        let kv_base = (head / group) * head_dim;
+        gemm_rhs_transposed(
+            gpu.context,
+            &cache.slice(offset * qkv_width + head * head_dim..),
+            qkv_width,
+            &cache.slice(key_base + kv_base..),
+            qkv_width,
+            &mut scores.slice_mut(head * rows * history..),
+            history,
+            rows,
+            history,
+            head_dim,
+            scale,
+            0.0,
+        )?;
+    }
+    let mut log_sum_exp = gpu.uninit(heads * rows)?;
+    gpu.attention_softmax(
+        &mut scores,
+        &mut log_sum_exp,
+        heads * rows,
+        history,
+        true,
+        rows,
+        offset,
+    )?;
+    let mut merged = gpu.act(rows * query_width, false)?;
+    {
+        let mut wide = merged.wide_mut();
+        for head in 0..heads {
+            let kv_base = (head / group) * head_dim;
+            gemm_plain(
+                gpu.context,
+                &scores.slice(head * rows * history..),
+                history,
+                &cache.slice(value_base + kv_base..),
+                qkv_width,
+                &mut wide.slice_mut(head * head_dim..),
+                query_width,
+                rows,
+                head_dim,
+                history,
+                1.0,
+                0.0,
+            )?;
+        }
+    }
+    let output_weight = gpu.pack(&[&attention.output], false)?;
+    gpu.linear_packed(
+        &output_weight.all(),
+        d_model,
+        query_width,
+        &merged.all(),
+        false,
+        &mut residual,
+        rows,
+        1.0,
+    )?;
+
+    let feed_forward_weight = gpu.upload(&block.feed_forward_norm.weight.value.data)?;
+    let (normed, _, output) = gpu.rmsnorm(
+        &residual,
+        &feed_forward_weight,
+        rows,
+        d_model,
+        block.feed_forward_norm.eps,
+        narrow,
+        true,
+    )?;
+    let mut output = output.expect("a norm asked for a duplicate returns one");
+    match &block.feed_forward {
+        FeedForward::SwiGlu(ffn) => {
+            forward_swiglu(gpu, ffn, &normed, &mut output, rows)?;
+        }
+        FeedForward::Gelu(_) => return Err(unsupported("a GELU MLP")),
+        FeedForward::Moe(moe) => {
+            forward_moe(gpu, moe, &normed, &mut output, valid, rows, rows)?;
+        }
+    }
+    Ok(output)
 }
 
 /// Forces a chunk size so a test can drive the loop over several chunks.

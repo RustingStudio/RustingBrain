@@ -887,22 +887,17 @@ impl TransformerLm {
             ));
         }
 
-        let mut caches = self.new_kv_caches();
-        let mut logits = self.forward_cached(prompt, &mut caches)?;
-        let mut history = prompt.to_vec();
+        let mut decoder = self.decoder();
+        decoder.feed(prompt)?;
         let mut generated = Vec::with_capacity(max_new_tokens);
-
-        for remaining in (1..=max_new_tokens).rev() {
-            let next = sampler.pick(logits.row(logits.rows - 1), &history);
+        for _ in 0..max_new_tokens {
+            // `next` defers the forward pass for the token it returns, so the
+            // last one costs none, and a generation that ends exactly on
+            // `max_seq_len` does not overflow the caches.
+            let next = decoder.next(sampler)?;
             generated.push(next);
             if !on_token(next) {
                 break;
-            }
-            // The last token needs no forward pass, and running one anyway
-            // would fail a generation that ends exactly on `max_seq_len`.
-            if remaining > 1 {
-                history.push(next);
-                logits = self.forward_cached(&[next], &mut caches)?;
             }
         }
 
@@ -934,6 +929,8 @@ impl TransformerLm {
             history: Vec::new(),
             logits: None,
             pending: None,
+            #[cfg(feature = "cuda")]
+            device: None,
         }
     }
 
@@ -2177,6 +2174,10 @@ pub struct Decoder<'a> {
     /// session that stops decoding never pays for one, and a session that fills
     /// `max_seq_len` exactly does not overflow its caches on the way out.
     pending: Option<u32>,
+    /// The caches on the device, for a model that lives there; `caches` then
+    /// stays empty.
+    #[cfg(feature = "cuda")]
+    device: Option<crate::gpu_model::DeviceKv>,
 }
 
 impl Decoder<'_> {
@@ -2187,7 +2188,7 @@ impl Decoder<'_> {
         if ids.is_empty() {
             return Ok(());
         }
-        self.logits = Some(self.model.forward_cached(ids, &mut self.caches)?);
+        self.logits = Some(self.run(ids)?);
         self.history.extend_from_slice(ids);
         Ok(())
     }
@@ -2212,9 +2213,24 @@ impl Decoder<'_> {
 
     fn catch_up(&mut self) -> Result<(), NetworkError> {
         if let Some(id) = self.pending.take() {
-            self.logits = Some(self.model.forward_cached(&[id], &mut self.caches)?);
+            self.logits = Some(self.run(&[id])?);
         }
         Ok(())
+    }
+
+    fn run(&mut self, ids: &[u32]) -> Result<Matrix, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(context) = &self.model.device {
+            if self.device.is_none() {
+                self.device = Some(crate::gpu_model::DeviceKv::new(self.model, context)?);
+            }
+            let kv = self.device.as_mut().expect("allocated above");
+            self.model.check_length(ids.len(), kv.len())?;
+            let logits = crate::gpu_model::decode(self.model, context, ids, kv)?;
+            self.model.check_device()?;
+            return Ok(logits);
+        }
+        self.model.forward_cached(ids, &mut self.caches)
     }
 }
 
@@ -2560,6 +2576,45 @@ mod tests {
             .shared_expert(true)
             .max_seq_len(32)
             .seed(1234)
+    }
+
+    /// A device decoder against the host one, logits after every call: a
+    /// prompt, single tokens, then a second multi-token turn, which is the
+    /// case where the causal mask has to start past the cached positions.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_device_decoder_matches_the_host_decoder_or_skips_without_device() {
+        match crate::cuda_training::cuda_doctor(0, 8192) {
+            Ok(_) => {}
+            Err(NetworkError::Cuda(message))
+                if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
+            {
+                crate::cuda_training::skip_without_cuda();
+                return;
+            }
+            Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
+        }
+        for (mixed, tolerance) in [(false, 1e-3), (true, 5e-2)] {
+            let cpu = tiny().mixed_precision(mixed).build().unwrap();
+            let mut gpu = cpu.clone();
+            gpu.to_cuda(0, 8192).unwrap();
+            let mut host = cpu.decoder();
+            let mut device = gpu.decoder();
+            let turns: [&[u32]; 5] = [&[3, 8, 1, 5], &[7], &[2], &[9, 4, 11], &[6]];
+            for (turn, ids) in turns.iter().enumerate() {
+                host.feed(ids).unwrap();
+                device.feed(ids).unwrap();
+                let host_logits = host.logits.as_ref().unwrap();
+                let host_last = host_logits.row(host_logits.rows - 1);
+                let device_logits = device.logits.as_ref().unwrap();
+                for (index, (d, h)) in device_logits.data.iter().zip(host_last).enumerate() {
+                    assert!(
+                        (d - h).abs() <= tolerance,
+                        "mixed {mixed}, turn {turn}, logit {index}: {d} on the device vs {h}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

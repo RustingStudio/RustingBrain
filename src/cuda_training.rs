@@ -218,12 +218,12 @@ __device__ __forceinline__ float warp_sum(float v){
 // decoder wants. Cross-attention clears the flag: it has two independent
 // lengths and every query sees every key, so `cols` is the key count rather
 // than the query count and the row index carries no position at all.
-extern "C" __global__ void attention_softmax_lse(float*s,float*lse,int rows,int cols,int causal){
+extern "C" __global__ void attention_softmax_lse(float*s,float*lse,int rows,int cols,int causal,int queries,int offset){
   int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
   int stride=gridDim.x*warps;
   for(int i=blockIdx.x*warps+threadIdx.x/WARP;i<rows;i+=stride){
     int seq_len=cols;
-    int vis=causal?i%cols+1:cols;float*row=s+(size_t)i*seq_len;
+    int vis=causal?offset+i%queries+1:cols;float*row=s+(size_t)i*seq_len;
     if(vis<=WARP*SOFTMAX_ROW){
       float v[SOFTMAX_ROW];float m=-3.0e38f;
       #pragma unroll
