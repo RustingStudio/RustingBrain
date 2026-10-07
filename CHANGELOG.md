@@ -8,6 +8,9 @@
   the dense feed-forward already did. The router, the expert outputs and the
   scatter back into the residual stay FP32. About 4% more tokens per second
   on the default model.
+- Under mixed precision the router and the shared expert of a MoE layer also
+  run in BF16, with FP32 router logits. About 2.5% more tokens per second on
+  the default model.
 
 ### Added
 
