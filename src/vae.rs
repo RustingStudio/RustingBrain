@@ -409,6 +409,108 @@ impl VaeDecoder {
         silu(&mut hidden);
         self.conv_out.forward(&hidden)
     }
+
+    /// [`VaeDecoder::decode`] a tile at a time, so an image too large to
+    /// decode in one piece fits in memory.
+    ///
+    /// The latent is cut into `tile` x `tile` squares that overlap their
+    /// neighbours by `overlap` latent pixels, each square is decoded on its
+    /// own, and the overlaps are blended with linear ramps so no seam shows.
+    /// The middle self-attention and the group norms then see one tile rather
+    /// than the whole image, so the result is close to, not equal to,
+    /// [`VaeDecoder::decode`]; a latent no larger than `tile` decodes exactly.
+    /// `overlap` must be smaller than `tile`; 64 and 8 are common.
+    pub fn decode_tiled(
+        &self,
+        latent: &FeatureMap,
+        tile: usize,
+        overlap: usize,
+    ) -> Result<FeatureMap, NetworkError> {
+        if overlap >= tile {
+            return Err(NetworkError::InvalidTarget {
+                expected: tile.saturating_sub(1),
+                actual: overlap,
+            });
+        }
+        stitch_tiles(latent, tile, overlap, self.config.upscale(), |part| {
+            self.decode(part)
+        })
+    }
+}
+
+/// Where tiles of length `tile`, overlapping by `overlap`, start along an
+/// axis of length `len`. The last one ends flush with the axis.
+fn tile_starts(len: usize, tile: usize, overlap: usize) -> Vec<usize> {
+    if len <= tile {
+        return vec![0];
+    }
+    let mut starts: Vec<usize> = (0..len - tile).step_by(tile - overlap).collect();
+    starts.push(len - tile);
+    starts
+}
+
+/// Weight of position `at` inside a tile of length `len` that starts at
+/// `start` on an axis of length `axis`: a ramp across `ramp` positions at
+/// each edge that borders another tile, and one elsewhere.
+fn ramp_weight(at: usize, len: usize, start: usize, axis: usize, ramp: usize) -> f32 {
+    let mut weight = 1.0f32;
+    if start > 0 {
+        weight = weight.min((at + 1) as f32 / (ramp + 1) as f32);
+    }
+    if start + len < axis {
+        weight = weight.min((len - at) as f32 / (ramp + 1) as f32);
+    }
+    weight
+}
+
+/// Cuts `latent` into overlapping tiles, runs `decode` on each, and blends
+/// the outputs, which are `scale` times the size of their tiles.
+fn stitch_tiles(
+    latent: &FeatureMap,
+    tile: usize,
+    overlap: usize,
+    scale: usize,
+    decode: impl Fn(&FeatureMap) -> Result<FeatureMap, NetworkError>,
+) -> Result<FeatureMap, NetworkError> {
+    let (height, width) = (latent.height * scale, latent.width * scale);
+    let ramp = overlap * scale;
+    let mut sum: Vec<f32> = Vec::new();
+    let mut weights = vec![0.0f32; height * width];
+    let mut channels = 0;
+    for top in tile_starts(latent.height, tile, overlap) {
+        for left in tile_starts(latent.width, tile, overlap) {
+            let (rows, cols) = (tile.min(latent.height), tile.min(latent.width));
+            let mut part = FeatureMap::new(latent.channels, rows, cols);
+            for c in 0..latent.channels {
+                for y in 0..rows {
+                    let from = (c * latent.height + top + y) * latent.width + left;
+                    let to = (c * rows + y) * cols;
+                    part.data[to..to + cols].copy_from_slice(&latent.data[from..from + cols]);
+                }
+            }
+            let out = decode(&part)?;
+            if sum.is_empty() {
+                channels = out.channels;
+                sum = vec![0.0; channels * height * width];
+            }
+            for y in 0..out.height {
+                let wy = ramp_weight(y, out.height, top * scale, height, ramp);
+                for x in 0..out.width {
+                    let w = wy * ramp_weight(x, out.width, left * scale, width, ramp);
+                    let at = (top * scale + y) * width + left * scale + x;
+                    weights[at] += w;
+                    for c in 0..channels {
+                        sum[c * height * width + at] +=
+                            w * out.data[(c * out.height + y) * out.width + x];
+                    }
+                }
+            }
+        }
+    }
+    for (index, value) in sum.iter_mut().enumerate() {
+        *value /= weights[index % (height * width)];
+    }
+    FeatureMap::from_vec(channels, height, width, sum)
 }
 
 /// One rung of the encoder's ladder: several residual blocks, then a halving.
@@ -1034,6 +1136,53 @@ pub(crate) mod tests {
         let mut deeper = config;
         deeper.block_out_channels.push(32);
         assert!(VaeDecoder::load(&path, "decoder.", deeper).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn tiles_blend_back_into_the_whole_image() {
+        // A decode that only upsamples is local, so the stitched tiles must
+        // reproduce decoding the whole latent, seams and edges included.
+        let latent = FeatureMap::from_vec(
+            2,
+            11,
+            7,
+            (0..154).map(|value| (value as f32 * 0.37).sin()).collect(),
+        )
+        .unwrap();
+        let decode = |map: &FeatureMap| Ok(crate::conv::upsample_nearest(map, 2));
+        let whole = decode(&latent).unwrap();
+        for (tile, overlap) in [(4, 1), (5, 2), (3, 0), (20, 4)] {
+            let tiled = stitch_tiles(&latent, tile, overlap, 2, decode).unwrap();
+            assert_eq!((tiled.height, tiled.width), (22, 14));
+            for (a, b) in tiled.data.iter().zip(&whole.data) {
+                assert!((a - b).abs() < 1e-5, "tile {tile} overlap {overlap}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tiled_decode_matches_the_whole_decode_when_one_tile_covers_it() {
+        let config = tiny();
+        let path = std::env::temp_dir().join("rusting_brain_vae_tiled.safetensors");
+        checkpoint(&config, &path);
+        let decoder = VaeDecoder::load(&path, "decoder.", config).unwrap();
+        let latent = FeatureMap::from_vec(
+            4,
+            5,
+            4,
+            (0..80).map(|value| (value as f32 * 0.1).cos()).collect(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoder.decode_tiled(&latent, 5, 1).unwrap(),
+            decoder.decode(&latent).unwrap()
+        );
+        let tiled = decoder.decode_tiled(&latent, 3, 1).unwrap();
+        assert_eq!((tiled.channels, tiled.height, tiled.width), (3, 10, 8));
+        assert!(tiled.data.iter().all(|value| value.is_finite()));
+        assert!(decoder.decode_tiled(&latent, 3, 3).is_err());
         std::fs::remove_file(path).ok();
     }
 

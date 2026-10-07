@@ -672,3 +672,10 @@ is about 1,000 times smaller than the expert GEMMs.
 
 No measurement: `SpikeGuard` is a scalar check per step on the host, off the
 GPU path, and adds no work to the training step itself.
+
+## Tiled VAE decode (C7, 2026-10-07)
+
+No measurement: no Stable Diffusion VAE checkpoint run was made, and
+`strata` held 10.5 GB of the GPU, so peak memory against a whole decode
+could not be compared. The tiled path calls `decode` per tile, so its peak
+is that of one tile's decode plus the FP32 output and weight buffers.
