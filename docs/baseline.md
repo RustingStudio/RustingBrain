@@ -913,3 +913,20 @@ tokens/s and was discarded.
 No measurement: export is a one-off file write, and correctness was checked
 against the `gguf` Python reader instead. The GPU was held by another process
 (RustingEngine tests) this iteration.
+
+## Event tracking off (C1 probe, 2026-10-07)
+
+nsys over 129 decode calls: 228,466 `cuStreamWaitEvent` (65 ms), 124,805
+`cuEventRecord` (38.6 ms), 24,274 `cudaLaunchKernel` (50.5 ms). The event
+calls come from cudarc's per-`CudaSlice` tracking in multi-stream mode.
+
+Same-session A/B, `bench_decode 512 128 cuda`, idle GPU (gnome-clocks only)
+before and after, second (warm) round:
+
+| Build | 1 sequence | 16 sequences |
+|---|---|---|
+| `74fd609`, tracking on | 1.53 ms, 655 tokens/s | 3.03 ms, 5280 tokens/s |
+| tracking off | 1.52 ms, 656 tokens/s | 2.93 ms, 5455 tokens/s |
+
+Not adopted: no gain at batch 1 and +3% at batch 16 do not pay for a global
+unsafe switch.
