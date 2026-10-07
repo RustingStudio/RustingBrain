@@ -15,11 +15,13 @@ rows and fails below 97%. Measured 2026-10-07 at `cd8b514` on the idle RTX 3060
 both. `bench_decode` is sensitive to anything else on the CPU: with one
 parallel `rustc` it measured 1464-2088 tokens/s, so run it on a quiet machine.
 Re-record with `scripts/bench_check.sh --record` after a change that is meant
-to move these numbers.
+to move these numbers. The train-step row was re-recorded alone on
+2026-10-07 at `6f48659` (idle GPU, best of 46927, 52707, 52890, 52783,
+52815) after A7's BF16 MoE work; the CPU was busy, so the decode row was kept.
 
 | Benchmark | Best tokens/s |
 |---|---|
-| bench_train_step 4 1024 cuda | 50329 |
+| bench_train_step 4 1024 cuda | 52890 |
 | bench_decode 512 128 | 2434 |
 
 ## Throughput
@@ -679,3 +681,23 @@ No measurement: no Stable Diffusion VAE checkpoint run was made, and
 `strata` held 10.5 GB of the GPU, so peak memory against a whole decode
 could not be compared. The tiled path calls `decode` per tile, so its peak
 is that of one tile's decode plus the FP32 output and weight buffers.
+
+## MoE permutation passes re-measured (A7 W2, 2026-10-07)
+
+`nsys` over `bench_train_step 4 1024 cuda` at `6f48659`, idle GPU, grouped
+per step:
+
+| Kernel | Calls | ms/step |
+|---|---:|---:|
+| `gather_scale_rows` (forward input, backward gradient) | 12 | 1.29 |
+| `scatter_add_scaled` (forward) | 6 | 0.93 |
+| `scatter_add_rows` (backward) | 6 | 0.92 |
+| `row_dot_scatter` (backward) | 6 | 0.63 |
+| `moe_stats` | 6 | 0.36 |
+| Total kernel time | | 78.1 |
+
+The five kernels are 4.2 ms (5.4%) against 17.8 ms when W2 was written,
+since W1 halved their bytes and the router work moved. The only redundant
+read left is the gathered output-gradient rows, read by both
+`row_dot_scatter` and the backward gather: about 0.5 ms (0.6%), below the
+run-to-run spread, so W2 parts 1 and 2 are rejected.
