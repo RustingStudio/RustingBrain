@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Device decode attention issues its cache loads in parallel: 16 sequences
+  after a 512-token prompt decode 7780-7980 to 8731-8835 tokens/s.
 - Int8 device decode runs the routed experts with an int8 routed GEMV instead
   of downloading the routing each MoE layer: one sequence of the default model
   decodes 1014-1049 to 1535-1613 tokens/s.
