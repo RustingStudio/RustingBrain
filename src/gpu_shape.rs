@@ -155,8 +155,15 @@ fn normalize(
     narrow: bool,
 ) -> Result<Normed, NetworkError> {
     let weight = gpu.upload(&norm.weight.value.data)?;
-    let (normed, inverse_rms, _) =
-        gpu.rmsnorm(&input, &weight, rows, width, norm.eps, narrow, false)?;
+    let (normed, inverse_rms, _) = gpu.rmsnorm(
+        &input,
+        &weight.as_view(),
+        rows,
+        width,
+        norm.eps,
+        narrow,
+        false,
+    )?;
     Ok(Normed {
         input,
         weight,

@@ -357,8 +357,15 @@ fn modulate(
 ) -> Result<(CudaSlice<f32>, Normed), NetworkError> {
     let width = norm.d_model();
     let weight = gpu.upload(&norm.norm.weight.value.data)?;
-    let (normalized, inverse_rms, _) =
-        gpu.rmsnorm(&input, &weight, rows, width, norm.norm.eps, false, false)?;
+    let (normalized, inverse_rms, _) = gpu.rmsnorm(
+        &input,
+        &weight.as_view(),
+        rows,
+        width,
+        norm.norm.eps,
+        false,
+        false,
+    )?;
     let modulated = gpu.adaln_modulate(&normalized.wide(), triple, rows, width, seq_len)?;
     Ok((
         modulated,

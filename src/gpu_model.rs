@@ -737,7 +737,7 @@ impl Gpu<'_> {
     pub(crate) fn rmsnorm(
         &self,
         input: &CudaSlice<f32>,
-        weight: &CudaSlice<f32>,
+        weight: &CudaView<'_, f32>,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -1484,6 +1484,15 @@ impl Gpu<'_> {
                 .map_or(Ok(0), |part| device_of(part).map(|d| d.cols()))?;
             self.quantized(&wide.wide(), wide.len / inner.max(1), inner)
         };
+        self.memoize(key, fresh)
+    }
+
+    /// `fresh()`, kept under `key` while a decoder has lent its [`PackMemo`].
+    fn memoize(
+        &self,
+        key: (usize, usize, bool),
+        fresh: impl FnOnce() -> Result<Act, NetworkError>,
+    ) -> Result<Arc<Act>, NetworkError> {
         let mut memo = self
             .context
             .packs
@@ -1499,6 +1508,19 @@ impl Gpu<'_> {
         }
         drop(memo);
         Ok(Arc::new(fresh()?))
+    }
+
+    /// A norm's weight on the device, uploaded once per decoder: the memo
+    /// keys it by the host buffer's address, which no weight pack shares.
+    pub(crate) fn decode_norm(&self, weight: &[f32]) -> Result<Arc<Act>, NetworkError> {
+        self.memoize((weight.as_ptr() as usize, weight.len(), false), || {
+            let mut act = self.act(weight.len(), false)?;
+            self.context
+                .stream
+                .memcpy_htod(weight, &mut act.wide_mut())
+                .map_err(cuda_alloc_err("host to device copy", size_of_val(weight)))?;
+            Ok(act)
+        })
     }
 
     /// [`Gpu::pack`], or the same weights as int8 while a decode that asked
@@ -2261,7 +2283,7 @@ fn forward_hidden(
     // The head narrows its own operands, so the last norm stays FP32.
     let (final_output, final_inverse_rms, _) = gpu.rmsnorm(
         &hidden,
-        &final_weight,
+        &final_weight.as_view(),
         rows,
         d_model,
         model.final_norm.eps,
@@ -2497,7 +2519,7 @@ fn forward_block(
     // The residual this norm's branch lands on is the duplicate it writes.
     let (attention_normed, attention_inverse_rms, residual) = gpu.rmsnorm(
         &input,
-        &attention_weight,
+        &attention_weight.as_view(),
         rows,
         d_model,
         block.attention_norm.eps,
@@ -2655,7 +2677,7 @@ fn forward_block(
     let feed_forward_weight = gpu.upload(&block.feed_forward_norm.weight.value.data)?;
     let (feed_forward_normed, feed_forward_inverse_rms, output) = gpu.rmsnorm(
         &residual,
-        &feed_forward_weight,
+        &feed_forward_weight.as_view(),
         rows,
         d_model,
         block.feed_forward_norm.eps,
@@ -3572,18 +3594,18 @@ pub(crate) fn decode(
                 &gpu, block, hidden, cache, kv.length, sequences, rows, &valid,
             )?;
         }
-        Ok::<_, NetworkError>(hidden)
+        let final_weight = gpu.decode_norm(&model.final_norm.weight.value.data)?;
+        Ok::<_, NetworkError>((hidden, final_weight))
     })();
     context.int8_decode.store(false, Ordering::Relaxed);
     lend(&mut kv.packs, false)?;
-    let hidden = blocks?;
+    let (hidden, final_weight) = blocks?;
     kv.length += rows / sequences;
 
     let narrow = context.mixed_precision;
-    let final_weight = gpu.upload(&model.final_norm.weight.value.data)?;
     let (final_output, _, _) = gpu.rmsnorm(
         &hidden,
-        &final_weight,
+        &final_weight.wide(),
         rows,
         d_model,
         model.final_norm.eps,
@@ -3658,10 +3680,10 @@ fn decode_block(
     let row_stride = sequences * qkv_width;
     let narrow = gpu.context.mixed_precision;
 
-    let attention_weight = gpu.upload(&block.attention_norm.weight.value.data)?;
+    let attention_weight = gpu.decode_norm(&block.attention_norm.weight.value.data)?;
     let (normed, _, residual) = gpu.rmsnorm(
         &input,
-        &attention_weight,
+        &attention_weight.wide(),
         rows,
         d_model,
         block.attention_norm.eps,
@@ -3836,10 +3858,10 @@ fn decode_block(
         1.0,
     )?;
 
-    let feed_forward_weight = gpu.upload(&block.feed_forward_norm.weight.value.data)?;
+    let feed_forward_weight = gpu.decode_norm(&block.feed_forward_norm.weight.value.data)?;
     let (normed, _, output) = gpu.rmsnorm(
         &residual,
-        &feed_forward_weight,
+        &feed_forward_weight.wide(),
         rows,
         d_model,
         block.feed_forward_norm.eps,
@@ -4779,7 +4801,15 @@ mod tests {
         let weight = gpu.upload(&norm.weight.value.data).unwrap();
         let device_input = gpu.upload(&input.data).unwrap();
         let (output, inverse, _) = gpu
-            .rmsnorm(&device_input, &weight, rows, cols, norm.eps, false, false)
+            .rmsnorm(
+                &device_input,
+                &weight.as_view(),
+                rows,
+                cols,
+                norm.eps,
+                false,
+                false,
+            )
             .unwrap();
         assert_close(
             "rmsnorm forward",

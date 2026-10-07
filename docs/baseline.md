@@ -1331,3 +1331,20 @@ three interleaved rounds, load average 18 to 33:
 
 One sequence (897-1133 against 742-1223) is inside the noise at this load.
 
+## Resident norm weights in decode (C1 part 2a, 2026-10-08)
+
+`nsys profile -t cuda bench_decode 512 128 cuda 1 int8`, API call counts over
+the whole run (129 decode calls plus the prompt):
+
+| Call | `b7aa1b5` | Norms in the memo |
+|---|---|---|
+| `cuMemcpyHtoDAsync` | 3092 | 916 |
+| `cuMemAllocAsync` | 19980 | 17804 |
+| `cuLaunchKernel` | 16891 | 16891 |
+
+`bench_decode`, three interleaved rounds, load average 29 to 33 (the first
+`b7aa1b5` round ran cold and is left out): BF16 one sequence 1237-1242
+against 1208-1358 tokens/s, int8 one sequence 1620-1677 against 1428-1681,
+16 sequences 8700-8911 against 8904-8967. No change beyond the noise; the
+uploads overlapped the kernels. Kept as a step toward graph capture.
+
