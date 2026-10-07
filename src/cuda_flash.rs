@@ -22,15 +22,15 @@
 //! `None` otherwise, leaving the three-kernel path in place.
 
 use crate::cuda_training::cuda_err;
+use cudarc::driver::sys::CUfunction_attribute;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Query rows, key columns and head dimension of one tile. `head_dim` is 64 in
-/// every configuration this crate validates, and fixing it is what lets the
-/// fragment layout below be written out rather than computed.
+/// Query rows and key columns of one tile, and the head width of the image
+/// kernel. The training kernels are also built for a head width of 128.
 pub(crate) const TILE: usize = 64;
 /// Threads per block: four warps, sixteen query rows each.
 pub(crate) const THREADS: u32 = 128;
@@ -44,12 +44,29 @@ pub(crate) const IMAGE_THREADS: u32 = 256;
 /// eight lanes of an `mma` fragment land in eight different shared-memory
 /// banks instead of all in one.
 pub(crate) const SHARED_BYTES: u32 = 2 * (TILE * (TILE + 8) * 2) as u32;
+
+/// Bytes of one `[64][head_dim]` tile and of one `[head_dim][64]` tile, each
+/// row padded by eight elements as above.
+const fn tiles(head_dim: usize) -> (usize, usize) {
+    (TILE * (head_dim + 8) * 2, head_dim * (TILE + 8) * 2)
+}
+/// Keys key-major and values dimension-major.
+pub(crate) const fn forward_shared_bytes(head_dim: usize) -> u32 {
+    let (rows, columns) = tiles(head_dim);
+    (rows + columns) as u32
+}
 /// Keys twice - key-major for the scores, dimension-major for the query
 /// gradient - and values once.
-pub(crate) const DQ_SHARED_BYTES: u32 = 3 * (TILE * (TILE + 8) * 2) as u32;
+pub(crate) const fn dq_shared_bytes(head_dim: usize) -> u32 {
+    let (rows, columns) = tiles(head_dim);
+    (2 * rows + columns) as u32
+}
 /// Queries and output gradients, each stored both ways round, plus the
 /// log-sum-exp and delta of the query tile.
-pub(crate) const DKV_SHARED_BYTES: u32 = 4 * (TILE * (TILE + 8) * 2) as u32 + 2 * TILE as u32 * 4;
+pub(crate) const fn dkv_shared_bytes(head_dim: usize) -> u32 {
+    let (rows, columns) = tiles(head_dim);
+    (2 * rows + 2 * columns + 2 * TILE * 4) as u32
+}
 
 const KERNELS: &str = r#"
 #define FA_D    64
@@ -291,11 +308,17 @@ extern "C" __global__ __launch_bounds__(256) void image_attention_fwd(
   }
 }
 
+// The training kernels below are templates over the head width `D`, 64 or
+// 128. A tile is always 64 queries or keys; only the head dimension changes.
+// A `[row][dim]` tile is padded to `DROW` and a `[dim][row]` one to `FA_ROW`,
+// both chosen so the eight rows of an mma fragment land in different banks.
+#define DROW (D+8)
+
 // One block per (query tile, head, sequence). Queries live in registers for
 // the whole block; keys and values stream through shared memory one tile at a
 // time. `lse` is written in the same layout the three-kernel path used, so the
 // backward pass rebuilds the probabilities from it unchanged.
-extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
+template<int D> __device__ __forceinline__ void flash_fwd(
     const unsigned short* __restrict__ qkv,
     unsigned short* __restrict__ out,
     float* __restrict__ lse,
@@ -305,23 +328,23 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
 {
   extern __shared__ unsigned short smem[];
   unsigned short* ks = smem;                      // [key][dim]
-  unsigned short* vt = smem + 64*FA_ROW;          // [dim][key], transposed
+  unsigned short* vt = smem + 64*DROW;            // [dim][key], transposed
 
   const int qt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
-  const int kv = (h / group) * FA_D;
+  const int kv = (h / group) * D;
   const size_t seq_base = (size_t)b * seq_len;
   const int q_row0 = qt*64 + warp*16;
   const int row_a = q_row0 + g, row_b = q_row0 + g + 8;
 
   // Queries, scaled once here rather than by the matmul's alpha as the cuBLAS
   // path did, and rounded to BF16 exactly as that path's tensor cores did.
-  unsigned qf[4][4];
+  unsigned qf[D/16][4];
   {
-    const size_t base = seq_base*(size_t)qkv_width + h*FA_D;
+    const size_t base = seq_base*(size_t)qkv_width + h*D;
     #pragma unroll
-    for (int kk=0; kk<4; ++kk) {
+    for (int kk=0; kk<D/16; ++kk) {
       int c = kk*16 + t*2;
       float a0=0.f,a1=0.f,a2=0.f,a3=0.f,a4=0.f,a5=0.f,a6=0.f,a7=0.f;
       if (row_a < seq_len) {
@@ -339,9 +362,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
     }
   }
 
-  float acc[8][4];
+  float acc[D/8][4];
   #pragma unroll
-  for (int n=0;n<8;++n)
+  for (int n=0;n<D/8;++n)
     #pragma unroll
     for (int i=0;i<4;++i) acc[n][i]=0.f;
   // Running maximum and sum of the two query rows this thread holds.
@@ -355,8 +378,8 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
     // One element a thread, not two: the value tile is stored transposed, and
     // measured, the wider load does not pay for the extra shared-memory bank
     // conflicts that come with it.
-    for (int i = threadIdx.x; i < 64*FA_D; i += 128) {
-      int r = i >> 6, c = i & 63;
+    for (int i = threadIdx.x; i < 64*D; i += 128) {
+      int r = (unsigned)i / D, c = (unsigned)i % D;
       int key = kt*64 + r;
       unsigned short kb = 0, vb = 0;
       if (key < seq_len) {
@@ -364,7 +387,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
         kb = qkv[p + key_base + kv + c];
         vb = qkv[p + value_base + kv + c];
       }
-      ks[r*FA_ROW + c] = kb;
+      ks[r*DROW + c] = kb;
       vt[c*FA_ROW + r] = vb;
     }
     __syncthreads();
@@ -378,8 +401,8 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
     #pragma unroll
     for (int n=0;n<8;++n) {
       #pragma unroll
-      for (int kk=0; kk<4; ++kk) {
-        const unsigned short* p = ks + (n*8+g)*FA_ROW + kk*16 + t*2;
+      for (int kk=0; kk<D/16; ++kk) {
+        const unsigned short* p = ks + (n*8+g)*DROW + kk*16 + t*2;
         unsigned bf[2];
         bf[0] = *(const unsigned*)p;
         bf[1] = *(const unsigned*)(p+8);
@@ -427,7 +450,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
     sum_b+=__shfl_xor_sync(0xffffffff,sum_b,1); sum_b+=__shfl_xor_sync(0xffffffff,sum_b,2);
     l_a=l_a*corr_a+sum_a; l_b=l_b*corr_b+sum_b; m_a=new_a; m_b=new_b;
     #pragma unroll
-    for (int n=0;n<8;++n) {
+    for (int n=0;n<D/8;++n) {
       acc[n][0]*=corr_a; acc[n][1]*=corr_a; acc[n][2]*=corr_b; acc[n][3]*=corr_b;
     }
 
@@ -442,7 +465,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
       pf[2]=pack2(s[2*kk+1][0],s[2*kk+1][1]);
       pf[3]=pack2(s[2*kk+1][2],s[2*kk+1][3]);
       #pragma unroll
-      for (int n=0;n<8;++n) {
+      for (int n=0;n<D/8;++n) {
         const unsigned short* p = vt + (n*8+g)*FA_ROW + kk*16 + t*2;
         unsigned bf[2];
         bf[0] = *(const unsigned*)p;
@@ -456,9 +479,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
   float inv_b = l_b>0.f ? 1.f/l_b : 0.f;
   // `out` is read by the output projection and by its weight-gradient GEMM and
   // by nothing else, so it is stored in whatever width those operands want.
-  const size_t obase = seq_base*(size_t)query_width + h*FA_D;
+  const size_t obase = seq_base*(size_t)query_width + h*D;
   #pragma unroll
-  for (int n=0;n<8;++n) {
+  for (int n=0;n<D/8;++n) {
     int c = n*8 + t*2;
     if (row_a < seq_len) {
       size_t p = obase + (size_t)row_a*query_width + c;
@@ -476,9 +499,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd(
   }
 }
 // Row dot product of the attention output with its gradient, which is the
-// `delta` term the softmax backward needs. One warp per row, two dimensions a
-// lane, so both loads are contiguous.
-extern "C" __global__ void flash_attention_delta(
+// `delta` term the softmax backward needs. One warp per row, `D / 32`
+// dimensions a lane, so every load is contiguous.
+template<int D> __device__ __forceinline__ void flash_delta(
     const unsigned short* __restrict__ out,
     const unsigned short* __restrict__ grad_out,
     float* __restrict__ delta,
@@ -489,10 +512,10 @@ extern "C" __global__ void flash_attention_delta(
   int stride = (gridDim.x*blockDim.x) >> 5;
   for (int warp = (blockIdx.x*blockDim.x + threadIdx.x) >> 5; warp < total; warp += stride) {
     int h = warp / rows, r = warp % rows;
-    size_t o = (size_t)r*query_width + h*FA_D;
-    size_t g = (size_t)r*query_width + h*FA_D;
-    float sum = bf16_load(out,o+lane)*bf16_load(grad_out,g+lane)
-              + bf16_load(out,o+lane+32)*bf16_load(grad_out,g+lane+32);
+    size_t o = (size_t)r*query_width + h*D;
+    float sum = 0.f;
+    #pragma unroll
+    for (int c = lane; c < D; c += 32) sum += bf16_load(out,o+c)*bf16_load(grad_out,o+c);
     #pragma unroll
     for (int step=16; step; step>>=1) sum += __shfl_xor_sync(0xffffffff,sum,step);
     if (lane == 0) delta[(size_t)h*delta_head_stride + r] = sum;
@@ -504,7 +527,7 @@ extern "C" __global__ void flash_attention_delta(
 // the log-sum-exp instead of being carried forward. Three key tiles live in
 // shared memory: keys twice, once each way round, because the score matmul
 // wants them key-major and the query matmul wants them dimension-major.
-extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
+template<int D> __device__ __forceinline__ void flash_dq(
     const unsigned short* __restrict__ qkv,
     const unsigned short* __restrict__ grad_out,
     const float* __restrict__ lse,
@@ -516,24 +539,24 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
 {
   extern __shared__ unsigned short smem[];
   unsigned short* ks = smem;                        // [key][dim]
-  unsigned short* vs = smem + 64*FA_ROW;            // [key][dim]
-  unsigned short* kt = smem + 2*64*FA_ROW;          // [dim][key]
+  unsigned short* vs = smem + 64*DROW;              // [key][dim]
+  unsigned short* kt = smem + 2*64*DROW;            // [dim][key]
 
   const int qt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
-  const int kv = (h / group) * FA_D;
+  const int kv = (h / group) * D;
   const size_t seq_base = (size_t)b * seq_len;
   const int q_row0 = qt*64 + warp*16;
   const int row_a = q_row0 + g, row_b = q_row0 + g + 8;
 
-  unsigned qf[4][4], df[4][4];
+  unsigned qf[D/16][4], df[D/16][4];
   float lse_a=0.f, lse_b=0.f, del_a=0.f, del_b=0.f;
   {
-    const size_t qbase = seq_base*(size_t)qkv_width + h*FA_D;
-    const size_t gbase = seq_base*(size_t)query_width + h*FA_D;
+    const size_t qbase = seq_base*(size_t)qkv_width + h*D;
+    const size_t gbase = seq_base*(size_t)query_width + h*D;
     #pragma unroll
-    for (int kk=0; kk<4; ++kk) {
+    for (int kk=0; kk<D/16; ++kk) {
       int c = kk*16 + t*2;
       float q0=0.f,q1=0.f,q2=0.f,q3=0.f,q4=0.f,q5=0.f,q6=0.f,q7=0.f;
       df[kk][0]=0; df[kk][1]=0; df[kk][2]=0; df[kk][3]=0;
@@ -560,17 +583,17 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
     if (row_b < seq_len) { lse_b=row[row_b]; del_b=dd[row_b]; }
   }
 
-  float acc[8][4];
+  float acc[D/8][4];
   #pragma unroll
-  for (int n=0;n<8;++n)
+  for (int n=0;n<D/8;++n)
     #pragma unroll
     for (int i=0;i<4;++i) acc[n][i]=0.f;
 
   const int last = causal ? qt : ((seq_len + 63) >> 6) - 1;
   for (int ktile=0; ktile<=last; ++ktile) {
     __syncthreads();
-    for (int i = threadIdx.x*2; i < 64*FA_D; i += 256) {
-      int r = i >> 6, c = i & 63;
+    for (int i = threadIdx.x*2; i < 64*D; i += 256) {
+      int r = (unsigned)i / D, c = (unsigned)i % D;
       int key = ktile*64 + r;
       unsigned kw = 0, vw = 0;
       if (key < seq_len) {
@@ -578,10 +601,10 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
         kw = bf16_pair(qkv,p + key_base + kv + c);
         vw = bf16_pair(qkv,p + value_base + kv + c);
       }
-      *(unsigned*)(ks + r*FA_ROW + c) = kw;
+      *(unsigned*)(ks + r*DROW + c) = kw;
       kt[c*FA_ROW + r] = (unsigned short)kw;
       kt[(c+1)*FA_ROW + r] = (unsigned short)(kw >> 16);
-      *(unsigned*)(vs + r*FA_ROW + c) = vw;
+      *(unsigned*)(vs + r*DROW + c) = vw;
     }
     __syncthreads();
 
@@ -593,9 +616,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
     #pragma unroll
     for (int n=0;n<8;++n) {
       #pragma unroll
-      for (int kk=0; kk<4; ++kk) {
-        const unsigned short* pk = ks + (n*8+g)*FA_ROW + kk*16 + t*2;
-        const unsigned short* pv = vs + (n*8+g)*FA_ROW + kk*16 + t*2;
+      for (int kk=0; kk<D/16; ++kk) {
+        const unsigned short* pk = ks + (n*8+g)*DROW + kk*16 + t*2;
+        const unsigned short* pv = vs + (n*8+g)*DROW + kk*16 + t*2;
         unsigned bk[2], bv[2];
         bk[0]=*(const unsigned*)pk; bk[1]=*(const unsigned*)(pk+8);
         bv[0]=*(const unsigned*)pv; bv[1]=*(const unsigned*)(pv+8);
@@ -633,7 +656,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
       pf[2]=pack2(s[2*kk+1][0],s[2*kk+1][1]);
       pf[3]=pack2(s[2*kk+1][2],s[2*kk+1][3]);
       #pragma unroll
-      for (int n=0;n<8;++n) {
+      for (int n=0;n<D/8;++n) {
         const unsigned short* p = kt + (n*8+g)*FA_ROW + kk*16 + t*2;
         unsigned bf[2];
         bf[0]=*(const unsigned*)p;
@@ -643,9 +666,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
     }
   }
 
-  const size_t obase = seq_base*(size_t)qkv_width + h*FA_D;
+  const size_t obase = seq_base*(size_t)qkv_width + h*D;
   #pragma unroll
-  for (int n=0;n<8;++n) {
+  for (int n=0;n<D/8;++n) {
     int c = n*8 + t*2;
     if (row_a < seq_len) {
       size_t p = obase + (size_t)row_a*qkv_width;
@@ -663,7 +686,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dq(
 // tiles that can see that key tile. Blocking on the key/value head rather than
 // the query head is what keeps grouped-query attention exact without atomics:
 // every query head that shares a key head is summed inside one block.
-extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
+template<int D> __device__ __forceinline__ void flash_dkv(
     const unsigned short* __restrict__ qkv,
     const unsigned short* __restrict__ grad_out,
     const float* __restrict__ lse,
@@ -675,10 +698,10 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
 {
   extern __shared__ unsigned short smem[];
   unsigned short* qs  = smem;                       // [query][dim]
-  unsigned short* qtr = smem + 64*FA_ROW;           // [dim][query]
-  unsigned short* gs  = smem + 2*64*FA_ROW;         // [query][dim]
-  unsigned short* gtr = smem + 3*64*FA_ROW;         // [dim][query]
-  float* lse_s = (float*)(smem + 4*64*FA_ROW);
+  unsigned short* qtr = qs + 64*DROW;               // [dim][query]
+  unsigned short* gs  = qtr + D*FA_ROW;             // [query][dim]
+  unsigned short* gtr = gs + 64*DROW;               // [dim][query]
+  float* lse_s = (float*)(gtr + D*FA_ROW);
   float* del_s = lse_s + 64;
 
   const int jt = blockIdx.x, kvh = blockIdx.y, b = blockIdx.z;
@@ -691,11 +714,11 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
 
   // Keys and values stay in registers for the whole block, as the operand of
   // every matmul below.
-  unsigned kf[4][4], vf[4][4];
+  unsigned kf[D/16][4], vf[D/16][4];
   {
-    const size_t base = seq_base*(size_t)qkv_width + kvh*FA_D;
+    const size_t base = seq_base*(size_t)qkv_width + kvh*D;
     #pragma unroll
-    for (int kk=0; kk<4; ++kk) {
+    for (int kk=0; kk<D/16; ++kk) {
       int c = kk*16 + t*2;
       kf[kk][0]=0; kf[kk][1]=0; kf[kk][2]=0; kf[kk][3]=0;
       vf[kk][0]=0; vf[kk][1]=0; vf[kk][2]=0; vf[kk][3]=0;
@@ -716,29 +739,29 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
     }
   }
 
-  float dk[8][4], dv[8][4];
+  float dk[D/8][4], dv[D/8][4];
   #pragma unroll
-  for (int n=0;n<8;++n)
+  for (int n=0;n<D/8;++n)
     #pragma unroll
     for (int i=0;i<4;++i) { dk[n][i]=0.f; dv[n][i]=0.f; }
 
   for (int hq = kvh*group; hq < (kvh+1)*group; ++hq) {
     for (int it = causal ? jt : 0; it < tiles; ++it) {
       __syncthreads();
-      for (int i = threadIdx.x*2; i < 64*FA_D; i += 256) {
-        int r = i >> 6, c = i & 63;
+      for (int i = threadIdx.x*2; i < 64*D; i += 256) {
+        int r = (unsigned)i / D, c = (unsigned)i % D;
         int q = it*64 + r;
         unsigned qw = 0, gw = 0;
         if (q < seq_len) {
-          qw = bf16_pair(qkv,(seq_base+q)*(size_t)qkv_width + hq*FA_D + c);
-          gw = bf16_pair(grad_out,(seq_base+q)*(size_t)query_width + hq*FA_D + c);
+          qw = bf16_pair(qkv,(seq_base+q)*(size_t)qkv_width + hq*D + c);
+          gw = bf16_pair(grad_out,(seq_base+q)*(size_t)query_width + hq*D + c);
         }
         // The queries are stored unscaled, so the scores carry the scale
         // instead: one multiply per score rather than one per element here.
-        *(unsigned*)(qs + r*FA_ROW + c) = qw;
+        *(unsigned*)(qs + r*DROW + c) = qw;
         qtr[c*FA_ROW + r] = (unsigned short)qw;
         qtr[(c+1)*FA_ROW + r] = (unsigned short)(qw >> 16);
-        *(unsigned*)(gs + r*FA_ROW + c) = gw;
+        *(unsigned*)(gs + r*DROW + c) = gw;
         gtr[c*FA_ROW + r] = (unsigned short)gw;
         gtr[(c+1)*FA_ROW + r] = (unsigned short)(gw >> 16);
       }
@@ -759,9 +782,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
       #pragma unroll
       for (int n=0;n<8;++n) {
         #pragma unroll
-        for (int kk=0; kk<4; ++kk) {
-          const unsigned short* pq = qs + (n*8+g)*FA_ROW + kk*16 + t*2;
-          const unsigned short* pg = gs + (n*8+g)*FA_ROW + kk*16 + t*2;
+        for (int kk=0; kk<D/16; ++kk) {
+          const unsigned short* pq = qs + (n*8+g)*DROW + kk*16 + t*2;
+          const unsigned short* pg = gs + (n*8+g)*DROW + kk*16 + t*2;
           unsigned bq[2], bg[2];
           bq[0]=*(const unsigned*)pq; bq[1]=*(const unsigned*)(pq+8);
           bg[0]=*(const unsigned*)pg; bg[1]=*(const unsigned*)(pg+8);
@@ -797,7 +820,7 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
         sf[2]=pack2(dpt[2*kk+1][0],dpt[2*kk+1][1]);
         sf[3]=pack2(dpt[2*kk+1][2],dpt[2*kk+1][3]);
         #pragma unroll
-        for (int n=0;n<8;++n) {
+        for (int n=0;n<D/8;++n) {
           const unsigned short* pg = gtr + (n*8+g)*FA_ROW + kk*16 + t*2;
           const unsigned short* pq = qtr + (n*8+g)*FA_ROW + kk*16 + t*2;
           unsigned bg[2], bq[2];
@@ -810,9 +833,9 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
     }
   }
 
-  const size_t base = seq_base*(size_t)qkv_width + kvh*FA_D;
+  const size_t base = seq_base*(size_t)qkv_width + kvh*D;
   #pragma unroll
-  for (int n=0;n<8;++n) {
+  for (int n=0;n<D/8;++n) {
     int c = n*8 + t*2;
     if (key_a < seq_len) {
       size_t p = base + (size_t)key_a*qkv_width;
@@ -827,17 +850,63 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv(
   }
 }
 
+// One entry point per kernel and head width, named `<kernel>_<width>`.
+#define FLASH_ARGS \
+    int seq_len, int qkv_width, int query_width, int key_base, int value_base, \
+    int group, int lse_head_stride, float scale, int causal
+#define FLASH_PASS \
+    seq_len, qkv_width, query_width, key_base, value_base, group, lse_head_stride, scale, causal
+#define FLASH_WIDTH(W) \
+extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd_##W( \
+    const unsigned short* __restrict__ qkv, unsigned short* __restrict__ out, \
+    float* __restrict__ lse, FLASH_ARGS) \
+{ flash_fwd<W>(qkv, out, lse, FLASH_PASS); } \
+extern "C" __global__ void flash_attention_delta_##W( \
+    const unsigned short* __restrict__ out, const unsigned short* __restrict__ grad_out, \
+    float* __restrict__ delta, int rows, int heads, int query_width, int delta_head_stride) \
+{ flash_delta<W>(out, grad_out, delta, rows, heads, query_width, delta_head_stride); } \
+extern "C" __global__ __launch_bounds__(128) void flash_attention_dq_##W( \
+    const unsigned short* __restrict__ qkv, const unsigned short* __restrict__ grad_out, \
+    const float* __restrict__ lse, const float* __restrict__ delta, \
+    unsigned short* __restrict__ grad_qkv, FLASH_ARGS) \
+{ flash_dq<W>(qkv, grad_out, lse, delta, grad_qkv, FLASH_PASS); } \
+extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv_##W( \
+    const unsigned short* __restrict__ qkv, const unsigned short* __restrict__ grad_out, \
+    const float* __restrict__ lse, const float* __restrict__ delta, \
+    unsigned short* __restrict__ grad_qkv, FLASH_ARGS) \
+{ flash_dkv<W>(qkv, grad_out, lse, delta, grad_qkv, FLASH_PASS); }
+
+FLASH_WIDTH(64)
+FLASH_WIDTH(128)
+
 "#;
 
-/// The fused kernels, resolved once per device.
-pub(crate) struct FlashKernels {
+/// The training kernels for one head width.
+pub(crate) struct FlashWidth {
     pub(crate) forward: CudaFunction,
-    /// The image path's variant: FP16, unmasked, and able to read its keys
-    /// from a different tensor than its queries.
-    pub(crate) image: CudaFunction,
     pub(crate) delta: CudaFunction,
     pub(crate) grad_query: CudaFunction,
     pub(crate) grad_key_value: CudaFunction,
+}
+
+/// The fused kernels, resolved once per device.
+pub(crate) struct FlashKernels {
+    /// The image path's variant: FP16, unmasked, and able to read its keys
+    /// from a different tensor than its queries.
+    pub(crate) image: CudaFunction,
+    narrow: FlashWidth,
+    wide: FlashWidth,
+}
+
+impl FlashKernels {
+    /// The kernels for a head width [`eligible`] accepted.
+    pub(crate) fn width(&self, head_dim: usize) -> &FlashWidth {
+        if head_dim == 128 {
+            &self.wide
+        } else {
+            &self.narrow
+        }
+    }
 }
 
 /// Compiles and loads the fused attention module for `context`, or returns
@@ -877,22 +946,42 @@ pub(crate) fn flash_kernels(device: usize, context: &Arc<CudaContext>) -> Option
             .map_err(cuda_err("fused attention kernel lookup"))
             .ok()
     };
+    let width = |head_dim: usize| {
+        let kernels = FlashWidth {
+            forward: get(&format!("flash_attention_fwd_{head_dim}"))?,
+            delta: get(&format!("flash_attention_delta_{head_dim}"))?,
+            grad_query: get(&format!("flash_attention_dq_{head_dim}"))?,
+            grad_key_value: get(&format!("flash_attention_dkv_{head_dim}"))?,
+        };
+        // At 128 the backward kernels want more than the 48 KiB of shared
+        // memory a launch gets without asking.
+        let opt_in = |function: &CudaFunction, bytes: u32| {
+            function
+                .set_attribute(
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    bytes as i32,
+                )
+                .ok()
+        };
+        opt_in(&kernels.forward, forward_shared_bytes(head_dim))?;
+        opt_in(&kernels.grad_query, dq_shared_bytes(head_dim))?;
+        opt_in(&kernels.grad_key_value, dkv_shared_bytes(head_dim))?;
+        Some(kernels)
+    };
     Some(FlashKernels {
-        forward: get("flash_attention_fwd")?,
         image: get("image_attention_fwd")?,
-        delta: get("flash_attention_delta")?,
-        grad_query: get("flash_attention_dq")?,
-        grad_key_value: get("flash_attention_dkv")?,
+        narrow: width(64)?,
+        wide: width(128)?,
     })
 }
 
 /// Whether the fused path can serve this shape.
 ///
-/// The fragment layout is written for a 64-wide head, and the BF16 operands
+/// The kernels are built for heads 64 and 128 wide, and the BF16 operands
 /// are only an honest substitute where the cuBLAS path was already rounding
 /// its own operands to BF16 - that is, under mixed precision.
 pub(crate) fn eligible(mixed_precision: bool, head_dim: usize) -> bool {
-    mixed_precision && head_dim == TILE && !disabled()
+    mixed_precision && matches!(head_dim, 64 | 128) && !disabled()
 }
 
 /// Set by `RUSTING_BRAIN_NO_FLASH`, and by the parity test that runs the same

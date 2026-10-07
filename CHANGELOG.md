@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Fused flash attention also serves a head width of 128, the width most
+  LLaMA-family checkpoints use, in training and in the forward pass. It used
+  to fall back to the three-kernel path; a 4 x 1024 training step at that
+  width runs 23% faster. `bench_train_step` takes the head width as an
+  optional fourth argument.
 - Mixed-precision training runs the routed experts of a MoE layer in BF16, as
   the dense feed-forward already did. The router, the expert outputs and the
   scatter back into the residual stay FP32. About 4% more tokens per second
