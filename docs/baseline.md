@@ -1063,3 +1063,25 @@ compare within this table only:
 
 (The first new int8 run at one sequence read 831, cold.) Int8 is now +19%
 over BF16 at one sequence, and still -12% at 16, the multi-row GEMV.
+
+## LoRA on an int8 base (B4 QLoRA slice 1, 2026-10-07)
+
+`TransformerLm::quantize_lora_base` stores every adapted projection's frozen
+base as int8 with a scale per row; the device uploads those bytes and
+dequantizes them into each weight pack where it used to cast FP32.
+`checkpoint_memory 4 512 lora`, default model, rank-16 LoRA, no
+checkpointing, two runs, load average 16 (another loop's `rustc`; the A/B
+ran in the same process):
+
+| Base | Peak device memory | Step |
+|---|---|---|
+| FP32 | 889 MiB | 46.1, 46.5 ms |
+| int8 | 778 MiB | 46.6, 46.3 ms |
+
+The 111 MiB is the adapted weights going from 4 bytes to 1 (about 38M of
+the 101.7M; the embedding, the norms and the routers stay FP32). The step
+does not slow: the dequantize kernel replaces a cast of the same length.
+The BF16 packs a step keeps for its backward pass are unchanged, so at
+this shape activations and packs, not the base, are most of the peak; the
+saving grows with the model and is largest with `checkpoint`, which drops
+the packs between blocks.

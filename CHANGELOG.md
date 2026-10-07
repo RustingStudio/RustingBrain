@@ -37,6 +37,11 @@
 
 ### Added
 
+- `TransformerLm::quantize_lora_base`: holds a LoRA run's frozen base
+  projections as int8 with a scale per row, on the host and the GPU, so
+  fine-tuning keeps the base in a quarter of the memory at the same step
+  time. The adapters train in full precision and save with `save_lora`.
+  `examples/checkpoint_memory` takes `lora` as a third argument to compare.
 - `TransformerLm::set_int8_decode` makes device decoders read the attention,
   dense and shared-expert feed-forward and output-head weights as int8 with a
   scale per row: about 10% more tokens per second for one sequence on the
