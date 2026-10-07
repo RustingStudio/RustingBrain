@@ -131,6 +131,8 @@ pub struct T5Encoder {
     pub(crate) position_bias: Matrix,
     pub(crate) blocks: Vec<Block>,
     pub(crate) final_norm: Vec<f32>,
+    #[cfg(feature = "cuda")]
+    device: Option<crate::cuda_t5::DeviceT5>,
 }
 
 impl T5Encoder {
@@ -212,6 +214,8 @@ impl T5Encoder {
             tokens,
             position_bias,
             blocks,
+            #[cfg(feature = "cuda")]
+            device: None,
         })
     }
 
@@ -239,8 +243,24 @@ impl T5Encoder {
         Ok(ids)
     }
 
+    /// Uploads every weight to a CUDA device and runs there from now on.
+    ///
+    /// Fails closed: an error leaves the encoder on the CPU, as it was.
+    #[cfg(feature = "cuda")]
+    pub fn attach_device(
+        &mut self,
+        context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
+    ) -> Result<(), NetworkError> {
+        self.device = Some(crate::cuda_t5::DeviceT5::upload(context, self)?);
+        Ok(())
+    }
+
     /// The hidden states for a sequence of token ids, `[tokens, d_model]`.
     pub fn forward(&self, ids: &[u32]) -> Result<Matrix, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            return device.forward(self, ids);
+        }
         let mut hidden = self.embed(ids)?;
         let bias = self.bias(ids.len());
         for block in &self.blocks {

@@ -305,6 +305,16 @@ impl PromptEncoder {
         }
     }
 
+    /// The T5 encoder this encoder holds, if any.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn t5(&mut self) -> Option<&mut T5Encoder> {
+        match self {
+            Self::T5 { encoder, .. } => Some(encoder),
+            Self::ClipPairAndT5 { third, .. } => Some(third),
+            _ => None,
+        }
+    }
+
     /// How wide one hidden state is.
     pub fn d_model(&self) -> usize {
         match self {
@@ -779,10 +789,10 @@ impl ImagePipeline {
 
     /// Moves everything that has a device path onto CUDA device `device`.
     ///
-    /// That is the UNet, the VAE decoder and every CLIP tower. A transformer
-    /// denoiser and a T5 encoder stay on the host, because neither has a
-    /// device mirror yet; a pipeline built from those loads and runs exactly
-    /// as it did.
+    /// That is the denoiser, the VAE decoder, every CLIP tower and a gated
+    /// T5 encoder. The UNet runs on the FP16 image kernels; a transformer
+    /// denoiser and T5 run on the BF16 ones, because T5 1.1's activations pass
+    /// FP16's range. The original ungated T5 stays on the host.
     ///
     /// Fails closed. Whatever was uploaded before the failure is dropped with
     /// the error, and every part that did not move is still the CPU one, so a
@@ -799,6 +809,16 @@ impl ImagePipeline {
         }
         if let Some(pooled) = &mut self.pooled {
             pooled.encoder.attach_device(gpu)?;
+        }
+        let t5 = self.encoder.t5().filter(|t5| t5.config().gated);
+        if t5.is_some() || matches!(self.denoiser, ImageDenoiser::Transformer(_)) {
+            let context = crate::gpu_transformer::GpuContext::new(device)?;
+            if let Some(t5) = t5 {
+                t5.attach_device(&context)?;
+            }
+            if let ImageDenoiser::Transformer(dit) = &mut self.denoiser {
+                dit.attach_device(&context)?;
+            }
         }
         Ok(())
     }
@@ -1965,8 +1985,18 @@ mod tests {
         assert_eq!(loaded.config.solver, Solver::DpmPlusPlus2m);
     }
 
-    #[test]
-    fn three_encoders_are_read_the_way_stable_diffusion_three_publishes_them() {
+    /// The parts of a tiny Stable Diffusion 3: two CLIP towers, a T5 encoder,
+    /// a VAE and a denoiser of the given width, heads and rotary axes.
+    fn sd3_parts(
+        d_model: usize,
+        num_heads: usize,
+        axes_dim: Vec<usize>,
+    ) -> (
+        crate::clip::ClipTextConfig,
+        crate::t5::T5Config,
+        VaeConfig,
+        DitConfig,
+    ) {
         let clip = crate::clip::ClipTextConfig {
             vocab_size: 320,
             bos_token: 300,
@@ -1991,18 +2021,24 @@ mod tests {
         let dit = DitConfig {
             in_channels: 16,
             out_channels: 16,
-            d_model: 16,
-            num_heads: 2,
+            d_model,
+            num_heads,
             double_blocks: 1,
             single_blocks: 1,
             mlp_ratio: 2.0,
             text_dim: t5.d_model,
             pooled_dim: 2 * clip.d_model,
-            axes_dim: vec![4, 4],
+            axes_dim,
             theta: 10_000.0,
             guidance: false,
             eps: 1e-6,
         };
+        (clip, t5, vae, dit)
+    }
+
+    #[test]
+    fn three_encoders_are_read_the_way_stable_diffusion_three_publishes_them() {
+        let (clip, t5, vae, dit) = sd3_parts(16, 2, vec![4, 4]);
 
         let directory = std::env::temp_dir().join("rusting_brain_pipeline_sd3");
         publish_parts(&dit, &vae, &directory, Some(&clip), Some(&t5), Some(&clip));
@@ -2038,6 +2074,56 @@ mod tests {
             .unwrap();
         assert_eq!((image.channels, image.height, image.width), (3, 8, 8));
         assert!(image.data.iter().all(|value| value.is_finite()));
+    }
+
+    /// A Stable Diffusion 3 pipeline on the device: T5 and the denoiser on
+    /// the BF16 kernels, the CLIP towers and the decoder on the FP16 ones.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_transformer_pipeline_on_the_device_matches_the_host_or_skips_without_device() {
+        if crate::cuda_training::cuda_doctor(0, 8192).is_err() {
+            crate::cuda_training::skip_without_cuda();
+            return;
+        }
+        // Heads of 64, which the fused attention takes.
+        let (clip, t5, vae, dit) = sd3_parts(128, 2, vec![32, 32]);
+        let directory = std::env::temp_dir().join("rusting_brain_pipeline_sd3_cuda");
+        publish_parts(&dit, &vae, &directory, Some(&clip), Some(&t5), Some(&clip));
+        let mut host = ImagePipeline::load(&directory).unwrap();
+        let mut device = ImagePipeline::load(&directory).unwrap();
+        std::fs::remove_dir_all(&directory).ok();
+        device.to_cuda(0).unwrap();
+        assert!(matches!(&device.denoiser, ImageDenoiser::Transformer(dit) if dit.on_device()));
+
+        let relative = |actual: &[f32], expected: &[f32]| {
+            let error: f32 = actual
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            error / expected.iter().map(|v| v * v).sum::<f32>().sqrt()
+        };
+        let expected = host.condition("abc", 8, 8).unwrap();
+        let actual = device.condition("abc", 8, 8).unwrap();
+        let error = relative(&actual.text.data, &expected.text.data);
+        // BF16 never reproduces the host bit for bit, so an exact match means
+        // the host path ran.
+        assert!(
+            0.0 < error && error < 2e-2,
+            "prompt states: relative error {error}"
+        );
+
+        host.config.steps = 2;
+        device.config.steps = 2;
+        let expected = host
+            .generate("a lighthouse", 8, 8, Some(4), |_, _| true)
+            .unwrap();
+        let actual = device
+            .generate("a lighthouse", 8, 8, Some(4), |_, _| true)
+            .unwrap();
+        let error = relative(&actual.data, &expected.data);
+        assert!(0.0 < error && error < 5e-2, "image: relative error {error}");
     }
 
     #[test]

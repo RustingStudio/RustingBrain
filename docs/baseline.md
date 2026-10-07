@@ -1263,3 +1263,9 @@ error 0.0076. Load 7 to 5, RTX 3060.
 On the tiny parity model the whole-model relative error is 0.020 at F32 and
 0.008 at Q8: Q8 weights are read exactly on both sides, so the gap is BF16
 weight rounding, not the kernels, which match the host to 1e-4.
+
+BF16 against int8 weights, same test, after C6 part 3 (2026-10-07, load 8
+to 15): F32/BF16 device 130 (first, cold), 23.7, 16.2, 15.7, 15.9 ms; Q8
+device 15.8, 15.8, 16.4, 15.8, 16.8 ms. Hosts 1.16 s and 1.47 s. At 1280
+tokens the GEMMs are compute-bound, so reading one byte a weight instead of
+two buys no time; it halves the weights' memory.
