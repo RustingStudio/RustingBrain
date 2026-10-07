@@ -4,6 +4,10 @@
 
 ### Changed
 
+- A device decode step with one new token per sequence runs attention as
+  two fused kernels per layer instead of seventeen cuBLAS and softmax
+  launches: about 30% more tokens per second on the default model, for one
+  sequence or sixteen.
 - Under mixed precision the device decoder reads a BF16 copy of the LM head,
   about 6% more tokens per second for one sequence on the default model.
 - Fused flash attention also serves a head width of 128, the width most

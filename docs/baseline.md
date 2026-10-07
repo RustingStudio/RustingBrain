@@ -949,3 +949,25 @@ before and after; host load average about 11 from other work.
 Each further 8 x 512 tokens costs about 102 MiB checkpointed against 806 MiB
 kept. The recompute adds 23% at 16 x 512, under the 30% the item estimated.
 An earlier timing run overlapped a `cargo clippy` build and was discarded.
+
+## Fused decode attention (C8, 2026-10-07)
+
+`nsys` of `bench_decode 512 128 cuda 1` at `1c3dd1f`: per layer and token,
+eight FP32 score GEMVs (about 3.8 us each), `attention_softmax_lse` (4.9 us)
+and eight FP32 value GEMVs (about 4.3 us), about 70 us, a third of kernel
+time. A first fused kernel with one block per (head, sequence) took 105 us a
+call at batch 1 (8 blocks, each walking 640 positions serially) and was slower
+end to end; splitting the history into 64-position chunks fixed that:
+`decode_attention` 16.7 us and `decode_attention_merge` 2.7 us a layer. Total
+kernel time over the 129 decode calls is 107 ms, against about 195 ms before.
+
+Same-session A/B, `bench_decode 512 128 cuda <sequences>`, idle GPU
+(gnome-clocks only) before and after, second (warm) round, CPU load average
+about 5:
+
+| Build | 1 sequence | 16 sequences |
+|---|---|---|
+| `74fd609` | 1.51 ms, 663 tokens/s | 3.00 ms, 5335 tokens/s |
+| fused | 1.16 ms, 864 tokens/s | 2.35 ms, 6819 tokens/s |
+
+The first round's baseline batch-1 run (2.10 ms) was a cold outlier.

@@ -2921,6 +2921,51 @@ mod tests {
         }
     }
 
+    /// Long enough for the device's fused single-row attention to split its
+    /// history over several chunks and merge them, for one and two sequences.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_long_device_decode_matches_the_host_or_skips_without_device() {
+        match crate::cuda_training::cuda_doctor(0, 8192) {
+            Ok(_) => {}
+            Err(NetworkError::Cuda(message))
+                if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
+            {
+                crate::cuda_training::skip_without_cuda();
+                return;
+            }
+            Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
+        }
+        let cpu = tiny()
+            .max_seq_len(200)
+            .mixed_precision(false)
+            .build()
+            .unwrap();
+        let mut gpu = cpu.clone();
+        gpu.to_cuda(0, 8192).unwrap();
+        let prompt: Vec<u32> = (0..130).map(|i| (i * 7 % 13) as u32).collect();
+        let mut host = cpu.decoder();
+        let mut device = gpu.batch_decoder(2).unwrap();
+        host.feed(&prompt).unwrap();
+        device.feed(&[&prompt, &prompt]).unwrap();
+        for step in 0..20u32 {
+            let id = step % 13;
+            host.feed(&[id]).unwrap();
+            device.feed(&[&[id], &[id]]).unwrap();
+            let host_logits = host.logits.as_ref().unwrap();
+            let expected = host_logits.row(host_logits.rows - 1);
+            let device_logits = device.logits.as_ref().unwrap();
+            for sequence in 0..2 {
+                for (d, h) in device_logits.row(sequence).iter().zip(expected) {
+                    assert!(
+                        (d - h).abs() <= 1e-3,
+                        "step {step}: {d} on the device vs {h}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Feeds `batched` and one single-sequence host decoder per sequence the
     /// same turns, and checks every sequence's logits agree after each.
     fn assert_batch_matches_single(host: &TransformerLm, batched: &TransformerLm, tolerance: f32) {
