@@ -1020,3 +1020,28 @@ At 16 rows the int8 kernel re-reads each weight four times (four rows a
 pass) and spends most of its time on per-row warp reductions and input
 loads, so it loses to cuBLAS.
 
+### Rejected: shared-memory input rows for the int8 GEMV (2026-10-07)
+
+A `gemv_q8_rows` kernel for more than four rows: each block of eight units
+staged a 512-wide slice of every input row in shared memory as FP32, and each
+lane read four consecutive weights in four 128-wide groups, so all loads were
+contiguous across lanes. It passed the int8 parity test, now with a six-token
+turn, and dropping one weight in four failed it. `bench_decode 512 128 cuda
+<sequences> int8`, three rounds interleaved, started on an idle GPU with the
+load average under 2 (`RustingStrata` reached the GPU near the end; rounds 2
+and 3 match round 1):
+
+| Int8 decode | `9561323` | Shared-memory kernel |
+|---|---|---|
+| 1 sequence | 953-1000 tokens/s | 984-1002 tokens/s (first run cold, 654) |
+| 8 sequences | 4325-4360 tokens/s | 3517-3658 tokens/s |
+| 16 sequences | 5978-6093 tokens/s | 4874-4900 tokens/s |
+
+The 16-row input is 16 KB in BF16, so the old kernel's per-warp re-reads
+most likely hit L1, and the estimate of L2 traffic behind the change was
+wrong. Staging adds two block barriers and 8192 scalar loads a slice for 256
+multiply-adds per lane, and 32 KB of shared memory caps a block at three per
+SM. Nsight Compute cannot read the counters on this machine
+(`ERR_NVGPUCTRPERM`, needs admin), so the next attempt must start from an
+`nsys` sweep of kernel variants, not from a counter profile.
+

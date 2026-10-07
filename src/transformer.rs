@@ -2950,7 +2950,8 @@ mod tests {
 
     /// An int8 device decoder against a host model whose projections and head
     /// went through [`Param::quantize`], the same rounding. The 20-token prompt
-    /// takes the dequantize-and-cuBLAS route, single tokens the int8 GEMV.
+    /// takes the dequantize-and-cuBLAS route, single tokens the int8 GEMV and
+    /// the six-token turn its multi-pass loop over input rows.
     /// Dense, because routed experts stay in full precision on the device.
     #[cfg(feature = "cuda")]
     #[test]
@@ -2986,7 +2987,7 @@ mod tests {
             let mut host = cpu.decoder();
             let mut device = gpu.decoder();
             let prompt: Vec<u32> = (0..20).map(|i| (i * 5 % 13) as u32).collect();
-            let turns: [&[u32]; 4] = [&prompt, &[7], &[2], &[9]];
+            let turns: [&[u32]; 5] = [&prompt, &[7], &[2], &[3, 1, 4, 1, 5, 9], &[9]];
             for (turn, ids) in turns.iter().enumerate() {
                 host.feed(ids).unwrap();
                 device.feed(ids).unwrap();
