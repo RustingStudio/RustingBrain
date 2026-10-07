@@ -4,6 +4,8 @@
 
 ### Added
 
+- `rusting_brain::BUILD`: the library version and the git commit it was built
+  from. Print it at startup to spot a binary built from an older checkout.
 - `Bpe` tokenizes LLaMA 3 and Qwen2 files the way the reference does: their
   split rule (digits in runs of up to three, or one for Qwen2,
   case-insensitive contractions) and `ignore_merges`.

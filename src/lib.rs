@@ -174,6 +174,31 @@ pub mod metal_training;
 pub mod onnx;
 pub(crate) mod onnx_export;
 
+/// The library version and the commit it was built from, such as
+/// `3.0.0 (b46a6b4)`. Print it at startup: a binary built from an older
+/// checkout then shows a hash that does not match `git rev-parse --short HEAD`.
+/// The hash is `unknown` outside a git checkout.
+pub const BUILD: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("RUSTING_BRAIN_GIT_HASH"),
+    ")"
+);
+
+#[cfg(test)]
+#[test]
+fn build_names_the_checkout() {
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .unwrap();
+    let head = String::from_utf8(head.stdout).unwrap();
+    assert_eq!(
+        BUILD,
+        format!("{} ({})", env!("CARGO_PKG_VERSION"), head.trim())
+    );
+}
+
 pub use accelerator::{
     AcceleratorDoctorReport, AcceleratorStats, TrainingSession, accelerator_doctor,
     estimate_tensor_memory_mib,
