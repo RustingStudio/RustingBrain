@@ -25,6 +25,10 @@
 
 ### Added
 
+- `TransformerLm::generate_speculative`: greedy speculative decoding with a
+  smaller draft model, one target pass per round of drafted ids, giving the
+  same continuation as greedy `generate`. `KvCache::truncate` drops cached
+  positions.
 - `sample_unipc`: the UniPC multistep predictor-corrector solver at
   diffusers' defaults, matching `UniPCMultistepScheduler` step for step.
 - `Scheduler::lcm_sigmas` and `sample_consistency`: the timesteps and the

@@ -55,6 +55,14 @@ impl KvCache {
         self.length == 0
     }
 
+    /// Keeps the first `positions` positions and drops the rest, so a caller
+    /// can take back tokens it fed, such as rejected speculative ones.
+    pub fn truncate(&mut self, positions: usize) {
+        self.length = self.length.min(positions);
+        self.keys.truncate(self.length * self.width);
+        self.values.truncate(self.length * self.width);
+    }
+
     pub fn clear(&mut self) {
         self.keys.clear();
         self.values.clear();

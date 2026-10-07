@@ -881,3 +881,10 @@ another process (RustingStrata, 10.5 GB) this iteration.
 No measurement: one model call per step like the other solvers, plus
 elementwise arithmetic. The GPU was held by another process (RustingStrata)
 this iteration.
+
+## Speculative decoding (C4, 2026-10-07)
+
+No measurement: the GPU was held by another process (RustingStrata, 10.5 GB)
+this iteration, and the speedup depends on how often a real draft agrees
+with its target, which the random test models do not show. A round costs one
+target pass over `lookahead + 1` rows plus `lookahead` draft passes.
