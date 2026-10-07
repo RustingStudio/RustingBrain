@@ -209,7 +209,7 @@ impl GpuCache {
 /// One byte buffer serves both precisions because a kernel launch only ever
 /// passes a device pointer, and cuBLAS takes the element type as a runtime
 /// argument. Buffers that a plain FP32 kernel still writes - the routed
-/// feed-forward's gathers and scatters - are held wide and read back through
+/// feed-forward's router input - are held wide and read back through
 /// [`Act::wide`].
 pub(crate) struct Act {
     bytes: CudaSlice<u8>,
@@ -1072,26 +1072,32 @@ impl Gpu<'_> {
         Ok(())
     }
 
+    /// `out[r] = scale[r] * source[rows_of[r]]`, or without the scale, written
+    /// at `out`'s precision.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gather_scaled(
         &self,
-        out: &mut CudaSlice<f32>,
-        source: &CudaSlice<f32>,
+        out: &mut Act,
+        source: &CudaView<'_, f32>,
         rows_of: &CudaSlice<u32>,
         scale: &CudaSlice<f32>,
+        scaled: bool,
         rows: usize,
         width: usize,
     ) -> Result<(), NetworkError> {
+        let narrow = out.flag();
         unsafe {
             self.context
                 .stream
                 .launch_builder(&self.context.model.gather_scaled)
-                .arg(out)
+                .arg(out.destination())
                 .arg(source)
                 .arg(rows_of)
                 .arg(scale)
                 .arg(&(rows as i32))
                 .arg(&(width as i32))
+                .arg(&i32::from(scaled))
+                .arg(&narrow)
                 .launch(cfg(rows * width))
                 .map_err(cuda_err("scaled row gather kernel"))?;
         }
@@ -1807,12 +1813,6 @@ impl Gpu<'_> {
     }
 }
 
-/// A device buffer read as untyped bytes, for a cuBLAS call whose other
-/// operand decides the element type.
-fn bytes_of(slice: &CudaSlice<f32>, len: usize) -> CudaView<'_, u8> {
-    unsafe { slice.transmute::<u8>(len * 4) }.expect("a device allocation is byte-aligned")
-}
-
 /// The device mirror of a LoRA matrix, or an error naming what is missing.
 fn device_param(param: &Param) -> Result<&DeviceParam, NetworkError> {
     param
@@ -2147,10 +2147,9 @@ fn forward_block(
     let query_width = heads * head_dim;
 
     // The attention side of the block is always fused-GEMM territory, so its
-    // activations follow the context flag. The feed-forward side only narrows
-    // when it is dense: a routed layer's gathers, scatters and row-wise
-    // reductions are FP32 kernels, and it is not what the benchmark shapes
-    // run.
+    // activations follow the context flag. The feed-forward norm only narrows
+    // when the feed-forward is dense: a routed layer's router and gather read
+    // it as FP32, and the gather narrows the rows the experts read.
     let narrow = gpu.context.mixed_precision;
     let dense_ffn = matches!(block.feed_forward, FeedForward::SwiGlu(_));
     let ffn_narrow = narrow && dense_ffn;
@@ -2513,18 +2512,21 @@ fn forward_moe(
     // `gather_scaled` touch every routed row, and the per-expert loops
     // partition the routed rows between them with `beta = 0` on the first
     // write of each slice.
-    let mut gathered = gpu.act(routed * d_model, false)?;
+    let narrow = gpu.context.mixed_precision;
+    let mut gathered = gpu.act(routed * d_model, narrow)?;
     if routed > 0 {
-        gpu.gather(
-            &mut gathered.wide_mut(),
+        gpu.gather_scaled(
+            &mut gathered,
             &input.wide(),
             &token_of,
+            &gates,
+            false,
             routed,
             d_model,
         )?;
     }
 
-    let expert_weights = gpu.pack_gate_up(moe.experts.iter(), false)?;
+    let expert_weights = gpu.pack_gate_up(moe.experts.iter(), narrow)?;
     let packed_stride = 2 * width * d_model;
     let mut gate_up = gpu.uninit(routed * 2 * width)?;
     for (expert, _) in moe.experts.iter().enumerate() {
@@ -2540,15 +2542,15 @@ fn forward_moe(
             2 * width,
             d_model,
             &rows_in,
-            false,
+            narrow,
             &mut out,
             count,
             0.0,
         )?;
     }
-    let hidden = gpu.swiglu(&gate_up, routed, width, false)?;
+    let hidden = gpu.swiglu(&gate_up, routed, width, narrow)?;
 
-    let down_weights = gpu.pack_down(moe.experts.iter(), false)?;
+    let down_weights = gpu.pack_down(moe.experts.iter(), narrow)?;
     let down_stride = d_model * width;
     let mut expert_output = gpu.uninit(routed * d_model)?;
     for (expert, _) in moe.experts.iter().enumerate() {
@@ -2563,7 +2565,7 @@ fn forward_moe(
             d_model,
             width,
             &rows_in,
-            false,
+            narrow,
             &mut rows_out,
             count,
             0.0,
@@ -3559,8 +3561,8 @@ fn backward_moe(
     let routed = cache.routed;
 
     if let (Some(shared), Some(shared_cache)) = (moe.shared.as_mut(), &cache.shared) {
-        // The routed path is FP32 throughout, so the norm above did not leave
-        // an operand copy for the shared expert's GEMMs; it is made here.
+        // The norm above a routed layer stays FP32, so it did not leave an
+        // operand copy for the shared expert's GEMMs; it is made here.
         let upstream = gpu.narrowed(&grad_output.slice(..), rows * d_model, input.is_narrow())?;
         backward_swiglu(
             gpu,
@@ -3590,12 +3592,14 @@ fn backward_moe(
                 .map_err(cuda_err("gate gradient kernel"))?;
         }
 
-        let mut grad_expert_output = gpu.uninit(routed * d_model)?;
+        let narrow = cache.input.is_narrow();
+        let mut grad_expert_output = gpu.act(routed * d_model, narrow)?;
         gpu.gather_scaled(
             &mut grad_expert_output,
-            grad_output,
+            &grad_output.slice(..),
             &cache.token_of,
             &cache.gates,
+            true,
             routed,
             d_model,
         )?;
@@ -3604,7 +3608,6 @@ fn backward_moe(
             NetworkError::Cuda("the routed feed-forward cache has no down projection".into())
         })?;
         let down_stride = d_model * width;
-        let grad_bytes = bytes_of(&grad_expert_output, routed * d_model);
         let mut grad_hidden = gpu.uninit(routed * width)?;
         for (expert, module) in moe.experts.iter_mut().enumerate() {
             let count = cache.counts[expert];
@@ -3612,14 +3615,14 @@ fn backward_moe(
                 continue;
             }
             let offset = cache.offsets[expert];
-            let upstream = grad_bytes.slice(offset * d_model * 4..);
+            let upstream = grad_expert_output.at(offset * d_model);
             let mut grad = grad_hidden.slice_mut(offset * width..);
             gpu.linear_packed_backward_input(
                 &down.at(expert * down_stride),
                 d_model,
                 width,
                 &upstream,
-                false,
+                narrow,
                 false,
                 &mut grad,
                 count,
@@ -3629,13 +3632,13 @@ fn backward_moe(
                 &mut module.down,
                 &upstream,
                 &cache.expert.hidden.at(offset * width),
-                false,
+                narrow,
                 count,
             )?;
         }
 
         let grad_gate_up =
-            gpu.swiglu_backward(&cache.expert.gate_up, &grad_hidden, routed, width, false)?;
+            gpu.swiglu_backward(&cache.expert.gate_up, &grad_hidden, routed, width, narrow)?;
 
         let packed_stride = 2 * width * d_model;
         let mut grad_expert_input = gpu.uninit(routed * d_model)?;
@@ -3654,7 +3657,7 @@ fn backward_moe(
                 2 * width,
                 d_model,
                 &upstream,
-                false,
+                narrow,
                 false,
                 &mut grad,
                 count,
@@ -3664,7 +3667,7 @@ fn backward_moe(
                 &mut [&mut module.gate, &mut module.up],
                 &upstream,
                 &rows_in,
-                false,
+                narrow,
                 count,
             )?;
         }

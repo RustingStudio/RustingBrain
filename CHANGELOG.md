@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Mixed-precision training runs the routed experts of a MoE layer in BF16, as
+  the dense feed-forward already did. The router, the expert outputs and the
+  scatter back into the residual stay FP32. About 4% more tokens per second
+  on the default model.
+
 ### Added
 
 - `Bpe::train_json`: trains a byte-level BPE tokenizer on a text corpus and
