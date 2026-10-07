@@ -9,6 +9,8 @@
   to fall back to the three-kernel path; a 4 x 1024 training step at that
   width runs 23% faster. `bench_train_step` takes the head width as an
   optional fourth argument.
+- `bench_decode` takes `cuda` as an optional third argument to time cached
+  decode of the default model on the GPU.
 - Mixed-precision training runs the routed experts of a MoE layer in BF16, as
   the dense feed-forward already did. The router, the expert outputs and the
   scatter back into the residual stay FP32. About 4% more tokens per second

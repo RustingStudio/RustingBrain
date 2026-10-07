@@ -808,3 +808,26 @@ four steps (77.5 ms of kernel time a step):
 
 Each GEMM is 4096 x 512 x 32000 (134 GFLOP). Rejected for speed: see
 roadmap A6.
+
+## Device decode before a device KV cache (C2 step 1, 2026-10-07)
+
+Idle GPU at `53ce3b1`, `bench_decode 512 128 cuda` (the default 55.2M model,
+FP32 weights on the device, host `KvCache`): 5.08, 5.16 and 5.53 ms/token,
+best 197 tokens/s. The host row on the small model measured 2346 tokens/s in
+the same session.
+
+nsys over the whole run (prefill plus 128 tokens), per decoded token:
+
+| Item | Per token |
+|---|---|
+| Kernel time | ~1.1 ms (LM-head GEMV 0.20 ms) |
+| Copy time | ~0.8 ms |
+| Host-to-device copies | ~194 |
+| Device-to-host copies | ~174 |
+| Kernel launches | ~245 |
+
+Kernels and copies explain under 2 ms of the 5.1 ms; the rest is the host
+waiting on each device-to-host copy (`cuMemcpyDtoHAsync` totals 270 ms) and
+per-op event, allocation and launch calls. Each layer runs attention on the
+host cache, so every linear layer round-trips its activations. This is what
+C2's device-resident cache removes.
