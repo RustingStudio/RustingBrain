@@ -27,6 +27,9 @@
 
 ### Added
 
+- `TransformerLm::save_gguf`: writes a LLaMA-layout model as a GGUF file in
+  F32 or Q8_0 for llama.cpp and Ollama, with query and key rows reordered for
+  llama.cpp's rotary convention.
 - `TransformerLm::generate_speculative`: greedy speculative decoding with a
   smaller draft model, one target pass per round of drafted ids, giving the
   same continuation as greedy `generate`. `KvCache::truncate` drops cached

@@ -31,8 +31,8 @@ pub struct Rope {
 /// Hugging Face `config.json`, so the value reads and writes there directly.
 ///
 /// NOTE: no YaRN or dynamic NTK yet. YaRN also rescales attention logits,
-/// and dynamic NTK changes the tables with the sequence length; add them when
-/// a checkpoint that needs one is in reach.
+/// and dynamic NTK changes the tables with the sequence length. The enum is
+/// exhaustive, so a new kind waits for the next major version.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "rope_type", rename_all = "lowercase")]
 pub enum RopeScaling {
@@ -50,7 +50,7 @@ pub enum RopeScaling {
 }
 
 impl RopeScaling {
-    fn apply(self, frequency: f32) -> f32 {
+    pub(crate) fn apply(self, frequency: f32) -> f32 {
         match self {
             Self::Linear { factor } => frequency / factor,
             Self::Llama3 {

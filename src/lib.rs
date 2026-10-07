@@ -115,6 +115,7 @@ pub mod ffn;
 pub mod flow_transformer;
 #[cfg(test)]
 mod fuzz;
+pub mod gguf;
 pub mod gltf;
 pub mod hf;
 pub mod interoceptive;

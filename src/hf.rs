@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Every parameter under its published name.
-fn named_params(model: &mut TransformerLm) -> Result<Vec<(String, &mut Param)>, NetworkError> {
+pub(crate) fn named_params(
+    model: &mut TransformerLm,
+) -> Result<Vec<(String, &mut Param)>, NetworkError> {
     let mut params = vec![(
         "model.embed_tokens.weight".to_string(),
         &mut model.embedding.weight,
@@ -78,12 +80,9 @@ fn refuse(reason: &str) -> NetworkError {
 }
 
 impl TransformerLm {
-    /// Writes `config.json` and an `F32` `model.safetensors` into `dir`, which
-    /// `transformers` reads as `LlamaForCausalLM`.
-    ///
-    /// A model on a device is read back from it first, so this is safe to
-    /// call in the middle of a run.
-    pub fn save_hf(&mut self, dir: impl AsRef<Path>) -> Result<(), NetworkError> {
+    /// Refuses what the LLaMA layout cannot express and reads a device model
+    /// back to the host.
+    pub(crate) fn prepare_llama_export(&mut self) -> Result<(), NetworkError> {
         if !self.config.causal {
             return Err(refuse("bidirectional attention"));
         }
@@ -95,6 +94,16 @@ impl TransformerLm {
         }
         #[cfg(feature = "cuda")]
         self.sync_from_device()?;
+        Ok(())
+    }
+
+    /// Writes `config.json` and an `F32` `model.safetensors` into `dir`, which
+    /// `transformers` reads as `LlamaForCausalLM`.
+    ///
+    /// A model on a device is read back from it first, so this is safe to
+    /// call in the middle of a run.
+    pub fn save_hf(&mut self, dir: impl AsRef<Path>) -> Result<(), NetworkError> {
+        self.prepare_llama_export()?;
 
         let config = &self.config;
         let json = serde_json::json!({
