@@ -1611,7 +1611,22 @@ impl Gpu<'_> {
             let mut slot = packed
                 .bytes
                 .slice_mut(base * element..(base + len) * element);
-            self.cast_into(&mut slot, &device.value().slice(..), len, narrow)?;
+            match device.int8() {
+                Some((bytes, scales)) => unsafe {
+                    self.context
+                        .stream
+                        .launch_builder(&self.context.model.dequantize_q8)
+                        .arg(bytes)
+                        .arg(scales)
+                        .arg(&mut slot)
+                        .arg(&(units as i32))
+                        .arg(&(inner as i32))
+                        .arg(&i32::from(narrow))
+                        .launch(cfg(len))
+                        .map_err(cuda_err("int8 dequantize kernel"))?;
+                },
+                None => self.cast_into(&mut slot, &device.value().slice(..), len, narrow)?,
+            }
             if let Some(lora) = &part.lora {
                 self.fold_lora(lora, &mut slot, units, inner, narrow)?;
             }

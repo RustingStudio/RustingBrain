@@ -1148,7 +1148,7 @@ impl TransformerLm {
     /// # }
     /// ```
     pub fn quantization_aware(&mut self, enabled: bool) -> Result<(), NetworkError> {
-        self.check_not_quantized("train quantization-aware")?;
+        self.check_full_precision("train quantization-aware")?;
         self.check_not_on_device("train quantization-aware")?;
         self.embedding.weight.set_fake_quantize(enabled);
         for block in &mut self.blocks {
@@ -1176,6 +1176,19 @@ impl TransformerLm {
         if self.is_quantized() {
             return Err(NetworkError::InvalidConfig(format!(
                 "this model was quantized for inference, so it cannot {action}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`TransformerLm::check_not_quantized`], and also no int8 LoRA base:
+    /// what needs the base weights in full precision.
+    fn check_full_precision(&self, action: &str) -> Result<(), NetworkError> {
+        self.check_not_quantized(action)?;
+        if self.has_int8_base() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "this model's LoRA base is int8, so it cannot {action}; save the adapter \
+                 with save_lora instead"
             )));
         }
         Ok(())
@@ -1267,7 +1280,7 @@ impl TransformerLm {
     /// [`add_lora`](TransformerLm::add_lora), it runs on the host: call
     /// [`to_cpu`](TransformerLm::to_cpu) first.
     pub fn merge_lora(&mut self) -> Result<(), NetworkError> {
-        self.check_not_quantized("merge a LoRA adapter")?;
+        self.check_full_precision("merge a LoRA adapter")?;
         self.check_not_on_device("merge a LoRA adapter")?;
         for block in &mut self.blocks {
             for linear in block.lora_linears_mut() {
@@ -1279,6 +1292,60 @@ impl TransformerLm {
         }
         self.config.lora = None;
         Ok(())
+    }
+
+    /// Stores every adapted projection's frozen base weight as int8 with one
+    /// scale per row, the [`Precision::Q8`] scheme, so fine-tuning holds the
+    /// base in a quarter of the memory: the QLoRA recipe, at int8.
+    ///
+    /// The adapters stay FP32 and train as before, against the rounded base.
+    /// On a device the base is uploaded as int8 and widened into each weight
+    /// pack as it is built. The embedding, the norms, the output head and a
+    /// MoE router keep full precision.
+    ///
+    /// One-way, like [`quantize`](TransformerLm::quantize): the model can then
+    /// train, generate and [`save_lora`](TransformerLm::save_lora), but not
+    /// `merge_lora` or `save_bin`. Load a full-precision base and the saved
+    /// adapter to merge. Call it on the host, after
+    /// [`add_lora`](TransformerLm::add_lora); returns the bytes the int8 bases
+    /// take.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{LoraConfig, TransformerLm};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut model = TransformerLm::load_hf("TinyLlama-1.1B", 2048)?;
+    /// model.add_lora(LoraConfig::new(16))?;
+    /// model.quantize_lora_base()?;
+    /// // `to_cuda` here, train_step as usual, then:
+    /// model.save_lora("adapter.rbl")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quantize_lora_base(&mut self) -> Result<usize, NetworkError> {
+        self.check_not_quantized("quantize its LoRA base")?;
+        self.check_not_on_device("quantize its LoRA base")?;
+        if !self.has_lora() {
+            return Err(NetworkError::InvalidConfig(
+                "quantize_lora_base needs a LoRA adapter; call add_lora first".into(),
+            ));
+        }
+        let mut bytes = 0;
+        for block in &mut self.blocks {
+            for linear in block.lora_linears_mut() {
+                bytes += linear.weight.quantize();
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Whether [`quantize_lora_base`](TransformerLm::quantize_lora_base) has
+    /// run.
+    pub fn has_int8_base(&self) -> bool {
+        // `quantize_lora_base` converts every adapted projection at once, and
+        // every block's query projection is one.
+        self.blocks
+            .iter()
+            .any(|block| block.attention.query.weight.quantized.is_some())
     }
 
     /// Whether [`add_lora`](TransformerLm::add_lora) is in effect.
@@ -2102,7 +2169,7 @@ impl TransformerLm {
     /// # }
     /// ```
     pub fn save_onnx<P: AsRef<Path>>(&self, path: P, seq_len: usize) -> Result<(), NetworkError> {
-        self.check_not_quantized("be exported to ONNX")?;
+        self.check_full_precision("be exported to ONNX")?;
         self.check_not_on_device("be exported to ONNX")?;
         if self.has_lora() {
             return Err(NetworkError::InvalidConfig(
@@ -2118,7 +2185,7 @@ impl TransformerLm {
         path: P,
         precision: Precision,
     ) -> Result<(), NetworkError> {
-        self.check_not_quantized("be saved")?;
+        self.check_full_precision("be saved")?;
         #[cfg(feature = "cuda")]
         self.sync_from_device()?;
         let header = serde_json::to_vec(&BinHeader {

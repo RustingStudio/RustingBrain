@@ -112,8 +112,8 @@ impl Quantized {
     ///
     /// The device path uploads BF16, so the one byte per weight this holds has
     /// to be widened somewhere; doing it here, once, keeps every device matmul
-    /// on cuBLAS instead of a hand-written dequantizing kernel.
-    #[cfg(feature = "cuda")]
+    /// on cuBLAS instead of a hand-written dequantizing kernel. The host
+    /// backward pass through an int8 LoRA base widens it here too.
     pub(crate) fn dequantize(&self) -> Matrix {
         let mut output = Matrix::new(self.rows, self.cols);
         for index in 0..self.rows {
@@ -141,6 +141,12 @@ impl Quantized {
 
     pub(crate) fn bytes(&self) -> usize {
         self.data.len() + self.scales.len() * 4
+    }
+
+    /// The int8 values, row-major, and one scale per row, for an upload.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn parts(&self) -> (&[i8], &[f32]) {
+        (&self.data, &self.scales)
     }
 }
 

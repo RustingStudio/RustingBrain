@@ -331,6 +331,9 @@ impl Param {
     /// frozen its gradient and both Adam moments.
     #[cfg(feature = "cuda")]
     fn device_bytes(&self) -> usize {
+        if let Some(quantized) = &self.quantized {
+            return quantized.bytes();
+        }
         let buffers = if self.frozen { 1 } else { 4 };
         self.value.data.len() * 4 * buffers
     }
@@ -360,7 +363,9 @@ impl Param {
 
     /// [`Param::to_cuda`] onto a device a caller already opened.
     pub fn to_cuda_on(&mut self, device: &CudaDevice) -> Result<(), crate::network::NetworkError> {
-        if self.quantized.is_some() {
+        // A frozen int8 weight - a LoRA base after `quantize_lora_base` -
+        // never trains, so the device can read it as int8 too.
+        if self.quantized.is_some() && !self.frozen {
             return Err(crate::network::NetworkError::UnsupportedCuda(
                 "a quantized parameter on a device: the device path trains in FP32 and the \
                  int8 weights cannot be recovered"
@@ -407,6 +412,15 @@ impl Param {
         context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
     ) -> Result<(), crate::network::NetworkError> {
         if self.device.is_none() {
+            if let Some(quantized) = &self.quantized {
+                self.device = Some(crate::gpu_transformer::DeviceParam::new_int8(
+                    context.clone(),
+                    quantized,
+                    self.value.rows,
+                    self.value.cols,
+                )?);
+                return Ok(());
+            }
             let mut device = crate::gpu_transformer::DeviceParam::new(
                 context.clone(),
                 &self.value,
@@ -771,8 +785,10 @@ impl Linear {
     /// The projection without its adapter, whichever of the three weight
     /// representations is live.
     fn base_forward(&self, input: &Matrix) -> Matrix {
+        // An int8 device weight falls through to the host's copy of the same
+        // bytes.
         #[cfg(feature = "cuda")]
-        if let Some(device) = &self.weight.device {
+        if let Some(device) = self.weight.device.as_ref().filter(|d| d.int8().is_none()) {
             return device.matmul_rhs_transposed(input);
         }
         if let Some(quantized) = &self.weight.quantized {
@@ -812,7 +828,7 @@ impl Linear {
     /// training runs in `gpu_model`, which never calls a `Linear` method.
     fn base_backward(&mut self, input: &Matrix, grad_output: &Matrix) -> Matrix {
         #[cfg(feature = "cuda")]
-        if let Some(device) = &mut self.weight.device {
+        if let Some(device) = self.weight.device.as_mut().filter(|d| d.int8().is_none()) {
             device.accumulate_grad(grad_output, input);
             return device.matmul(grad_output);
         }
@@ -820,7 +836,13 @@ impl Linear {
             grad_output.dot_self_transposed_accumulate(input, &mut self.weight.grad);
         }
         let mut grad_input = Matrix::new(grad_output.rows, self.in_features());
-        grad_output.dot(&self.weight.value, &mut grad_input);
+        // NOTE: an int8 base is widened on every backward call, one pass
+        // over the weight next to a GEMM over it. The host path is the parity
+        // reference; device training reads the int8 bytes directly.
+        match &self.weight.quantized {
+            Some(quantized) => grad_output.dot(&quantized.dequantize(), &mut grad_input),
+            None => grad_output.dot(&self.weight.value, &mut grad_input),
+        }
         grad_input
     }
 
