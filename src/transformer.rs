@@ -1113,6 +1113,38 @@ impl TransformerLm {
         bytes
     }
 
+    /// [`quantize`](TransformerLm::quantize) with every projection inside the
+    /// blocks at 4 bits a weight, on `codebook`, with one scale per 64
+    /// weights of a row. The embedding table and an untied output head stay
+    /// int8: they are a small share of the weights and the most sensitive to
+    /// rounding. Returns the bytes the quantized weights now occupy.
+    ///
+    /// Host only for now: a 4-bit model refuses `to_cuda`. The same one-way
+    /// rules as `quantize` apply.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::TransformerLm;
+    /// # use rusting_brain::quantized::Codebook;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut model = TransformerLm::load_bin("model.rbw")?;
+    /// let bytes = model.quantize_4bit(Codebook::Nf4);
+    /// println!("{} MiB of weights", bytes / (1024 * 1024));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quantize_4bit(&mut self, codebook: crate::quantized::Codebook) -> usize {
+        let mut bytes = self.embedding.weight.quantize();
+        for block in &mut self.blocks {
+            for linear in block.linears_mut() {
+                bytes += linear.weight.quantize_4bit(codebook);
+            }
+        }
+        if let Some(head) = &mut self.lm_head {
+            bytes += head.weight.quantize();
+        }
+        bytes
+    }
+
     /// Rounds every weight [`quantize`](TransformerLm::quantize) would round
     /// through the int8 grid in the forward pass, while the stored weights and
     /// the optimizer stay in full precision.
@@ -2956,6 +2988,42 @@ mod tests {
         // nonsense.
         assert!(model.train_step(&[[1u32, 2, 3]]).is_err());
         assert!(model.save_bin("/dev/null", Precision::F32).is_err());
+    }
+
+    /// A 4-bit model against a float model holding the same rounded weights:
+    /// the block projections on the 4-bit grid, the embedding and the
+    /// untied head on the int8 one. Only the storage differs, so the logits
+    /// agree to rounding.
+    #[test]
+    fn a_4bit_model_matches_a_float_model_on_the_same_grid_and_refuses_to_train() {
+        use crate::quantized::{Codebook, Quantized};
+        let base = tiny().tie_embeddings(false).build().unwrap();
+        let mut reference = base.clone();
+        let mut quantized = base;
+        assert!(quantized.quantize_4bit(Codebook::Nf4) > 0);
+        for block in &mut reference.blocks {
+            for linear in block.linears_mut() {
+                let value = &mut linear.weight.value;
+                *value = Quantized::from_matrix_4bit(value, Codebook::Nf4).dequantize();
+            }
+        }
+        for weight in [
+            &mut reference.embedding.weight,
+            &mut reference.lm_head.as_mut().unwrap().weight,
+        ] {
+            weight.value = Quantized::from_matrix(&weight.value).dequantize();
+        }
+        let ids: Vec<u32> = (0..12).map(|i| (i * 5 % 24) as u32).collect();
+        let mut expected = reference.decoder();
+        let mut actual = quantized.decoder();
+        expected.feed(&ids).unwrap();
+        actual.feed(&ids).unwrap();
+        let (expected, actual) = (expected.logits.unwrap(), actual.logits.unwrap());
+        for (got, want) in actual.data.iter().zip(&expected.data) {
+            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        }
+        assert!(quantized.train_step(&[[1u32, 2, 3]]).is_err());
+        assert!(quantized.save_bin("/dev/null", Precision::Q8).is_err());
     }
 
     fn tiny() -> TransformerBuilder {

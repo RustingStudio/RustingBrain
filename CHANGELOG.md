@@ -40,6 +40,12 @@
 
 ### Added
 
+- 4-bit host weights: `TransformerLm::quantize_4bit(Codebook::Nf4 | Int4)`
+  stores every block linear as two 4-bit codebook indices a byte with an
+  absmax scale per block of 64 (0.5625 bytes a weight), keeping the
+  embedding and an untied head at int8. `bench_decode` takes `nf4` as its
+  quantization argument. Host decode of a 100M-parameter shape runs about 17%
+  faster than int8.
 - `TransformerLm::quantize_lora_base`: holds a LoRA run's frozen base
   projections as int8 with a scale per row, on the host and the GPU, so
   fine-tuning keeps the base in a quarter of the memory at the same step

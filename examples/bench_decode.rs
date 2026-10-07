@@ -1,11 +1,13 @@
 //! Times cached single-token decode, the inference hot loop.
 //!
-//! `cargo run --release --example bench_decode -- <prompt_len> <new_tokens> [cuda|cpu] [sequences] [int8]`
+//! `cargo run --release --example bench_decode -- <prompt_len> <new_tokens> [cuda|cpu] [sequences] [int8|nf4]`
 //!
 //! The host run uses a small model; `cuda` decodes the default model on the
 //! device instead. `sequences` decodes that many in step, and tokens/s counts
 //! the tokens of all of them. `int8` turns on
-//! [`TransformerLm::set_int8_decode`] for the device run.
+//! [`TransformerLm::set_int8_decode`] for the device run and
+//! [`TransformerLm::quantize`] for the host run; `nf4` is
+//! [`TransformerLm::quantize_4bit`] on the host.
 
 use rusting_brain::TransformerLm;
 use std::time::Instant;
@@ -41,7 +43,15 @@ fn main() {
             .moe_layers([])
     };
     let mut model = builder.build().unwrap();
-    model.set_int8_decode(std::env::args().nth(5).is_some_and(|a| a == "int8"));
+    let weights = std::env::args().nth(5).unwrap_or_default();
+    model.set_int8_decode(weights == "int8");
+    if !device {
+        match weights.as_str() {
+            "int8" => _ = model.quantize(),
+            "nf4" => _ = model.quantize_4bit(rusting_brain::quantized::Codebook::Nf4),
+            _ => {}
+        }
+    }
     if device {
         #[cfg(feature = "cuda")]
         model.to_cuda(0, 16384).unwrap();

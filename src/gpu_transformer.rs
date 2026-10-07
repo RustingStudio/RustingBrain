@@ -521,7 +521,11 @@ impl DeviceParam {
         rows: usize,
         cols: usize,
     ) -> Result<Self, NetworkError> {
-        let (bytes, scales) = weight.parts();
+        let Some((bytes, scales)) = weight.parts() else {
+            return Err(NetworkError::InvalidConfig(
+                "a 4-bit weight on a device: only int8 weights have a device path".into(),
+            ));
+        };
         let bytes = context
             .stream
             .clone_htod(bytes)

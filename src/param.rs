@@ -267,6 +267,19 @@ impl Param {
                 .map_or(0, crate::quantized::Quantized::bytes);
         }
         let quantized = crate::quantized::Quantized::from_matrix(&self.value);
+        self.store_quantized(quantized)
+    }
+
+    /// [`Param::quantize`] at 4 bits a weight, on `codebook`.
+    pub(crate) fn quantize_4bit(&mut self, codebook: crate::quantized::Codebook) -> usize {
+        if let Some(quantized) = &self.quantized {
+            return quantized.bytes();
+        }
+        let quantized = crate::quantized::Quantized::from_matrix_4bit(&self.value, codebook);
+        self.store_quantized(quantized)
+    }
+
+    fn store_quantized(&mut self, quantized: crate::quantized::Quantized) -> usize {
         let bytes = quantized.bytes();
         self.quantized = Some(quantized);
         self.value.data = Vec::new();
