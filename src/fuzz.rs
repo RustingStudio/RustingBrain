@@ -223,3 +223,14 @@ fn weight_file_survives_corruption() {
         let _ = Ema::load(file("ema", bytes));
     });
 }
+
+#[test]
+fn webdataset_survives_corruption() {
+    survives("tar", &crate::webdataset::tests::shard(), |bytes| {
+        for sample in crate::webdataset::WebDataset::new(bytes) {
+            if sample.is_err() {
+                break;
+            }
+        }
+    });
+}

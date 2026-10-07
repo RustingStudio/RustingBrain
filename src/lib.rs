@@ -147,6 +147,7 @@ pub mod unet;
 pub mod vae;
 pub mod vision;
 pub mod vit_encoder;
+pub mod webdataset;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_flash;
