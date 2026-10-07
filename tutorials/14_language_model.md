@@ -69,22 +69,21 @@ things fall back to pieces. Fixed vocabulary, nothing is unrepresentable.
 "fn main() {"  →  [1023, 887, 12, 13, 45]
 ```
 
-RustingBrain does not ship a tokenizer. That is a deliberate boundary: a
-tokenizer is a text-processing problem, not a neural-network one, and the
-[`tokenizers`](https://crates.io/crates/tokenizers) crate already does it
-properly with the Hugging Face format.
-
-```bash
-cargo add tokenizers
-```
+RustingBrain reads the Hugging Face `tokenizer.json` format, which is how
+GPT-2, LLaMA, Mistral, Qwen and most other published models ship their
+vocabulary. `Bpe` covers byte-pair files and `Unigram` covers the T5 kind:
 
 ```rust
-use tokenizers::Tokenizer;
+use rusting_brain::Bpe;
 
-let tokenizer = Tokenizer::from_file("tokenizer.json")?;
-let ids: Vec<u32> = tokenizer.encode("fn main() {", false)?.get_ids().to_vec();
-let text = tokenizer.decode(&ids, true)?;
+let tokenizer = Bpe::from_file("tokenizer.json")?;
+let ids: Vec<u32> = tokenizer.encode("fn main() {")?;
+let text = tokenizer.decode(&ids);
 ```
+
+It does not train a vocabulary. To make one for your own corpus, train it with
+the [`tokenizers`](https://crates.io/crates/tokenizers) library (Rust or
+Python) and load the `tokenizer.json` it writes.
 
 For this chapter's code we will use a character-level tokenizer built in
 fifteen lines, so the example runs with no extra dependency and you can read
@@ -519,8 +518,8 @@ can store, the same three settings are three visibly different paragraphs.
    whole prefix through `forward_train` each step.
 4. Set `tie_embeddings(false)` and compare `parameter_counts()` and the loss
    after 200 steps. Was the saving worth it?
-5. Replace the character tokenizer with a real BPE one from the `tokenizers`
-   crate. Note how many fewer tokens the same text becomes.
+5. Replace the character tokenizer with `Bpe::from_file` on a published
+   `tokenizer.json`. Note how many fewer tokens the same text becomes.
 6. Raise `SEQ_LEN` from 64 to 128 and retrain. Confirm the coherent stretch of
    generated text grows with it, and explain why.
 
@@ -532,7 +531,8 @@ can store, the same three settings are three visibly different paragraphs.
   Every position is a training example, which is why text labels itself.
 - The causal mask is what keeps it a prediction rather than a lookup.
 - Subword (BPE) tokenization is the practical middle between characters and
-  words. RustingBrain leaves it to the `tokenizers` crate.
+  words. `Bpe` reads a published vocabulary; training one is left to the
+  `tokenizers` library.
 - `d_model` and `n_layers` are the capacity dials; `d_ff` holds most of the
   parameters; `max_seq_len` is baked into the checkpoint.
 - Grouped-query attention exists to shrink the KV cache, which is the dominant

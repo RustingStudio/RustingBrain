@@ -153,9 +153,8 @@ impl TokenFile {
     /// produced, so the corpus never has to fit in memory. Returns how many
     /// tokens were written.
     ///
-    /// Tokenization is the caller's: the crate ships no tokenizer, and
-    /// `tokenize` is where a `tokenizers` BPE vocabulary or a byte-level
-    /// mapping goes.
+    /// Tokenization is the caller's: `tokenize` is where a [`Bpe`](crate::Bpe)
+    /// vocabulary or a byte-level mapping goes.
     ///
     /// ```no_run
     /// # use rusting_brain::TokenFile;
@@ -336,9 +335,8 @@ impl TokenFile {
 /// on disk is the only copy and training can start immediately.
 ///
 /// Tokenization is the caller's, as it is for
-/// [`write_jsonl`](TokenFile::write_jsonl): the crate ships no tokenizer, and
-/// `tokenize` is where a `tokenizers` BPE vocabulary or a byte-level mapping
-/// goes.
+/// [`write_jsonl`](TokenFile::write_jsonl): `tokenize` is where a
+/// [`Bpe`](crate::Bpe) vocabulary or a byte-level mapping goes.
 ///
 /// ```no_run
 /// # use rusting_brain::TokenStream;
