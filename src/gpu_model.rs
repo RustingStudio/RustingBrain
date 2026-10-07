@@ -1535,17 +1535,38 @@ impl Gpu<'_> {
         rows: usize,
         beta: f32,
     ) -> Result<(), NetworkError> {
+        self.project_at(weights, 0, units, inner, x, narrow, out, rows, beta)
+    }
+
+    /// [`Gpu::project`] on the `units` weight rows from `first` on, one
+    /// expert of a packed set.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn project_at(
+        &self,
+        weights: &Act,
+        first: usize,
+        units: usize,
+        inner: usize,
+        x: &CudaView<'_, u8>,
+        narrow: bool,
+        out: &mut CudaViewMut<'_, f32>,
+        rows: usize,
+        beta: f32,
+    ) -> Result<(), NetworkError> {
         let Some(scales) = &weights.scales else {
-            return self.linear_packed(&weights.all(), units, inner, x, narrow, out, rows, beta);
+            let rows_of = weights.at(first * inner);
+            return self.linear_packed(&rows_of, units, inner, x, narrow, out, rows, beta);
         };
+        let bytes = weights.bytes.slice(first * inner..);
+        let scales = scales.slice(first..);
         if rows > Q8_GEMV_ROWS || inner % 16 != 0 {
             let mut wide = self.act(units * inner, narrow)?;
             unsafe {
                 self.context
                     .stream
                     .launch_builder(&self.context.model.dequantize_q8)
-                    .arg(&weights.bytes)
-                    .arg(scales)
+                    .arg(&bytes)
+                    .arg(&scales)
                     .arg(&mut wide.bytes)
                     .arg(&(units as i32))
                     .arg(&(inner as i32))
@@ -1559,8 +1580,8 @@ impl Gpu<'_> {
             self.context
                 .stream
                 .launch_builder(&self.context.model.gemv_q8)
-                .arg(&weights.bytes)
-                .arg(scales)
+                .arg(&bytes)
+                .arg(&scales)
                 .arg(x)
                 .arg(&i32::from(narrow))
                 .arg(out)
@@ -1657,7 +1678,7 @@ impl Gpu<'_> {
             parts.push(&ffn.gate);
             parts.push(&ffn.up);
         }
-        self.pack(&parts, narrow)
+        self.decode_pack(&parts, narrow)
     }
 
     /// The down projections of the given feed-forwards, one after another.
@@ -1671,7 +1692,7 @@ impl Gpu<'_> {
         narrow: bool,
     ) -> Result<Arc<Act>, NetworkError> {
         let parts: Vec<&Linear> = ffns.map(|ffn| &ffn.down).collect();
-        self.pack(&parts, narrow)
+        self.decode_pack(&parts, narrow)
     }
 
     /// `out = x . weight^T + beta * out` for a weight that is a plain buffer
@@ -2676,15 +2697,15 @@ fn forward_moe(
     let width = moe.config.d_ff;
 
     let narrow = input.is_narrow();
-    let router = gpu.pack(&[&moe.router.projection], narrow)?;
+    let router = gpu.decode_pack(&[&moe.router.projection], narrow)?;
     let mut logits = gpu.uninit(rows * experts)?;
-    gpu.linear_packed(
-        &router.all(),
+    gpu.project(
+        &router,
         experts,
         d_model,
         &input.all(),
         narrow,
-        &mut logits,
+        &mut logits.slice_mut(..),
         rows,
         0.0,
     )?;
@@ -2780,7 +2801,6 @@ fn forward_moe(
     }
 
     let expert_weights = gpu.pack_gate_up(moe.experts.iter(), narrow)?;
-    let packed_stride = 2 * width * d_model;
     let mut gate_up = gpu.uninit(routed * 2 * width)?;
     for (expert, _) in moe.experts.iter().enumerate() {
         let count = counts[expert];
@@ -2788,10 +2808,10 @@ fn forward_moe(
             continue;
         }
         let rows_in = gathered.at(offsets[expert] * d_model);
-        let weights = expert_weights.at(expert * packed_stride);
         let mut out = gate_up.slice_mut(offsets[expert] * 2 * width..);
-        gpu.linear_packed(
-            &weights,
+        gpu.project_at(
+            &expert_weights,
+            expert * 2 * width,
             2 * width,
             d_model,
             &rows_in,
@@ -2804,7 +2824,6 @@ fn forward_moe(
     let hidden = gpu.swiglu(&gate_up, routed, width, narrow)?;
 
     let down_weights = gpu.pack_down(moe.experts.iter(), narrow)?;
-    let down_stride = d_model * width;
     let mut expert_output = gpu.uninit(routed * d_model)?;
     for (expert, _) in moe.experts.iter().enumerate() {
         let count = counts[expert];
@@ -2813,8 +2832,9 @@ fn forward_moe(
         }
         let rows_in = hidden.at(offsets[expert] * width);
         let mut rows_out = expert_output.slice_mut(offsets[expert] * d_model..);
-        gpu.linear_packed(
-            &down_weights.at(expert * down_stride),
+        gpu.project_at(
+            &down_weights,
+            expert * d_model,
             d_model,
             width,
             &rows_in,

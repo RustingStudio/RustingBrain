@@ -1949,12 +1949,11 @@ impl TransformerLm {
         self.checkpoint = checkpoint_flags(blocks);
     }
 
-    /// Makes decoders of a model on a device read the attention projections,
-    /// the dense and shared-expert feed-forwards and the output head as int8,
-    /// one byte per weight and a scale per row (the scheme of
+    /// Makes decoders of a model on a device read every block projection
+    /// (attention, feed-forwards, routers and experts) and the output head as
+    /// int8, one byte per weight and a scale per row (the scheme of
     /// [`TransformerLm::quantize`]), instead of FP32 or, under mixed
-    /// precision, BF16. Routed experts and the router keep their precision.
-    /// Takes effect for decoders made afterwards.
+    /// precision, BF16. Takes effect for decoders made afterwards.
     ///
     /// A device decode step reads every weight once, so it is bound by memory
     /// bandwidth. The stored weights are untouched: training, saving and
@@ -1962,8 +1961,8 @@ impl TransformerLm {
     /// live as long as a decoder and come on top of the model's own weights.
     /// Host decoders ignore it; [`TransformerLm::quantize`] is the host route.
     ///
-    /// On the default model this is about 10% more tokens per second for one
-    /// sequence and about 13% fewer for a batch of 16, where the int8 kernel
+    /// On the default model this is about 19% more tokens per second for one
+    /// sequence and about 12% fewer for a batch of 16, where the int8 kernel
     /// does not yet beat cuBLAS on BF16 weights.
     pub fn set_int8_decode(&mut self, int8: bool) {
         self.int8_decode = int8;
@@ -2952,7 +2951,6 @@ mod tests {
     /// went through [`Param::quantize`], the same rounding. The 20-token prompt
     /// takes the dequantize-and-cuBLAS route, single tokens the int8 GEMV and
     /// the six-token turn its multi-pass loop over input rows.
-    /// Dense, because routed experts stay in full precision on the device.
     #[cfg(feature = "cuda")]
     #[test]
     fn an_int8_device_decoder_matches_a_quantized_host_or_skips_without_device() {
@@ -2969,7 +2967,6 @@ mod tests {
         // BF16 decode of this model, int8 or not, lands within about 1.3e-2.
         for (mixed, tolerance) in [(false, 1e-3), (true, 3e-2)] {
             let base = tiny()
-                .moe_layers([])
                 .tie_embeddings(false)
                 .mixed_precision(mixed)
                 .build()
