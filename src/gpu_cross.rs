@@ -80,9 +80,9 @@ pub(crate) struct CrossCache {
     /// Key and value in one buffer, two slices of every row, because they read
     /// the same input and are one GEMM against their weights packed together.
     kv: Act,
-    query_weight: Act,
-    kv_weights: Act,
-    output_weight: Act,
+    query_weight: std::sync::Arc<Act>,
+    kv_weights: std::sync::Arc<Act>,
+    output_weight: std::sync::Arc<Act>,
     merged: Act,
     log_sum_exp: CudaSlice<f32>,
     shape: CrossShape,

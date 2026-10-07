@@ -71,6 +71,9 @@ pub struct GpuContext {
     pub(crate) flash: Option<crate::cuda_flash::FlashKernels>,
     /// RoPE tables, uploaded on first use and shared by every layer.
     pub(crate) rope: Mutex<Option<Arc<crate::gpu_model::DeviceRope>>>,
+    /// Packed weights a [`Decoder`](crate::transformer::Decoder) lent for the
+    /// call in progress, see [`crate::gpu_model::DeviceKv`].
+    pub(crate) packs: Mutex<Option<crate::gpu_model::PackMemo>>,
     /// First CUDA failure seen by an infallible operation.
     poison: Mutex<Option<String>>,
 }
@@ -153,6 +156,7 @@ impl GpuContext {
             model: crate::gpu_model::ModelKernels::load(&module)?,
             flash: crate::cuda_flash::flash_kernels(device, &context),
             rope: Mutex::new(None),
+            packs: Mutex::new(None),
             poison: Mutex::new(None),
         }))
     }

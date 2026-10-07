@@ -294,13 +294,13 @@ struct BlockCache {
     qkv: Act,
     /// Those three weights packed, which the input gradient reads again in the
     /// backward pass.
-    qkv_weights: Act,
+    qkv_weights: Arc<Act>,
     /// The per-query log-sum-exp of the attention scores, which is all the
     /// backward pass needs of a probability matrix that never existed.
     log_sum_exp: CudaSlice<f32>,
     merged: Act,
     /// The attention output projection, narrowed to match `merged`.
-    output_weight: Act,
+    output_weight: Arc<Act>,
     residual: CudaSlice<f32>,
     feed_forward_weight: CudaSlice<f32>,
     feed_forward_inverse_rms: CudaSlice<f32>,
@@ -316,11 +316,11 @@ pub(crate) struct SwiGluCache {
     pub(crate) hidden: Act,
     /// The gate and up weights concatenated, which the input gradient reads
     /// again in the backward pass.
-    pub(crate) weights: Act,
+    pub(crate) weights: Arc<Act>,
     /// The down projection, narrowed to match `hidden`. A routed layer has one
     /// per expert and keeps them in the parameters instead, so this is `None`
     /// there.
-    pub(crate) down: Option<Act>,
+    pub(crate) down: Option<Arc<Act>>,
 }
 
 /// The normed activations, the inverse RMS of each row that the backward pass
@@ -1409,7 +1409,36 @@ impl Gpu<'_> {
     /// of the single wide projection that replaces them. cuBLAS is close to
     /// twice as fast on one wide shape as on two narrow ones, and the packing
     /// itself is a device-to-device copy of weight-sized buffers.
-    pub(crate) fn pack(&self, parts: &[&Linear], narrow: bool) -> Result<Act, NetworkError> {
+    /// `parts`' weights end to end in one buffer, narrowed if `narrow`.
+    ///
+    /// Packed afresh on every call, which is what a training step wants: the
+    /// optimizer moves the weights between two of them. A decoder lends a
+    /// [`PackMemo`] instead, because its model is borrowed and cannot change.
+    pub(crate) fn pack(&self, parts: &[&Linear], narrow: bool) -> Result<Arc<Act>, NetworkError> {
+        // The first weight's address names the pack: no two packs a model
+        // asks for start at the same weight with the same length.
+        let first = parts
+            .first()
+            .map_or(0, |part| std::ptr::from_ref(*part) as usize);
+        let key = (first, parts.len(), narrow);
+        let mut memo = self
+            .context
+            .packs
+            .lock()
+            .map_err(|_| NetworkError::Cuda("the pack memo lock was poisoned".into()))?;
+        if let Some(memo) = memo.as_mut() {
+            if let Some(packed) = memo.get(&key) {
+                return Ok(packed.clone());
+            }
+            let packed = Arc::new(self.pack_fresh(parts, narrow)?);
+            memo.insert(key, packed.clone());
+            return Ok(packed);
+        }
+        drop(memo);
+        Ok(Arc::new(self.pack_fresh(parts, narrow)?))
+    }
+
+    fn pack_fresh(&self, parts: &[&Linear], narrow: bool) -> Result<Act, NetworkError> {
         let element = Act::element(narrow);
         let mut total = 0;
         for part in parts {
@@ -1486,7 +1515,7 @@ impl Gpu<'_> {
         &self,
         ffns: impl Iterator<Item = &'a SwiGlu>,
         narrow: bool,
-    ) -> Result<Act, NetworkError> {
+    ) -> Result<Arc<Act>, NetworkError> {
         let mut parts = Vec::new();
         for ffn in ffns {
             parts.push(&ffn.gate);
@@ -1504,7 +1533,7 @@ impl Gpu<'_> {
         &self,
         ffns: impl Iterator<Item = &'a SwiGlu>,
         narrow: bool,
-    ) -> Result<Act, NetworkError> {
+    ) -> Result<Arc<Act>, NetworkError> {
         let parts: Vec<&Linear> = ffns.map(|ffn| &ffn.down).collect();
         self.pack(&parts, narrow)
     }
@@ -3019,7 +3048,14 @@ fn head_chunk_rows(rows: usize, vocab: usize, logit_bytes: usize) -> usize {
 pub(crate) struct DeviceKv {
     layers: Vec<CudaSlice<f32>>,
     length: usize,
+    /// Every weight pack the decode has asked for. The model is borrowed for
+    /// the decoder's life, so a pack never goes stale, and repacking on every
+    /// token was half of a decode step's kernel time.
+    packs: PackMemo,
 }
+
+/// Packed weights by first weight's address, part count and precision.
+pub(crate) type PackMemo = std::collections::HashMap<(usize, usize, bool), Arc<Act>>;
 
 impl DeviceKv {
     pub(crate) fn new(
@@ -3038,7 +3074,11 @@ impl DeviceKv {
                 gpu.uninit(positions * width)
             })
             .collect::<Result<_, _>>()?;
-        Ok(Self { layers, length: 0 })
+        Ok(Self {
+            layers,
+            length: 0,
+            packs: PackMemo::new(),
+        })
     }
 
     /// Number of cached positions, the absolute position of the next token.
@@ -3085,9 +3125,31 @@ pub(crate) fn decode(
     )?;
 
     let valid = gpu.upload_flags(&vec![1; rows])?;
-    for (block, cache) in model.blocks.iter().zip(&mut kv.layers) {
-        hidden = decode_block(&gpu, block, hidden, cache, kv.length, rows, &valid)?;
-    }
+    let lend = |memo: &mut PackMemo, into_context: bool| -> Result<(), NetworkError> {
+        let mut slot = context
+            .packs
+            .lock()
+            .map_err(|_| NetworkError::Cuda("the pack memo lock was poisoned".into()))?;
+        if into_context {
+            *slot = Some(std::mem::take(memo));
+        } else {
+            *memo = slot.take().unwrap_or_default();
+        }
+        Ok(())
+    };
+    // NOTE: one memo slot per context, so two decoders of one model
+    // running at once swap memos and repack; both packs are still correct,
+    // since a borrowed model's weights cannot move. Key the slot by decoder if
+    // concurrent sessions ever matter.
+    lend(&mut kv.packs, true)?;
+    let blocks = (|| {
+        for (block, cache) in model.blocks.iter().zip(&mut kv.layers) {
+            hidden = decode_block(&gpu, block, hidden, cache, kv.length, rows, &valid)?;
+        }
+        Ok::<_, NetworkError>(hidden)
+    })();
+    lend(&mut kv.packs, false)?;
+    let hidden = blocks?;
     kv.length += rows;
 
     let final_weight = gpu.upload(&model.final_norm.weight.value.data)?;
@@ -3142,8 +3204,8 @@ fn decode_block(
     )?;
     let mut residual = residual.expect("a norm asked for a duplicate returns one");
 
-    // NOTE: the weights are packed again on every call, as the training
-    // forward does; keep the packs in `DeviceKv` if a profile shows the copies.
+    // `decode` has lent the context its `PackMemo`, so after the first token
+    // every `pack` here and in the feed forward is a lookup.
     let qkv_weights = gpu.pack(
         &[&attention.query, &attention.key, &attention.value],
         narrow,
