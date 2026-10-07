@@ -667,3 +667,8 @@ that spread.
 
 Both D1 and D2 are rejected. Each touches only `[tokens, experts]`, which
 is about 1,000 times smaller than the expert GEMMs.
+
+## Loss-spike guard (B7, 2026-10-07)
+
+No measurement: `SpikeGuard` is a scalar check per step on the host, off the
+GPU path, and adds no work to the training step itself.

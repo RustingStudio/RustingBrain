@@ -251,7 +251,7 @@ pub use network::{
     TrainingBackend, TrainingHistory,
 };
 pub use norm::RmsNorm;
-pub use optimizers::{Optimizer, Schedule};
+pub use optimizers::{Optimizer, Schedule, SpikeGuard};
 pub use param::{CudaDevice, Linear, Lora, Param};
 pub use pipeline::{
     DynamicShift, ImageDenoiser, ImagePipeline, PipelineConfig, PooledEncoder, PromptEncoder,
