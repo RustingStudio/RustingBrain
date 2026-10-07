@@ -502,6 +502,23 @@ impl TransformerCache {
         self.auxiliary_loss
     }
 
+    /// The share of routed token slots each expert received, one vector per
+    /// MoE layer in block order; each sums to one. Empty for a dense model.
+    ///
+    /// The benchmark's random tokens route almost evenly, real text need not:
+    /// an expert well above `1 / num_experts` is the one every MoE cost
+    /// estimate is waiting on.
+    pub fn expert_loads(&self) -> Vec<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            return device.expert_loads();
+        }
+        self.blocks
+            .iter()
+            .filter_map(TransformerBlockCache::expert_loads)
+            .collect()
+    }
+
     /// The batch this cache was produced from, which the loss needs in order
     /// to find the sequence boundaries.
     pub fn batch(&self) -> &TokenBatch {
@@ -2543,6 +2560,30 @@ mod tests {
             .shared_expert(true)
             .max_seq_len(32)
             .seed(1234)
+    }
+
+    #[test]
+    fn expert_loads_report_each_moe_layer_and_sum_to_one() {
+        let batch = TokenBatch::new(&[vec![3u32, 8, 1, 5, 2], vec![9, 4, 0]]).unwrap();
+        let (_, cache) = tiny().build().unwrap().forward_batch(&batch).unwrap();
+        let loads = cache.expert_loads();
+        assert_eq!(loads.len(), 2);
+        for layer in &loads {
+            assert_eq!(layer.len(), 4);
+            assert!((layer.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+            // Eight real tokens, two slots each: every share is a multiple of 1/16.
+            assert!(layer.iter().all(|share| (share * 16.0).fract() == 0.0));
+        }
+
+        let dense = tiny().moe_layers([]).build().unwrap();
+        assert!(
+            dense
+                .forward_batch(&batch)
+                .unwrap()
+                .1
+                .expert_loads()
+                .is_empty()
+        );
     }
 
     #[test]

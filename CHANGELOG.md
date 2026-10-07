@@ -14,6 +14,9 @@
 
 ### Added
 
+- `TransformerCache::expert_loads`: each MoE layer's share of routed tokens
+  per expert, from a forward pass on the host or the GPU, for checking that
+  routing on real data stays balanced.
 - `VaeDecoder::decode_tiled`: decodes a latent in overlapping tiles blended
   with linear ramps, so images too large to decode at once fit in memory.
 - `SpikeGuard`: flags a training loss that is not finite or jumps above a
