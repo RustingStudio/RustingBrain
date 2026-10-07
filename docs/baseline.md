@@ -990,3 +990,33 @@ run, 653 tokens/s, was cold):
 |---|---|---|
 | `b014141` | 1.11-1.12 ms, 893-898 tokens/s | 2.25-2.27 ms, 7035-7100 tokens/s |
 | BF16 output | 1.07-1.09 ms, 919-931 tokens/s | 2.25-2.26 ms, 7089-7123 tokens/s |
+
+## Int8 device decode (C5 slice 1, 2026-10-07)
+
+Profile at `0f20131` before the change: BF16 weight GEMVs 31.9% and the BF16
+head 12.2% of a batch-1 decode step's kernel time, the bandwidth-bound part
+int8 halves. `bench_decode 512 128 cuda <sequences> [int8]`, three rounds
+interleaved, started once the GPU was idle (gnome-clocks only) and the CPU
+load average under 2; `forever_bear` reached the GPU near the end of the
+third round, whose numbers match the first two.
+
+| Build | 1 sequence | 16 sequences |
+|---|---|---|
+| `0f20131` | 891-909 tokens/s | 6985-7034 tokens/s |
+| new, int8 off | 904-910 tokens/s | 7049-7071 tokens/s |
+| new, int8 on | 998-1006 tokens/s | 6081-6105 tokens/s |
+
+(One `0f20131` batch-1 run read 717 tokens/s, a cold outlier.)
+
+`nsys` kernel sums over the 129 decode calls, idle GPU:
+
+| Run | `gemv_q8` | Other |
+|---|---|---|
+| int8, 1 sequence | 4225 calls, 5.2 us avg, 28.5% | BF16 expert GEMVs 3.8 us avg, 19.2%; `decode_attention` 18.3% |
+| int8, 16 sequences | 4225 calls, 21.8 us avg, 92 ms | `decode_attention` 99 ms |
+| BF16, 16 sequences | - | cuBLAS BF16 GEMV kernels about 78 ms; `decode_attention` 107 ms |
+
+At 16 rows the int8 kernel re-reads each weight four times (four rows a
+pass) and spends most of its time on per-row warp reductions and input
+loads, so it loses to cuBLAS.
+

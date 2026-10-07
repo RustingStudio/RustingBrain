@@ -74,6 +74,9 @@ pub struct GpuContext {
     /// Packed weights a [`Decoder`](crate::transformer::Decoder) lent for the
     /// call in progress, see [`crate::gpu_model::DeviceKv`].
     pub(crate) packs: Mutex<Option<crate::gpu_model::PackMemo>>,
+    /// Set while a decoder in int8 mode lends its memo: its projections are
+    /// packed as int8, see [`crate::gpu_model::Gpu::decode_pack`].
+    pub(crate) int8_decode: std::sync::atomic::AtomicBool,
     /// First CUDA failure seen by an infallible operation.
     poison: Mutex<Option<String>>,
 }
@@ -157,6 +160,7 @@ impl GpuContext {
             flash: crate::cuda_flash::flash_kernels(device, &context),
             rope: Mutex::new(None),
             packs: Mutex::new(None),
+            int8_decode: std::sync::atomic::AtomicBool::new(false),
             poison: Mutex::new(None),
         }))
     }

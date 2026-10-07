@@ -33,6 +33,11 @@
 
 ### Added
 
+- `TransformerLm::set_int8_decode` makes device decoders read the attention,
+  dense and shared-expert feed-forward and output-head weights as int8 with a
+  scale per row: about 10% more tokens per second for one sequence on the
+  default model, 13% fewer for 16. `bench_decode` takes `int8` as a fifth
+  argument.
 - `TransformerBuilder::checkpoint` and `TransformerLm::set_checkpoint` pick
   blocks whose activations are recomputed in the backward pass on the device
   instead of kept. With every block checkpointed, a 16 x 512 step on the

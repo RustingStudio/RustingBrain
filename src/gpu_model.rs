@@ -43,6 +43,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Every fused kernel, resolved once per device.
 pub(crate) struct ModelKernels {
@@ -54,6 +55,9 @@ pub(crate) struct ModelKernels {
     softmax_lse_rows: CudaFunction,
     decode_attention: CudaFunction,
     decode_attention_merge: CudaFunction,
+    quantize_q8: CudaFunction,
+    dequantize_q8: CudaFunction,
+    gemv_q8: CudaFunction,
     swiglu_forward: CudaFunction,
     swiglu_backward: CudaFunction,
     adaln_modulate: CudaFunction,
@@ -97,6 +101,9 @@ impl ModelKernels {
             softmax_lse_rows: get("attention_softmax_lse")?,
             decode_attention: get("decode_attention")?,
             decode_attention_merge: get("decode_attention_merge")?,
+            quantize_q8: get("quantize_rows_q8")?,
+            dequantize_q8: get("dequantize_q8")?,
+            gemv_q8: get("gemv_q8")?,
             swiglu_forward: get("swiglu_fwd")?,
             swiglu_backward: get("swiglu_bwd")?,
             adaln_modulate: get("adaln_modulate")?,
@@ -242,6 +249,9 @@ pub(crate) struct Act {
     bytes: CudaSlice<u8>,
     narrow: bool,
     len: usize,
+    /// Set on an int8 weight from [`Gpu::decode_pack`]: `bytes` then holds one
+    /// `i8` per weight and this one scale per row.
+    scales: Option<CudaSlice<f32>>,
 }
 
 impl Act {
@@ -406,7 +416,12 @@ impl Gpu<'_> {
             "device allocation",
             len.max(1) * Act::element(narrow),
         ))?;
-        Ok(Act { bytes, narrow, len })
+        Ok(Act {
+            bytes,
+            narrow,
+            len,
+            scales: None,
+        })
     }
 
     /// `dst[..n] = src[..n]`, narrowed on the way if `narrow`.
@@ -1423,12 +1438,33 @@ impl Gpu<'_> {
     /// optimizer moves the weights between two of them. A decoder lends a
     /// [`PackMemo`] instead, because its model is borrowed and cannot change.
     pub(crate) fn pack(&self, parts: &[&Linear], narrow: bool) -> Result<Arc<Act>, NetworkError> {
+        self.memo_pack(parts, narrow, false)
+    }
+
+    fn memo_pack(
+        &self,
+        parts: &[&Linear],
+        narrow: bool,
+        int8: bool,
+    ) -> Result<Arc<Act>, NetworkError> {
         // The first weight's address names the pack: no two packs a model
-        // asks for start at the same weight with the same length.
+        // asks for start at the same weight with the same length. An int8 pack
+        // takes the slot of the FP32 one: a memo belongs to one decoder, and a
+        // decoder in int8 mode never asks for FP32.
         let first = parts
             .first()
             .map_or(0, |part| std::ptr::from_ref(*part) as usize);
-        let key = (first, parts.len(), narrow);
+        let key = (first, parts.len(), narrow && !int8);
+        let fresh = || -> Result<Act, NetworkError> {
+            if !int8 {
+                return self.pack_fresh(parts, narrow);
+            }
+            let wide = self.pack_fresh(parts, false)?;
+            let inner = parts
+                .first()
+                .map_or(Ok(0), |part| device_of(part).map(|d| d.cols()))?;
+            self.quantized(&wide.wide(), wide.len / inner.max(1), inner)
+        };
         let mut memo = self
             .context
             .packs
@@ -1438,12 +1474,104 @@ impl Gpu<'_> {
             if let Some(packed) = memo.get(&key) {
                 return Ok(packed.clone());
             }
-            let packed = Arc::new(self.pack_fresh(parts, narrow)?);
+            let packed = Arc::new(fresh()?);
             memo.insert(key, packed.clone());
             return Ok(packed);
         }
         drop(memo);
-        Ok(Arc::new(self.pack_fresh(parts, narrow)?))
+        Ok(Arc::new(fresh()?))
+    }
+
+    /// [`Gpu::pack`], or the same weights as int8 while a decode that asked
+    /// for them runs. Every reader goes through [`Gpu::project`].
+    pub(crate) fn decode_pack(
+        &self,
+        parts: &[&Linear],
+        narrow: bool,
+    ) -> Result<Arc<Act>, NetworkError> {
+        let int8 = self.context.int8_decode.load(Ordering::Relaxed);
+        self.memo_pack(parts, narrow, int8)
+    }
+
+    /// `rows x cols` FP32 weights on the device as int8 plus a scale per row.
+    pub(crate) fn quantized(
+        &self,
+        weights: &CudaView<'_, f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Act, NetworkError> {
+        let mut act = self.act(rows * cols / 4 + 1, false)?;
+        act.len = rows * cols;
+        let mut scales = self.uninit(rows)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.quantize_q8)
+                .arg(weights)
+                .arg(&mut act.bytes)
+                .arg(&mut scales)
+                .arg(&(rows as i32))
+                .arg(&(cols as i32))
+                .launch(warp_each(rows))
+                .map_err(cuda_err("int8 quantize kernel"))?;
+        }
+        act.scales = Some(scales);
+        Ok(act)
+    }
+
+    /// [`Gpu::linear_packed`] for a weight that may be int8. A few rows, a
+    /// decode step, read the int8 bytes directly; more, a prompt, dequantize
+    /// into a scratch copy and take cuBLAS, as does a width the GEMV's 16-byte
+    /// loads do not divide.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn project(
+        &self,
+        weights: &Act,
+        units: usize,
+        inner: usize,
+        x: &CudaView<'_, u8>,
+        narrow: bool,
+        out: &mut CudaViewMut<'_, f32>,
+        rows: usize,
+        beta: f32,
+    ) -> Result<(), NetworkError> {
+        let Some(scales) = &weights.scales else {
+            return self.linear_packed(&weights.all(), units, inner, x, narrow, out, rows, beta);
+        };
+        if rows > Q8_GEMV_ROWS || inner % 16 != 0 {
+            let mut wide = self.act(units * inner, narrow)?;
+            unsafe {
+                self.context
+                    .stream
+                    .launch_builder(&self.context.model.dequantize_q8)
+                    .arg(&weights.bytes)
+                    .arg(scales)
+                    .arg(&mut wide.bytes)
+                    .arg(&(units as i32))
+                    .arg(&(inner as i32))
+                    .arg(&i32::from(narrow))
+                    .launch(cfg(units * inner))
+                    .map_err(cuda_err("int8 dequantize kernel"))?;
+            }
+            return self.linear_packed(&wide.all(), units, inner, x, narrow, out, rows, beta);
+        }
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.gemv_q8)
+                .arg(&weights.bytes)
+                .arg(scales)
+                .arg(x)
+                .arg(&i32::from(narrow))
+                .arg(out)
+                .arg(&(units as i32))
+                .arg(&(inner as i32))
+                .arg(&(rows as i32))
+                .arg(&beta)
+                .launch(warp_each(units))
+                .map_err(cuda_err("int8 GEMV kernel"))?;
+        }
+        Ok(())
     }
 
     fn pack_fresh(&self, parts: &[&Linear], narrow: bool) -> Result<Act, NetworkError> {
@@ -2492,27 +2620,28 @@ pub(crate) fn forward_swiglu(
     let width = ffn.d_ff();
     let inner = ffn.d_model();
     let narrow = input.is_narrow();
-    let weights = gpu.pack_gate_up(std::iter::once(ffn), narrow)?;
+    // `decode_pack` is `pack_gate_up` and `pack_down` outside an int8 decode.
+    let weights = gpu.decode_pack(&[&ffn.gate, &ffn.up], narrow)?;
     let mut gate_up = gpu.uninit(rows * 2 * width)?;
-    gpu.linear_packed(
-        &weights.all(),
+    gpu.project(
+        &weights,
         2 * width,
         inner,
         &input.all(),
         narrow,
-        &mut gate_up,
+        &mut gate_up.slice_mut(..),
         rows,
         0.0,
     )?;
     let hidden = gpu.swiglu(&gate_up, rows, width, narrow)?;
-    let down = gpu.pack(&[&ffn.down], narrow)?;
-    gpu.linear_packed(
-        &down.all(),
+    let down = gpu.decode_pack(&[&ffn.down], narrow)?;
+    gpu.project(
+        &down,
         inner,
         width,
         &hidden.all(),
         narrow,
-        out,
+        &mut out.slice_mut(..),
         rows,
         1.0,
     )?;
@@ -3099,9 +3228,13 @@ pub(crate) struct DeviceKv {
     /// the decoder's life, so a pack never goes stale, and repacking on every
     /// token was half of a decode step's kernel time.
     packs: PackMemo,
-    /// The LM head narrowed to BF16 under mixed precision, made on first use.
-    /// The FP32 head was a fifth of a decode step's kernel time.
+    /// The LM head narrowed to BF16 under mixed precision, or int8 in int8
+    /// mode, made on first use. The FP32 head was a fifth of a decode step's
+    /// kernel time.
     head: Option<Act>,
+    /// Set from [`TransformerLm::set_int8_decode`] when the decoder is made:
+    /// every projection and the head run as int8 weights.
+    int8: bool,
 }
 
 /// Packed weights by first weight's address, part count and precision.
@@ -3131,6 +3264,7 @@ impl DeviceKv {
             sequences,
             packs: PackMemo::new(),
             head: None,
+            int8: model.int8_decode,
         })
     }
 
@@ -3207,6 +3341,7 @@ pub(crate) fn decode(
     // since a borrowed model's weights cannot move. Key the slot by decoder if
     // concurrent sessions ever matter.
     lend(&mut kv.packs, true)?;
+    context.int8_decode.store(kv.int8, Ordering::Relaxed);
     let blocks = (|| {
         for (block, cache) in model.blocks.iter().zip(&mut kv.layers) {
             hidden = decode_block(
@@ -3215,6 +3350,7 @@ pub(crate) fn decode(
         }
         Ok::<_, NetworkError>(hidden)
     })();
+    context.int8_decode.store(false, Ordering::Relaxed);
     lend(&mut kv.packs, false)?;
     let hidden = blocks?;
     kv.length += rows / sequences;
@@ -3232,27 +3368,31 @@ pub(crate) fn decode(
     )?;
     // Position-major, so every sequence's last rows sit in one block.
     let kept = (positions * sequences).min(rows);
-    if !narrow {
+    if !narrow && !kv.int8 {
         let last = final_output.wide().slice((rows - kept) * d_model..);
         let logits = gpu.linear(head_of(model)?, &last, kept)?;
         return gpu.matrix(&logits, kept, vocab);
     }
     if kv.head.is_none() {
-        let head = head_of(model)?;
-        kv.head = Some(gpu.narrowed(&head.value().slice(..), vocab * d_model, true)?);
+        let head = head_of(model)?.value().slice(..);
+        kv.head = Some(if kv.int8 {
+            gpu.quantized(&head, vocab, d_model)?
+        } else {
+            gpu.narrowed(&head, vocab * d_model, true)?
+        });
     }
-    let head = kv.head.as_ref().expect("narrowed above");
+    let head = kv.head.as_ref().expect("made above");
     let last = final_output
         .all()
-        .slice((rows - kept) * d_model * Act::element(true)..);
+        .slice((rows - kept) * d_model * Act::element(narrow)..);
     let mut logits = gpu.uninit(kept * vocab)?;
-    gpu.linear_packed(
-        &head.all(),
+    gpu.project(
+        head,
         vocab,
         d_model,
         &last,
-        true,
-        &mut logits,
+        narrow,
+        &mut logits.slice_mut(..),
         kept,
         0.0,
     )?;
@@ -3308,12 +3448,12 @@ fn decode_block(
 
     // `decode` has lent the context its `PackMemo`, so after the first token
     // every `pack` here and in the feed forward is a lookup.
-    let qkv_weights = gpu.pack(
+    let qkv_weights = gpu.decode_pack(
         &[&attention.query, &attention.key, &attention.value],
         narrow,
     )?;
-    gpu.linear_packed(
-        &qkv_weights.all(),
+    gpu.project(
+        &qkv_weights,
         qkv_width,
         d_model,
         &normed.all(),
@@ -3460,14 +3600,14 @@ fn decode_block(
             }
         }
     }
-    let output_weight = gpu.pack(&[&attention.output], merged.is_narrow())?;
-    gpu.linear_packed(
-        &output_weight.all(),
+    let output_weight = gpu.decode_pack(&[&attention.output], merged.is_narrow())?;
+    gpu.project(
+        &output_weight,
         d_model,
         query_width,
         &merged.all(),
         merged.is_narrow(),
-        &mut residual,
+        &mut residual.slice_mut(..),
         rows,
         1.0,
     )?;
@@ -3519,6 +3659,19 @@ fn row_per_block(rows: usize) -> cudarc::driver::LaunchConfig {
 /// cap keeps enough blocks to fill the device several times over while
 /// cutting the number of blocks that contend for a shared gradient column.
 const ROW_GRID_BLOCKS: usize = 2048;
+
+/// One warp per row, eight rows per block, every row its own warp.
+fn warp_each(rows: usize) -> cudarc::driver::LaunchConfig {
+    cudarc::driver::LaunchConfig {
+        grid_dim: (rows.div_ceil(8).max(1) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Rows up to which [`Gpu::project`] runs an int8 weight as a GEMV. A batch
+/// decode step is one row per sequence.
+const Q8_GEMV_ROWS: usize = 16;
 
 /// One warp per row, eight rows per block.
 fn warp_per_row_grid(rows: usize) -> cudarc::driver::LaunchConfig {

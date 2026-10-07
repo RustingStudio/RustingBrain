@@ -633,6 +633,10 @@ pub struct TransformerLm {
     #[serde(skip)]
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) checkpoint: Vec<bool>,
+    /// Set by [`TransformerLm::set_int8_decode`]. Not serialized either.
+    #[serde(skip)]
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) int8_decode: bool,
 }
 
 /// Weights and configuration, not transient training or device state: two
@@ -715,6 +719,7 @@ impl TransformerLm {
             mixed_precision: builder.mixed_precision,
             z_loss: builder.z_loss,
             checkpoint: builder.checkpoint,
+            int8_decode: false,
         };
         if let Some(lora) = model.config.lora {
             model.attach_lora(lora);
@@ -1944,6 +1949,26 @@ impl TransformerLm {
         self.checkpoint = checkpoint_flags(blocks);
     }
 
+    /// Makes decoders of a model on a device read the attention projections,
+    /// the dense and shared-expert feed-forwards and the output head as int8,
+    /// one byte per weight and a scale per row (the scheme of
+    /// [`TransformerLm::quantize`]), instead of FP32 or, under mixed
+    /// precision, BF16. Routed experts and the router keep their precision.
+    /// Takes effect for decoders made afterwards.
+    ///
+    /// A device decode step reads every weight once, so it is bound by memory
+    /// bandwidth. The stored weights are untouched: training, saving and
+    /// decoders made with this off still see full precision. The int8 copies
+    /// live as long as a decoder and come on top of the model's own weights.
+    /// Host decoders ignore it; [`TransformerLm::quantize`] is the host route.
+    ///
+    /// On the default model this is about 10% more tokens per second for one
+    /// sequence and about 13% fewer for a batch of 16, where the int8 kernel
+    /// does not yet beat cuBLAS on BF16 weights.
+    pub fn set_int8_decode(&mut self, int8: bool) {
+        self.int8_decode = int8;
+    }
+
     /// Writes the Adam moments to `path`, in the order
     /// [`TransformerLm::params_mut`] yields them.
     ///
@@ -2907,6 +2932,61 @@ mod tests {
             let mut host = cpu.decoder();
             let mut device = gpu.decoder();
             let turns: [&[u32]; 5] = [&[3, 8, 1, 5], &[7], &[2], &[9, 4, 11], &[6]];
+            for (turn, ids) in turns.iter().enumerate() {
+                host.feed(ids).unwrap();
+                device.feed(ids).unwrap();
+                let host_logits = host.logits.as_ref().unwrap();
+                let host_last = host_logits.row(host_logits.rows - 1);
+                let device_logits = device.logits.as_ref().unwrap();
+                for (index, (d, h)) in device_logits.data.iter().zip(host_last).enumerate() {
+                    assert!(
+                        (d - h).abs() <= tolerance,
+                        "mixed {mixed}, turn {turn}, logit {index}: {d} on the device vs {h}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An int8 device decoder against a host model whose projections and head
+    /// went through [`Param::quantize`], the same rounding. The 20-token prompt
+    /// takes the dequantize-and-cuBLAS route, single tokens the int8 GEMV.
+    /// Dense, because routed experts stay in full precision on the device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn an_int8_device_decoder_matches_a_quantized_host_or_skips_without_device() {
+        match crate::cuda_training::cuda_doctor(0, 8192) {
+            Ok(_) => {}
+            Err(NetworkError::Cuda(message))
+                if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
+            {
+                crate::cuda_training::skip_without_cuda();
+                return;
+            }
+            Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
+        }
+        // BF16 decode of this model, int8 or not, lands within about 1.3e-2.
+        for (mixed, tolerance) in [(false, 1e-3), (true, 3e-2)] {
+            let base = tiny()
+                .moe_layers([])
+                .tie_embeddings(false)
+                .mixed_precision(mixed)
+                .build()
+                .unwrap();
+            let mut gpu = base.clone();
+            gpu.set_int8_decode(true);
+            gpu.to_cuda(0, 8192).unwrap();
+            let mut cpu = base.clone();
+            for block in &mut cpu.blocks {
+                for linear in block.linears_mut() {
+                    linear.weight.quantize();
+                }
+            }
+            cpu.lm_head.as_mut().unwrap().weight.quantize();
+            let mut host = cpu.decoder();
+            let mut device = gpu.decoder();
+            let prompt: Vec<u32> = (0..20).map(|i| (i * 5 % 13) as u32).collect();
+            let turns: [&[u32]; 4] = [&prompt, &[7], &[2], &[9]];
             for (turn, ids) in turns.iter().enumerate() {
                 host.feed(ids).unwrap();
                 device.feed(ids).unwrap();
