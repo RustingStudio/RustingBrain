@@ -4,6 +4,10 @@
 
 ### Added
 
+- Tutorial chapter 17, fine-tuning with LoRA: attach an adapter, train it,
+  save it alone, load it onto the base, merge it, and measure what the base
+  forgets.
+
 - `webdataset::WebDataset` reads WebDataset tar shards one sample at a
   time: the members that share a key, such as `000017.jpg` and
   `000017.txt`, come back together. No new dependency.

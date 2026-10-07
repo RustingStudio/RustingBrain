@@ -568,9 +568,9 @@ flow in the other direction.
 
 ## Tutorials
 
-Sixteen chapters in [tutorials/](tutorials/README.md), from what a neural
-network is to training a language model end to end. Chapters 1–10 need nothing
-but Rust; 11 and 14–16 want a GPU.
+Seventeen chapters in [tutorials/](tutorials/README.md), from what a neural
+network is to training a language model end to end and fine-tuning it with
+LoRA. Chapters 1–10 need nothing but Rust; 11 and 14–17 want a GPU.
 
 ## Benchmarks
 
