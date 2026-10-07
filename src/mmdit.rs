@@ -566,6 +566,8 @@ pub struct Dit {
     pub(crate) final_out: Dense,
     conditioning: Option<Conditioning>,
     unconditional: Option<Conditioning>,
+    #[cfg(feature = "cuda")]
+    device: Option<crate::cuda_mmdit::DeviceDit>,
 }
 
 impl Dit {
@@ -721,6 +723,8 @@ impl Dit {
             config,
             conditioning: None,
             unconditional: None,
+            #[cfg(feature = "cuda")]
+            device: None,
         })
     }
 
@@ -780,6 +784,24 @@ impl Dit {
         self.forward_with(patches, timestep, conditioning)
     }
 
+    /// Uploads every weight to a CUDA device and runs there from now on.
+    ///
+    /// Fails closed: an error leaves the model on the CPU, as it was.
+    #[cfg(feature = "cuda")]
+    pub fn attach_device(
+        &mut self,
+        context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
+    ) -> Result<(), NetworkError> {
+        self.device = Some(crate::cuda_mmdit::DeviceDit::upload(context, self)?);
+        Ok(())
+    }
+
+    /// Whether [`Dit::attach_device`] moved this model.
+    #[cfg(feature = "cuda")]
+    pub fn on_device(&self) -> bool {
+        self.device.is_some()
+    }
+
     /// The conditioning vector every modulation reads: the noise level first,
     /// then the pooled prompt, then the distilled guidance scale if the model
     /// takes one.
@@ -828,6 +850,10 @@ impl Dit {
                 expected: conditioning.height * conditioning.width,
                 actual: patches.rows,
             });
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            return device.forward_with(self, patches, timestep, conditioning);
         }
 
         let vector = self.vector(timestep, conditioning)?;

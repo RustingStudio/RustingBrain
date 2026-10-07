@@ -4,6 +4,9 @@
 
 ### Changed
 
+- `ImagePipeline::to_cuda` also moves a transformer denoiser and a gated T5
+  encoder, so FLUX and Stable Diffusion 3 pipelines run on the device. Both
+  use the BF16 kernels; the original ungated T5 stays on the host.
 - Device decode of up to 16 sequences routes its mixture-of-experts layers
   on the device instead of copying the routing back to the host each layer:
   one sequence of the default model decodes about 1.5x faster (about 900 to
@@ -52,11 +55,11 @@
 - `cuda_mmdit::DeviceDit` runs the FLUX-style MMDiT denoiser on the device
   with BF16 weights, FP32 residual streams and the fused attention kernel.
   A small FLUX-shaped model over a 512x512 image takes about 16 ms a pass
-  against 1.27 s on the host. It is not yet wired into `ImagePipeline`.
+  against 1.27 s on the host, at the same speed with int8 weights.
 - `cuda_t5::DeviceT5` runs a gated T5 encoder (T5 1.1, the one FLUX and
   Stable Diffusion 3 read) on the device with BF16 weights and an FP32
   residual stream. A T5-base-sized encoder over 512 tokens takes about 29 ms
-  against 528 ms on the host. It is not yet wired into `ImagePipeline`.
+  against 528 ms on the host.
 - `TransformerLm::quantize_lora_base_4bit(Codebook::Nf4)`: QLoRA on an NF4
   base, on the host and the device. A rank-16 run on the default model
   peaks at 762 MiB against 778 on an int8 base and 889 on FP32, at the same

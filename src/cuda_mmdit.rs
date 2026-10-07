@@ -897,9 +897,9 @@ mod tests {
         };
         let path = std::env::temp_dir().join("rusting_brain_cuda_mmdit_time.safetensors");
         checkpoint(&config, &path);
-        let dit = Dit::load_at(&path, "", config.clone(), Precision::F32).unwrap();
+        let models = [Precision::F32, Precision::Q8]
+            .map(|precision| Dit::load_at(&path, "", config.clone(), precision).unwrap());
         std::fs::remove_file(path).ok();
-        let device = DeviceDit::upload(&context, &dit).unwrap();
         let (height, width) = (32, 32);
         let patches = Matrix::from_vec(
             height * width,
@@ -919,35 +919,39 @@ mod tests {
             ..conditioning(&config, height, width)
         };
 
-        let started = std::time::Instant::now();
-        let expected = dit.forward_with(&patches, 0.4, &conditioning).unwrap();
-        let host = started.elapsed();
-        device
-            .forward_with(&dit, &patches, 0.4, &conditioning)
-            .unwrap();
-        let mut device_times = Vec::new();
-        let mut actual = None;
-        for _ in 0..5 {
+        // BF16 weights against the byte path, each against its own host.
+        for (dit, precision) in models.iter().zip([Precision::F32, Precision::Q8]) {
+            let device = DeviceDit::upload(&context, dit).unwrap();
             let started = std::time::Instant::now();
-            actual = Some(
-                device
-                    .forward_with(&dit, &patches, 0.4, &conditioning)
-                    .unwrap(),
+            let expected = dit.forward_with(&patches, 0.4, &conditioning).unwrap();
+            let host = started.elapsed();
+            device
+                .forward_with(dit, &patches, 0.4, &conditioning)
+                .unwrap();
+            let mut device_times = Vec::new();
+            let mut actual = None;
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                actual = Some(
+                    device
+                        .forward_with(dit, &patches, 0.4, &conditioning)
+                        .unwrap(),
+                );
+                device_times.push(started.elapsed());
+            }
+            let actual = actual.unwrap();
+            let error: f32 = actual
+                .data
+                .iter()
+                .zip(&expected.data)
+                .map(|(actual, expected)| (actual - expected).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let norm: f32 = expected.data.iter().map(|v| v * v).sum::<f32>().sqrt();
+            println!(
+                "{precision:?}: host {host:?}, device {device_times:?}, relative error {}",
+                error / norm
             );
-            device_times.push(started.elapsed());
         }
-        let actual = actual.unwrap();
-        let error: f32 = actual
-            .data
-            .iter()
-            .zip(&expected.data)
-            .map(|(actual, expected)| (actual - expected).powi(2))
-            .sum::<f32>()
-            .sqrt();
-        let norm: f32 = expected.data.iter().map(|v| v * v).sum::<f32>().sqrt();
-        println!(
-            "host {host:?}, device {device_times:?}, relative error {}",
-            error / norm
-        );
     }
 }
