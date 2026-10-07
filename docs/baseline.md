@@ -1269,3 +1269,12 @@ to 15): F32/BF16 device 130 (first, cold), 23.7, 16.2, 15.7, 15.9 ms; Q8
 device 15.8, 15.8, 16.4, 15.8, 16.8 ms. Hosts 1.16 s and 1.47 s. At 1280
 tokens the GEMMs are compute-bound, so reading one byte a weight instead of
 two buys no time; it halves the weights' memory.
+
+## Image path kernel shares (C6 part 4, 2026-10-07)
+
+`nsys profile --trace=cuda` on `cuda_image_bench /home/vasylt/ml/models/pony-v6-xl`
+with `SIZES=1024 CPU=0 QUANTIZE=1`: one UNet pass 0.251 s (first 0.40 s),
+VAE decode 0.53 s, peak 7.45 GB. Kernel time 1847 ms: FP16 GEMMs 25.2% +
+22.2% + 5.9% + 2.3%, `im2col` 18.7% (2804), `image_attention_fwd` 7.2%,
+`group_apply` 3.6%, `add_plane_bias` 3.5%, `transpose` 0.96% (70 launches,
+17.7 ms). Load 7.5 to 5.7.
