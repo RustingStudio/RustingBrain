@@ -1856,6 +1856,22 @@ mod tests {
     /// widths. The weight is large so the term moves the gradient far outside
     /// the tolerance if either the value or the gradient is wrong.
     #[test]
+    fn expert_loads_on_the_device_match_the_host_or_skip_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let batch =
+            crate::batch::TokenBatch::new(&[vec![3u32, 8, 1, 5, 2, 7], vec![9, 4, 4, 0]]).unwrap();
+        let cpu = tiny().build().unwrap();
+        let mut gpu = cpu.clone();
+        gpu.to_cuda(0, 8192).unwrap();
+        let host = cpu.forward_batch(&batch).unwrap().1.expert_loads();
+        let device = gpu.forward_batch(&batch).unwrap().1.expert_loads();
+        assert_eq!(host.len(), 1);
+        assert_eq!(device, host);
+    }
+
+    #[test]
     fn a_z_loss_step_on_the_device_matches_the_host_or_skips_without_device() {
         if !cuda_or_skip() {
             return;

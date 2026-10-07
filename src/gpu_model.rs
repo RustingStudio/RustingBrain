@@ -190,6 +190,20 @@ impl GpuCache {
     pub(crate) fn auxiliary_loss(&self) -> f32 {
         self.stack.auxiliary_loss
     }
+
+    pub(crate) fn expert_loads(&self) -> Vec<Vec<f32>> {
+        self.stack
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.feed_forward {
+                FfnCache::Moe(moe) => {
+                    let slots = moe.routed.max(1) as f32;
+                    Some(moe.counts.iter().map(|&n| n as f32 / slots).collect())
+                }
+                FfnCache::Dense(_) => None,
+            })
+            .collect()
+    }
 }
 
 /// A GEMM operand, held as untyped device bytes.

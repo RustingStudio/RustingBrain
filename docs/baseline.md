@@ -738,3 +738,25 @@ occupancy. At the dense GEMMs' 22 TFLOPS the routed set would take about
 7.3 ms, so about 3.4 ms (4.4%) is recoverable, under the 10 ms bar the plan
 set for writing a kernel. `bench` routes uniformly random tokens almost
 evenly, so real text (step 3) may differ.
+
+## Expert loads on real text (A7 W4 step 3, 2026-10-07)
+
+Default model on the GPU (default mixed precision), Adam 3e-4,
+seed 7, 16 x 256 windows of the repository's markdown with a 4096-entry BPE.
+Range of the per-expert share across the 8 experts, for each of the 6 MoE
+layers, read with `TransformerCache::expert_loads` on the training batch.
+An even split is 0.125.
+
+| Step | Loss | Min-max share per layer |
+|---:|---:|---|
+| 0 | 8.355 | 0.058-0.242, 0.011-0.331, 0.035-0.304, 0.016-0.221, 0.019-0.406, 0.005-0.304 |
+| 100 | 6.294 | 0.027-0.243, 0.050-0.207, 0.049-0.219, 0.026-0.194, 0.060-0.206, 0.010-0.234 |
+| 200 | 5.004 | 0.082-0.148, 0.067-0.157, 0.092-0.153, 0.101-0.158, 0.095-0.194, 0.093-0.169 |
+| 300 | 4.290 | 0.090-0.168, 0.093-0.160, 0.082-0.152, 0.055-0.178, 0.095-0.165, 0.103-0.146 |
+| 499 | 3.151 | 0.111-0.145, 0.097-0.155, 0.089-0.152, 0.094-0.151, 0.085-0.148, 0.100-0.169 |
+
+Held-out batch at step 499: every share is between 0.089 and 0.158. The
+load-balancing loss evens the routing out within about 200 steps; after that
+the busiest expert carries at most 1.35 times an even share, so the uniform
+benchmark is a fair stand-in for the expert GEMM estimate. The GPU had a
+21 MiB test process on it; these are counts, not timings.

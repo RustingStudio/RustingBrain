@@ -161,6 +161,14 @@ impl TransformerBlockCache {
     pub fn auxiliary_loss(&self) -> f32 {
         self.feed_forward.auxiliary_loss()
     }
+
+    /// [`MoeCache::load_fractions`] for a MoE block, `None` for a dense one.
+    pub fn expert_loads(&self) -> Option<Vec<f32>> {
+        match &self.feed_forward {
+            FeedForwardCache::Moe(cache) => Some(cache.load_fractions()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
