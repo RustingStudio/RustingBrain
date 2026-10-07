@@ -580,3 +580,39 @@ tokenizer tests cover the split.
 | 78,000 | 617 ms | 1.42 ms |
 
 Training itself is not timed: there is no fixed corpus to compare against yet.
+
+## MoE routed path in BF16 (A7 W1, 2026-10-07)
+
+Default model (55.2M total, 35.7M active, 6 routed layers of 8 experts, top
+2), `bench_train_step 4 1024 cuda`, RTX 3060 with only gnome-clocks (41 MiB)
+on it. Kernel times are `nsys` totals over the four steps the benchmark runs,
+divided by four.
+
+| | Before | After |
+|---|---:|---:|
+| Kernel time per step | 82.0 ms | 80.1 ms |
+| FP32-operand GEMMs (`s1688bf16gemm`, the expert GEMMs) | 18.4 ms | 6.1 ms |
+| All GEMMs | 45.7 ms | 44.6 ms |
+| `swiglu_fwd` + `swiglu_bwd` | 3.5 ms | 3.2 ms |
+| `cast_act` | 1.6 ms | 1.4 ms |
+| The two gathers | 1.5 ms | 1.3 ms |
+| Best of five, tokens/s | 49,802 | 51,631 |
+
+Most of the expert GEMMs' time moved into the BF16 GEMM rows rather than
+disappearing: at this shape (512 wide, about 1,000 rows per expert) the
+operand conversion was the smaller part of their cost.
+
+Loss check: the default model at vocabulary 4096 (a byte-level BPE trained
+with `Bpe::train_json` on the repository's markdown, 180k tokens), 16 x 256
+tokens a step, Adam 3e-4, 500 steps, same seed, mixed precision on, before
+and after this change.
+
+| Step | FP32 routed | BF16 routed |
+|---:|---:|---:|
+| 0 | 8.3616 | 8.3616 |
+| 100 | 6.2913 | 6.2807 |
+| 200 | 5.0341 | 5.0238 |
+| 300 | 4.3433 | 4.3658 |
+| 400 | 3.8325 | 3.7833 |
+| 499 | 3.1830 | 3.1844 |
+| Held-out | 4.9438 | 4.9239 |
