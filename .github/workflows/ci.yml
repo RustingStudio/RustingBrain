@@ -42,3 +42,20 @@ jobs:
       - run: cargo check --locked --all-targets
       - run: cargo check --locked --all-targets --features onnx
       - run: cargo check --locked --all-targets --features cuda
+
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Compares the public API against the last release tag, so the next
+      # breaking change is a choice. Default features only: the tool resolves
+      # dependencies afresh, without Cargo.lock, and `metal` only builds on
+      # macOS.
+      - id: release
+        run: echo "tag=$(git describe --tags --abbrev=0)" >> "$GITHUB_OUTPUT"
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: ${{ steps.release.outputs.tag }}
+          feature-group: default-features

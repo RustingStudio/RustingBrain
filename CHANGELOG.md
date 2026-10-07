@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- CI runs `cargo semver-checks` against the latest release tag.
+
 ### Changed
 
 - The fused attention query-gradient kernel at head width 128 uses 34 KiB
