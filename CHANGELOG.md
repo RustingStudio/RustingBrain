@@ -4,6 +4,9 @@
 
 ### Added
 
+- Karras noise levels for DDIM-schedule models: `Scheduler::karras_sigmas`,
+  run through the new `sample_with_sigmas`. With `Solver::DpmPlusPlus2m` this
+  is "DPM++ 2M Karras".
 - z-loss on the LM head: `TransformerBuilder::z_loss(weight)` or
   `TransformerLm::set_z_loss` adds `weight * logsumexp(logits)^2` to the
   training loss, reported in `TotalLoss::auxiliary_loss`, on the host and in

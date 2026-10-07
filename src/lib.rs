@@ -224,7 +224,9 @@ pub use dataset::{
     Augment, BatchCursor, BatchSource, Dataset, DatasetBatch, DatasetStream, JsonlStream,
     Standardizer,
 };
-pub use diffusion::{Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_from};
+pub use diffusion::{
+    Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_from, sample_with_sigmas,
+};
 pub use ema::Ema;
 pub use embedding::Embedding;
 pub use ffn::{GeluMlp, SwiGlu};
