@@ -1701,10 +1701,18 @@ mod tests {
         if !cuda_or_skip() {
             return;
         }
+        // BF16 folds the adapter into a narrow weight, which is its own GEMM.
+        for (mixed, tolerance) in [(false, 1e-3), (true, 1e-2)] {
+            lora_step_matches_the_host(mixed, tolerance);
+        }
+    }
+
+    fn lora_step_matches_the_host(mixed: bool, tolerance: f32) {
         let mut cpu = tiny().build().unwrap();
         cpu.add_lora(crate::transformer::LoraConfig::new(4).alpha(8.0))
             .unwrap();
         let mut gpu = cpu.clone();
+        gpu.set_mixed_precision(mixed);
         gpu.to_cuda(0, 8192).unwrap();
         let ids = [3u32, 8, 1, 5, 2, 7];
         let before = cpu.blocks[0].attention.query.weight.value.clone();
@@ -1716,8 +1724,8 @@ mod tests {
             let host = cpu.train_step(&[&ids[..]]).unwrap();
             let device = gpu.train_step(&[&ids[..]]).unwrap();
             assert!(
-                (host.total() - device.total()).abs() < 1e-3,
-                "step {step}: {} on the device vs {} on the host",
+                (host.total() - device.total()).abs() < tolerance,
+                "mixed {mixed}, step {step}: {} on the device vs {} on the host",
                 device.total(),
                 host.total()
             );
@@ -1742,6 +1750,12 @@ mod tests {
             "the device step left the adapter at its zero initialization"
         );
 
+        // Adam divides out the gradient's scale, so a BF16 rounding that flips
+        // a near-zero gradient moves that weight by a whole step: under mixed
+        // precision only the loss is comparable.
+        if mixed {
+            return;
+        }
         for (index, (device_param, host_param)) in
             gpu.params_mut().iter().zip(cpu.params_mut()).enumerate()
         {

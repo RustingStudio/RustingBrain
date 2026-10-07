@@ -1406,16 +1406,19 @@ impl Gpu<'_> {
         let down = device_param(&lora.down)?;
         let up = device_param(&lora.up)?;
         let rank = down.rows();
-        // Both adapter matrices are FP32 on the device whatever the
-        // activations are doing, so the operands go in wide and only the
-        // accumulator follows the packed weight's precision.
+        // Both adapter matrices are FP32 on the device, and cuBLAS has no GEMM
+        // from FP32 operands into a narrow output, so a narrow weight gets
+        // narrowed copies of the two. They are `rank` wide, so the casts are
+        // small next to the weight they fold into.
+        let up = self.narrowed(&up.value().slice(..), units * rank, narrow)?;
+        let down = self.narrowed(&down.value().slice(..), rank * inner, narrow)?;
         act_plain(
             self.context,
-            &bytes_of(up.value(), units * rank),
+            &up.all(),
             rank,
-            &bytes_of(down.value(), rank * inner),
+            &down.all(),
             inner,
-            false,
+            narrow,
             narrow,
             slot,
             inner,
