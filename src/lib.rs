@@ -226,7 +226,7 @@ pub use dataset::{
 };
 pub use diffusion::{
     Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_consistency, sample_from,
-    sample_with_sigmas,
+    sample_unipc, sample_with_sigmas,
 };
 pub use ema::Ema;
 pub use embedding::Embedding;
