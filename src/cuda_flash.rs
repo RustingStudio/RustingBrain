@@ -781,64 +781,71 @@ template<int D> __device__ __forceinline__ void flash_dkv(
       __syncthreads();
 
       // Transposed scores and transposed dP: rows are keys, columns queries.
-      float st[8][4], dpt[8][4];
+      // At width 128 the query tile goes in two halves of 32, so only half
+      // the scores are live beside the key, value and gradient fragments: the
+      // whole tile's scores spilled. At 64 one pass is quicker.
+      constexpr int HALVES = D > 64 ? 2 : 1, NQ = 8 / HALVES;
       #pragma unroll
-      for (int n=0;n<8;++n)
+      for (int half=0; half<HALVES; ++half) {
+        float st[NQ][4], dpt[NQ][4];
         #pragma unroll
-        for (int i=0;i<4;++i) { st[n][i]=0.f; dpt[n][i]=0.f; }
-      #pragma unroll
-      for (int n=0;n<8;++n) {
+        for (int n=0;n<NQ;++n)
+          #pragma unroll
+          for (int i=0;i<4;++i) { st[n][i]=0.f; dpt[n][i]=0.f; }
         #pragma unroll
-        for (int kk=0; kk<D/16; kk+=2) {
-          // Matrix m is columns kk*16 + 8m: both halves of two k steps.
-          int at = (n*8 + (lane&7))*DROW + kk*16 + (lane>>3)*8;
-          unsigned bq[4], bg[4];
-          ldsm_x4(bq, qs + at);
-          ldsm_x4(bg, gs + at);
-          MMA(st[n],  kf[kk],   bq);
-          MMA(dpt[n], vf[kk],   bg);
-          MMA(st[n],  kf[kk+1], (bq+2));
-          MMA(dpt[n], vf[kk+1], (bg+2));
+        for (int n=0;n<NQ;++n) {
+          #pragma unroll
+          for (int kk=0; kk<D/16; kk+=2) {
+            // Matrix m is columns kk*16 + 8m: both halves of two k steps.
+            int at = ((half*NQ + n)*8 + (lane&7))*DROW + kk*16 + (lane>>3)*8;
+            unsigned bq[4], bg[4];
+            ldsm_x4(bq, qs + at);
+            ldsm_x4(bg, gs + at);
+            MMA(st[n],  kf[kk],   bq);
+            MMA(dpt[n], vf[kk],   bg);
+            MMA(st[n],  kf[kk+1], (bq+2));
+            MMA(dpt[n], vf[kk+1], (bg+2));
+          }
         }
-      }
 
-      #pragma unroll
-      for (int n=0;n<8;++n) {
-        int col = n*8 + t*2;
-        int q0 = it*64 + col, q1 = q0 + 1;
-        float l0 = lse_s[col], l1 = lse_s[col+1];
-        float d0 = del_s[col], d1 = del_s[col+1];
-        float p0 = ((!causal || q0 >= key_a) && q0 < seq_len) ? __expf(st[n][0]*scale-l0) : 0.f;
-        float p1 = ((!causal || q1 >= key_a) && q1 < seq_len) ? __expf(st[n][1]*scale-l1) : 0.f;
-        float p2 = ((!causal || q0 >= key_b) && q0 < seq_len) ? __expf(st[n][2]*scale-l0) : 0.f;
-        float p3 = ((!causal || q1 >= key_b) && q1 < seq_len) ? __expf(st[n][3]*scale-l1) : 0.f;
-        st[n][0]=p0; st[n][1]=p1; st[n][2]=p2; st[n][3]=p3;
-        dpt[n][0]=p0*(dpt[n][0]-d0); dpt[n][1]=p1*(dpt[n][1]-d1);
-        dpt[n][2]=p2*(dpt[n][2]-d0); dpt[n][3]=p3*(dpt[n][3]-d1);
-      }
-
-      #pragma unroll
-      for (int kk=0; kk<4; ++kk) {
-        unsigned pf[4], sf[4];
-        pf[0]=pack2(st[2*kk][0],  st[2*kk][1]);
-        pf[1]=pack2(st[2*kk][2],  st[2*kk][3]);
-        pf[2]=pack2(st[2*kk+1][0],st[2*kk+1][1]);
-        pf[3]=pack2(st[2*kk+1][2],st[2*kk+1][3]);
-        sf[0]=pack2(dpt[2*kk][0],  dpt[2*kk][1]);
-        sf[1]=pack2(dpt[2*kk][2],  dpt[2*kk][3]);
-        sf[2]=pack2(dpt[2*kk+1][0],dpt[2*kk+1][1]);
-        sf[3]=pack2(dpt[2*kk+1][2],dpt[2*kk+1][3]);
         #pragma unroll
-        for (int n=0;n<D/8;n+=2) {
-          // Matrix m is output columns (n + m/2)*8, k (query) half m%2.
-          int at = (kk*16 + ((lane>>3)&1)*8 + (lane&7))*DROW + (n + (lane>>4))*8;
-          unsigned bg[4], bq[4];
-          ldsm_x4_trans(bg, gs + at);
-          ldsm_x4_trans(bq, qs + at);
-          MMA(dv[n],   pf, bg);
-          MMA(dk[n],   sf, bq);
-          MMA(dv[n+1], pf, (bg+2));
-          MMA(dk[n+1], sf, (bq+2));
+        for (int n=0;n<NQ;++n) {
+          int col = (half*NQ + n)*8 + t*2;
+          int q0 = it*64 + col, q1 = q0 + 1;
+          float l0 = lse_s[col], l1 = lse_s[col+1];
+          float d0 = del_s[col], d1 = del_s[col+1];
+          float p0 = ((!causal || q0 >= key_a) && q0 < seq_len) ? __expf(st[n][0]*scale-l0) : 0.f;
+          float p1 = ((!causal || q1 >= key_a) && q1 < seq_len) ? __expf(st[n][1]*scale-l1) : 0.f;
+          float p2 = ((!causal || q0 >= key_b) && q0 < seq_len) ? __expf(st[n][2]*scale-l0) : 0.f;
+          float p3 = ((!causal || q1 >= key_b) && q1 < seq_len) ? __expf(st[n][3]*scale-l1) : 0.f;
+          st[n][0]=p0; st[n][1]=p1; st[n][2]=p2; st[n][3]=p3;
+          dpt[n][0]=p0*(dpt[n][0]-d0); dpt[n][1]=p1*(dpt[n][1]-d1);
+          dpt[n][2]=p2*(dpt[n][2]-d0); dpt[n][3]=p3*(dpt[n][3]-d1);
+        }
+
+        #pragma unroll
+        for (int kk=0; kk<NQ/2; ++kk) {
+          unsigned pf[4], sf[4];
+          pf[0]=pack2(st[2*kk][0],  st[2*kk][1]);
+          pf[1]=pack2(st[2*kk][2],  st[2*kk][3]);
+          pf[2]=pack2(st[2*kk+1][0],st[2*kk+1][1]);
+          pf[3]=pack2(st[2*kk+1][2],st[2*kk+1][3]);
+          sf[0]=pack2(dpt[2*kk][0],  dpt[2*kk][1]);
+          sf[1]=pack2(dpt[2*kk][2],  dpt[2*kk][3]);
+          sf[2]=pack2(dpt[2*kk+1][0],dpt[2*kk+1][1]);
+          sf[3]=pack2(dpt[2*kk+1][2],dpt[2*kk+1][3]);
+          #pragma unroll
+          for (int n=0;n<D/8;n+=2) {
+            // Matrix m is output columns (n + m/2)*8, k (query) half m%2.
+            int at = ((half*NQ/2 + kk)*16 + ((lane>>3)&1)*8 + (lane&7))*DROW + (n + (lane>>4))*8;
+            unsigned bg[4], bq[4];
+            ldsm_x4_trans(bg, gs + at);
+            ldsm_x4_trans(bq, qs + at);
+            MMA(dv[n],   pf, bg);
+            MMA(dk[n],   sf, bq);
+            MMA(dv[n+1], pf, (bg+2));
+            MMA(dk[n+1], sf, (bq+2));
+          }
         }
       }
     }

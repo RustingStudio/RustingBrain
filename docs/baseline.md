@@ -1394,3 +1394,17 @@ Four interleaved rounds, load 5 (tokens/s):
 |---|---|---|
 | 128 | 48517-48770 | 49954-50304 |
 | 64 | 53257-53636 | 52856-53643 |
+
+Then `flash_attention_dkv_128`: the query tile in two halves of 32 so half
+the scores are live, ptxas spills 180 to 48 bytes (255 registers either
+way; `dkv_64` keeps one pass, 168 registers, no spill). Clean GPU, load 3-4,
+four interleaved rounds:
+
+| | before | after |
+|---|---|---|
+| `dkv_128` median | 891 us | 783 us |
+| step, heads of 128 | 49921-50451 tok/s | 50471-50589 tok/s |
+| step, heads of 64 | 53134-53751 tok/s | 53558-53912 tok/s |
+
+Splitting at 64 too made `dkv_64` 670 to 699 us, so the split is width 128
+only.
