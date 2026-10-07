@@ -1203,3 +1203,20 @@ the load was high, so re-measure on an idle machine before quoting it.
 `dkv_128` still sits at 255 registers (stack 128 to 184 bytes), so it gains
 the shared memory but not the occupancy.
 
+
+## LoRA fold cost (B4, 2026-10-07)
+
+`examples/checkpoint_memory.rs 4 512 lora`, default model, rank 16, RTX 3060,
+two interleaved rounds, with `fold_lora` returning at once in a throwaway
+build (the adapter then has no effect; timing only). Load 6 to 9.
+
+| Base | Fold | No fold |
+|---|---|---|
+| FP32 | 43.3, 42.6 ms | 40.5, 41.0 ms |
+| int8 | 42.8, 42.9 ms | 40.5, 41.0 ms |
+| NF4 | 43.4, 43.4 ms | 40.8, 40.8 ms |
+
+The fold costs about 2.2 ms a step (5%). Moving the adapter to its readers
+would replace one `[units, inner]` write per projection with a `[rows,
+units]` write in the forward pass and a `[rows, inner]` write in the input
+gradient, at 2048 rows here, so it is not taken.
