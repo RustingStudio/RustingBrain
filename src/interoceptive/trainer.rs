@@ -170,8 +170,16 @@ impl Trainer {
 
             if self.buffer.len() >= cfg.warmup.max(1) {
                 for _ in 0..cfg.updates_per_step {
-                    self.buffer.sample_into(&mut batch, &mut self.rng);
-                    loss_sum += self.agent.train_step(&batch);
+                    if self.buffer.is_prioritized() {
+                        self.buffer
+                            .sample_prioritized_into(&mut batch, &mut self.rng);
+                        let weights = self.buffer.weights().unwrap_or_default();
+                        loss_sum += self.agent.train_step_weighted(&batch, weights);
+                        self.buffer.update_priorities(self.agent.last_td_errors());
+                    } else {
+                        self.buffer.sample_into(&mut batch, &mut self.rng);
+                        loss_sum += self.agent.train_step(&batch);
+                    }
                     report.updates += 1;
                 }
             }
@@ -208,11 +216,17 @@ mod tests {
             epsilon_decay_steps: 400,
             ..TrainerConfig::default()
         };
-        let mut trainer = Trainer::new(Arc::new(synthetic_ticks(500, 1)), sim, agent, config);
-        let report = trainer.run();
-        assert_eq!(report.transitions, 800);
-        assert!(report.episodes >= 4 * (800 / 4 / 32));
-        assert!(report.updates > 100);
-        assert!(report.mean_loss.is_finite());
+        for prioritized in [false, true] {
+            let ticks = Arc::new(synthetic_ticks(500, 1));
+            let mut trainer = Trainer::new(ticks, sim.clone(), agent.clone(), config.clone());
+            if prioritized {
+                trainer.buffer = ReplayBuffer::prioritized(1_000, sim.obs_dim(), 0.6, 0.4);
+            }
+            let report = trainer.run();
+            assert_eq!(report.transitions, 800);
+            assert!(report.episodes >= 4 * (800 / 4 / 32));
+            assert!(report.updates > 100);
+            assert!(report.mean_loss.is_finite());
+        }
     }
 }

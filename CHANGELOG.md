@@ -4,6 +4,10 @@
 
 ### Added
 
+- Prioritized replay for the interoceptive agent: build the trainer's buffer
+  with `ReplayBuffer::prioritized` and it samples by TD error, weights the
+  loss by importance (`InteroceptiveAgent::train_step_weighted`,
+  `weighted_td_huber_loss`) and updates the priorities after each step.
 - `scripts/bench_check.sh`: fails when `bench_train_step` or `bench_decode`
   is more than 3% below its row in `docs/baseline.md`. Run it locally before a
   release; CI has no GPU.

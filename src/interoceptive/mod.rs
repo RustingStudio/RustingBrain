@@ -32,7 +32,10 @@ pub mod trunk;
 pub use agent::{AgentConfig, InteroceptiveAgent, QNetwork};
 pub use backtest::{BacktestReport, EquityStats, backtest, walk_forward};
 pub use buffer::{BatchData, ReplayBuffer};
-pub use loss::{bellman_targets, double_bellman_targets, homeostatic_reward, td_huber_loss};
+pub use loss::{
+    bellman_targets, double_bellman_targets, homeostatic_reward, td_huber_loss,
+    weighted_td_huber_loss,
+};
 pub use market_sim::{
     Action, MarketEnvironment, MarketTick, SimConfig, StepInfo, StepResult, synthetic_ticks,
     ticks_from_csv, ticks_from_flat,
