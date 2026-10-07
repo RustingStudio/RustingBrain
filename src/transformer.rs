@@ -3129,8 +3129,16 @@ mod tests {
             Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
         }
         // BF16 decode of this model, int8 or not, lands within about 1.3e-2.
-        for (mixed, tolerance) in [(false, 1e-3), (true, 3e-2)] {
+        // An expert width of 16 takes the routed int8 GEMV, 12 the per-expert
+        // GEMMs its 16-byte loads need.
+        for (moe_d_ff, mixed, tolerance) in [
+            (12, false, 1e-3),
+            (12, true, 3e-2),
+            (16, false, 1e-3),
+            (16, true, 3e-2),
+        ] {
             let base = tiny()
+                .moe_d_ff(moe_d_ff)
                 .tie_embeddings(false)
                 .mixed_precision(mixed)
                 .build()
@@ -3158,7 +3166,7 @@ mod tests {
                 for (index, (d, h)) in device_logits.data.iter().zip(host_last).enumerate() {
                     assert!(
                         (d - h).abs() <= tolerance,
-                        "mixed {mixed}, turn {turn}, logit {index}: {d} on the device vs {h}"
+                        "width {moe_d_ff}, mixed {mixed}, turn {turn}, logit {index}: {d} on the device vs {h}"
                     );
                 }
             }
