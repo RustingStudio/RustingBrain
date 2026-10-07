@@ -1297,3 +1297,37 @@ model, old and new binaries interleaved, three rounds, load average 15 to
 
 Int8 is now +46% over BF16 at one sequence in this session; 16 sequences
 are unchanged, where the dense GEMMs dominate.
+
+## Decode attention loads in flight (C8 follow-up, 2026-10-08)
+
+A note on method first. Under `nsys` the decode loop runs at 1.87 ms a
+token against 0.62 ms unprofiled, because the trace slows the host's ~1000
+event calls a token; the GPU then idles most of the time, its clocks drop,
+and every small kernel reads about twice as slow. `decode_attention` read
+11.5 us at a 32-160 position history and 13.6 us at 640 in the model trace,
+and 12.9 us at 64 in a standalone loop with a short warmup, but 5-8 us in
+the same loop after 30000 warmup launches. Compare kernel shares from such
+a trace, not absolute microseconds, and time single kernels warm.
+
+Standalone loop (`decode_attention` alone, 8 heads, 2 KV heads, width 64,
+one sequence, L2-resident cache, 1000 launches after 30000 warmup):
+
+| History | Before | After |
+|---|---|---|
+| 64 | 7.64 us | 5.05 us |
+| 640 | 8.46 us | 6.59 us |
+| 1664 | 20.46 us | 14.00 us |
+
+Bisected at 64 positions: dropping the value pass saves the most (5.05 to
+3.00), dropping the score pass 0.95 us.
+
+`bench_decode <prompt> 128 cuda 16`, BF16, `45a8ef1` against the change,
+three interleaved rounds, load average 18 to 33:
+
+| Prompt | Before | After |
+|---|---|---|
+| 512 | 7780-7980 tokens/s | 8731-8835 tokens/s |
+| 1536 | 4335-4380 tokens/s | 4548-5294 tokens/s |
+
+One sequence (897-1133 against 742-1223) is inside the noise at this load.
+

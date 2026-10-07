@@ -263,18 +263,19 @@ extern "C" __global__ void decode_attention(const float*qkv,float*partial,int hi
   __shared__ float part[1024];
   int head=blockIdx.x,seq=blockIdx.y,chunk=blockIdx.z,chunks=gridDim.z;
   int first=chunk*DECODE_CHUNK,count=min(DECODE_CHUNK,history-first);
-  int lane=threadIdx.x%WARP,warp=threadIdx.x/WARP,warps=blockDim.x/WARP;
+  int lane=threadIdx.x%WARP,warp=threadIdx.x/WARP;
   long row_stride=(long)sequences*qkv_width;
   int kv=(head/group)*head_dim;
   const float*q=qkv+start+(long)seq*qkv_width+head*head_dim;
   const float*k=qkv+(long)seq*qkv_width+key_base+kv+first*row_stride;
   const float*v=qkv+(long)seq*qkv_width+value_base+kv+first*row_stride;
-  for(int p=warp;p<count;p+=warps){
-    const float*kp=k+p*row_stride;float d=0.f;
-    for(int i=lane;i<head_dim;i+=WARP)d+=q[i]*kp[i];
-    d=warp_sum(d);
-    if(lane==0)s[p]=d*scale;
-  }
+  // A few threads per position, so every key load is in flight at once.
+  {int per=blockDim.x/DECODE_CHUNK,p=threadIdx.x/per,sub=threadIdx.x%per;float d=0.f;
+    if(p<count){const float*kp=k+p*row_stride;
+      #pragma unroll 8
+      for(int i=sub;i<head_dim;i+=per)d+=q[i]*kp[i];}
+    for(int o=per/2;o>0;o>>=1)d+=__shfl_xor_sync(0xffffffff,d,o);
+    if(sub==0&&p<count)s[p]=d*scale;}
   __syncthreads();
   if(warp==0){
     float m=-3.0e38f;for(int p=lane;p<count;p+=WARP)m=fmaxf(m,s[p]);
@@ -286,7 +287,9 @@ extern "C" __global__ void decode_attention(const float*qkv,float*partial,int hi
   __syncthreads();
   int slices=blockDim.x/head_dim,t=threadIdx.x%head_dim,slice=threadIdx.x/head_dim;
   float acc=0.f;
-  if(slice<slices)for(int p=slice;p<count;p+=slices)acc+=s[p]*v[p*row_stride+t];
+  if(slice<slices){
+    #pragma unroll 16
+    for(int p=slice;p<count;p+=slices)acc+=s[p]*v[p*row_stride+t];}
   part[threadIdx.x]=acc;__syncthreads();
   float*out=partial+((long)(seq*gridDim.x+head)*chunks+chunk)*(head_dim+2);
   if(threadIdx.x<head_dim){
