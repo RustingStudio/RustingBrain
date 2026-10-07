@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Under mixed precision the device decoder's attention output projection
+  reads BF16, about 3% more tokens per second for one sequence.
 - A device decode step with one new token per sequence runs attention as
   two fused kernels per layer instead of seventeen cuBLAS and softmax
   launches: about 30% more tokens per second on the default model, for one

@@ -296,14 +296,14 @@ extern "C" __global__ void decode_attention(const float*qkv,float*partial,int hi
   if(threadIdx.x==0){out[0]=red[0];out[1]=red[1];}
 }
 // Block (head, sequence), one thread per output element.
-extern "C" __global__ void decode_attention_merge(const float*partial,float*out,int chunks,int head_dim,int query_width){
+extern "C" __global__ void decode_attention_merge(const float*partial,void*out,int chunks,int head_dim,int query_width,int narrow){
   int head=blockIdx.x,seq=blockIdx.y,t=threadIdx.x;
   if(t>=head_dim)return;
   const float*in=partial+(long)(seq*gridDim.x+head)*chunks*(head_dim+2);
   float m=-3.0e38f;for(int c=0;c<chunks;c++)m=fmaxf(m,in[c*(head_dim+2)]);
   float sum=0.f,acc=0.f;
   for(int c=0;c<chunks;c++){const float*p=in+c*(head_dim+2);float w=__expf(p[0]-m);sum+=w*p[1];acc+=w*p[2+t];}
-  out[(long)seq*query_width+head*head_dim+t]=acc/sum;
+  store_act(out,(size_t)seq*query_width+head*head_dim+t,acc/sum,narrow);
 }
 extern "C" __global__ void attention_softmax_bwd(float*g,const float*p,int rows,int cols,int causal){
   int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;

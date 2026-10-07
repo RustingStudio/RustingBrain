@@ -3355,8 +3355,11 @@ fn decode_block(
     // three-kernel path below.
     const THREADS: usize = 256;
     let group = heads / kv_heads;
-    let mut merged = gpu.act(rows * query_width, false)?;
-    if queries == 1 && head_dim <= THREADS {
+    // Only the fused path writes `merged` narrow; the cuBLAS path below
+    // accumulates into FP32.
+    let fused = queries == 1 && head_dim <= THREADS;
+    let mut merged = gpu.act(rows * query_width, fused && narrow)?;
+    if fused {
         let chunks = history.div_ceil(DECODE_CHUNK);
         let mut partial = gpu.uninit(heads * sequences * chunks * (head_dim + 2))?;
         unsafe {
@@ -3385,10 +3388,11 @@ fn decode_block(
                 .stream
                 .launch_builder(&gpu.context.model.decode_attention_merge)
                 .arg(&partial)
-                .arg(&mut merged.wide_mut())
+                .arg(merged.destination())
                 .arg(&(chunks as i32))
                 .arg(&(head_dim as i32))
                 .arg(&(query_width as i32))
+                .arg(&i32::from(fused && narrow))
                 .launch(cudarc::driver::LaunchConfig {
                     grid_dim: (heads as u32, sequences as u32, 1),
                     block_dim: (head_dim.next_multiple_of(32) as u32, 1, 1),
@@ -3456,13 +3460,13 @@ fn decode_block(
             }
         }
     }
-    let output_weight = gpu.pack(&[&attention.output], false)?;
+    let output_weight = gpu.pack(&[&attention.output], merged.is_narrow())?;
     gpu.linear_packed(
         &output_weight.all(),
         d_model,
         query_width,
         &merged.all(),
-        false,
+        merged.is_narrow(),
         &mut residual,
         rows,
         1.0,
