@@ -98,12 +98,11 @@ Tokenizing is slow, deterministic, and you will do it many times if you put it
 in the training loop. Do it once and write the ids to disk:
 
 ```rust
-use rusting_brain::TokenFile;
-use tokenizers::Tokenizer;
+use rusting_brain::{Bpe, TokenFile};
 
-let tokenizer = Tokenizer::from_file("tokenizer.json")?;
+let tokenizer = Bpe::from_file("tokenizer.json")?;
 let text = std::fs::read_to_string("corpus.txt")?;
-let ids: Vec<u32> = tokenizer.encode(text, false)?.get_ids().to_vec();
+let ids: Vec<u32> = tokenizer.encode(&text)?;
 
 TokenFile::write("train.bin", &ids)?;
 ```
@@ -120,7 +119,7 @@ let tokens = TokenFile::write_jsonl(
     "corpus.jsonl",
     "text",                 // the string field to read
     Some(end_of_text),      // appended after every document
-    |text| tokenizer.encode(text, false).unwrap().get_ids().to_vec(),
+    |text| tokenizer.encode(text).unwrap(),
 )?;
 println!("{tokens} tokens");
 ```
@@ -283,7 +282,6 @@ A week-long run will be interrupted. Plan for it.
 
 ```rust
 fn checkpoint(model: &mut TransformerLm, step: usize) -> Result<(), NetworkError> {
-    model.sync_from_device()?;                              // weights back to host
     model.save_bin("checkpoint.rbw", Precision::F32)?;
     model.save_optimizer_state("checkpoint.rbw.opt")?;
     println!("checkpoint at step {step}");
@@ -375,8 +373,8 @@ That is a loss mask, and `TokenBatch::supervised` builds one:
 
 ```rust
 let batch = TokenBatch::supervised(&[
-    (tokenizer.encode("Q: what is a borrow?\nA: ", false)?.get_ids(),
-     tokenizer.encode("a reference that does not own.", false)?.get_ids()),
+    (tokenizer.encode("Q: what is a borrow?\nA: ")?,
+     tokenizer.encode("a reference that does not own.")?),
     (prompt_two, response_two),
 ])?;
 
@@ -473,42 +471,47 @@ accumulation, a warmup-cosine schedule, periodic evaluation, a checkpoint, and
 a resume that restores the optimizer state in the right order.
 
 It runs on a CPU in under a minute. The only differences between it and a real
-run are the size of the model, the size of the corpus, and two commented lines.
+run are the size of the model, the size of the corpus, and the commented
+`to_cuda` lines. The output below came from the GPU path, with both the live
+model and the resumed one on the device; device kernels sum in a different
+order from the host, so your digits will differ a little:
 
 ```text
-vocabulary 27, 120 training windows, 1 validation batches
+vocabulary 27, 495 training tokens, 88 held-out tokens
 0.6M total / 0.6M active (1.00x)
 
  step      lr     train    held-out
-   50  0.00299   1.9062      2.5124
-  100  0.00282   0.9616      2.8207
-  150  0.00242   0.2926      3.3196
-  200  0.00188   0.0661      4.1111
-  250  0.00130   0.0583      4.4164
-  300  0.00078   0.0544      4.5251
-  350  0.00043   0.0476      4.5935
-  400  0.00030   0.0516      4.6298
+   50  0.00299   1.3554      2.7262
+  100  0.00282   0.2509      3.2027
+  150  0.00242   0.1312      3.5455
+  200  0.00188   0.1209      3.5091
+  250  0.00130   0.1031      3.5134
+  300  0.00078   0.0976      3.7387
+  350  0.00043   0.0887      3.9342
+  400  0.00030   0.0860      3.8869
 
 resuming from the step-200 checkpoint
   optimizer step counter restored: 200 (checkpoint was at 200)
-  held-out loss at the checkpoint: 4.1111
+  held-out loss at the checkpoint: 3.5091
 ```
 
 That is textbook overfitting, and it is worth sitting with, because it is the
-third row of 16.5's table drawn from life. Training loss falls from 1.91 to
-0.05 — a beautiful curve, and if it were the only number you logged you would
+third row of 16.5's table drawn from life. Training loss falls from 1.36 to
+0.09 — a beautiful curve, and if it were the only number you logged you would
 call the run a success. Held-out loss bottoms out at step 50 and climbs from
 there. **The best model this run ever produced existed around step 50**, and
 every step after that made it worse while the training curve kept improving.
 
-A 0.6M-parameter model on 400 characters of text has nothing else it can do. At
+A 0.6M-parameter model on 500 tokens of text has nothing else it can do. At
 real scale the shape is the same and the turn is later, which is the entire
 reason to log both curves rather than one.
 
 The resume is also doing more than it looks. The held-out loss after loading
-the step-200 checkpoint is 4.1111 — bit for bit the value the live model had at
-step 200. That is what a correct checkpoint looks like: `F32` weights, restored
-optimizer moments, restored step counter, and no discontinuity.
+the step-200 checkpoint is 3.5091 — the value the live model had at step 200.
+That is what a correct checkpoint looks like: `F32` weights, restored
+optimizer moments, restored step counter, and no discontinuity. Evaluate the
+resumed model on the host instead and the last digit or two can move, from
+the same summation order difference, not from the checkpoint.
 
 ## 16.9 If something went wrong
 

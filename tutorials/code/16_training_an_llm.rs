@@ -1,7 +1,8 @@
 //! Chapter 16: a complete training program, at a size that finishes.
 //!
 //! Everything a week-long run needs, in the order a week-long run needs it:
-//! a held-out split, gradient accumulation, a warmup-cosine learning-rate
+//! the corpus tokenized once into token files, a held-out split, gradient
+//! accumulation, a warmup-cosine learning-rate
 //! schedule, periodic evaluation, checkpointing, and a resume that restores
 //! the optimizer state in the right order.
 //!
@@ -10,10 +11,7 @@
 //!
 //! Run with `cargo run --release`.
 
-use rusting_brain::{
-    NetworkError, Optimizer, Precision, Schedule, TokenBatch, TransformerLm,
-    causal_lm_loss_batch,
-};
+use rusting_brain::{NetworkError, Optimizer, Precision, Schedule, TokenFile, TransformerLm};
 
 const SEQ_LEN: usize = 48;
 const MICRO_BATCH: usize = 4;
@@ -58,29 +56,22 @@ impl CharTokenizer {
     }
 }
 
-/// Fixed-length windows out of one flat token array, which is what a real
-/// pre-tokenized corpus file looks like.
-fn windows(ids: &[u32], stride: usize) -> Vec<Vec<u32>> {
-    ids.windows(SEQ_LEN).step_by(stride).map(<[u32]>::to_vec).collect()
-}
-
 /// Mean loss over data the model has never trained on.
 ///
 /// Training loss says the model is moving. Only this says it is learning.
-fn evaluate(model: &TransformerLm, batches: &[TokenBatch]) -> Result<f32, NetworkError> {
-    let mut total = 0.0;
-    for batch in batches {
-        let (logits, _cache) = model.forward_batch(batch)?;
-        total += causal_lm_loss_batch(&logits, batch)?.loss;
+/// `chunk` walks the file in order and covers every token once, so two
+/// evaluations of the same model give the same number.
+fn evaluate(model: &TransformerLm, held_out: &mut TokenFile) -> Result<f32, NetworkError> {
+    let (mut total, mut batches) = (0.0, 0);
+    while let Some(batch) = held_out.chunk(batches, 1, SEQ_LEN)? {
+        total += model.evaluate(&batch)?.lm_loss;
+        batches += 1;
     }
-    Ok(total / batches.len() as f32)
+    Ok(total / batches as f32)
 }
 
 /// Weights and optimizer state together. Either alone is not a resumable run.
 fn checkpoint(model: &mut TransformerLm, path: &str) -> Result<(), NetworkError> {
-    // On a device the weights live there; pull them back before writing.
-    #[cfg(feature = "cuda")]
-    model.sync_from_device()?;
     // F32, never Q8: int8 rounding is invisible for inference and shows up as
     // a step in the loss curve of a resumed run.
     model.save_bin(path, Precision::F32)?;
@@ -92,19 +83,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = CharTokenizer::fit(CORPUS);
     let ids = tokenizer.encode(CORPUS);
 
-    // Hold back the tail and never train on it.
-    let split = ids.len() * 9 / 10;
-    let train_windows = windows(&ids[..split], 4);
-    let validation: Vec<TokenBatch> = windows(&ids[split..], SEQ_LEN)
-        .chunks(MICRO_BATCH)
-        .map(TokenBatch::new)
-        .collect::<Result<_, _>>()?;
+    // Tokenize once and write the ids to disk. Hold back the tail and never
+    // train on it. A real corpus goes through `TokenFile::write_jsonl`, which
+    // never holds the whole of it in memory.
+    let split = ids.len() * 85 / 100;
+    TokenFile::write("train.bin", &ids[..split])?;
+    TokenFile::write("validation.bin", &ids[split..])?;
+    let mut corpus = TokenFile::open("train.bin", 42)?;
+    let mut validation = TokenFile::open("validation.bin", 0)?;
 
     println!(
-        "vocabulary {}, {} training windows, {} validation batches",
+        "vocabulary {}, {} training tokens, {} held-out tokens",
         tokenizer.len(),
-        train_windows.len(),
-        validation.len()
+        corpus.tokens(),
+        validation.tokens()
     );
 
     let mut model = TransformerLm::builder()
@@ -128,7 +120,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let schedule = Schedule::warmup_cosine(PEAK_LR, WARMUP_STEPS, TOTAL_STEPS);
 
-    let mut cursor = 0;
     for step in 1..=TOTAL_STEPS {
         // Warmup, then cosine decay to 10% of peak: full-size steps early are
         // dangerous because Adam's moment estimates are still noise, and
@@ -140,15 +131,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Gradient accumulation: the effective batch is not bounded by memory.
         model.zero_grad();
         let mut train_loss = 0.0;
-        for _ in 0..ACCUMULATE {
-            let micro: Vec<Vec<u32>> = (0..MICRO_BATCH)
-                .map(|_| {
-                    let window = train_windows[cursor % train_windows.len()].clone();
-                    cursor += 1;
-                    window
-                })
-                .collect();
-            train_loss += model.accumulate_step(&TokenBatch::new(&micro)?)?.lm_loss;
+        for micro in 0..ACCUMULATE {
+            // Windows at random offsets, drawn from this counter alone: a run
+            // resumed at any step reads exactly the batches it would have read.
+            let counter = (step * ACCUMULATE + micro) as u64;
+            let batch = corpus.batch(counter, MICRO_BATCH, SEQ_LEN)?;
+            train_loss += model.accumulate_step(&batch)?.lm_loss;
         }
         // The averaging goes on the step, not on each backward pass: Adam
         // normalizes by the gradient's own second moment, so scaling every
@@ -157,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if step % EVAL_EVERY == 0 {
             let train = train_loss / ACCUMULATE as f32;
-            let held_out = evaluate(&model, &validation)?;
+            let held_out = evaluate(&model, &mut validation)?;
             println!("{step:>5}  {rate:.5}   {train:.4}      {held_out:.4}");
         }
 
@@ -176,9 +164,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "  optimizer step counter restored: {} (checkpoint was at {CHECKPOINT_STEP})",
         resumed.optimizer_step()
     );
-    println!("  held-out loss at the checkpoint: {:.4}", evaluate(&resumed, &validation)?);
+    println!(
+        "  held-out loss at the checkpoint: {:.4}",
+        evaluate(&resumed, &mut validation)?
+    );
 
-    std::fs::remove_file("run.rbw")?;
-    std::fs::remove_file("run.rbw.opt")?;
+    for file in ["run.rbw", "run.rbw.opt", "train.bin", "validation.bin"] {
+        std::fs::remove_file(file)?;
+    }
     Ok(())
 }

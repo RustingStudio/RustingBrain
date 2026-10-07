@@ -102,10 +102,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Tokens go in as `u32` ids. RustingBrain does not ship a tokenizer; the
-[`tokenizers`](https://crates.io/crates/tokenizers) crate trains and loads
-Hugging Face BPE vocabularies, and chapter 14 of the tutorials walks through
-it.
+Tokens go in as `u32` ids. `Bpe` and `Unigram` read a Hugging Face
+`tokenizer.json`, and chapter 14 of the tutorials walks through them. Training
+a new vocabulary is left to the
+[`tokenizers`](https://crates.io/crates/tokenizers) library.
 
 ## Held-out loss
 
@@ -155,7 +155,7 @@ BPE vocabulary goes:
 
 ```rust
 TokenFile::write_jsonl("corpus.bin", "corpus.jsonl", "text", Some(eos), |text| {
-    tokenizer.encode(text, false).unwrap().get_ids().to_vec()
+    tokenizer.encode(text).unwrap()
 })?;
 ```
 
@@ -231,7 +231,9 @@ model.to_cuda(0, 9_000)?;          // device 0, 9000 MiB budget
 Every later `train_step`, `forward_batch`, and `backward` runs on the device.
 The path is fail-closed: a driver, cuBLAS, kernel, allocation, or numerical
 failure returns a `NetworkError` rather than silently continuing on the CPU.
-`sync_from_device()` pulls the weights back before a save.
+`save_bin`, `save_lora` and `save_hf` copy the weights back from the device
+themselves; call `sync_from_device()` before `save_json` or before reading
+weights on the host.
 
 A 12 GiB card should be given a budget around `9000` MiB, leaving room for the
 desktop, the driver, and everything else on the machine.

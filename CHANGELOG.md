@@ -30,6 +30,9 @@
 
 ### Changed
 
+- Tutorial chapter 16 trains from `TokenFile` shards, and chapters 14 and 16
+  and the README load tokenizers with `Bpe` rather than the `tokenizers` crate.
+
 - `Bpe` merges in `n log n` instead of `n^2`. A sentencepiece-style file
   (LLaMA 2, Mistral, TinyLlama) merges the whole text as one piece, so a
   50 KB document went from 43 s to 13 ms. Ids are unchanged.
