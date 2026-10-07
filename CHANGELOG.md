@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Int8 device decode of three or more sequences multiplies on the tensor
+  cores (Ampere and later, mixed precision): 16 sequences on the default
+  model went from 13% slower than BF16 to about 12% faster.
 - Int8 device decode (`TransformerLm::set_int8_decode`) now covers the
   routed MoE experts and the router as well, matching the host
   `Precision::Q8` scheme: about 19% more tokens per second than BF16 for one

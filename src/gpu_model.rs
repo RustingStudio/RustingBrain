@@ -1520,7 +1520,8 @@ impl Gpu<'_> {
     }
 
     /// [`Gpu::linear_packed`] for a weight that may be int8. A few rows, a
-    /// decode step, read the int8 bytes directly; more, a prompt, dequantize
+    /// decode step, read the int8 bytes directly, from [`Q8_MMA_ROWS`] on the
+    /// tensor cores; more, a prompt, dequantize
     /// into a scratch copy and take cuBLAS, as does a width the GEMV's 16-byte
     /// loads do not divide.
     #[allow(clippy::too_many_arguments)]
@@ -1575,6 +1576,33 @@ impl Gpu<'_> {
                     .map_err(cuda_err("int8 dequantize kernel"))?;
             }
             return self.linear_packed(&wide.all(), units, inner, x, narrow, out, rows, beta);
+        }
+        let mma = self
+            .context
+            .flash
+            .as_ref()
+            .filter(|_| narrow && inner % 32 == 0 && rows >= Q8_MMA_ROWS);
+        if let Some(flash) = mma {
+            unsafe {
+                self.context
+                    .stream
+                    .launch_builder(&flash.gemv_q8)
+                    .arg(&bytes)
+                    .arg(&scales)
+                    .arg(x)
+                    .arg(out)
+                    .arg(&(units as i32))
+                    .arg(&(inner as i32))
+                    .arg(&(rows as i32))
+                    .arg(&beta)
+                    .launch(cudarc::driver::LaunchConfig {
+                        grid_dim: (units.div_ceil(16) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(cuda_err("int8 tensor-core GEMV kernel"))?;
+            }
+            return Ok(());
         }
         unsafe {
             self.context
@@ -3707,6 +3735,10 @@ fn warp_each(rows: usize) -> cudarc::driver::LaunchConfig {
 /// Rows up to which [`Gpu::project`] runs an int8 weight as a GEMV. A batch
 /// decode step is one row per sequence.
 const Q8_GEMV_ROWS: usize = 16;
+/// Rows from which an int8 GEMV runs on the tensor cores (Ampere and later,
+/// BF16 input, a width that is a multiple of 32). Default model: 4 sequences
+/// 3075 to 3240 tokens/s, 16 sequences 5900 to 7600; one or two are even.
+const Q8_MMA_ROWS: usize = 3;
 
 /// One warp per row, eight rows per block.
 fn warp_per_row_grid(rows: usize) -> cudarc::driver::LaunchConfig {
@@ -5079,5 +5111,71 @@ mod tests {
             &host_probabilities,
             2e-6,
         );
+    }
+
+    /// Every int8 GEMV the decode step can pick - one row, the four-row
+    /// kernel's row groups, both of the tensor-core kernel's sequence tiles -
+    /// against the host product on the device's own int8 bytes. 37 units leave
+    /// a partial 16-unit tile.
+    #[test]
+    fn an_int8_projection_matches_the_host_for_every_batch_or_skips_without_device() {
+        let Some(context) = cuda_or_skip() else {
+            return;
+        };
+        let gpu = Gpu { context: &context };
+        // 288 is nine steps of 32 over the tensor-core kernel's eight warps, so
+        // every warp adds a partial sum and one wraps round; 48 takes the
+        // warp-per-unit kernel.
+        for (units, inner) in [(37, 288), (37, 48)] {
+            let weights = gpu.upload(&ramp(units * inner)).unwrap();
+            let packed = gpu.quantized(&weights.slice(..), units, inner).unwrap();
+            let bytes = context.stream.clone_dtoh(&packed.all()).unwrap();
+            let scales = gpu.download(packed.scales.as_ref().unwrap()).unwrap();
+            for rows in [1, 4, 6, 8, 9, 16] {
+                for beta in [0.0, 0.5] {
+                    let input = gpu.upload(&ramp_from(rows * inner, 5)).unwrap();
+                    let mut x = gpu.act(rows * inner, true).unwrap();
+                    gpu.cast_into(
+                        &mut x.bytes.slice_mut(..),
+                        &input.slice(..),
+                        rows * inner,
+                        true,
+                    )
+                    .unwrap();
+                    let x_host = gpu.download_act(&x).unwrap();
+                    let start = ramp_from(rows * units, 9);
+                    let mut out = gpu.upload(&start).unwrap();
+                    gpu.project(
+                        &packed,
+                        units,
+                        inner,
+                        &x.all(),
+                        true,
+                        &mut out.slice_mut(..),
+                        rows,
+                        beta,
+                    )
+                    .unwrap();
+                    let expected: Vec<f32> = (0..rows * units)
+                        .map(|i| {
+                            let (row, unit) = (i / units, i % units);
+                            let dot: f32 = (0..inner)
+                                .map(|k| {
+                                    x_host[row * inner + k]
+                                        * f32::from(bytes[unit * inner + k] as i8)
+                                })
+                                .sum();
+                            dot * scales[unit] + beta * start[i]
+                        })
+                        .collect();
+                    assert_close(
+                        &format!("{inner} wide, {rows} rows, beta {beta}"),
+                        &gpu.download(&out).unwrap(),
+                        &expected,
+                        1e-4,
+                    );
+                }
+            }
+        }
     }
 }

@@ -1085,3 +1085,35 @@ The BF16 packs a step keeps for its backward pass are unchanged, so at
 this shape activations and packs, not the base, are most of the peak; the
 saving grows with the model and is largest with `checkpoint`, which drops
 the packs between blocks.
+
+## Int8 decode GEMV on the tensor cores (C5 slice 3, 2026-10-07)
+
+Profile at `68f7c70`, `bench_decode 512 128 cuda 16 int8` under `nsys`:
+`gemv_q8` 32.8% of kernel time (12,909 calls, 11.3 us average), the largest
+kernel, ahead of `decode_attention` at 22.9%. At 16 rows it walks the weights
+four rows at a time.
+
+`gemv_q8_mma` (in `src/cuda_flash.rs`, which is built for `compute_80`): a
+block of eight warps owns 16 weight rows as the mma's A operand and takes up
+to 16 BF16 input rows as B, so each weight byte is read once. The warps split
+the width in steps of 32 and add their partial sums in shared memory. The
+first version gave each warp 16 rows and the whole width: a 512-unit layer
+then had 32 warps in flight, and one sequence fell from 1040 to 735
+tokens/s, 16 sequences were no faster than the old kernel.
+
+`bench_decode 512 128 cuda <sequences> int8`, the old kernel against the new
+one in the same build, rounds interleaved, gnome-clocks the only other GPU
+process, load average 4 to 12 (other loops' builds):
+
+| Sequences | Old int8 GEMV | Tensor-core GEMV | BF16 (int8 off) |
+|---|---|---|---|
+| 1 | 984-998 | 999-1003 | 837-855 |
+| 2 | 1946-1950 | 1619-1914 | - |
+| 4 | 3061-3089 | 3235-3246 | - |
+| 8 | 4498-4518 | 5132-5148 | - |
+| 16 | 5900-5930 | 7535-7700 | 6764-6788 |
+
+(A third round with the load average rising to 12 read 5817 against 6801 at
+16 sequences, and 952 against 870 at one.) The tensor-core kernel runs from
+three rows on (`Q8_MMA_ROWS`); one and two rows keep the warp-per-unit
+kernel, which ties it there.

@@ -879,6 +879,71 @@ extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv_##W( \
 FLASH_WIDTH(64)
 FLASH_WIDTH(128)
 
+// `y[r, n] = scales[n] * (x[r, ..] . q[n, ..]) + beta * y[r, n]` for up to 16
+// BF16 rows of `x`, on the tensor cores: the int8 decode GEMV for a batch.
+// A block owns 16 weight rows, the mma's A, and the rows of `x` are its B, so
+// each weight byte is read once whatever the batch. Its eight warps split the
+// width in steps of 32 and add their partial sums in shared memory: one warp
+// per 16 rows alone leaves too few warps in flight to cover the loads. The k
+// order inside an mma is free as long as A and B agree, so a thread reads 8
+// consecutive weights of each of its two rows and the same 8 inputs of each
+// of its sequences, one load apiece, and feeds them to two mmas: k slots
+// {2t, 2t+1} take inputs {4s, 4s+1} of the 8 and slots {2t+8, 2t+9} take
+// {4s+2, 4s+3}. An int8 value converts to BF16 exactly. `inner` is a
+// multiple of 32.
+#define Q8_WARPS 8
+extern "C" __global__ __launch_bounds__(256) void gemv_q8_mma(
+    const signed char* __restrict__ q, const float* __restrict__ scales,
+    const unsigned short* __restrict__ x, float* __restrict__ y,
+    int units, int inner, int rows, float beta)
+{
+  __shared__ float partial[Q8_WARPS-1][8][32];
+  int warp=threadIdx.x/32,lane=threadIdx.x%32,g=lane/4,t=lane%4;
+  int u0=blockIdx.x*16;
+  int ua=min(u0+g,units-1),ub=min(u0+g+8,units-1);
+  const signed char*wa=q+(size_t)ua*inner+t*8;
+  const signed char*wb=q+(size_t)ub*inner+t*8;
+  bool in0=g<rows,in1=g+8<rows,two=rows>8;
+  const unsigned short*x0=x+(size_t)(in0?g:0)*inner+t*8;
+  const unsigned short*x1=x+(size_t)(in1?g+8:0)*inner+t*8;
+  float d[8]={0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+  for(int k=warp*32;k<inner;k+=Q8_WARPS*32){
+    int2 pa=*(const int2*)(wa+k),pb=*(const int2*)(wb+k);
+    uint4 xa=in0?*(const uint4*)(x0+k):make_uint4(0,0,0,0);
+    uint4 xb=two&&in1?*(const uint4*)(x1+k):make_uint4(0,0,0,0);
+    const signed char*ba=(const signed char*)&pa,*bb=(const signed char*)&pb;
+    const unsigned*ia=(const unsigned*)&xa,*ib=(const unsigned*)&xb;
+    #pragma unroll
+    for(int s=0;s<2;s++){
+      unsigned a[4]={pack2(ba[4*s],ba[4*s+1]),pack2(bb[4*s],bb[4*s+1]),
+                     pack2(ba[4*s+2],ba[4*s+3]),pack2(bb[4*s+2],bb[4*s+3])};
+      unsigned b0[2]={ia[2*s],ia[2*s+1]};
+      MMA(d,a,b0);
+      if(two){unsigned b1[2]={ib[2*s],ib[2*s+1]};MMA((d+4),a,b1);}
+    }
+  }
+  if(warp>0){
+    #pragma unroll
+    for(int e=0;e<8;e++)partial[warp-1][e][lane]=d[e];
+  }
+  __syncthreads();
+  if(warp>0)return;
+  #pragma unroll
+  for(int w=0;w<Q8_WARPS-1;w++){
+    #pragma unroll
+    for(int e=0;e<8;e++)d[e]+=partial[w][e][lane];
+  }
+  float sa=scales[ua],sb=scales[ub];
+  #pragma unroll
+  for(int e=0;e<8;e++){
+    int unit=u0+g+((e&2)?8:0),n=2*t+(e&1)+(e>=4?8:0);
+    if(unit>=units||n>=rows)continue;
+    size_t i=(size_t)n*units+unit;
+    float v=d[e]*((e&2)?sb:sa);
+    y[i]=beta==0.f?v:v+beta*y[i];
+  }
+}
+
 "#;
 
 /// The training kernels for one head width.
@@ -894,6 +959,8 @@ pub(crate) struct FlashKernels {
     /// The image path's variant: FP16, unmasked, and able to read its keys
     /// from a different tensor than its queries.
     pub(crate) image: CudaFunction,
+    /// The int8 decode GEMV for a batch, on the tensor cores.
+    pub(crate) gemv_q8: CudaFunction,
     narrow: FlashWidth,
     wide: FlashWidth,
 }
@@ -970,6 +1037,7 @@ pub(crate) fn flash_kernels(device: usize, context: &Arc<CudaContext>) -> Option
     };
     Some(FlashKernels {
         image: get("image_attention_fwd")?,
+        gemv_q8: get("gemv_q8_mma")?,
         narrow: width(64)?,
         wide: width(128)?,
     })
