@@ -1,9 +1,10 @@
 //! Times cached single-token decode, the inference hot loop.
 //!
-//! `cargo run --release --example bench_decode -- <prompt_len> <new_tokens> [cuda]`
+//! `cargo run --release --example bench_decode -- <prompt_len> <new_tokens> [cuda|cpu] [sequences]`
 //!
 //! The host run uses a small model; `cuda` decodes the default model on the
-//! device instead.
+//! device instead. `sequences` decodes that many in step, and tokens/s counts
+//! the tokens of all of them.
 
 use rusting_brain::TransformerLm;
 use std::time::Instant;
@@ -19,6 +20,10 @@ fn main() {
         .unwrap_or(128);
 
     let device = std::env::args().nth(3).is_some_and(|a| a == "cuda");
+    let sequences: usize = std::env::args()
+        .nth(4)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1);
 
     let builder = TransformerLm::builder()
         .max_seq_len(prompt + new_tokens + 1)
@@ -43,20 +48,25 @@ fn main() {
         panic!("rebuild with --features cuda to benchmark the device path");
     }
 
-    let mut decoder = model.decoder();
+    let mut decoder = model.batch_decoder(sequences).unwrap();
     let ids: Vec<u32> = (0..prompt).map(|t| (t * 17 % 32_000) as u32).collect();
-    decoder.feed(&ids).unwrap();
+    decoder.feed(&vec![&ids[..]; sequences]).unwrap();
 
     let start = Instant::now();
     for t in 0..new_tokens {
-        decoder.feed(&[(t * 31 % 32_000) as u32]).unwrap();
+        let step: Vec<[u32; 1]> = (0..sequences)
+            .map(|s| [((t * 31 + s) % 32_000) as u32])
+            .collect();
+        let step: Vec<&[u32]> = step.iter().map(|id| &id[..]).collect();
+        decoder.feed(&step).unwrap();
     }
     model.synchronize().unwrap();
     let elapsed = start.elapsed().as_secs_f64();
+    let tokens = (new_tokens * sequences) as f64;
     println!(
-        "prompt {prompt} + {new_tokens} decoded on {}: {:.2} ms/token, {:.0} tokens/s",
+        "prompt {prompt} + {new_tokens} x {sequences} decoded on {}: {:.2} ms/step, {:.0} tokens/s",
         if device { "cuda" } else { "cpu" },
         1e3 * elapsed / new_tokens as f64,
-        new_tokens as f64 / elapsed
+        tokens / elapsed
     );
 }

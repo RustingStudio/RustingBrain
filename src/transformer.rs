@@ -934,6 +934,39 @@ impl TransformerLm {
         }
     }
 
+    /// A [`Decoder`] over `sequences` independent sequences decoded in step.
+    ///
+    /// One token per sequence is one forward pass over `sequences` rows, so
+    /// on a device the weights are read once for all of them instead of once
+    /// each, which is where a single sequence's decode spends its time.
+    /// Every call feeds every sequence the same number of tokens:
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Sampler, TransformerLm};
+    /// # let model = TransformerLm::load_bin("model.rbw")?;
+    /// # let mut sampler = Sampler::greedy();
+    /// let mut decoder = model.batch_decoder(2)?;
+    /// decoder.feed(&[&[1, 2, 3], &[4, 5, 6]])?;
+    /// let step: Vec<u32> = decoder.next(&mut sampler)?; // one id per sequence
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn batch_decoder(&self, sequences: usize) -> Result<BatchDecoder<'_>, NetworkError> {
+        if sequences == 0 {
+            return Err(NetworkError::InvalidConfig(
+                "a batch decoder needs at least one sequence".into(),
+            ));
+        }
+        Ok(BatchDecoder {
+            model: self,
+            caches: (0..sequences).map(|_| self.new_kv_caches()).collect(),
+            histories: vec![Vec::new(); sequences],
+            logits: None,
+            pending: None,
+            #[cfg(feature = "cuda")]
+            device: None,
+        })
+    }
+
     /// Replaces every projection weight with one `i8` per value and a scale per
     /// row, and drops the gradients and Adam moments. Returns the bytes the
     /// weights now occupy.
@@ -2222,7 +2255,7 @@ impl Decoder<'_> {
         #[cfg(feature = "cuda")]
         if let Some(context) = &self.model.device {
             if self.device.is_none() {
-                self.device = Some(crate::gpu_model::DeviceKv::new(self.model, context)?);
+                self.device = Some(crate::gpu_model::DeviceKv::new(self.model, context, 1)?);
             }
             let kv = self.device.as_mut().expect("allocated above");
             self.model.check_length(ids.len(), kv.len())?;
@@ -2231,6 +2264,117 @@ impl Decoder<'_> {
             return Ok(logits);
         }
         self.model.forward_cached(ids, &mut self.caches)
+    }
+}
+
+/// A [`Decoder`] for several sequences at once. Built by
+/// [`TransformerLm::batch_decoder`].
+pub struct BatchDecoder<'a> {
+    model: &'a TransformerLm,
+    /// One set of caches per sequence on the host; empty sets on a device.
+    caches: Vec<Vec<KvCache>>,
+    histories: Vec<Vec<u32>>,
+    /// `[sequences, vocab_size]`: each sequence's next-token logits.
+    logits: Option<Matrix>,
+    /// Sampled but not yet run, as [`Decoder`] defers it.
+    pending: Option<Vec<u32>>,
+    #[cfg(feature = "cuda")]
+    device: Option<crate::gpu_model::DeviceKv>,
+}
+
+impl BatchDecoder<'_> {
+    /// Appends `ids[s]` to sequence `s`. Every sequence takes the same number
+    /// of tokens; pad a ragged batch, or decode it in separate sessions.
+    pub fn feed(&mut self, ids: &[&[u32]]) -> Result<(), NetworkError> {
+        if ids.len() != self.histories.len() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "expected tokens for {} sequences, got {}",
+                self.histories.len(),
+                ids.len()
+            )));
+        }
+        let length = ids[0].len();
+        if ids.iter().any(|sequence| sequence.len() != length) {
+            return Err(NetworkError::InvalidConfig(
+                "every sequence in a batch decoder takes the same number of tokens".into(),
+            ));
+        }
+        self.catch_up()?;
+        if length == 0 {
+            return Ok(());
+        }
+        self.logits = Some(self.run(ids)?);
+        for (history, sequence) in self.histories.iter_mut().zip(ids) {
+            history.extend_from_slice(sequence);
+        }
+        Ok(())
+    }
+
+    /// Samples the next token of every sequence and appends it.
+    pub fn next(
+        &mut self,
+        sampler: &mut crate::sampling::Sampler,
+    ) -> Result<Vec<u32>, NetworkError> {
+        self.catch_up()?;
+        let logits = self.logits.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig("decoding needs a prompt fed in first".into())
+        })?;
+        let next: Vec<u32> = self
+            .histories
+            .iter_mut()
+            .enumerate()
+            .map(|(sequence, history)| {
+                let id = sampler.pick(logits.row(sequence), history);
+                history.push(id);
+                id
+            })
+            .collect();
+        self.pending = Some(next.clone());
+        Ok(next)
+    }
+
+    /// Every id sequence `sequence` has seen. Panics past the last sequence.
+    pub fn history(&self, sequence: usize) -> &[u32] {
+        &self.histories[sequence]
+    }
+
+    fn catch_up(&mut self) -> Result<(), NetworkError> {
+        if let Some(ids) = self.pending.take() {
+            let ids: Vec<[u32; 1]> = ids.into_iter().map(|id| [id]).collect();
+            let ids: Vec<&[u32]> = ids.iter().map(|id| &id[..]).collect();
+            self.logits = Some(self.run(&ids)?);
+        }
+        Ok(())
+    }
+
+    fn run(&mut self, ids: &[&[u32]]) -> Result<Matrix, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(context) = &self.model.device {
+            if self.device.is_none() {
+                self.device = Some(crate::gpu_model::DeviceKv::new(
+                    self.model,
+                    context,
+                    ids.len(),
+                )?);
+            }
+            let kv = self.device.as_mut().expect("allocated above");
+            self.model.check_length(ids[0].len(), kv.len())?;
+            // Position-major, the order the device cache keeps its rows in.
+            let interleaved: Vec<u32> = (0..ids[0].len())
+                .flat_map(|position| ids.iter().map(move |sequence| sequence[position]))
+                .collect();
+            let logits = crate::gpu_model::decode(self.model, context, &interleaved, kv)?;
+            self.model.check_device()?;
+            return Ok(logits);
+        }
+        // NOTE: the host runs the sequences one after another; batch the
+        // rows through `forward_cached` if host throughput ever matters.
+        let mut data = Vec::new();
+        for (sequence, caches) in ids.iter().zip(&mut self.caches) {
+            let logits = self.model.forward_cached(sequence, caches)?;
+            data.extend_from_slice(logits.row(logits.rows - 1));
+        }
+        Ok(Matrix::from_vec(ids.len(), data.len() / ids.len(), data))
     }
 }
 
@@ -2614,6 +2758,64 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Feeds `batched` and one single-sequence host decoder per sequence the
+    /// same turns, and checks every sequence's logits agree after each.
+    fn assert_batch_matches_single(host: &TransformerLm, batched: &TransformerLm, tolerance: f32) {
+        let turns: [[&[u32]; 3]; 4] = [
+            [&[3, 8, 1, 5], &[9, 4, 11, 2], &[6, 6, 0, 13]],
+            [&[7], &[2], &[10]],
+            [&[2, 12], &[5, 1], &[8, 3]],
+            [&[6], &[11], &[4]],
+        ];
+        let mut batch = batched.batch_decoder(3).unwrap();
+        let mut singles: Vec<_> = (0..3).map(|_| host.decoder()).collect();
+        for (turn, ids) in turns.iter().enumerate() {
+            batch.feed(ids).unwrap();
+            let batch_logits = batch.logits.as_ref().unwrap();
+            for (sequence, single) in singles.iter_mut().enumerate() {
+                single.feed(ids[sequence]).unwrap();
+                let single_logits = single.logits.as_ref().unwrap();
+                let expected = single_logits.row(single_logits.rows - 1);
+                for (index, (b, h)) in batch_logits.row(sequence).iter().zip(expected).enumerate() {
+                    assert!(
+                        (b - h).abs() <= tolerance,
+                        "turn {turn}, sequence {sequence}, logit {index}: {b} batched vs {h}"
+                    );
+                }
+            }
+        }
+        assert!(batch.feed(&[&[1], &[2]]).is_err());
+        assert!(batch.feed(&[&[1], &[2, 3], &[4]]).is_err());
+    }
+
+    #[test]
+    fn a_batch_decoder_matches_one_decoder_per_sequence() {
+        let model = tiny().build().unwrap();
+        assert_batch_matches_single(&model, &model, 1e-5);
+        assert!(model.batch_decoder(0).is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_device_batch_decoder_matches_host_decoders_or_skips_without_device() {
+        match crate::cuda_training::cuda_doctor(0, 8192) {
+            Ok(_) => {}
+            Err(NetworkError::Cuda(message))
+                if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
+            {
+                crate::cuda_training::skip_without_cuda();
+                return;
+            }
+            Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
+        }
+        for (mixed, tolerance) in [(false, 1e-3), (true, 5e-2)] {
+            let cpu = tiny().mixed_precision(mixed).build().unwrap();
+            let mut gpu = cpu.clone();
+            gpu.to_cuda(0, 8192).unwrap();
+            assert_batch_matches_single(&cpu, &gpu, tolerance);
         }
     }
 

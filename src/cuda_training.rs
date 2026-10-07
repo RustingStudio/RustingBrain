@@ -185,7 +185,7 @@ extern "C" __global__ void rmsnorm_bwd(float*gx,float*gw,const float*x,const flo
 // `width` and `off` locate the rotated block inside a wider row: queries and
 // keys are two slices of one fused projection output, so they share a row
 // stride and differ only in where they start.
-extern "C" __global__ void rope_rotate(void*x,const float*cs,const float*sn,int rows,int heads,int head_dim,int seq_len,float dir,int width,int off,int narrow){int half=head_dim/2;int total=rows*heads*half;int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;int ch=i%half;int h=(i/half)%heads;int r=i/(half*heads);int t=(r%seq_len)*half+ch;float c=cs[t];float s=dir*sn[t];size_t base=(size_t)r*width+off+(size_t)h*head_dim+ch;float lo=load_act(x,base,narrow);float hi=load_act(x,base+half,narrow);store_act(x,base,lo*c-hi*s,narrow);store_act(x,base+half,hi*c+lo*s,narrow);}
+extern "C" __global__ void rope_rotate(void*x,const float*cs,const float*sn,int rows,int heads,int head_dim,int seq_len,float dir,int width,int off,int narrow,int per){int half=head_dim/2;int total=rows*heads*half;int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;int ch=i%half;int h=(i/half)%heads;int r=i/(half*heads);int t=((r/per)%seq_len)*half+ch;float c=cs[t];float s=dir*sn[t];size_t base=(size_t)r*width+off+(size_t)h*head_dim+ch;float lo=load_act(x,base,narrow);float hi=load_act(x,base+half,narrow);store_act(x,base,lo*c-hi*s,narrow);store_act(x,base+half,hi*c+lo*s,narrow);}
 // Attention rows are short (one per query position, and only the positions up
 // to it are visible), so a whole block per row would leave most of its threads
 // idle. One warp per row instead, reducing through shuffles with no shared
