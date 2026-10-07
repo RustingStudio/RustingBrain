@@ -1072,13 +1072,14 @@ impl Gpu<'_> {
         Ok(())
     }
 
-    /// `out[r] = scale[r] * source[rows_of[r]]`, or without the scale, written
-    /// at `out`'s precision.
+    /// `out[r] = scale[r] * source[rows_of[r]]`, or without the scale, read
+    /// at `source_narrow` and written at `out`'s precision.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn gather_scaled(
+    pub(crate) fn gather_scaled<T>(
         &self,
         out: &mut Act,
-        source: &CudaView<'_, f32>,
+        source: &CudaView<'_, T>,
+        source_narrow: bool,
         rows_of: &CudaSlice<u32>,
         scale: &CudaSlice<f32>,
         scaled: bool,
@@ -1097,6 +1098,7 @@ impl Gpu<'_> {
                 .arg(&(rows as i32))
                 .arg(&(width as i32))
                 .arg(&i32::from(scaled))
+                .arg(&i32::from(source_narrow))
                 .arg(&narrow)
                 .launch(cfg(rows * width))
                 .map_err(cuda_err("scaled row gather kernel"))?;
@@ -2146,13 +2148,10 @@ fn forward_block(
     let scale = (head_dim as f32).sqrt().recip();
     let query_width = heads * head_dim;
 
-    // The attention side of the block is always fused-GEMM territory, so its
-    // activations follow the context flag. The feed-forward norm only narrows
-    // when the feed-forward is dense: a routed layer's router and gather read
-    // it as FP32, and the gather narrows the rows the experts read.
+    // Every activation here is a GEMM operand or a gather source, so all of
+    // them follow the context flag.
     let narrow = gpu.context.mixed_precision;
-    let dense_ffn = matches!(block.feed_forward, FeedForward::SwiGlu(_));
-    let ffn_narrow = narrow && dense_ffn;
+    let ffn_narrow = narrow;
 
     let attention_weight = gpu.upload(&block.attention_norm.weight.value.data)?;
     // The residual this norm's branch lands on is the duplicate it writes.
@@ -2434,7 +2433,19 @@ fn forward_moe(
     let d_model = moe.d_model();
     let width = moe.config.d_ff;
 
-    let logits = gpu.linear(device_of(&moe.router.projection)?, &input.wide(), rows)?;
+    let narrow = input.is_narrow();
+    let router = gpu.pack(&[&moe.router.projection], narrow)?;
+    let mut logits = gpu.uninit(rows * experts)?;
+    gpu.linear_packed(
+        &router.all(),
+        experts,
+        d_model,
+        &input.all(),
+        narrow,
+        &mut logits,
+        rows,
+        0.0,
+    )?;
     let mut probabilities = gpu.zeros(rows * experts)?;
     let mut log_sum_exp = gpu.zeros(rows)?;
     unsafe {
@@ -2512,12 +2523,12 @@ fn forward_moe(
     // `gather_scaled` touch every routed row, and the per-expert loops
     // partition the routed rows between them with `beta = 0` on the first
     // write of each slice.
-    let narrow = gpu.context.mixed_precision;
     let mut gathered = gpu.act(routed * d_model, narrow)?;
     if routed > 0 {
         gpu.gather_scaled(
             &mut gathered,
-            &input.wide(),
+            &input.all(),
+            narrow,
             &token_of,
             &gates,
             false,
@@ -3561,8 +3572,8 @@ fn backward_moe(
     let routed = cache.routed;
 
     if let (Some(shared), Some(shared_cache)) = (moe.shared.as_mut(), &cache.shared) {
-        // The norm above a routed layer stays FP32, so it did not leave an
-        // operand copy for the shared expert's GEMMs; it is made here.
+        // The norm's backward pass leaves no operand copy for a routed layer,
+        // whose router and gathers read the FP32 gradient; it is made here.
         let upstream = gpu.narrowed(&grad_output.slice(..), rows * d_model, input.is_narrow())?;
         backward_swiglu(
             gpu,
@@ -3597,6 +3608,7 @@ fn backward_moe(
         gpu.gather_scaled(
             &mut grad_expert_output,
             &grad_output.slice(..),
+            false,
             &cache.token_of,
             &cache.gates,
             true,
@@ -3755,10 +3767,12 @@ fn backward_moe(
         rows,
         1.0,
     )?;
-    gpu.accumulate_weight_grad(
-        device_of_mut(&mut moe.router.projection)?,
-        &grad_logits,
-        &input.wide(),
+    let grad_logits = gpu.narrowed(&grad_logits.slice(..), rows * experts, input.is_narrow())?;
+    gpu.accumulate_projection_grad(
+        &mut moe.router.projection,
+        &grad_logits.all(),
+        &input.all(),
+        input.is_narrow(),
         rows,
     )
 }

@@ -617,6 +617,39 @@ and after this change.
 | 499 | 3.1830 | 3.1844 |
 | Held-out | 4.9438 | 4.9239 |
 
+## MoE router and shared expert in BF16 (A7, 2026-10-07)
+
+`bench_train_step 4 1024 cuda`, default model, mixed precision. The MoE
+block takes the BF16 normed input, so the router GEMM, the gather and the
+shared expert read BF16 operands. The router logits stay FP32.
+
+nsys kernel sum over 4 steps: 80.1 to 76.7 ms a step. The FP32-operand
+`s1688bf16` GEMM category is gone; the added `cast_act` costs 1.30 ms.
+
+Throughput (GPU quiet at the time): 49,193, 52,872, 47,815, 52,823 and
+52,914 tok/s. Best of five 52,914 against 51,631 after W1 (+2.5%). The
+regression floor was not re-recorded: `--record` also re-records CPU decode,
+which needs a quiet machine. `strata_head` took the GPU right after the
+profile, so there are no further runs.
+
+Loss, 500 steps of 16 x 256 on the repository's markdown with a 4096-entry
+BPE, Adam 3e-4, seed 7:
+
+| Step | This change | W1 run |
+|---:|---:|---:|
+| 0 | 8.3501 | 8.3616 |
+| 100 | 6.2603 | 6.2807 |
+| 200 | 4.8686 | 5.0238 |
+| 300 | 4.1520 | 4.3658 |
+| 400 | 3.6789 | 3.7833 |
+| 499 | 2.9449 | 3.1844 |
+| Held-out | 4.6321 | 4.9239 |
+
+The W1 column was taken on an earlier copy of the corpus (the roadmap and
+baseline files have changed since), so it is a sanity bound, not a paired
+comparison. A same-corpus rerun of the previous commit ran out of memory
+because `strata` held 10.5 GB of the GPU.
+
 ## CPU MoE pieces (D1, D2, 2026-10-07)
 
 Release build on the Ryzen 5 7600X, one `MoeLayer` with `d_model` 512, 8
