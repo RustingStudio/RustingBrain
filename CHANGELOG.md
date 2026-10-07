@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Under mixed precision the device decoder reads a BF16 copy of the LM head,
+  about 6% more tokens per second for one sequence on the default model.
 - Fused flash attention also serves a head width of 128, the width most
   LLaMA-family checkpoints use, in training and in the forward pass. It used
   to fall back to the three-kernel path; a 4 x 1024 training step at that
