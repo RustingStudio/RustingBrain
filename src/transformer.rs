@@ -904,6 +904,76 @@ impl TransformerLm {
         Ok(generated)
     }
 
+    /// [`generate`](TransformerLm::generate) with a greedy sampler, drafted
+    /// by a smaller model `draft` that shares this model's vocabulary.
+    ///
+    /// The draft proposes up to `lookahead` ids one at a time, and this model
+    /// scores all of them in one forward pass, keeping the proposals that
+    /// match its own greedy choice plus one id of its own. Each round costs one
+    /// pass of this model instead of one per id, and the continuation is the
+    /// one greedy decoding gives, up to near-ties in the logits that the
+    /// multi-row pass can round the other way.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::TransformerLm;
+    /// # let model = TransformerLm::load_bin("model.rbw")?;
+    /// # let draft = TransformerLm::load_bin("draft.rbw")?;
+    /// let continuation = model.generate_speculative(&draft, &[1, 2, 3], 128, 4)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn generate_speculative(
+        &self,
+        draft: &TransformerLm,
+        prompt: &[u32],
+        max_new_tokens: usize,
+        lookahead: usize,
+    ) -> Result<Vec<u32>, NetworkError> {
+        if prompt.is_empty() {
+            return Err(NetworkError::InvalidConfig(
+                "generation needs at least one prompt token".into(),
+            ));
+        }
+        if draft.embedding.vocab_size() != self.embedding.vocab_size() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "the draft model has {} tokens, this model {}",
+                draft.embedding.vocab_size(),
+                self.embedding.vocab_size()
+            )));
+        }
+        let mut greedy = crate::sampling::Sampler::greedy();
+        let mut target = self.decoder();
+        let mut proposer = draft.decoder();
+        target.rewrite(0, prompt)?;
+        proposer.rewrite(0, prompt)?;
+        let capacity = self.config.max_seq_len.min(draft.config.max_seq_len);
+
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        while generated.len() < max_new_tokens {
+            let base = target.history.len();
+            let proposals = lookahead
+                .min(max_new_tokens - generated.len() - 1)
+                .min(capacity.saturating_sub(base));
+            let proposal = (0..proposals)
+                .map(|_| proposer.next(&mut greedy))
+                .collect::<Result<Vec<_>, _>>()?;
+            let logits = target.score(&proposal)?;
+            let choices: Vec<u32> = (0..logits.rows)
+                .map(|row| greedy.pick(logits.row(row), &[]))
+                .collect();
+            let accepted = proposal
+                .iter()
+                .zip(&choices)
+                .take_while(|(proposed, chosen)| proposed == chosen)
+                .count();
+            let own = choices[accepted];
+            generated.extend_from_slice(&proposal[..accepted]);
+            generated.push(own);
+            target.rewrite(base + accepted, &[own])?;
+            proposer.rewrite(base + accepted, &[own])?;
+        }
+        Ok(generated)
+    }
+
     /// A decoding session that keeps its caches between turns.
     ///
     /// [`generate`](TransformerLm::generate) throws the caches away when it
@@ -2221,7 +2291,7 @@ impl Decoder<'_> {
         if ids.is_empty() {
             return Ok(());
         }
-        self.logits = Some(self.run(ids)?);
+        self.logits = Some(self.run(ids, 1)?);
         self.history.extend_from_slice(ids);
         Ok(())
     }
@@ -2246,12 +2316,61 @@ impl Decoder<'_> {
 
     fn catch_up(&mut self) -> Result<(), NetworkError> {
         if let Some(id) = self.pending.take() {
-            self.logits = Some(self.run(&[id])?);
+            self.logits = Some(self.run(&[id], 1)?);
         }
         Ok(())
     }
 
-    fn run(&mut self, ids: &[u32]) -> Result<Matrix, NetworkError> {
+    /// Positions the caches hold, which trail the history by any pending id.
+    fn cached(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if self.model.device.is_some() {
+            return self
+                .device
+                .as_ref()
+                .map_or(0, crate::gpu_model::DeviceKv::len);
+        }
+        self.caches.first().map_or(0, KvCache::len)
+    }
+
+    /// Keeps the first `keep` ids of the history, appends `ids` and leaves the
+    /// last of them pending, as [`next`](Decoder::next) would. Ids the caches
+    /// already hold are not run again.
+    fn rewrite(&mut self, keep: usize, ids: &[u32]) -> Result<(), NetworkError> {
+        self.pending = None;
+        let cached = self.cached().min(keep);
+        for cache in &mut self.caches {
+            cache.truncate(cached);
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(kv) = &mut self.device {
+            kv.truncate(cached);
+        }
+        let mut tail = self.history[cached..keep].to_vec();
+        tail.extend_from_slice(ids);
+        self.history.truncate(cached);
+        if let Some((&last, rest)) = tail.split_last() {
+            self.feed(rest)?;
+            self.history.push(last);
+            self.pending = Some(last);
+        }
+        Ok(())
+    }
+
+    /// Runs the pending id and then `ids`, returning the logits of every row:
+    /// row `i` predicts the id after the `i`-th one run.
+    fn score(&mut self, ids: &[u32]) -> Result<Matrix, NetworkError> {
+        let mut run: Vec<u32> = self.pending.take().into_iter().collect();
+        run.extend_from_slice(ids);
+        let logits = self.run(&run, run.len())?;
+        self.history.extend_from_slice(ids);
+        Ok(logits)
+    }
+
+    /// The host returns every row's logits; a device only the last
+    /// `positions`.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn run(&mut self, ids: &[u32], positions: usize) -> Result<Matrix, NetworkError> {
         #[cfg(feature = "cuda")]
         if let Some(context) = &self.model.device {
             if self.device.is_none() {
@@ -2259,7 +2378,7 @@ impl Decoder<'_> {
             }
             let kv = self.device.as_mut().expect("allocated above");
             self.model.check_length(ids.len(), kv.len())?;
-            let logits = crate::gpu_model::decode(self.model, context, ids, kv)?;
+            let logits = crate::gpu_model::decode(self.model, context, ids, kv, positions)?;
             self.model.check_device()?;
             return Ok(logits);
         }
@@ -2363,7 +2482,7 @@ impl BatchDecoder<'_> {
             let interleaved: Vec<u32> = (0..ids[0].len())
                 .flat_map(|position| ids.iter().map(move |sequence| sequence[position]))
                 .collect();
-            let logits = crate::gpu_model::decode(self.model, context, &interleaved, kv)?;
+            let logits = crate::gpu_model::decode(self.model, context, &interleaved, kv, 1)?;
             self.model.check_device()?;
             return Ok(logits);
         }
@@ -2817,6 +2936,61 @@ mod tests {
             gpu.to_cuda(0, 8192).unwrap();
             assert_batch_matches_single(&cpu, &gpu, tolerance);
         }
+    }
+
+    /// Speculative decoding against plain greedy decoding, with the target as
+    /// its own draft (every proposal kept) and with an unrelated draft (most
+    /// rejected), each run to `max_seq_len`.
+    fn assert_speculative_matches_greedy(target: &TransformerLm, draft: &TransformerLm) {
+        let prompt = [3, 1, 4];
+        let expected = target
+            .generate(&prompt, 29, &mut Sampler::greedy())
+            .unwrap();
+        for draft in [target, draft] {
+            for lookahead in [1, 3, 8] {
+                let got = target
+                    .generate_speculative(draft, &prompt, 29, lookahead)
+                    .unwrap();
+                assert_eq!(got, expected, "lookahead {lookahead}");
+            }
+        }
+        assert_eq!(
+            target.generate_speculative(draft, &prompt, 5, 0).unwrap(),
+            expected[..5]
+        );
+    }
+
+    #[test]
+    fn speculative_decoding_matches_greedy_decoding() {
+        let target = tiny().build().unwrap();
+        let draft = tiny().n_layers(1).moe_layers([]).seed(99).build().unwrap();
+        assert_speculative_matches_greedy(&target, &draft);
+        let other_vocab = tiny().vocab_size(25).build().unwrap();
+        assert!(
+            target
+                .generate_speculative(&other_vocab, &[1], 4, 2)
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_speculative_decoding_matches_greedy_or_skips_without_device() {
+        match crate::cuda_training::cuda_doctor(0, 8192) {
+            Ok(_) => {}
+            Err(NetworkError::Cuda(message))
+                if message.contains("NO_DEVICE") || message.contains("no CUDA-capable device") =>
+            {
+                crate::cuda_training::skip_without_cuda();
+                return;
+            }
+            Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
+        }
+        let mut target = tiny().build().unwrap();
+        let mut draft = tiny().n_layers(1).moe_layers([]).seed(99).build().unwrap();
+        target.to_cuda(0, 8192).unwrap();
+        draft.to_cuda(0, 8192).unwrap();
+        assert_speculative_matches_greedy(&target, &draft);
     }
 
     #[test]

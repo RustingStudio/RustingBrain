@@ -3093,11 +3093,17 @@ impl DeviceKv {
     pub(crate) fn len(&self) -> usize {
         self.length
     }
+
+    /// Forgets every position from `positions` on.
+    pub(crate) fn truncate(&mut self, positions: usize) {
+        self.length = self.length.min(positions);
+    }
 }
 
 /// Runs `ids` through the model against `kv` and returns the logits of each
-/// sequence's last position, `[sequences, vocab_size]`, which is all a decoder
-/// samples from.
+/// sequence's last `positions` positions, `[positions * sequences,
+/// vocab_size]` position-major. A decoder samples from the last one only;
+/// speculative verification scores every new one.
 ///
 /// `ids` holds the same number of new positions for every sequence of `kv`,
 /// position-major: `ids[position * sequences + sequence]`.
@@ -3109,6 +3115,7 @@ pub(crate) fn decode(
     context: &Arc<GpuContext>,
     ids: &[u32],
     kv: &mut DeviceKv,
+    positions: usize,
 ) -> Result<Matrix, NetworkError> {
     let gpu = Gpu { context };
     let rows = ids.len();
@@ -3177,10 +3184,11 @@ pub(crate) fn decode(
         false,
         false,
     )?;
-    // Position-major, so every sequence's last row sits in one block.
-    let last = final_output.wide().slice((rows - sequences) * d_model..);
-    let logits = gpu.linear(head_of(model)?, &last, sequences)?;
-    gpu.matrix(&logits, sequences, vocab)
+    // Position-major, so every sequence's last rows sit in one block.
+    let kept = (positions * sequences).min(rows);
+    let last = final_output.wide().slice((rows - kept) * d_model..);
+    let logits = gpu.linear(head_of(model)?, &last, kept)?;
+    gpu.matrix(&logits, kept, vocab)
 }
 
 /// [`forward_block`] for `rows` new rows, interleaved over `sequences`, after
