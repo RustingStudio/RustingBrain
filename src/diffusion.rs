@@ -128,6 +128,41 @@ impl Scheduler {
         })
     }
 
+    /// The noise range of [`Scheduler::sigmas`] for a DDIM schedule, spaced
+    /// the way Karras et al. (2022) space it: even steps in `sigma^(1/7)`, so
+    /// more of the run is spent at low noise, where detail is decided. This
+    /// is the "Karras" in "DPM++ 2M Karras". Run it with
+    /// [`sample_with_sigmas`].
+    ///
+    /// A flow-matching schedule has no such spacing; its `shift` does that
+    /// job, and it is refused here.
+    pub fn karras_sigmas(&self, steps: usize) -> Result<Vec<f32>, NetworkError> {
+        let Self::Ddim {
+            beta_start,
+            beta_end,
+            train_steps,
+        } = *self
+        else {
+            return Err(NetworkError::InvalidConfig(
+                "Karras spacing is for a DDIM schedule; flow matching spaces its levels with `shift`"
+                    .into(),
+            ));
+        };
+        self.sigmas(steps)?;
+        const RHO: f32 = 7.0;
+        let alphas = alphas_cumprod(beta_start, beta_end, train_steps);
+        let root = |alpha: f32| ((1.0 - alpha) / alpha).sqrt().powf(1.0 / RHO);
+        let (high, low) = (root(alphas[train_steps - 1]), root(alphas[0]));
+        let mut sigmas: Vec<f32> = (0..steps)
+            .map(|step| {
+                let fraction = step as f32 / (steps - 1).max(1) as f32;
+                (high + fraction * (low - high)).powf(RHO)
+            })
+            .collect();
+        sigmas.push(0.0);
+        Ok(sigmas)
+    }
+
     /// One update: `latents` moves from `sigma` to `next_sigma` given the
     /// model's `prediction`.
     pub fn step(
@@ -321,17 +356,41 @@ pub fn sample<D: Denoiser>(
 pub fn sample_from<D: Denoiser>(
     denoiser: &mut D,
     scheduler: Scheduler,
+    latents: Matrix,
+    config: &SamplingConfig,
+    first: usize,
+    on_step: impl FnMut(usize, &Matrix) -> bool,
+) -> Result<Matrix, NetworkError> {
+    let sigmas = scheduler.sigmas(config.steps)?;
+    sample_with_sigmas(
+        denoiser, scheduler, latents, &sigmas, config, first, on_step,
+    )
+}
+
+/// [`sample_from`] over noise levels the caller chose, such as
+/// [`Scheduler::karras_sigmas`].
+///
+/// `sigmas` runs from noisiest to zero, one more entry than there are steps,
+/// and sets the step count: `config.steps` is not read.
+pub fn sample_with_sigmas<D: Denoiser>(
+    denoiser: &mut D,
+    scheduler: Scheduler,
     mut latents: Matrix,
+    sigmas: &[f32],
     config: &SamplingConfig,
     first: usize,
     mut on_step: impl FnMut(usize, &Matrix) -> bool,
 ) -> Result<Matrix, NetworkError> {
-    let sigmas = scheduler.sigmas(config.steps)?;
+    let Some(steps) = sigmas.len().checked_sub(1).filter(|&steps| steps > 0) else {
+        return Err(NetworkError::InvalidConfig(
+            "a sampling run needs at least two noise levels".into(),
+        ));
+    };
     // DPM++ is a multistep solver: it reuses the image the last step believed
     // was underneath, and the step size it was taken over.
     let mut previous: Option<(Vec<f32>, f32)> = None;
 
-    for step in first.min(config.steps)..config.steps {
+    for step in first.min(steps)..steps {
         let (sigma, next) = (sigmas[step], sigmas[step + 1]);
         let mut prediction = denoiser.denoise(&latents, sigma)?;
 
@@ -465,6 +524,46 @@ mod tests {
         assert_eq!(model.calls, 30);
         for (value, target) in image.data.iter().zip(&target) {
             assert!((value - target).abs() < 0.05, "{value} vs {target}");
+        }
+    }
+
+    #[test]
+    fn karras_sigmas_span_the_stable_diffusion_range() {
+        let sigmas = Scheduler::ddim().karras_sigmas(10).unwrap();
+        // The range diffusers reports for Stable Diffusion's betas.
+        assert_eq!(sigmas.len(), 11);
+        assert!((sigmas[0] - 14.6146).abs() < 1e-2, "{}", sigmas[0]);
+        assert!((sigmas[9] - 0.0292).abs() < 1e-4, "{}", sigmas[9]);
+        assert_eq!(sigmas[10], 0.0);
+        assert!(sigmas.windows(2).all(|pair| pair[0] > pair[1]));
+        // Denser at the low end than the DDIM spacing over the same range.
+        let ddim = Scheduler::ddim().sigmas(10).unwrap();
+        assert!(sigmas[5] < ddim[5]);
+        assert!(Scheduler::flow_match(1.0).karras_sigmas(10).is_err());
+
+        let target = vec![0.5, -0.25, 1.0, 0.0];
+        let mut model = Straight {
+            target: target.clone(),
+            calls: 0,
+        };
+        let start = Matrix::from_vec(1, 4, vec![2.0, -3.0, 0.5, 1.5]);
+        let config = SamplingConfig {
+            solver: Solver::DpmPlusPlus2m,
+            ..SamplingConfig::default()
+        };
+        let image = sample_with_sigmas(
+            &mut model,
+            Scheduler::ddim(),
+            start,
+            &sigmas,
+            &config,
+            0,
+            |_, _| true,
+        )
+        .unwrap();
+        assert_eq!(model.calls, 10);
+        for (value, target) in image.data.iter().zip(&target) {
+            assert!((value - target).abs() < 1e-4, "{value} vs {target}");
         }
     }
 
