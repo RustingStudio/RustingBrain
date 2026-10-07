@@ -3058,6 +3058,9 @@ pub(crate) struct DeviceKv {
     /// the decoder's life, so a pack never goes stale, and repacking on every
     /// token was half of a decode step's kernel time.
     packs: PackMemo,
+    /// The LM head narrowed to BF16 under mixed precision, made on first use.
+    /// The FP32 head was a fifth of a decode step's kernel time.
+    head: Option<Act>,
 }
 
 /// Packed weights by first weight's address, part count and precision.
@@ -3086,6 +3089,7 @@ impl DeviceKv {
             length: 0,
             sequences,
             packs: PackMemo::new(),
+            head: None,
         })
     }
 
@@ -3174,6 +3178,7 @@ pub(crate) fn decode(
     let hidden = blocks?;
     kv.length += rows / sequences;
 
+    let narrow = context.mixed_precision;
     let final_weight = gpu.upload(&model.final_norm.weight.value.data)?;
     let (final_output, _, _) = gpu.rmsnorm(
         &hidden,
@@ -3181,13 +3186,35 @@ pub(crate) fn decode(
         rows,
         d_model,
         model.final_norm.eps,
-        false,
+        narrow,
         false,
     )?;
     // Position-major, so every sequence's last rows sit in one block.
     let kept = (positions * sequences).min(rows);
-    let last = final_output.wide().slice((rows - kept) * d_model..);
-    let logits = gpu.linear(head_of(model)?, &last, kept)?;
+    if !narrow {
+        let last = final_output.wide().slice((rows - kept) * d_model..);
+        let logits = gpu.linear(head_of(model)?, &last, kept)?;
+        return gpu.matrix(&logits, kept, vocab);
+    }
+    if kv.head.is_none() {
+        let head = head_of(model)?;
+        kv.head = Some(gpu.narrowed(&head.value().slice(..), vocab * d_model, true)?);
+    }
+    let head = kv.head.as_ref().expect("narrowed above");
+    let last = final_output
+        .all()
+        .slice((rows - kept) * d_model * Act::element(true)..);
+    let mut logits = gpu.uninit(kept * vocab)?;
+    gpu.linear_packed(
+        &head.all(),
+        vocab,
+        d_model,
+        &last,
+        true,
+        &mut logits,
+        kept,
+        0.0,
+    )?;
     gpu.matrix(&logits, kept, vocab)
 }
 

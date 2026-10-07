@@ -888,3 +888,22 @@ No measurement: the GPU was held by another process (RustingStrata, 10.5 GB)
 this iteration, and the speedup depends on how often a real draft agrees
 with its target, which the random test models do not show. A round costs one
 target pass over `lookahead + 1` rows plus `lookahead` draft passes.
+
+## BF16 LM head in device decode (C2 step 5, 2026-10-07)
+
+Profile first, idle GPU at `0f28b3e`, nsys over `bench_decode 512 128 cuda`:
+the LM-head GEMV (`gemv2T_kernel_val` on FP32 weights) took 30.8 ms over 129
+calls, median 200 us, a fifth of the decode's kernel time; every other
+projection already read BF16 packs. After narrowing the head once per
+decoder, the same kernel on BF16 weights has a median of 120 us.
+
+Same-session A/B, idle GPU (only gnome-clocks) before and after, CPU load
+average about 6, `bench_decode 512 128 cuda`, warm runs:
+
+| Build | ms/token | tokens/s |
+|---|---|---|
+| `0f28b3e` (FP32 head) | 1.60, 1.60 | 626 |
+| BF16 head | 1.50, 1.50 | 666 |
+
+A background run during a `cargo build` on the same machine gave 155-488
+tokens/s and was discarded.
