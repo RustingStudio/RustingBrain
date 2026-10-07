@@ -551,3 +551,12 @@ only shows the shape of the cost.
 Four times the text costs about sixteen times the time: the merge loop is
 quadratic in the length of the piece, and Metaspace hands it the whole text.
 Roadmap item E8.
+
+After E8 (heap merge), same file and machine, load average about 3.8. The
+50 KB text is this README repeated. Ids hash the same before and after.
+
+| Characters | Before | After | Per character after |
+|---:|---:|---:|---:|
+| 1,008 | 17.2 ms | 0.258 ms | 0.26 µs |
+| 5,376 | 451 ms | 1.06 ms | 0.20 µs |
+| 50,000 | 43.1 s | 12.6 ms | 0.25 µs |

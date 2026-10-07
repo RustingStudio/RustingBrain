@@ -27,6 +27,9 @@
 
 ### Changed
 
+- `Bpe` merges in `n log n` instead of `n^2`. A sentencepiece-style file
+  (LLaMA 2, Mistral, TinyLlama) merges the whole text as one piece, so a
+  50 KB document went from 43 s to 13 ms. Ids are unchanged.
 - CUDA tests that find no device print `skipped: no CUDA device`, and fail
   instead when `RUSTING_BRAIN_REQUIRE_CUDA` is set, so a GPU run cannot pass
   without running them. CI builds the docs with `-D warnings`.
