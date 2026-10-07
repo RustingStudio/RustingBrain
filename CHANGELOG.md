@@ -4,6 +4,9 @@
 
 ### Changed
 
+- The fused attention query-gradient kernel at head width 128 uses 34 KiB
+  of shared memory instead of 52 KiB, so two blocks fit per SM: a training
+  step with heads of 128 runs about 2.6% faster.
 - `GpuContext` runs on the CUDA default stream, so cudarc no longer records
   and waits on an event for every kernel argument. Batch-1 int8 decode gains
   about 2% (1676-1712 to 1711-1747 tokens/s); training is unchanged.

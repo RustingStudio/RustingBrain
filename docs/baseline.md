@@ -1373,3 +1373,24 @@ Profiles taken under nsys before this change overstate how host-bound decode
 is: nsys slows the API calls the tracking made. An earlier test that called
 `disable_event_tracking` (C1 note) measured the same effect and also found it
 within noise.
+
+## Query-gradient kernel at head width 128 (A3, 2026-10-08)
+
+`flash_attention_dq_128` kept a transposed copy of the key tile in shared
+memory beside the key and value tiles: 52 KiB a block, one block per SM on
+the RTX 3060 (100 KiB). The copy is gone; the dS.K product reads the key
+tile transposed with `ldmatrix.trans`. ptxas registers are unchanged
+(`dq_128` 254, `dq_64` 163 to 164), so the gain is occupancy.
+
+nsys, `bench_train_step 4 1024 cuda 128`, four steps, load 5-8:
+
+| kernel | before (median) | after (median) |
+|---|---|---|
+| `flash_attention_dq_128` | 1075 us | 620 us |
+
+Four interleaved rounds, load 5 (tokens/s):
+
+| head width | before | after |
+|---|---|---|
+| 128 | 48517-48770 | 49954-50304 |
+| 64 | 53257-53636 | 52856-53643 |
