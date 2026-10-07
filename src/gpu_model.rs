@@ -52,6 +52,8 @@ pub(crate) struct ModelKernels {
     softmax_backward: CudaFunction,
     probs_from_lse: CudaFunction,
     softmax_lse_rows: CudaFunction,
+    decode_attention: CudaFunction,
+    decode_attention_merge: CudaFunction,
     swiglu_forward: CudaFunction,
     swiglu_backward: CudaFunction,
     adaln_modulate: CudaFunction,
@@ -93,6 +95,8 @@ impl ModelKernels {
             softmax_backward: get("attention_softmax_bwd")?,
             probs_from_lse: get("attention_probs_from_lse")?,
             softmax_lse_rows: get("attention_softmax_lse")?,
+            decode_attention: get("decode_attention")?,
+            decode_attention_merge: get("decode_attention_merge")?,
             swiglu_forward: get("swiglu_fwd")?,
             swiglu_backward: get("swiglu_bwd")?,
             adaln_modulate: get("adaln_modulate")?,
@@ -3255,6 +3259,10 @@ pub(crate) fn decode(
     gpu.matrix(&logits, kept, vocab)
 }
 
+/// Positions per block of the fused decode attention, `DECODE_CHUNK` in the
+/// kernel source.
+const DECODE_CHUNK: usize = 64;
+
 /// [`forward_block`] for `rows` new rows, interleaved over `sequences`, after
 /// `offset` cached positions, without anything kept for a backward pass.
 #[allow(clippy::too_many_arguments)]
@@ -3342,66 +3350,110 @@ fn decode_block(
         }
     }
 
-    // NOTE: one batched GEMM per head for scores and one for values, the
-    // three-kernel path at a single query row; a fused decode kernel is C1's.
-    // Scores are `[heads, sequences, queries, history]`.
+    // A single new row per sequence, the common decode step, runs one fused
+    // kernel per layer. Several rows (a prompt, a speculative check) take the
+    // three-kernel path below.
+    const THREADS: usize = 256;
     let group = heads / kv_heads;
-    let block_scores = queries * history;
-    let mut scores = gpu.uninit(heads * sequences * block_scores)?;
-    for head in 0..heads {
-        let kv_base = (head / group) * head_dim;
-        gemm_rhs_transposed_batched(
-            gpu.context,
-            &cache.slice(start + head * head_dim..),
-            row_stride,
-            &cache.slice(key_base + kv_base..),
-            row_stride,
-            &mut scores.slice_mut(head * sequences * block_scores..),
-            history,
-            queries,
-            history,
-            head_dim,
-            scale,
-            0.0,
-            sequences,
-            qkv_width,
-            qkv_width,
-            block_scores,
-        )?;
-    }
-    let mut log_sum_exp = gpu.uninit(heads * rows)?;
-    gpu.attention_softmax(
-        &mut scores,
-        &mut log_sum_exp,
-        heads * rows,
-        history,
-        true,
-        queries,
-        offset,
-    )?;
     let mut merged = gpu.act(rows * query_width, false)?;
-    {
-        let mut wide = merged.wide_mut();
+    if queries == 1 && head_dim <= THREADS {
+        let chunks = history.div_ceil(DECODE_CHUNK);
+        let mut partial = gpu.uninit(heads * sequences * chunks * (head_dim + 2))?;
+        unsafe {
+            gpu.context
+                .stream
+                .launch_builder(&gpu.context.model.decode_attention)
+                .arg(&*cache)
+                .arg(&mut partial)
+                .arg(&(history as i32))
+                .arg(&(sequences as i32))
+                .arg(&(qkv_width as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(group as i32))
+                .arg(&(key_base as i32))
+                .arg(&(value_base as i32))
+                .arg(&(start as i64))
+                .arg(&scale)
+                .arg(&(query_width as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (heads as u32, sequences as u32, chunks as u32),
+                    block_dim: (THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(cuda_err("decode attention kernel"))?;
+            gpu.context
+                .stream
+                .launch_builder(&gpu.context.model.decode_attention_merge)
+                .arg(&partial)
+                .arg(&mut merged.wide_mut())
+                .arg(&(chunks as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(query_width as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (heads as u32, sequences as u32, 1),
+                    block_dim: (head_dim.next_multiple_of(32) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(cuda_err("decode attention merge kernel"))?;
+        }
+    } else {
+        // Scores are `[heads, sequences, queries, history]`.
+        let block_scores = queries * history;
+        let mut scores = gpu.uninit(heads * sequences * block_scores)?;
         for head in 0..heads {
             let kv_base = (head / group) * head_dim;
-            gemm_plain_batched(
+            gemm_rhs_transposed_batched(
                 gpu.context,
-                &scores.slice(head * sequences * block_scores..),
-                history,
-                &cache.slice(value_base + kv_base..),
+                &cache.slice(start + head * head_dim..),
                 row_stride,
-                &mut wide.slice_mut(head * head_dim..),
-                sequences * query_width,
-                queries,
-                head_dim,
+                &cache.slice(key_base + kv_base..),
+                row_stride,
+                &mut scores.slice_mut(head * sequences * block_scores..),
                 history,
-                1.0,
+                queries,
+                history,
+                head_dim,
+                scale,
                 0.0,
                 sequences,
-                block_scores,
                 qkv_width,
-                query_width,
+                qkv_width,
+                block_scores,
             )?;
+        }
+        let mut log_sum_exp = gpu.uninit(heads * rows)?;
+        gpu.attention_softmax(
+            &mut scores,
+            &mut log_sum_exp,
+            heads * rows,
+            history,
+            true,
+            queries,
+            offset,
+        )?;
+        {
+            let mut wide = merged.wide_mut();
+            for head in 0..heads {
+                let kv_base = (head / group) * head_dim;
+                gemm_plain_batched(
+                    gpu.context,
+                    &scores.slice(head * sequences * block_scores..),
+                    history,
+                    &cache.slice(value_base + kv_base..),
+                    row_stride,
+                    &mut wide.slice_mut(head * head_dim..),
+                    sequences * query_width,
+                    queries,
+                    head_dim,
+                    history,
+                    1.0,
+                    0.0,
+                    sequences,
+                    block_scores,
+                    qkv_width,
+                    query_width,
+                )?;
+            }
         }
     }
     let output_weight = gpu.pack(&[&attention.output], false)?;

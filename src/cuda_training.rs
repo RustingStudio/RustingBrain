@@ -249,6 +249,62 @@ extern "C" __global__ void attention_softmax_lse(float*s,float*lse,int rows,int 
     for(int j=vis+lane;j<seq_len;j+=WARP)row[j]=0.f;
   }
 }
+// One decode step's attention for a single new row per sequence, split the
+// flash-decoding way so a batch-1 step still fills the card. Block
+// (head, sequence, chunk) scores DECODE_CHUNK positions of the history,
+// reading the [query, key, value] rows of the device cache in place, and
+// writes its running max, its exp-sum and its unnormalised weighted sum of
+// values; `decode_attention_merge` rescales and adds the chunks. Position p of
+// sequence `seq` is cache row p*sequences+seq.
+#define DECODE_CHUNK 64
+extern "C" __global__ void decode_attention(const float*qkv,float*partial,int history,int sequences,int qkv_width,int head_dim,int group,int key_base,int value_base,long start,float scale,int query_width){
+  __shared__ float s[DECODE_CHUNK];
+  __shared__ float red[32];
+  __shared__ float part[1024];
+  int head=blockIdx.x,seq=blockIdx.y,chunk=blockIdx.z,chunks=gridDim.z;
+  int first=chunk*DECODE_CHUNK,count=min(DECODE_CHUNK,history-first);
+  int lane=threadIdx.x%WARP,warp=threadIdx.x/WARP,warps=blockDim.x/WARP;
+  long row_stride=(long)sequences*qkv_width;
+  int kv=(head/group)*head_dim;
+  const float*q=qkv+start+(long)seq*qkv_width+head*head_dim;
+  const float*k=qkv+(long)seq*qkv_width+key_base+kv+first*row_stride;
+  const float*v=qkv+(long)seq*qkv_width+value_base+kv+first*row_stride;
+  for(int p=warp;p<count;p+=warps){
+    const float*kp=k+p*row_stride;float d=0.f;
+    for(int i=lane;i<head_dim;i+=WARP)d+=q[i]*kp[i];
+    d=warp_sum(d);
+    if(lane==0)s[p]=d*scale;
+  }
+  __syncthreads();
+  if(warp==0){
+    float m=-3.0e38f;for(int p=lane;p<count;p+=WARP)m=fmaxf(m,s[p]);
+    m=warp_max(m);
+    float sum=0.f;for(int p=lane;p<count;p+=WARP){float e=__expf(s[p]-m);s[p]=e;sum+=e;}
+    sum=warp_sum(sum);
+    if(lane==0){red[0]=m;red[1]=sum;}
+  }
+  __syncthreads();
+  int slices=blockDim.x/head_dim,t=threadIdx.x%head_dim,slice=threadIdx.x/head_dim;
+  float acc=0.f;
+  if(slice<slices)for(int p=slice;p<count;p+=slices)acc+=s[p]*v[p*row_stride+t];
+  part[threadIdx.x]=acc;__syncthreads();
+  float*out=partial+((long)(seq*gridDim.x+head)*chunks+chunk)*(head_dim+2);
+  if(threadIdx.x<head_dim){
+    float total=0.f;for(int i=0;i<slices;i++)total+=part[i*head_dim+threadIdx.x];
+    out[2+threadIdx.x]=total;
+  }
+  if(threadIdx.x==0){out[0]=red[0];out[1]=red[1];}
+}
+// Block (head, sequence), one thread per output element.
+extern "C" __global__ void decode_attention_merge(const float*partial,float*out,int chunks,int head_dim,int query_width){
+  int head=blockIdx.x,seq=blockIdx.y,t=threadIdx.x;
+  if(t>=head_dim)return;
+  const float*in=partial+(long)(seq*gridDim.x+head)*chunks*(head_dim+2);
+  float m=-3.0e38f;for(int c=0;c<chunks;c++)m=fmaxf(m,in[c*(head_dim+2)]);
+  float sum=0.f,acc=0.f;
+  for(int c=0;c<chunks;c++){const float*p=in+c*(head_dim+2);float w=__expf(p[0]-m);sum+=w*p[1];acc+=w*p[2+t];}
+  out[(long)seq*query_width+head*head_dim+t]=acc/sum;
+}
 extern "C" __global__ void attention_softmax_bwd(float*g,const float*p,int rows,int cols,int causal){
   int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
   int stride=gridDim.x*warps;
