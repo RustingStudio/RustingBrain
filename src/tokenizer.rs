@@ -30,6 +30,19 @@
 use crate::network::NetworkError;
 use std::collections::HashMap;
 
+/// Ids at or above this are refused. The token table is sized by the largest
+/// id, so a corrupt id would otherwise allocate gigabytes; the largest
+/// published vocabularies are around 260k.
+const MAX_TOKEN_ID: u64 = 1 << 24;
+
+/// A JSON token id, if it is one a real vocabulary could hold.
+fn token_id(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .filter(|id| *id < MAX_TOKEN_ID)
+        .map(|id| id as u32)
+}
+
 /// A byte-level BPE tokenizer.
 #[derive(Clone, Debug)]
 pub struct Bpe {
@@ -89,10 +102,9 @@ impl Bpe {
             .ok_or_else(|| NetworkError::InvalidDataset("the model has no vocabulary".into()))?
             .iter()
             .map(|(token, id)| {
-                let id = id
-                    .as_u64()
+                let id = token_id(id)
                     .ok_or_else(|| NetworkError::InvalidDataset(format!("{token} has no id")))?;
-                Ok((token.clone(), id as u32))
+                Ok((token.clone(), id))
             })
             .collect::<Result<_, NetworkError>>()?;
 
@@ -134,7 +146,7 @@ impl Bpe {
                     .filter_map(|token| {
                         Some((
                             token.get("content")?.as_str()?.to_string(),
-                            token.get("id")?.as_u64()? as u32,
+                            token_id(token.get("id")?)?,
                         ))
                     })
                     .collect()
@@ -730,7 +742,7 @@ impl Unigram {
                     .filter_map(|token| {
                         Some((
                             token.get("content")?.as_str()?.to_string(),
-                            token.get("id")?.as_u64()? as u32,
+                            token_id(token.get("id")?)?,
                         ))
                     })
                     .collect()
@@ -930,7 +942,7 @@ pub(crate) mod tests {
         std::fs::write(path, tokenizer_json(merges, extra, suffix)).unwrap();
     }
 
-    fn tokenizer_json(merges: &[&str], extra: &[&str], suffix: Option<&str>) -> String {
+    pub(crate) fn tokenizer_json(merges: &[&str], extra: &[&str], suffix: Option<&str>) -> String {
         let alphabet = byte_alphabet();
         let mut vocab = serde_json::Map::new();
         for (id, character) in alphabet.iter().enumerate() {

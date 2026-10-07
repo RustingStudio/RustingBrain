@@ -700,13 +700,10 @@ fn read_npy(path: &Path) -> Result<Vec<Vec<f32>>, NetworkError> {
         return Err(invalid("not a .npy file".into()));
     }
     // Version 1 stores the header length as u16, versions 2 and 3 as u32.
-    let (header_length, start) = if bytes[6] == 1 {
-        (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10)
-    } else {
-        (
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize,
-            12,
-        )
+    let (header_length, start) = match (bytes[6], bytes.get(8..12)) {
+        (1, _) => (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10),
+        (_, Some(length)) => (u32::from_le_bytes(length.try_into().unwrap()) as usize, 12),
+        (_, None) => return Err(invalid("truncated header".into())),
     };
     let Some(header) = bytes
         .get(start..start + header_length)
@@ -783,7 +780,10 @@ fn read_npy(path: &Path) -> Result<Vec<Vec<f32>>, NetworkError> {
         }
     };
 
-    if values.len() < rows * columns {
+    if rows
+        .checked_mul(columns)
+        .is_none_or(|count| values.len() < count)
+    {
         return Err(invalid(format!(
             "header promises {rows}x{columns} values and the file holds {}",
             values.len()
@@ -827,6 +827,14 @@ fn read_idx(path: &Path, scale: bool) -> Result<Vec<Vec<f32>>, NetworkError> {
         .chunks_exact(4)
         .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as usize)
         .collect();
+    // A corrupt shape can overflow; the file can never hold that many values.
+    if shape
+        .iter()
+        .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
+        .is_none_or(|total| total > bytes.len())
+    {
+        return Err(invalid(format!("shape {shape:?} is larger than the file")));
+    }
     let rows = shape[0];
     let columns: usize = shape[1..].iter().product::<usize>().max(1);
     if rows == 0 {
