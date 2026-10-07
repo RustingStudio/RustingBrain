@@ -47,6 +47,11 @@
 
 ### Fixed
 
+- LoRA training on CUDA works under mixed precision, the default. Folding the
+  adapter into a BF16 weight asked cuBLAS for an FP32-to-BF16 GEMM it does
+  not have, so every step failed with `CUBLAS_STATUS_NOT_SUPPORTED`; the test
+  covered FP32 only.
+
 - `TransformerLm::save_bin` and `save_lora` copy the weights back from the
   device first, as `save_hf` already did. A model trained on CUDA used to
   save the weights it had before its first device step.
