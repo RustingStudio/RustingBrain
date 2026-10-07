@@ -713,3 +713,28 @@ parameter, 32 with the weight-decay re-read. That is 1.55 to 1.77 GB a step,
 302 to 345 GB/s against the RTX 3060's 360 GB/s. A fused multi-tensor kernel
 can only close the gap to the roofline, at most about 0.8 ms (1%), so A9 is
 rejected.
+
+## Routed expert GEMMs attributed (A7 W4 step 1, 2026-10-07)
+
+Same idle-GPU `nsys` report at `6f48659` (`bench_train_step 4 1024 cuda`,
+4 steps), exported with `nsys stats -r cuda_gpu_trace`. Each MoE layer's
+kernels run in a fixed order: the forward gather, the per-expert gate/up and
+down GEMMs, then `scatter_add_scaled`; in the backward pass
+`row_dot_scatter`, the gradient gather, the per-expert GEMMs, then
+`scatter_add_rows`. The GEMMs inside those brackets are the routed experts.
+
+| | ms/step | Launches/step | FLOPs/step | TFLOPS |
+|---|---:|---:|---:|---:|
+| Routed forward | 3.92 | 96 | 53.2 G | 13.6 |
+| Routed backward | 6.75 | 192 | 106.3 G | 15.8 |
+| All other GEMMs | 32.50 | | | |
+| Total kernel time | 78.1 | | | |
+
+FLOPs: 6 MoE layers, 8192 routed rows each (4096 tokens, top 2), `d_model`
+512, expert width 352, `2 * rows * 3 * 512 * 352` forward and twice that
+backward. Each per-expert GEMM is about 1024 rows, and the grids are 24 to 48
+blocks on the RTX 3060's 28 SMs: one partial wave, so the split costs
+occupancy. At the dense GEMMs' 22 TFLOPS the routed set would take about
+7.3 ms, so about 3.4 ms (4.4%) is recoverable, under the 10 ms bar the plan
+set for writing a kernel. `bench` routes uniformly random tokens almost
+evenly, so real text (step 3) may differ.
