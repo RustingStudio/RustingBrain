@@ -199,15 +199,15 @@ pub struct Conditioning {
 
 /// The rotation table for one sequence: a cosine and a sine per head dimension
 /// pair per token.
-struct Positions {
-    cos: Vec<f32>,
-    sin: Vec<f32>,
+pub(crate) struct Positions {
+    pub(crate) cos: Vec<f32>,
+    pub(crate) sin: Vec<f32>,
     pairs: usize,
 }
 
 impl Positions {
     /// Text tokens at the origin, then one entry per patch in row-major order.
-    fn new(config: &DitConfig, text_len: usize, height: usize, width: usize) -> Self {
+    pub(crate) fn new(config: &DitConfig, text_len: usize, height: usize, width: usize) -> Self {
         let pairs = config.head_dim() / 2;
         let tokens = text_len + height * width;
         let mut cos = vec![0.0; tokens * pairs];
@@ -244,7 +244,7 @@ impl Positions {
     }
 
     /// Rotates every head of a `[tokens, heads * head_dim]` matrix in place.
-    fn apply(&self, values: &mut Matrix, num_heads: usize) {
+    pub(crate) fn apply(&self, values: &mut Matrix, num_heads: usize) {
         let head_dim = self.pairs * 2;
         values
             .data
@@ -270,12 +270,12 @@ impl Positions {
 /// The per-head RMS normalization every modern denoiser puts on its queries
 /// and keys, which is what keeps attention logits from drifting at scale.
 #[derive(Clone, Debug)]
-struct HeadNorm {
-    scale: Vec<f32>,
+pub(crate) struct HeadNorm {
+    pub(crate) scale: Vec<f32>,
 }
 
 impl HeadNorm {
-    fn apply(&self, values: &mut Matrix, num_heads: usize) {
+    pub(crate) fn apply(&self, values: &mut Matrix, num_heads: usize) {
         let head_dim = self.scale.len();
         values
             .data
@@ -383,7 +383,7 @@ pub(crate) fn layer_norm(tokens: &Matrix, eps: f32) -> Matrix {
 }
 
 /// `x * (1 + scale) + shift`, the modulation an adaptive norm applies.
-fn modulate(tokens: &Matrix, shift: &[f32], scale: &[f32]) -> Matrix {
+pub(crate) fn modulate(tokens: &Matrix, shift: &[f32], scale: &[f32]) -> Matrix {
     let mut output = tokens.clone();
     output.data.par_chunks_mut(tokens.cols).for_each(|row| {
         for ((value, shift), scale) in row.iter_mut().zip(shift).zip(scale) {
@@ -431,7 +431,7 @@ pub(crate) fn sinusoid(time: f32, dim: usize) -> Vec<f32> {
 /// The two-layer embedder that turns a vector into a conditioning signal.
 #[derive(Clone, Debug)]
 struct Embedder {
-    input: Dense,
+    pub(crate) input: Dense,
     output: Dense,
 }
 
@@ -446,9 +446,9 @@ impl Embedder {
 /// One stream's modulation: a projection from the conditioning vector into as
 /// many `(shift, scale, gate)` triples as the block needs.
 #[derive(Clone, Debug)]
-struct Modulation {
-    projection: Dense,
-    chunks: usize,
+pub(crate) struct Modulation {
+    pub(crate) projection: Dense,
+    pub(crate) chunks: usize,
 }
 
 impl Modulation {
@@ -472,21 +472,21 @@ impl Modulation {
 
 /// Image and text, separate weights, one attention.
 #[derive(Clone, Debug)]
-struct DoubleBlock {
-    image: Stream,
-    text: Stream,
+pub(crate) struct DoubleBlock {
+    pub(crate) image: Stream,
+    pub(crate) text: Stream,
 }
 
 /// One side of a double-stream block.
 #[derive(Clone, Debug)]
-struct Stream {
-    modulation: Modulation,
-    qkv: Dense,
-    query_norm: HeadNorm,
-    key_norm: HeadNorm,
-    projection: Dense,
-    mlp_in: Dense,
-    mlp_out: Dense,
+pub(crate) struct Stream {
+    pub(crate) modulation: Modulation,
+    pub(crate) qkv: Dense,
+    pub(crate) query_norm: HeadNorm,
+    pub(crate) key_norm: HeadNorm,
+    pub(crate) projection: Dense,
+    pub(crate) mlp_in: Dense,
+    pub(crate) mlp_out: Dense,
 }
 
 impl Stream {
@@ -542,28 +542,28 @@ impl Stream {
 /// One set of weights over the concatenated sequence, with the attention and
 /// the feed-forward sharing a projection.
 #[derive(Clone, Debug)]
-struct SingleBlock {
-    modulation: Modulation,
-    fused_in: Dense,
-    fused_out: Dense,
-    query_norm: HeadNorm,
-    key_norm: HeadNorm,
+pub(crate) struct SingleBlock {
+    pub(crate) modulation: Modulation,
+    pub(crate) fused_in: Dense,
+    pub(crate) fused_out: Dense,
+    pub(crate) query_norm: HeadNorm,
+    pub(crate) key_norm: HeadNorm,
 }
 
 /// The denoising transformer.
 pub struct Dit {
     config: DitConfig,
-    image_in: Dense,
-    text_in: Dense,
+    pub(crate) image_in: Dense,
+    pub(crate) text_in: Dense,
     time_in: Embedder,
     /// The pooled-prompt embedder, which the models that take no pooled
     /// vector do not have.
     vector_in: Option<Embedder>,
     guidance_in: Option<Embedder>,
-    double: Vec<DoubleBlock>,
-    single: Vec<SingleBlock>,
-    final_modulation: Dense,
-    final_out: Dense,
+    pub(crate) double: Vec<DoubleBlock>,
+    pub(crate) single: Vec<SingleBlock>,
+    pub(crate) final_modulation: Dense,
+    pub(crate) final_out: Dense,
     conditioning: Option<Conditioning>,
     unconditional: Option<Conditioning>,
 }
@@ -780,24 +780,14 @@ impl Dit {
         self.forward_with(patches, timestep, conditioning)
     }
 
-    /// The same pass against a conditioning handed in rather than the one the
-    /// model is holding, which is how the unconditional half of a guided step
-    /// runs.
-    pub fn forward_with(
+    /// The conditioning vector every modulation reads: the noise level first,
+    /// then the pooled prompt, then the distilled guidance scale if the model
+    /// takes one.
+    pub(crate) fn vector(
         &self,
-        patches: &Matrix,
         timestep: f32,
         conditioning: &Conditioning,
-    ) -> Result<Matrix, NetworkError> {
-        if patches.rows != conditioning.height * conditioning.width {
-            return Err(NetworkError::InvalidTarget {
-                expected: conditioning.height * conditioning.width,
-                actual: patches.rows,
-            });
-        }
-
-        // The conditioning vector: noise level first, then the pooled prompt,
-        // then the distilled guidance scale if the model takes one.
+    ) -> Result<Vec<f32>, NetworkError> {
         let mut vector = self
             .time_in
             .forward(&timestep_embedding(timestep, self.time_in.input.in_dim()))?;
@@ -821,7 +811,26 @@ impl Dit {
                 *value += guidance;
             }
         }
+        Ok(vector)
+    }
 
+    /// The same pass against a conditioning handed in rather than the one the
+    /// model is holding, which is how the unconditional half of a guided step
+    /// runs.
+    pub fn forward_with(
+        &self,
+        patches: &Matrix,
+        timestep: f32,
+        conditioning: &Conditioning,
+    ) -> Result<Matrix, NetworkError> {
+        if patches.rows != conditioning.height * conditioning.width {
+            return Err(NetworkError::InvalidTarget {
+                expected: conditioning.height * conditioning.width,
+                actual: patches.rows,
+            });
+        }
+
+        let vector = self.vector(timestep, conditioning)?;
         let mut image = self.image_in.forward(patches)?;
         let mut text = self.text_in.forward(&conditioning.text)?;
         let positions = Positions::new(
@@ -1283,7 +1292,7 @@ pub(crate) mod tests {
     use crate::diffusion::{SamplingConfig, Scheduler, sample};
     use std::collections::BTreeMap;
 
-    fn tiny() -> DitConfig {
+    pub(crate) fn tiny() -> DitConfig {
         DitConfig {
             in_channels: 4,
             out_channels: 4,
@@ -1558,7 +1567,7 @@ pub(crate) mod tests {
         out
     }
 
-    fn conditioning(config: &DitConfig, height: usize, width: usize) -> Conditioning {
+    pub(crate) fn conditioning(config: &DitConfig, height: usize, width: usize) -> Conditioning {
         Conditioning {
             text: Matrix::from_vec(
                 3,

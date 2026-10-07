@@ -1250,3 +1250,16 @@ after a warm-up, 33.8, 29.0, 30.1, 28.6, 29.9 ms including the upload of the
 embeddings and the bias and the download of the states. Worst difference
 0.0073 against a largest state of 0.39. Load 32 (other jobs on the host),
 RTX 3060.
+
+## MMDiT on the device (C6 part 2, 2026-10-07)
+
+`time_a_dit_over_a_512_image` (release, ignored): a random FLUX-shaped
+denoiser (d_model 768, 6 heads of 128, 2 double and 4 single blocks, mlp
+ratio 4) over 32x32 patches and 256 text tokens. Host `Dit::forward_with`
+1.27 s; `DeviceDit::forward_with`, five runs after a warm-up, 15.7, 16.0,
+15.9, 15.9, 17.1 ms, including the uploads and the download. Relative L2
+error 0.0076. Load 7 to 5, RTX 3060.
+
+On the tiny parity model the whole-model relative error is 0.020 at F32 and
+0.008 at Q8: Q8 weights are read exactly on both sides, so the gap is BF16
+weight rounding, not the kernels, which match the host to 1e-4.
