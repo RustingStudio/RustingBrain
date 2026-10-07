@@ -869,3 +869,9 @@ ms per step and tokens/s over all sequences:
 One sequence is unchanged from step 3 (624). A step costs 0.39 ms more at 4
 sequences than at 1 and 5.4 ms more at 64, so the single-sequence step is
 almost all fixed launch overhead and weight reads.
+
+## LCM sampling (C7, 2026-10-07)
+
+No measurement: `sample_consistency` costs one model call per step like the
+other solvers, and its own arithmetic is elementwise. The GPU was held by
+another process (RustingStrata, 10.5 GB) this iteration.

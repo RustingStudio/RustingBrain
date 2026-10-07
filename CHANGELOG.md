@@ -25,6 +25,9 @@
 
 ### Added
 
+- `Scheduler::lcm_sigmas` and `sample_consistency`: the timesteps and the
+  multistep consistency loop a latent consistency model (LCM, LCM-LoRA) runs
+  in two to eight steps, matching diffusers' `LCMScheduler` timesteps.
 - `TransformerLm::batch_decoder(n)` returns a `BatchDecoder`, which decodes n
   sequences in step and samples one token for each per `next`. On a device
   model the n sequences share every weight read: the default model decodes
