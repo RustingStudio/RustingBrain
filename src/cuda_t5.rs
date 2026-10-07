@@ -114,7 +114,7 @@ impl DeviceT5 {
         for block in &self.blocks {
             let (normed, _, _) = gpu.rmsnorm(
                 &hidden,
-                &block.attention_norm,
+                &block.attention_norm.as_view(),
                 tokens,
                 d_model,
                 config.eps,
@@ -197,7 +197,7 @@ impl DeviceT5 {
 
             let (normed, _, _) = gpu.rmsnorm(
                 &hidden,
-                &block.mlp_norm,
+                &block.mlp_norm.as_view(),
                 tokens,
                 d_model,
                 config.eps,
@@ -230,7 +230,7 @@ impl DeviceT5 {
 
         let (normed, _, _) = gpu.rmsnorm(
             &hidden,
-            &self.final_norm,
+            &self.final_norm.as_view(),
             tokens,
             d_model,
             config.eps,
