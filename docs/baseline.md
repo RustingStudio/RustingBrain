@@ -7,6 +7,21 @@ Every earlier measurement in this repository's history was taken while a
 second training job held 5754 MiB and 100% of the GPU. Those numbers are
 superseded by this table and should not be compared against it.
 
+## Regression check
+
+`scripts/bench_check.sh` compares the best tokens/s of five runs against these
+rows and fails below 97%. Measured 2026-10-07 at `cd8b514` on the idle RTX 3060
+(train step) and the Ryzen 5 7600X (decode, CPU). One run spreads about 3.5% on
+both. `bench_decode` is sensitive to anything else on the CPU: with one
+parallel `rustc` it measured 1464-2088 tokens/s, so run it on a quiet machine.
+Re-record with `scripts/bench_check.sh --record` after a change that is meant
+to move these numbers.
+
+| Benchmark | Best tokens/s |
+|---|---|
+| bench_train_step 4 1024 cuda | 50329 |
+| bench_decode 512 128 | 2434 |
+
 ## Throughput
 
 FLOPs per token counts the parameter term and the attention term:

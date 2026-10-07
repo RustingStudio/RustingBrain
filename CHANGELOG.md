@@ -4,6 +4,9 @@
 
 ### Added
 
+- `scripts/bench_check.sh`: fails when `bench_train_step` or `bench_decode`
+  is more than 3% below its row in `docs/baseline.md`. Run it locally before a
+  release; CI has no GPU.
 - `rusting_brain::BUILD`: the library version and the git commit it was built
   from. Print it at startup to spot a binary built from an older checkout.
 - `Bpe` tokenizes LLaMA 3 and Qwen2 files the way the reference does: their
