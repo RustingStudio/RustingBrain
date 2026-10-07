@@ -1169,3 +1169,37 @@ int8's cost on half the bytes. Holding the 16 levels in two registers and
 looking up eight indices per `vpermps`, blended on bit 3, makes the 4-bit
 row cheaper than the int8 one. One outlier int8 round at 135 is left out.
 
+## dkv without transposed tiles (A1, 2026-10-07)
+
+`examples/flash_probe.rs` (fixed for the `_64` kernel names and the `causal`
+argument), batch 4 x 1024, 12 query heads over 4 key/value heads, head dim
+64, RTX 3060, two interleaved rounds, load 9:
+
+| `flash_attention_dkv_64` | Registers | Shared | Probe |
+|---|---|---|---|
+| previous kernel | 198 | 37,376 B | 0.990, 0.992 ms |
+| B operands by `ldmatrix.x4` | 168 | 37,376 B | 0.973, 0.974 ms |
+| ... and `ldmatrix.x4.trans` from the query-major tiles | 168 | 18,944 B | 0.800, 0.800 ms |
+
+The `ldmatrix` loads alone change little, so the second loop's fragment
+packing was not the cost. Dropping the transposed tiles does two things:
+the load phase stops issuing scattered 16-bit stores, and the block fits in
+19 KB, so 168 registers and 19 KB allow three blocks an SM where 37 KB
+allowed two.
+
+In the model, `nsys` on `bench_train_step 4 1024 cuda`: `flash_attention_dkv`
+847 to 637 us a launch; the forward (~484/444 us), `dq` (~335/325 us) and
+delta (31 us) kernels are unchanged code and within noise. Throughput,
+interleaved rounds, load 9 to 24 (other projects on the CPU; the first
+before-round, 41661, was cold):
+
+| Build | tok/s |
+|---|---|
+| before | 52149, 52208 |
+| after | 52536 to 53452 |
+
+The whole-step gain (about 1%) is smaller than the kernel time suggests;
+the load was high, so re-measure on an idle machine before quoting it.
+`dkv_128` still sits at 255 registers (stack 128 to 184 bytes), so it gains
+the shared memory but not the occupancy.
+

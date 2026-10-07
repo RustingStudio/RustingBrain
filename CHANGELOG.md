@@ -4,6 +4,11 @@
 
 ### Changed
 
+- The fused attention backward pass's key/value kernel reads its query and
+  output-gradient tiles transposed with `ldmatrix` instead of keeping a
+  second copy, which halves its shared memory and fits three blocks on an
+  SM: 25% less time in that kernel, about 1% more training tokens per
+  second on the default model.
 - Int8 device decode of three or more sequences multiplies on the tensor
   cores (Ampere and later, mixed precision): 16 sequences on the default
   model went from 13% slower than BF16 to about 12% faster.
