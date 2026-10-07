@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Int8 device decode (`TransformerLm::set_int8_decode`) now covers the
+  routed MoE experts and the router as well, matching the host
+  `Precision::Q8` scheme: about 19% more tokens per second than BF16 for one
+  sequence on the default model, up from 10%.
 - Under mixed precision the device decoder's attention output projection
   reads BF16, about 3% more tokens per second for one sequence.
 - A device decode step with one new token per sequence runs attention as

@@ -1045,3 +1045,21 @@ SM. Nsight Compute cannot read the counters on this machine
 (`ERR_NVGPUCTRPERM`, needs admin), so the next attempt must start from an
 `nsys` sweep of kernel variants, not from a counter profile.
 
+## Int8 routed experts (C5 slice 2, 2026-10-07)
+
+Profile at `9561323` (int8, one sequence): the routed experts' BF16 GEMVs
+were 19.2% of kernel time, the largest share left at full precision. With
+this change the experts and the router read int8 as well.
+`bench_decode 512 128 cuda <sequences> [int8]`, three rounds interleaved,
+idle GPU, load average under 2, CLEAN. The machine ran slower than in the
+slice-1 session (int8 off 820 against 905 tokens/s at one sequence), so
+compare within this table only:
+
+| Build | 1 sequence | 16 sequences |
+|---|---|---|
+| `9561323`, int8 on | 893-897 tokens/s | 5568-5617 tokens/s |
+| new, int8 off | 818-824 tokens/s | 6389-6518 tokens/s |
+| new, int8 on | 971-979 tokens/s | 5626-5726 tokens/s |
+
+(The first new int8 run at one sequence read 831, cold.) Int8 is now +19%
+over BF16 at one sequence, and still -12% at 16, the multi-row GEMV.
