@@ -1931,7 +1931,24 @@ impl TransformerLm {
         // file can hold it first: every weight takes at least one byte.
         let needed = weights_needed(&header.config);
         let rope_table = (header.config.max_seq_len as u128) * (header.config.head_dim as u128);
-        if needed > file_length as u128 || rope_table > 1 << 28 {
+        // An adapter of rank r on an m x n weight holds r * (m + n) values,
+        // at most twice the weight when r <= min(m, n), which the file bounds.
+        let config = &header.config;
+        let smallest = [
+            config.d_model,
+            config.n_heads.saturating_mul(config.head_dim),
+            config.n_kv_heads.saturating_mul(config.head_dim),
+            if config.moe_layers.is_empty() {
+                config.d_ff
+            } else {
+                config.d_ff.min(config.moe_d_ff)
+            },
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(0);
+        let lora_too_big = config.lora.is_some_and(|lora| lora.rank > smallest);
+        if needed > file_length as u128 || rope_table > 1 << 28 || lora_too_big {
             return Err(NetworkError::InvalidSnapshot(format!(
                 "weight file header describes a model that does not fit in its {file_length} bytes"
             )));

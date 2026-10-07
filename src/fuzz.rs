@@ -13,7 +13,7 @@ use crate::gltf::Glb;
 use crate::mesh::Mesh;
 use crate::safetensors::SafeTensors;
 use crate::tokenizer::{Bpe, Unigram};
-use crate::transformer::{Precision, TransformerLm};
+use crate::transformer::{LoraConfig, Precision, TransformerLm};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -199,6 +199,23 @@ fn weight_file_survives_corruption() {
     survives("bin", &read(&valid), |bytes| {
         let _ = TransformerLm::load_bin(file("bin", bytes));
     });
+
+    // The header's adapter rank sizes allocations the file does not hold.
+    model.add_lora(LoraConfig::new(2)).unwrap();
+    model.save_bin(&valid, Precision::F32).unwrap();
+    let adapted = read(&valid);
+    let length = u64::from_le_bytes(adapted[8..16].try_into().unwrap()) as usize;
+    let header = std::str::from_utf8(&adapted[16..16 + length]).unwrap();
+    let header = header.replacen("\"rank\":2", "\"rank\":99999999999", 1);
+    let mut huge = adapted[..8].to_vec();
+    huge.extend((header.len() as u64).to_le_bytes());
+    huge.extend(header.bytes());
+    huge.extend(&adapted[16 + length..]);
+    assert_ne!(huge.len(), adapted.len());
+    match TransformerLm::load_bin(file("bin_rank", &huge)) {
+        Err(error) => assert!(error.to_string().contains("does not fit"), "{error}"),
+        Ok(_) => panic!("a rank the file cannot hold loaded"),
+    }
 
     let ema = file("ema_valid", &[]);
     Ema::new(&mut model.params_mut()).save(&ema).unwrap();
