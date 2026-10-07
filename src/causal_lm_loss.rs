@@ -30,8 +30,9 @@ impl CausalLmLoss {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TotalLoss {
     pub lm_loss: f32,
-    /// Sum of the load-balancing and z-losses over all MoE layers, already
-    /// weighted by their configured coefficients.
+    /// Sum of the load-balancing and z-losses over all MoE layers, plus the
+    /// LM head's z-loss in a training step, each already weighted by its
+    /// configured coefficient.
     pub auxiliary_loss: f32,
 }
 
@@ -142,6 +143,50 @@ pub(crate) fn cross_entropy_rows(
     })
 }
 
+/// The z-loss `weight * logsumexp(row)^2`, averaged over the rows `batch`
+/// predicts from, with its gradient added into `grad_logits`.
+///
+/// It pulls the log-partition of every row toward zero, which keeps the
+/// logits from drifting large and the softmax from saturating: the stability
+/// trick PaLM applies to the LM head, and the one the MoE router already has.
+/// Its gradient is `2 * weight * lse * softmax(row)`.
+///
+/// NOTE: a second pass over the logits that recomputes the log-partition
+/// `cross_entropy_rows` already had. Fold it into that pass if the host head
+/// shows up in a profile.
+pub(crate) fn add_z_loss(
+    logits: &Matrix,
+    batch: &TokenBatch,
+    weight: f32,
+    grad_logits: &mut Matrix,
+) -> f32 {
+    if weight == 0.0 {
+        return 0.0;
+    }
+    let inverse_predicted = 1.0 / batch.predicted() as f32;
+    let vocab_size = logits.cols;
+    let per_row: Vec<f32> = grad_logits
+        .data
+        .par_chunks_mut(vocab_size)
+        .enumerate()
+        .map(|(row_index, grad)| {
+            if !batch.predicts(row_index) {
+                return 0.0;
+            }
+            let row = logits.row(row_index);
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&value| (value - max).exp()).sum();
+            let lse = max + sum.ln();
+            let scale = 2.0 * weight * lse * inverse_predicted / sum;
+            for (g, &value) in grad.iter_mut().zip(row) {
+                *g += (value - max).exp() * scale;
+            }
+            weight * lse * lse
+        })
+        .collect();
+    per_row.iter().sum::<f32>() * inverse_predicted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +222,28 @@ mod tests {
             let high = causal_lm_loss(&bumped, &ids).unwrap().loss;
             bumped.data[index] -= 2.0 * epsilon;
             let low = causal_lm_loss(&bumped, &ids).unwrap().loss;
+            let numeric = (high - low) / (2.0 * epsilon);
+            assert!((analytic.data[index] - numeric).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn z_loss_gradient_matches_finite_differences() {
+        let logits = Matrix::from_vec(3, 3, vec![2.2, -1.0, 0.5, 1.5, 3.3, -0.7, 0.1, 0.9, -0.2]);
+        let batch = TokenBatch::new(&[[2u32, 0, 1]]).unwrap();
+        let z = |logits: &Matrix| add_z_loss(logits, &batch, 0.1, &mut Matrix::new(3, 3));
+        let mut analytic = Matrix::new(3, 3);
+        let value = add_z_loss(&logits, &batch, 0.1, &mut analytic);
+        assert!(value > 0.0);
+        assert_eq!(analytic.row(2), &[0.0, 0.0, 0.0]);
+
+        let epsilon = 1e-3;
+        for index in 0..logits.data.len() {
+            let mut bumped = logits.clone();
+            bumped.data[index] += epsilon;
+            let high = z(&bumped);
+            bumped.data[index] -= 2.0 * epsilon;
+            let low = z(&bumped);
             let numeric = (high - low) / (2.0 * epsilon);
             assert!((analytic.data[index] - numeric).abs() < 1e-3);
         }

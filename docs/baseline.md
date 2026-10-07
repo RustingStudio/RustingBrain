@@ -560,3 +560,9 @@ After E8 (heap merge), same file and machine, load average about 3.8. The
 | 1,008 | 17.2 ms | 0.258 ms | 0.26 µs |
 | 5,376 | 451 ms | 1.06 ms | 0.20 µs |
 | 50,000 | 43.1 s | 12.6 ms | 0.25 µs |
+
+## LM-head z-loss (B7, 2026-10-07)
+
+Not measured: another process held the GPU. The term adds one FP32 multiply
+to the head kernel's softmax scale and, when the weight is nonzero, one atomic
+per row. At the default weight of 0 the host path skips its extra pass.

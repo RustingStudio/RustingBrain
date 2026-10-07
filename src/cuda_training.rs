@@ -364,7 +364,8 @@ extern "C" __global__ void add_inplace(float*a,const float*b,int off,int n,int k
 // nothing (padding, and the last position of every sequence), whose gradient
 // is zero. One block of CE_THREADS threads per row; `loss` accumulates the
 // unscaled negative log-likelihood, which the host divides by the predicted
-// count.
+// count. `z_weight` adds the z-loss of `TransformerBuilder::z_loss`, whose
+// unscaled sum lands in `loss[1]`.
 extern "C" __global__ void to_bf16(bf16_t*out,const float*in,int n){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=f32_to_bf16(in[i]);
 }
@@ -376,7 +377,7 @@ extern "C" __global__ void accumulate_bf16(float*acc,const bf16_t*in,int n){
 }
 
 #define CE_THREADS 256
-extern "C" __global__ void ce_loss_grad(float*x,float*loss,const int*target,int rows,int vocab,float inv_predicted){
+extern "C" __global__ void ce_loss_grad(float*x,float*loss,const int*target,int rows,int vocab,float inv_predicted,float z_weight){
   int r=blockIdx.x;if(r>=rows)return;
   float*row=x+(size_t)r*vocab;
   int tid=threadIdx.x;
@@ -403,8 +404,11 @@ extern "C" __global__ void ce_loss_grad(float*x,float*loss,const int*target,int 
   float sum=reds[0];
   if(tid==0)tgt=row[t];
   __syncthreads();
-  float scale=inv_predicted/sum;
-  if(tid==0)atomicAdd(loss,(m+logf(sum))-tgt);
+  // The z-loss z*lse^2 adds 2*z*lse*softmax to the gradient, which folds into
+  // the softmax scale, and accumulates separately in loss[1].
+  float lse=m+logf(sum);
+  float scale=inv_predicted*(1.f+2.f*z_weight*lse)/sum;
+  if(tid==0){atomicAdd(loss,lse-tgt);if(z_weight!=0.f)atomicAdd(loss+1,z_weight*lse*lse);}
   for(int c=tid;c<vocab;c+=CE_THREADS)row[c]=__expf(row[c]-m)*scale;
   __syncthreads();
   if(tid==0)row[t]-=inv_predicted;
@@ -413,7 +417,7 @@ extern "C" __global__ void ce_loss_grad(float*x,float*loss,const int*target,int 
 // The bf16 mirror of `ce_loss_grad`. Identical arithmetic in FP32 registers;
 // only the row's storage is half as wide, which halves the traffic over the
 // largest tensor a training step touches.
-extern "C" __global__ void ce_loss_grad_bf16(bf16_t*x,float*loss,const int*target,int rows,int vocab,float inv_predicted){
+extern "C" __global__ void ce_loss_grad_bf16(bf16_t*x,float*loss,const int*target,int rows,int vocab,float inv_predicted,float z_weight){
   int r=blockIdx.x;if(r>=rows)return;
   bf16_t*row=x+(size_t)r*vocab;
   int tid=threadIdx.x;
@@ -456,8 +460,11 @@ extern "C" __global__ void ce_loss_grad_bf16(bf16_t*x,float*loss,const int*targe
   float sum=reds[0];
   if(tid==0)tgt=bf16_to_f32(row[t]);
   __syncthreads();
-  float scale=inv_predicted/sum;
-  if(tid==0)atomicAdd(loss,(m+logf(sum))-tgt);
+  // The z-loss z*lse^2 adds 2*z*lse*softmax to the gradient, which folds into
+  // the softmax scale, and accumulates separately in loss[1].
+  float lse=m+logf(sum);
+  float scale=inv_predicted*(1.f+2.f*z_weight*lse)/sum;
+  if(tid==0){atomicAdd(loss,lse-tgt);if(z_weight!=0.f)atomicAdd(loss+1,z_weight*lse*lse);}
   {
     unsigned int*pairs=(unsigned int*)row;
     for(int c=tid;c<half;c+=CE_THREADS){

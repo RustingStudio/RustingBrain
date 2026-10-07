@@ -2682,7 +2682,8 @@ pub(crate) fn backward(
 /// chunk instead of the batch is also what lets a large batch run at all: the
 /// full logits for batch 1024 do not fit in 12 GiB, one chunk always does.
 ///
-/// Returns the mean language-modelling loss and the summed auxiliary losses.
+/// Returns the mean language-modelling loss and the summed auxiliary losses,
+/// the LM head's z-loss among them.
 pub(crate) fn train_step(
     model: &mut TransformerLm,
     context: &Arc<GpuContext>,
@@ -2712,9 +2713,11 @@ pub(crate) fn train_step(
     let d_model = model.config.d_model;
 
     let targets = gpu.upload_signed(&targets)?;
-    let mut loss = gpu.zeros(1)?;
+    // [cross-entropy, z-loss], both summed over the predicted rows.
+    let mut loss = gpu.zeros(2)?;
     let mut grad_final = gpu.zeros(rows * d_model)?;
     let inverse_predicted = 1.0 / predicted as f32;
+    let z_loss = model.z_loss;
     let logit_bytes = if gpu.context.mixed_precision { 2 } else { 4 };
     let chunk = head_chunk_rows(rows, vocab, logit_bytes);
 
@@ -2742,6 +2745,7 @@ pub(crate) fn train_step(
                     &mut out,
                     count,
                     inverse_predicted,
+                    z_loss,
                 )?;
                 start += count;
                 continue;
@@ -2757,6 +2761,7 @@ pub(crate) fn train_step(
                     .arg(&(count as i32))
                     .arg(&(vocab as i32))
                     .arg(&inverse_predicted)
+                    .arg(&z_loss)
                     .launch(row_per_block(count))
                     .map_err(cuda_err("cross-entropy kernel"))?;
             }
@@ -2770,8 +2775,12 @@ pub(crate) fn train_step(
     // After the backward pass, not before: this download drains the stream,
     // and the backward pass does not need the value.
     backward_from_final(model, context, &cache, &grad_final)?;
-    let lm_loss = gpu.download(&loss)?[0] / predicted as f32;
-    Ok((lm_loss, cache.stack.auxiliary_loss))
+    let loss = gpu.download(&loss)?;
+    let lm_loss = loss[0] / predicted as f32;
+    Ok((
+        lm_loss,
+        cache.stack.auxiliary_loss + loss[1] / predicted as f32,
+    ))
 }
 
 /// The LM head run in BF16, behind [`crate::TransformerBuilder::mixed_precision`].
@@ -2829,6 +2838,7 @@ impl HeadBf16 {
         grad_input: &mut CudaViewMut<'_, f32>,
         count: usize,
         inverse_predicted: f32,
+        z_loss: f32,
     ) -> Result<(), NetworkError> {
         let (vocab, d_model) = (head.rows(), head.cols());
         gpu.cast_to_bf16(&mut self.input, input, count * d_model)?;
@@ -2856,6 +2866,7 @@ impl HeadBf16 {
                 .arg(&(count as i32))
                 .arg(&(vocab as i32))
                 .arg(&inverse_predicted)
+                .arg(&z_loss)
                 .launch(row_per_block(count))
                 .map_err(cuda_err("cross-entropy kernel"))?;
         }
