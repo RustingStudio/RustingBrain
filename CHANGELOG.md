@@ -32,7 +32,8 @@
 - Corrupt files no longer panic or allocate without limit: a huge token id in
   `tokenizer.json`, a truncated or overflowing `.npy` or IDX header, and a
   weight, LoRA or weight-average file whose header claims more than the file
-  holds now return an error. A seeded corruption test (`fuzz::*`) covers the
+  holds now return an error. `load_bin` also refuses a LoRA rank larger than
+  the smallest weight it adapts. A seeded corruption test (`fuzz::*`) covers the
   file readers.
 - `step_clipped` skips the update when the gradient norm is NaN or infinite
   and clears the gradients, instead of writing NaN into the weights and the
