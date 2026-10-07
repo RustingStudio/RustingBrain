@@ -1086,6 +1086,33 @@ this shape activations and packs, not the base, are most of the peak; the
 saving grows with the model and is largest with `checkpoint`, which drops
 the packs between blocks.
 
+## LoRA on an NF4 base (B4 slice 2, 2026-10-07)
+
+`TransformerLm::quantize_lora_base_4bit(Codebook::Nf4)`: the adapted bases
+at 4 bits with a scale per block of 64, uploaded as packed bytes and widened
+into each weight pack by `dequantize_q4`. `checkpoint_memory 4 512 lora`,
+default model, rank 16, RTX 3060, two runs, load average 4-7:
+
+| Base | Peak device memory | Step |
+|---|---|---|
+| FP32 | 889 MiB | 43.2, 42.9 ms |
+| int8 | 778 MiB | 43.2, 42.5 ms |
+| NF4 | 762 MiB | 43.3, 42.6 ms |
+
+The 16 MiB from int8 to NF4 matches the arithmetic: about 38M adapted
+weights go from 1 byte to 0.5625. As with int8, activations and the BF16
+packs are most of the peak at this shape.
+
+## Device int4 decode, measured before building (D3b, 2026-10-07)
+
+`nsys` on `bench_decode 512 128 cuda 1 int8`, RTX 3060 (360 GB/s), load 4:
+`gemv_q8` is 43% of kernel time (8069 calls, median 3.0 us). By grid:
+512-unit projections (64 blocks) take 3.0 us for 256 KiB, about 87 GB/s;
+2816-unit ones 7.1 us; the 32000-unit LM head 60 us for 16 MiB, about
+270 GB/s. Only the head is bandwidth-bound, and it is about 6% of a token,
+so halving the weight bytes would gain a few percent at most on the default
+model. Not built for speed; it remains the way to fit a larger model.
+
 ## Int8 decode GEMV on the tensor cores (C5 slice 3, 2026-10-07)
 
 Profile at `68f7c70`, `bench_decode 512 128 cuda 16 int8` under `nsys`:

@@ -4,12 +4,13 @@
 //! `cargo run --release --features cuda --example checkpoint_memory -- <batch> <seq_len>`
 //!
 //! A third argument `lora` compares a rank-16 LoRA run on an FP32 base with
-//! one on an int8 base (`quantize_lora_base`) instead, neither checkpointed.
+//! one on an int8 base (`quantize_lora_base`) and one on an NF4 base
+//! (`quantize_lora_base_4bit`) instead, none checkpointed.
 
 #[cfg(feature = "cuda")]
 fn main() {
     use cudarc::driver::sys;
-    use rusting_brain::{LoraConfig, Optimizer, TransformerLm};
+    use rusting_brain::{LoraConfig, Optimizer, TransformerLm, quantized::Codebook};
 
     let arg = |n: usize, default: usize| {
         std::env::args()
@@ -46,8 +47,8 @@ fn main() {
     };
 
     let lora = std::env::args().nth(3).is_some_and(|a| a == "lora");
-    for variant in [false, true] {
-        let checkpoint = variant && !lora;
+    for variant in 0..if lora { 3 } else { 2 } {
+        let checkpoint = variant == 1 && !lora;
         let mut model = TransformerLm::builder()
             .optimizer(Optimizer::adam(1e-4))
             .max_seq_len(seq_len.max(256))
@@ -57,8 +58,10 @@ fn main() {
             .unwrap();
         if lora {
             model.add_lora(LoraConfig::new(16)).unwrap();
-            if variant {
-                model.quantize_lora_base().unwrap();
+            match variant {
+                1 => _ = model.quantize_lora_base().unwrap(),
+                2 => _ = model.quantize_lora_base_4bit(Codebook::Nf4).unwrap(),
+                _ => {}
             }
         }
         model.to_cuda(0, 16384).unwrap();
@@ -74,8 +77,9 @@ fn main() {
             "batch {batch_size} x seq {seq_len}, {}: peak {peak:.0} MiB, {:.1} ms/step",
             match (lora, variant) {
                 (false, _) => format!("checkpoint {checkpoint}"),
-                (true, false) => "LoRA on FP32 base".into(),
-                (true, true) => "LoRA on int8 base".into(),
+                (true, 0) => "LoRA on FP32 base".into(),
+                (true, 1) => "LoRA on int8 base".into(),
+                (true, _) => "LoRA on NF4 base".into(),
             },
             start.elapsed().as_secs_f64() * 1e3 / 3.0
         );

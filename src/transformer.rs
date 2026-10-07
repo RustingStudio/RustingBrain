@@ -1213,13 +1213,13 @@ impl TransformerLm {
         Ok(())
     }
 
-    /// [`TransformerLm::check_not_quantized`], and also no int8 LoRA base:
+    /// [`TransformerLm::check_not_quantized`], and also no quantized LoRA base:
     /// what needs the base weights in full precision.
     fn check_full_precision(&self, action: &str) -> Result<(), NetworkError> {
         self.check_not_quantized(action)?;
-        if self.has_int8_base() {
+        if self.has_quantized_base() {
             return Err(NetworkError::InvalidConfig(format!(
-                "this model's LoRA base is int8, so it cannot {action}; save the adapter \
+                "this model's LoRA base is quantized, so it cannot {action}; save the adapter \
                  with save_lora instead"
             )));
         }
@@ -1354,6 +1354,34 @@ impl TransformerLm {
     /// # }
     /// ```
     pub fn quantize_lora_base(&mut self) -> Result<usize, NetworkError> {
+        self.quantize_lora_base_with(crate::param::Param::quantize)
+    }
+
+    /// [`quantize_lora_base`](TransformerLm::quantize_lora_base) at 4 bits a
+    /// weight on `codebook`, with a scale per block of 64: the QLoRA recipe
+    /// proper with [`Codebook::Nf4`](crate::quantized::Codebook::Nf4), an
+    /// eighth of the FP32 base's memory against a quarter at int8.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{LoraConfig, TransformerLm, quantized::Codebook};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut model = TransformerLm::load_hf("TinyLlama-1.1B", 2048)?;
+    /// model.add_lora(LoraConfig::new(16))?;
+    /// model.quantize_lora_base_4bit(Codebook::Nf4)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quantize_lora_base_4bit(
+        &mut self,
+        codebook: crate::quantized::Codebook,
+    ) -> Result<usize, NetworkError> {
+        self.quantize_lora_base_with(|weight| weight.quantize_4bit(codebook))
+    }
+
+    fn quantize_lora_base_with(
+        &mut self,
+        quantize: impl Fn(&mut crate::param::Param) -> usize,
+    ) -> Result<usize, NetworkError> {
         self.check_not_quantized("quantize its LoRA base")?;
         self.check_not_on_device("quantize its LoRA base")?;
         if !self.has_lora() {
@@ -1364,15 +1392,16 @@ impl TransformerLm {
         let mut bytes = 0;
         for block in &mut self.blocks {
             for linear in block.lora_linears_mut() {
-                bytes += linear.weight.quantize();
+                bytes += quantize(&mut linear.weight);
             }
         }
         Ok(bytes)
     }
 
-    /// Whether [`quantize_lora_base`](TransformerLm::quantize_lora_base) has
+    /// Whether [`quantize_lora_base`](TransformerLm::quantize_lora_base) or
+    /// [`quantize_lora_base_4bit`](TransformerLm::quantize_lora_base_4bit) has
     /// run.
-    pub fn has_int8_base(&self) -> bool {
+    pub fn has_quantized_base(&self) -> bool {
         // `quantize_lora_base` converts every adapted projection at once, and
         // every block's query projection is one.
         self.blocks

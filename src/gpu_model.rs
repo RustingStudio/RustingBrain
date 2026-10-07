@@ -57,6 +57,7 @@ pub(crate) struct ModelKernels {
     decode_attention_merge: CudaFunction,
     quantize_q8: CudaFunction,
     dequantize_q8: CudaFunction,
+    dequantize_q4: CudaFunction,
     gemv_q8: CudaFunction,
     swiglu_forward: CudaFunction,
     swiglu_backward: CudaFunction,
@@ -103,6 +104,7 @@ impl ModelKernels {
             decode_attention_merge: get("decode_attention_merge")?,
             quantize_q8: get("quantize_rows_q8")?,
             dequantize_q8: get("dequantize_q8")?,
+            dequantize_q4: get("dequantize_q4")?,
             gemv_q8: get("gemv_q8")?,
             swiglu_forward: get("swiglu_fwd")?,
             swiglu_backward: get("swiglu_bwd")?,
@@ -1653,7 +1655,23 @@ impl Gpu<'_> {
                         .launch(cfg(len))
                         .map_err(cuda_err("int8 dequantize kernel"))?;
                 },
-                None => self.cast_into(&mut slot, &device.value().slice(..), len, narrow)?,
+                None => match device.four_bit() {
+                    Some((packed, scales, levels)) => unsafe {
+                        self.context
+                            .stream
+                            .launch_builder(&self.context.model.dequantize_q4)
+                            .arg(packed)
+                            .arg(scales)
+                            .arg(levels)
+                            .arg(&mut slot)
+                            .arg(&(units as i32))
+                            .arg(&(inner as i32))
+                            .arg(&i32::from(narrow))
+                            .launch(cfg(len))
+                            .map_err(cuda_err("4-bit dequantize kernel"))?;
+                    },
+                    None => self.cast_into(&mut slot, &device.value().slice(..), len, narrow)?,
+                },
             }
             if let Some(lora) = &part.lora {
                 self.fold_lora(lora, &mut slot, units, inner, narrow)?;

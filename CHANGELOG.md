@@ -40,6 +40,10 @@
 
 ### Added
 
+- `TransformerLm::quantize_lora_base_4bit(Codebook::Nf4)`: QLoRA on an NF4
+  base, on the host and the device. A rank-16 run on the default model
+  peaks at 762 MiB against 778 on an int8 base and 889 on FP32, at the same
+  step time. `has_int8_base` is now `has_quantized_base`.
 - 4-bit host weights: `TransformerLm::quantize_4bit(Codebook::Nf4 | Int4)`
   stores every block linear as two 4-bit codebook indices a byte with an
   absmax scale per block of 64 (0.5625 bytes a weight), keeping the
