@@ -14,6 +14,8 @@
 
 ### Added
 
+- `VaeDecoder::decode_tiled`: decodes a latent in overlapping tiles blended
+  with linear ramps, so images too large to decode at once fit in memory.
 - `SpikeGuard`: flags a training loss that is not finite or jumps above a
   multiple of its moving mean, so a loop can skip that step and, after
   several in a row, roll back to its last checkpoint.
