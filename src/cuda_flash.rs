@@ -55,11 +55,10 @@ pub(crate) const fn forward_shared_bytes(head_dim: usize) -> u32 {
     let (rows, columns) = tiles(head_dim);
     (rows + columns) as u32
 }
-/// Keys twice - key-major for the scores, dimension-major for the query
-/// gradient - and values once.
+/// Keys and values, key-major; the query gradient reads the keys transposed.
 pub(crate) const fn dq_shared_bytes(head_dim: usize) -> u32 {
-    let (rows, columns) = tiles(head_dim);
-    (2 * rows + columns) as u32
+    let (rows, _) = tiles(head_dim);
+    (2 * rows) as u32
 }
 /// Queries and output gradients, query-major, plus the log-sum-exp and delta
 /// of the query tile.
@@ -555,7 +554,6 @@ template<int D> __device__ __forceinline__ void flash_dq(
   extern __shared__ unsigned short smem[];
   unsigned short* ks = smem;                        // [key][dim]
   unsigned short* vs = smem + 64*DROW;              // [key][dim]
-  unsigned short* kt = smem + 2*64*DROW;            // [dim][key]
 
   const int qt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -617,8 +615,6 @@ template<int D> __device__ __forceinline__ void flash_dq(
         vw = bf16_pair(qkv,p + value_base + kv + c);
       }
       *(unsigned*)(ks + r*DROW + c) = kw;
-      kt[c*FA_ROW + r] = (unsigned short)kw;
-      kt[(c+1)*FA_ROW + r] = (unsigned short)(kw >> 16);
       *(unsigned*)(vs + r*DROW + c) = vw;
     }
     __syncthreads();
@@ -671,12 +667,12 @@ template<int D> __device__ __forceinline__ void flash_dq(
       pf[2]=pack2(s[2*kk+1][0],s[2*kk+1][1]);
       pf[3]=pack2(s[2*kk+1][2],s[2*kk+1][3]);
       #pragma unroll
-      for (int n=0;n<D/8;++n) {
-        const unsigned short* p = kt + (n*8+g)*FA_ROW + kk*16 + t*2;
-        unsigned bf[2];
-        bf[0]=*(const unsigned*)p;
-        bf[1]=*(const unsigned*)(p+8);
-        MMA(acc[n], pf, bf);
+      for (int n=0;n<D/8;n+=2) {
+        // Matrix m is output columns (n + m/2)*8, k (key) half m%2.
+        unsigned bf[4];
+        ldsm_x4_trans(bf, ks + (kk*16 + ((lane>>3)&1)*8 + (lane&7))*DROW + (n + (lane>>4))*8);
+        MMA(acc[n],   pf, bf);
+        MMA(acc[n+1], pf, (bf+2));
       }
     }
   }
