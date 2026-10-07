@@ -443,6 +443,28 @@ extern "C" __global__ void gate_residual_bwd(float*gb,float*gt,const float*branc
  size_t gate=(size_t)(r/seq_len)*3*cols+2*cols+c;float u=gout[i];
  gb[i]=u*triple[gate];atomicAdd(&gt[gate],u*branch[i]);}
 extern "C" __global__ void softmax_lse(float*p,float*lse,const float*x,int rows,int cols){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;const float*src=x+(size_t)r*cols;float*dst=p+(size_t)r*cols;float m=-3.0e38f;for(int c=0;c<cols;c++)m=fmaxf(m,src[c]);float sum=0;for(int c=0;c<cols;c++){float e=expf(src[c]-m);dst[c]=e;sum+=e;}lse[r]=m+logf(sum);if(sum>0)for(int c=0;c<cols;c++)dst[c]/=sum;}
+// A decode step's routed experts without the host: one warp per output unit
+// `n` of output row `o`, summing over that row's `per` slots `s = o*per + j`
+// the product of expert `expert_of[s]`'s weight row `n` with input row
+// `s / x_div`, times `gate_of[s]` when `gated`. A slot routed nowhere (`-1`)
+// adds nothing. The gate/up product is `per = 1, x_div = top_k`, one output
+// row per slot; the down product is `per = top_k, x_div = 1` with the gates,
+// one output row per token.
+extern "C" __global__ void gemv_routed(const void*w,const void*x,int narrow,float*y,const int*expert_of,const float*gate_of,int gated,int outs,int per,int x_div,int units,int inner,float beta){
+  int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP,lane=threadIdx.x%WARP;
+  if(warp>=outs*units)return;
+  int o=warp/units,n=warp%units;float acc=0.f;
+  for(int j=0;j<per;j++){int s=o*per+j,e=expert_of[s];if(e<0)continue;
+    size_t wrow=((size_t)e*units+n)*inner,xrow=(size_t)(s/x_div)*inner;float a=0.f;
+    if(narrow&&(inner&7)==0){const unsigned short*wp=(const unsigned short*)w+wrow,*xp=(const unsigned short*)x+xrow;
+      for(int k=lane*8;k<inner;k+=WARP*8){uint4 wv=*(const uint4*)(wp+k),xv=*(const uint4*)(xp+k);const unsigned short*wu=(const unsigned short*)&wv,*xu=(const unsigned short*)&xv;
+        #pragma unroll
+        for(int t=0;t<8;t++)a+=bf16_to_f32(wu[t])*bf16_to_f32(xu[t]);}}
+    else for(int k=lane;k<inner;k+=WARP)a+=load_act(w,wrow+k,narrow)*load_act(x,xrow+k,narrow);
+    acc+=gated?gate_of[s]*a:a;}
+  acc=warp_sum(acc);
+  if(lane==0){size_t i=(size_t)o*units+n;y[i]=acc+(beta!=0.f?beta*y[i]:0.f);}
+}
 extern "C" __global__ void topk_gate(int*expert_of,float*gate_of,const float*p,const int*valid,int rows,int experts,int top_k){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;int base=r*top_k;if(valid!=0&&valid[r]==0){for(int k=0;k<top_k;k++){expert_of[base+k]=-1;gate_of[base+k]=0;}return;}const float*row=p+(size_t)r*experts;float total=0;for(int k=0;k<top_k;k++){int best=-1;for(int e=0;e<experts;e++){int taken=0;for(int j=0;j<k;j++)if(expert_of[base+j]==e)taken=1;if(taken)continue;if(best<0||row[e]>row[best])best=e;}expert_of[base+k]=best;gate_of[base+k]=row[best];total+=row[best];}if(total>0)for(int k=0;k<top_k;k++)gate_of[base+k]/=total;}
 // The routed layer's gathers: rows of `src` by `rows_of`, times `scale` if
 // `scaled`, read and written at either precision so the expert GEMMs read BF16.
