@@ -110,27 +110,27 @@ impl T5Config {
 
 /// One encoder block: bidirectional attention, then a feed-forward, each behind
 /// its own root-mean-square norm.
-struct Block {
-    attention_norm: Vec<f32>,
-    query: Dense,
-    key: Dense,
-    value: Dense,
-    output: Dense,
-    mlp_norm: Vec<f32>,
+pub(crate) struct Block {
+    pub(crate) attention_norm: Vec<f32>,
+    pub(crate) query: Dense,
+    pub(crate) key: Dense,
+    pub(crate) value: Dense,
+    pub(crate) output: Dense,
+    pub(crate) mlp_norm: Vec<f32>,
     /// The gate of a gated feed-forward, absent in the original models.
-    gate: Option<Dense>,
-    mlp_in: Dense,
-    mlp_out: Dense,
+    pub(crate) gate: Option<Dense>,
+    pub(crate) mlp_in: Dense,
+    pub(crate) mlp_out: Dense,
 }
 
 /// A T5 encoder.
 pub struct T5Encoder {
-    config: T5Config,
-    tokens: Matrix,
+    pub(crate) config: T5Config,
+    pub(crate) tokens: Matrix,
     /// The shared position bias, `[buckets, heads]`.
-    position_bias: Matrix,
-    blocks: Vec<Block>,
-    final_norm: Vec<f32>,
+    pub(crate) position_bias: Matrix,
+    pub(crate) blocks: Vec<Block>,
+    pub(crate) final_norm: Vec<f32>,
 }
 
 impl T5Encoder {
@@ -241,25 +241,7 @@ impl T5Encoder {
 
     /// The hidden states for a sequence of token ids, `[tokens, d_model]`.
     pub fn forward(&self, ids: &[u32]) -> Result<Matrix, NetworkError> {
-        if ids.is_empty() {
-            return Err(NetworkError::InvalidConfig(
-                "an empty prompt has no hidden states".into(),
-            ));
-        }
-
-        let mut hidden = Matrix::new(ids.len(), self.config.d_model);
-        for (position, id) in ids.iter().enumerate() {
-            if *id as usize >= self.tokens.rows {
-                return Err(NetworkError::InvalidTarget {
-                    expected: self.tokens.rows,
-                    actual: *id as usize,
-                });
-            }
-            hidden
-                .row_mut(position)
-                .copy_from_slice(self.tokens.row(*id as usize));
-        }
-
+        let mut hidden = self.embed(ids)?;
         let bias = self.bias(ids.len());
         for block in &self.blocks {
             let normed = rms_norm(&hidden, &block.attention_norm, self.config.eps);
@@ -293,6 +275,29 @@ impl T5Encoder {
         Ok(rms_norm(&hidden, &self.final_norm, self.config.eps))
     }
 
+    /// The embedding rows of `ids`, `[tokens, d_model]`.
+    pub(crate) fn embed(&self, ids: &[u32]) -> Result<Matrix, NetworkError> {
+        if ids.is_empty() {
+            return Err(NetworkError::InvalidConfig(
+                "an empty prompt has no hidden states".into(),
+            ));
+        }
+
+        let mut hidden = Matrix::new(ids.len(), self.config.d_model);
+        for (position, id) in ids.iter().enumerate() {
+            if *id as usize >= self.tokens.rows {
+                return Err(NetworkError::InvalidTarget {
+                    expected: self.tokens.rows,
+                    actual: *id as usize,
+                });
+            }
+            hidden
+                .row_mut(position)
+                .copy_from_slice(self.tokens.row(*id as usize));
+        }
+        Ok(hidden)
+    }
+
     /// Tokenizing and running in one call.
     pub fn encode(
         &self,
@@ -305,7 +310,7 @@ impl T5Encoder {
 
     /// The learned position bias for a sequence of this length, one
     /// `[tokens, tokens]` block per head.
-    fn bias(&self, tokens: usize) -> Vec<Vec<f32>> {
+    pub(crate) fn bias(&self, tokens: usize) -> Vec<Vec<f32>> {
         (0..self.config.num_heads)
             .map(|head| {
                 let mut head_bias = vec![0.0; tokens * tokens];

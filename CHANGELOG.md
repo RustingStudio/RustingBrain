@@ -49,6 +49,10 @@
 
 ### Added
 
+- `cuda_t5::DeviceT5` runs a gated T5 encoder (T5 1.1, the one FLUX and
+  Stable Diffusion 3 read) on the device with BF16 weights and an FP32
+  residual stream. A T5-base-sized encoder over 512 tokens takes about 29 ms
+  against 528 ms on the host. It is not yet wired into `ImagePipeline`.
 - `TransformerLm::quantize_lora_base_4bit(Codebook::Nf4)`: QLoRA on an NF4
   base, on the host and the device. A rank-16 run on the default model
   peaks at 762 MiB against 778 on an int8 base and 889 on FP32, at the same

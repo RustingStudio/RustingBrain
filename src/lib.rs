@@ -155,6 +155,8 @@ pub(crate) mod cuda_flash;
 #[cfg(feature = "cuda")]
 pub mod cuda_image;
 #[cfg(feature = "cuda")]
+pub mod cuda_t5;
+#[cfg(feature = "cuda")]
 pub mod cuda_training;
 #[cfg(feature = "cuda")]
 pub(crate) mod gpu_cross;

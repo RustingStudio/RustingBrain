@@ -1256,6 +1256,18 @@ impl Gpu<'_> {
         width: usize,
         narrow: bool,
     ) -> Result<Act, NetworkError> {
+        self.gated(gate_up, rows, width, narrow, false)
+    }
+
+    /// [`Gpu::swiglu`] with the tanh GELU on the first half, or SiLU.
+    pub(crate) fn gated(
+        &self,
+        gate_up: &CudaSlice<f32>,
+        rows: usize,
+        width: usize,
+        narrow: bool,
+        gelu: bool,
+    ) -> Result<Act, NetworkError> {
         let mut hidden = self.act(rows * width, narrow)?;
         unsafe {
             self.context
@@ -1266,6 +1278,7 @@ impl Gpu<'_> {
                 .arg(&(rows as i32))
                 .arg(&(width as i32))
                 .arg(&i32::from(narrow))
+                .arg(&i32::from(gelu))
                 .launch(cfg(if width % 4 == 0 {
                     rows * width / 4
                 } else {
