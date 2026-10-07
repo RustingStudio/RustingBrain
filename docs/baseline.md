@@ -1220,3 +1220,24 @@ The fold costs about 2.2 ms a step (5%). Moving the adapter to its readers
 would replace one `[units, inner]` write per projection with a `[rows,
 units]` write in the forward pass and a `[rows, inner]` write in the input
 gradient, at 2048 rows here, so it is not taken.
+
+## Routed experts on the device in decode (C1 part 1, 2026-10-07)
+
+`nsys` on `bench_decode 512 256 cuda` at `79f9aac`: 1.13 ms a token, of which
+about 0.65 ms kernels. API side, 19 `cuMemcpyDtoHAsync` and 39
+`cuMemcpyHtoDAsync` a token. Each MoE layer downloaded `expert_of`,
+`gate_of` and the auxiliary-loss sums, so the stream drained six times a
+token.
+
+| Build | 1 seq | 4 seq | 16 seq |
+|---|---|---|---|
+| before | 784, 924 | 2725, 2730 | 6929, 6933 |
+| every expert dense, zero gates | 877, 876 | 2623, 2634 | 7054, 7079 |
+| `gemv_routed` | 1357, 1363 | 3793, 3795 | 7918, 7930 |
+
+Tokens/s, default model, 512-token prompt, 256 new tokens, RTX 3060. The
+dense variant was measured in a separate session (its before-row read
+711-897, 2620-2628, 6153-6731 there) and cut the downloads to one a token,
+but its expert GEMVs rose from 63 to 138 ms of kernel time over the run.
+Load 4 to 10 for the `gemv_routed` rounds, 9 to 20 for the dense ones.
+

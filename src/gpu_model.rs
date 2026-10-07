@@ -67,6 +67,7 @@ pub(crate) struct ModelKernels {
     gate_residual_backward: CudaFunction,
     softmax_lse: CudaFunction,
     topk_gate: CudaFunction,
+    gemv_routed: CudaFunction,
     gather: CudaFunction,
     gather_scaled: CudaFunction,
     scatter_scaled: CudaFunction,
@@ -114,6 +115,7 @@ impl ModelKernels {
             gate_residual_backward: get("gate_residual_bwd")?,
             softmax_lse: get("softmax_lse")?,
             topk_gate: get("topk_gate")?,
+            gemv_routed: get("gemv_routed")?,
             gather: get("gather_rows")?,
             gather_scaled: get("gather_scale_rows")?,
             scatter_scaled: get("scatter_add_scaled")?,
@@ -2735,28 +2737,28 @@ pub(crate) fn forward_swiglu(
     })
 }
 
-/// The routed feed-forward.
-///
-/// The router's softmax, top-k and gate renormalization are one kernel each.
-/// The routing table then comes back to the host once, so the per-expert token
-/// counts can shape the expert GEMMs, and the tokens are gathered into one
-/// contiguous buffer grouped by expert: three GEMMs per non-empty expert for
-/// the whole batch, not three per expert per sequence.
-#[allow(clippy::too_many_arguments)]
-fn forward_moe(
+/// The router's logits, softmax and top-k: each row's probabilities and
+/// log-sum-exp, and its `top_k` experts with their renormalized gates (`-1`
+/// and `0` for a padding row), all left on the device.
+#[allow(clippy::type_complexity)]
+fn route(
     gpu: &Gpu<'_>,
     moe: &MoeLayer,
     input: &Act,
-    out: &mut CudaSlice<f32>,
     valid: &CudaSlice<i32>,
-    valid_tokens: usize,
     rows: usize,
-) -> Result<(MoeGpuCache, f32), NetworkError> {
+) -> Result<
+    (
+        CudaSlice<f32>,
+        CudaSlice<f32>,
+        CudaSlice<i32>,
+        CudaSlice<f32>,
+    ),
+    NetworkError,
+> {
     let experts = moe.config.num_experts;
     let top_k = moe.config.experts_per_token;
     let d_model = moe.d_model();
-    let width = moe.config.d_ff;
-
     let narrow = input.is_narrow();
     let router = gpu.decode_pack(&[&moe.router.projection], narrow)?;
     let mut logits = gpu.uninit(rows * experts)?;
@@ -2805,6 +2807,120 @@ fn forward_moe(
             .launch(cfg(rows))
             .map_err(cuda_err("router top-k kernel"))?;
     }
+    Ok((probabilities, log_sum_exp, expert_of, gate_of))
+}
+
+/// The routed feed-forward of a decode step, without the host round trip.
+///
+/// [`forward_moe`] downloads the routing to shape one GEMM per expert, which
+/// stalls the stream once a layer. Here two GEMV kernels read each slot's
+/// expert index on the device instead: one gate/up row per slot, then the down
+/// product summed over a token's slots with their gates. Only the chosen
+/// experts' weights are read. The auxiliary losses are skipped; decode does
+/// not train. Int8 packs keep [`forward_moe`].
+fn decode_moe(
+    gpu: &Gpu<'_>,
+    moe: &MoeLayer,
+    input: &Act,
+    out: &mut CudaSlice<f32>,
+    valid: &CudaSlice<i32>,
+    rows: usize,
+) -> Result<(), NetworkError> {
+    let top_k = moe.config.experts_per_token;
+    let d_model = moe.d_model();
+    let width = moe.config.d_ff;
+    let narrow = input.is_narrow();
+    let (_, _, expert_of, gate_of) = route(gpu, moe, input, valid, rows)?;
+    let slots = rows * top_k;
+
+    let gate_up_weights = gpu.pack_gate_up(moe.experts.iter(), narrow)?;
+    let mut gate_up = gpu.uninit(slots * 2 * width)?;
+    let routed_gemv = |weights: &Act,
+                       x: &CudaView<'_, u8>,
+                       y: &mut CudaSlice<f32>,
+                       gated: bool,
+                       outs: usize,
+                       per: usize,
+                       x_div: usize,
+                       units: usize,
+                       inner: usize,
+                       beta: f32| unsafe {
+        gpu.context
+            .stream
+            .launch_builder(&gpu.context.model.gemv_routed)
+            .arg(&weights.all())
+            .arg(x)
+            .arg(&i32::from(narrow))
+            .arg(y)
+            .arg(&expert_of)
+            .arg(&gate_of)
+            .arg(&i32::from(gated))
+            .arg(&(outs as i32))
+            .arg(&(per as i32))
+            .arg(&(x_div as i32))
+            .arg(&(units as i32))
+            .arg(&(inner as i32))
+            .arg(&beta)
+            .launch(warp_each(outs * units))
+            .map(|_| ())
+            .map_err(cuda_err("routed expert GEMV kernel"))
+    };
+    routed_gemv(
+        &gate_up_weights,
+        &input.all(),
+        &mut gate_up,
+        false,
+        slots,
+        1,
+        top_k,
+        2 * width,
+        d_model,
+        0.0,
+    )?;
+    let hidden = gpu.swiglu(&gate_up, slots, width, narrow)?;
+    let down_weights = gpu.pack_down(moe.experts.iter(), narrow)?;
+    routed_gemv(
+        &down_weights,
+        &hidden.all(),
+        out,
+        true,
+        rows,
+        top_k,
+        1,
+        d_model,
+        width,
+        1.0,
+    )?;
+    if let Some(module) = &moe.shared {
+        forward_swiglu(gpu, module, input, out, rows)?;
+    }
+    Ok(())
+}
+
+/// The routed feed-forward.
+///
+/// The router's softmax, top-k and gate renormalization are one kernel each.
+/// The routing table then comes back to the host once, so the per-expert token
+/// counts can shape the expert GEMMs, and the tokens are gathered into one
+/// contiguous buffer grouped by expert: three GEMMs per non-empty expert for
+/// the whole batch, not three per expert per sequence.
+#[allow(clippy::too_many_arguments)]
+fn forward_moe(
+    gpu: &Gpu<'_>,
+    moe: &MoeLayer,
+    input: &Act,
+    out: &mut CudaSlice<f32>,
+    valid: &CudaSlice<i32>,
+    valid_tokens: usize,
+    rows: usize,
+) -> Result<(MoeGpuCache, f32), NetworkError> {
+    let experts = moe.config.num_experts;
+    let top_k = moe.config.experts_per_token;
+    let d_model = moe.d_model();
+    let width = moe.config.d_ff;
+
+    let narrow = input.is_narrow();
+    let (probabilities, log_sum_exp, expert_of, gate_of) = route(gpu, moe, input, valid, rows)?;
 
     // The one deliberate round trip: cuBLAS needs each expert's token count on
     // the host to shape its GEMM.
@@ -3709,6 +3825,11 @@ fn decode_block(
             forward_swiglu(gpu, ffn, &normed, &mut output, rows)?;
         }
         FeedForward::Gelu(_) => return Err(unsupported("a GELU MLP")),
+        FeedForward::Moe(moe)
+            if rows <= ROUTED_GEMV_ROWS && !gpu.context.int8_decode.load(Ordering::Relaxed) =>
+        {
+            decode_moe(gpu, moe, &normed, &mut output, valid, rows)?;
+        }
         FeedForward::Moe(moe) => {
             forward_moe(gpu, moe, &normed, &mut output, valid, rows, rows)?;
         }
@@ -3753,6 +3874,12 @@ fn warp_each(rows: usize) -> cudarc::driver::LaunchConfig {
 /// Rows up to which [`Gpu::project`] runs an int8 weight as a GEMV. A batch
 /// decode step is one row per sequence.
 const Q8_GEMV_ROWS: usize = 16;
+
+/// Up to this many rows, a decode step runs its routed experts as GEMVs that
+/// read the routing on the device ([`decode_moe`]) rather than downloading it
+/// to group the rows for cuBLAS.
+const ROUTED_GEMV_ROWS: usize = 16;
+
 /// Rows from which an int8 GEMV runs on the tensor cores (Ampere and later,
 /// BF16 input, a width that is a multiple of 32). Default model: 4 sequences
 /// 3075 to 3240 tokens/s, 16 sequences 5900 to 7600; one or two are even.

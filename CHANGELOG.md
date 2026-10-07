@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Device decode of up to 16 sequences routes its mixture-of-experts layers
+  on the device instead of copying the routing back to the host each layer:
+  one sequence of the default model decodes about 1.5x faster (about 900 to
+  1360 tokens per second), four 1.4x, sixteen 1.14x.
 - The fused attention backward pass's key/value kernel reads its query and
   output-gradient tiles transposed with `ldmatrix` instead of keeping a
   second copy, which halves its shared memory and fits three blocks on an
