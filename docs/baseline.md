@@ -793,3 +793,18 @@ Kernel time per step at 128 (nsys, four steps): `dkv` 8.66 ms, `dq` 7.21 ms,
 divided a signed index by the width raised `fwd_64` from 126 to 146
 registers and doubled its time; the unsigned divide restores the old counts.
 ptxas at 128: `fwd` 165 registers, `dq` 254, `dkv` 255 with 128 bytes spilled.
+
+## LM head re-measured (A6, 2026-10-07)
+
+Idle GPU at `96ffcc5`, `bench_train_step 4 1024 cuda`, nsys kernel summary over
+four steps (77.5 ms of kernel time a step):
+
+| Kernel | ms/step | Rate |
+|---|---|---|
+| `ampere_bf16_s16816gemm_bf16_256x128_..._tn` (logits) | 5.83 | 23.0 TFLOP/s |
+| `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x128_..._nn` (grad of hidden) | 5.21 | 25.8 TFLOP/s |
+| `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_..._nt` (grad of weight) | 5.06 | 26.5 TFLOP/s |
+| `ce_loss_grad_bf16` | 2.73 | ~288 GB/s |
+
+Each GEMM is 4096 x 512 x 32000 (134 GFLOP). Rejected for speed: see
+roadmap A6.
