@@ -875,3 +875,9 @@ almost all fixed launch overhead and weight reads.
 No measurement: `sample_consistency` costs one model call per step like the
 other solvers, and its own arithmetic is elementwise. The GPU was held by
 another process (RustingStrata, 10.5 GB) this iteration.
+
+## UniPC sampling (C7, 2026-10-07)
+
+No measurement: one model call per step like the other solvers, plus
+elementwise arithmetic. The GPU was held by another process (RustingStrata)
+this iteration.

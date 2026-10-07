@@ -25,6 +25,8 @@
 
 ### Added
 
+- `sample_unipc`: the UniPC multistep predictor-corrector solver at
+  diffusers' defaults, matching `UniPCMultistepScheduler` step for step.
 - `Scheduler::lcm_sigmas` and `sample_consistency`: the timesteps and the
   multistep consistency loop a latent consistency model (LCM, LCM-LoRA) runs
   in two to eight steps, matching diffusers' `LCMScheduler` timesteps.

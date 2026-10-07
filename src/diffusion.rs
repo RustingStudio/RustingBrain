@@ -570,6 +570,137 @@ pub fn sample_consistency<D: Denoiser>(
     Ok(latents)
 }
 
+/// UniPC (Zhao et al., 2023), the multistep predictor-corrector solver many
+/// Stable Diffusion front ends default to: second order, `bh2`, predicting
+/// the image, falling back to first order on the first and last step, as
+/// diffusers' `UniPCMultistepScheduler` runs by default.
+///
+/// Every step first corrects the latent it arrived at with the model's new
+/// answer, then predicts the next one from the last two answers, so it still
+/// reads the model once per step. It is a function rather than a [`Solver`]
+/// because it carries more state between steps. `config.solver` is not read.
+///
+/// For a DDIM schedule this matches diffusers step for step when it is given
+/// the same noise levels; diffusers spaces its timesteps slightly differently
+/// from [`Scheduler::sigmas`].
+pub fn sample_unipc<D: Denoiser>(
+    denoiser: &mut D,
+    scheduler: Scheduler,
+    mut latents: Matrix,
+    sigmas: &[f32],
+    config: &SamplingConfig,
+    mut on_step: impl FnMut(usize, &Matrix) -> bool,
+) -> Result<Matrix, NetworkError> {
+    let Some(steps) = sigmas.len().checked_sub(1).filter(|&steps| steps > 0) else {
+        return Err(NetworkError::InvalidConfig(
+            "a sampling run needs at least two noise levels".into(),
+        ));
+    };
+    // The images the model gave on the last two steps, newest last, and the
+    // latent and order of the last prediction, which the corrector redoes.
+    let mut answers: Vec<Vec<f32>> = Vec::with_capacity(2);
+    let mut last: Option<(Vec<f32>, usize)> = None;
+    for step in 0..steps {
+        let (sigma, next) = (sigmas[step], sigmas[step + 1]);
+        let prediction = predict(denoiser, &latents, sigma, config.guidance)?;
+        let mut answer = latents.clone();
+        scheduler.step(&mut answer, &prediction, sigma, 0.0)?;
+
+        if let Some((before, order)) = &last {
+            let earlier = (*order == 2).then(|| (&answers[0][..], sigmas[step - 2]));
+            latents.data = unipc_update(
+                scheduler,
+                before,
+                (sigmas[step - 1], sigma),
+                &answers[answers.len() - 1],
+                earlier,
+                Some(&answer.data),
+            );
+        }
+        if answers.len() == 2 {
+            answers.remove(0);
+        }
+        answers.push(answer.data);
+
+        let order = if step == 0 || step + 1 == steps { 1 } else { 2 };
+        let earlier = (order == 2).then(|| (&answers[0][..], sigmas[step - 1]));
+        let predicted = unipc_update(
+            scheduler,
+            &latents.data,
+            (sigma, next),
+            &answers[answers.len() - 1],
+            earlier,
+            None,
+        );
+        last = Some((std::mem::replace(&mut latents.data, predicted), order));
+        if !on_step(step, &latents) {
+            break;
+        }
+    }
+    Ok(latents)
+}
+
+/// The signal and noise scales of a latent at `sigma`: a DDIM latent is the
+/// image plus `sigma` of noise, a flow-matching one mixes the two.
+fn signal_and_noise(scheduler: Scheduler, sigma: f32) -> (f64, f64) {
+    let sigma = f64::from(sigma);
+    match scheduler {
+        Scheduler::FlowMatch { .. } => (1.0 - sigma, sigma),
+        Scheduler::Ddim { .. } => (1.0, sigma),
+    }
+}
+
+/// One UniPC `bh2` update of `x` from level `from` to level `to`, given the
+/// model's newest answer `newest`, the answer before it with its level when
+/// the update is second order, and, for the corrector, the answer at `to`.
+fn unipc_update(
+    scheduler: Scheduler,
+    x: &[f32],
+    (from, to): (f32, f32),
+    newest: &[f32],
+    earlier: Option<(&[f32], f32)>,
+    answer_at_to: Option<&[f32]>,
+) -> Vec<f32> {
+    let log_snr = |sigma| {
+        let (signal, noise) = signal_and_noise(scheduler, sigma);
+        signal.ln() - noise.ln()
+    };
+    let (signal_to, noise_to) = signal_and_noise(scheduler, to);
+    let (_, noise_from) = signal_and_noise(scheduler, from);
+    let h = log_snr(to) - log_snr(from);
+    let phi = (-h).exp_m1();
+    // bh2: B(h) = e^-h - 1, and the right-hand side of the order conditions.
+    let phi_2 = phi / -h - 1.0;
+    let first = phi_2 / phi;
+    let second = 2.0 * (phi_2 / -h - 0.5) / phi;
+    // `earlier` enters through its slope against the newest answer, scaled by
+    // where its level sits on this step's log-SNR axis.
+    let ratio = earlier.map(|(_, sigma)| (log_snr(sigma) - log_snr(from)) / h);
+    let (weight_earlier, weight_new) = match (answer_at_to, ratio) {
+        (None, _) => (0.5, 0.0),
+        (Some(_), None) => (0.0, 0.5),
+        (Some(_), Some(ratio)) => {
+            let weight = (first - second) / (1.0 - ratio);
+            (weight, first - weight)
+        }
+    };
+    let keep = noise_to / noise_from;
+    (0..x.len())
+        .map(|i| {
+            let newest = f64::from(newest[i]);
+            let mut correction = 0.0;
+            if let (Some((answers, _)), Some(ratio)) = (earlier, ratio) {
+                correction += weight_earlier * (f64::from(answers[i]) - newest) / ratio;
+            }
+            if let Some(at_to) = answer_at_to {
+                correction += weight_new * (f64::from(at_to[i]) - newest);
+            }
+            let value = keep * f64::from(x[i]) - signal_to * phi * (newest + correction);
+            value as f32
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +855,94 @@ mod tests {
         assert_eq!(model.calls, 3);
         for (value, target) in image.data.iter().zip(&target) {
             assert!((value - target).abs() < 1e-5, "{value} vs {target}");
+        }
+    }
+
+    /// A noise-predicting model with a nonlinear term, so the solver's
+    /// higher-order terms change the result.
+    struct Wavy;
+
+    impl Denoiser for Wavy {
+        fn denoise(&mut self, latents: &Matrix, sigma: f32) -> Result<Matrix, NetworkError> {
+            let data = latents
+                .data
+                .iter()
+                .map(|x| sigma * x / (1.0 + sigma * sigma) + 0.1 * x.sin())
+                .collect();
+            Ok(Matrix::from_vec(latents.rows, latents.cols, data))
+        }
+    }
+
+    #[test]
+    fn unipc_matches_the_diffusers_scheduler() {
+        // diffusers 0.40 `UniPCMultistepScheduler` at its defaults over the
+        // Stable Diffusion betas, driving the same model from
+        // `x_T = [2, -3, 0.5, 1.5]` (our latent is `x_T / sqrt(alpha_bar)`).
+        let alphas = alphas_cumprod(0.00085, 0.012, 1000);
+        let cases: [(&[usize], [f32; 4]); 3] = [
+            (
+                &[999, 500],
+                [1.393_945_2, -1.558_015_2, -0.032_679_02, 0.594_333_2],
+            ),
+            (
+                &[999, 874, 749, 624, 500, 375, 250, 125],
+                [1.819_281_8, -2.845_583, 0.296_030_2, 1.358_274],
+            ),
+            (
+                &[
+                    999, 949, 899, 849, 799, 749, 699, 649, 599, 549, 500, 450, 400, 350, 300, 250,
+                    200, 150, 100, 50,
+                ],
+                [1.961_916_3, -2.946_663, 0.386_013, 1.407_398_7],
+            ),
+        ];
+        for (timesteps, expected) in cases {
+            let mut sigmas: Vec<f32> = timesteps
+                .iter()
+                .map(|&t| ((1.0 - alphas[t]) / alphas[t]).sqrt())
+                .collect();
+            sigmas.push(0.0);
+            let scale = alphas[999].sqrt();
+            let start = Matrix::from_vec(1, 4, [2.0, -3.0, 0.5, 1.5].map(|x| x / scale).to_vec());
+            let image = sample_unipc(
+                &mut Wavy,
+                Scheduler::ddim(),
+                start,
+                &sigmas,
+                &SamplingConfig::default(),
+                |_, _| true,
+            )
+            .unwrap();
+            for (value, expected) in image.data.iter().zip(expected) {
+                assert!(
+                    (value - expected).abs() < 1e-4,
+                    "{} steps: {value} vs diffusers {expected}",
+                    timesteps.len()
+                );
+            }
+        }
+
+        // From pure noise at level 1.0 a flow model that knows its image
+        // lands on it.
+        let target = vec![0.5, -0.25, 1.0, 0.0];
+        let mut model = Straight {
+            target: target.clone(),
+            calls: 0,
+        };
+        let start = Matrix::from_vec(1, 4, vec![2.0, -3.0, 0.5, 1.5]);
+        let sigmas = Scheduler::flow_match(3.0).sigmas(6).unwrap();
+        let image = sample_unipc(
+            &mut model,
+            Scheduler::flow_match(3.0),
+            start,
+            &sigmas,
+            &SamplingConfig::default(),
+            |_, _| true,
+        )
+        .unwrap();
+        assert_eq!(model.calls, 6);
+        for (value, target) in image.data.iter().zip(&target) {
+            assert!((value - target).abs() < 1e-4, "{value} vs {target}");
         }
     }
 
