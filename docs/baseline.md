@@ -1117,3 +1117,28 @@ process, load average 4 to 12 (other loops' builds):
 16 sequences, and 952 against 870 at one.) The tensor-core kernel runs from
 three rows on (`Q8_MMA_ROWS`); one and two rows keep the warp-per-unit
 kernel, which ties it there.
+
+## 4-bit host weights (D3a, 2026-10-07)
+
+`quantized::Codebook::{Int4, Nf4}` with one `f32` absmax scale per block of
+64 along a row, two indices a byte (byte j of a block holds weight j low and
+weight j+32 high). Storage is 0.5625 bytes a weight at a width blocks divide,
+against 1 byte plus a row scale for int8; narrow rows pad to a whole block.
+
+Round-trip RMS error on standard-normal weights: symmetric int4 0.1074, NF4
+0.0940 (`nf4_loses_less_than_the_even_grid_on_normal_weights`).
+
+Host decode, `bench_decode 64 64 cpu 1` with a temporary 100M-block-parameter
+shape (`d_model` 1024, 8 layers, heads 16/16/64, `d_ff` 2816), rounds
+interleaved:
+
+| Version | int8 tok/s | nf4 tok/s | Load |
+|---|---|---|---|
+| Scalar codebook walk | 260-270 | 132-136 | 3-4 |
+| AVX2 `vpermps` lookup | 255-271 | 292-331 | 15-17 |
+
+The scalar walk widened one weight at a time and was compute-bound at twice
+int8's cost on half the bytes. Holding the 16 levels in two registers and
+looking up eight indices per `vpermps`, blended on bit 3, makes the 4-bit
+row cheaper than the int8 one. One outlier int8 round at 135 is left out.
+
