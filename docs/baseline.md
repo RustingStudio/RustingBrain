@@ -769,3 +769,9 @@ launches (6 layers x 8 experts x gate, up and down) and 0.69 ms a step, out
 of 1.31 ms for all 218 `cast_act` launches and 78.1 ms of kernel time. The
 backward pass reuses the packed copies from the cache. Deferred: the fix
 changes `SwiGlu`'s public fields.
+
+## Device VAE overflow guard (C6, 2026-10-07)
+
+No measurement. The guard is one pass over the downloaded image to look for
+non-finite values, which is a host-side scan of the output only; it adds no
+kernel and does not change the decode itself.

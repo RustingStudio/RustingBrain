@@ -24,7 +24,9 @@
 //!
 //!   NOTE: FP16 tops out at 65504, and the Stable Diffusion XL decoder is
 //!   the one part of a published model known to reach that on some latents.
-//!   Nothing seen here has, and the upgrade path if one does is a second
+//!   Nothing seen here has. If one does, `DeviceVae::decode` returns an error
+//!   instead of the black image the NaNs would become, and the upgrade path is
+//!   a second
 //!   module compiled from this same source with the two conversion helpers
 //!   written for BF16, handed to the decoder alone.
 //! * **`Precision::Q8` is dequantized on upload**, not in the kernel. Keeping
@@ -2152,7 +2154,17 @@ impl DeviceVae {
 
         gpu.group_norm(&self.norm_out, &mut hidden, 0)?;
         let output = gpu.conv(&self.conv_out, &hidden)?;
-        download_map(gpu, &output)
+        let image = download_map(gpu, &output)?;
+        // An FP16 overflow anywhere above turns into infinities, and the first
+        // group norm after it into NaN, which an image writer clamps to black.
+        // Saying so is the whole guard: the host path decodes the same latent
+        // in f32.
+        if image.data.iter().any(|value| !value.is_finite()) {
+            return Err(NetworkError::Cuda(
+                "VAE decode overflowed FP16 on the device; decode this latent on the host".into(),
+            ));
+        }
+        Ok(image)
     }
 
     /// Takes the input by value so the normalization can run in place.
@@ -2852,6 +2864,26 @@ mod tests {
             (expected.channels, expected.height, expected.width)
         );
         assert_close("vae", &actual.data, &expected.data, 0.05);
+    }
+
+    #[test]
+    fn a_vae_decode_that_overflows_fp16_fails_instead_of_returning_nan() {
+        let Some(gpu) = device() else { return };
+        let config = crate::vae::tests::tiny();
+        let path = std::env::temp_dir().join("rusting_brain_cuda_vae_overflow.safetensors");
+        crate::vae::tests::checkpoint(&config, &path);
+        let mut decoder = VaeDecoder::load(&path, "decoder.", config.clone()).expect("a decoder");
+        std::fs::remove_file(&path).ok();
+
+        // Past FP16's 65504 once scaled, so the upload alone is infinite, while
+        // the host's group norms keep its f32 decode finite.
+        let mut latent = map(config.latent_channels, 4, 4, 0.18);
+        latent.data.iter_mut().for_each(|value| *value *= 1.0e6);
+        let host = decoder.decode(&latent).expect("a host decode");
+        assert!(host.data.iter().all(|value| value.is_finite()));
+        decoder.attach_device(gpu).expect("an upload");
+        let error = decoder.decode(&latent).expect_err("an overflow error");
+        assert!(error.to_string().contains("overflowed FP16"), "{error}");
     }
 
     #[test]
