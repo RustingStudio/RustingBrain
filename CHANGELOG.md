@@ -44,6 +44,10 @@
 
 ### Fixed
 
+- `TransformerLm::save_bin` and `save_lora` copy the weights back from the
+  device first, as `save_hf` already did. A model trained on CUDA used to
+  save the weights it had before its first device step.
+
 - Corrupt files no longer panic or allocate without limit: a huge token id in
   `tokenizer.json`, a truncated or overflowing `.npy` or IDX header, and a
   weight, LoRA or weight-average file whose header claims more than the file
