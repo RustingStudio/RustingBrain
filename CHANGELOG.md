@@ -4,6 +4,10 @@
 
 ### Added
 
+- z-loss on the LM head: `TransformerBuilder::z_loss(weight)` or
+  `TransformerLm::set_z_loss` adds `weight * logsumexp(logits)^2` to the
+  training loss, reported in `TotalLoss::auxiliary_loss`, on the host and in
+  the fused CUDA head. Off by default.
 - Tutorial chapter 17, fine-tuning with LoRA: attach an adapter, train it,
   save it alone, load it onto the base, merge it, and measure what the base
   forgets.

@@ -2,7 +2,7 @@
 
 use crate::attention::{KvCache, causal_by_default};
 use crate::batch::TokenBatch;
-use crate::causal_lm_loss::{TotalLoss, causal_lm_loss_batch};
+use crate::causal_lm_loss::{TotalLoss, add_z_loss, causal_lm_loss_batch};
 use crate::embedding::Embedding;
 use crate::matrix::Matrix;
 use crate::moe::{DEFAULT_AUX_LOSS_WEIGHT, DEFAULT_ROUTER_Z_LOSS_WEIGHT, MoeConfig};
@@ -278,6 +278,7 @@ pub struct TransformerBuilder {
     optimizer: Optimizer,
     seed: Option<u64>,
     mixed_precision: bool,
+    z_loss: f32,
 }
 
 impl TransformerBuilder {
@@ -287,6 +288,7 @@ impl TransformerBuilder {
             optimizer: Optimizer::adam(3e-4),
             seed: None,
             mixed_precision: true,
+            z_loss: 0.0,
         }
     }
 
@@ -446,6 +448,20 @@ impl TransformerBuilder {
         self
     }
 
+    /// Adds `weight * logsumexp(logits)^2` per predicted position to the
+    /// training loss, which keeps the LM head's logits from drifting large
+    /// and the softmax from saturating. PaLM used `1e-4`. The default of `0`
+    /// leaves the loss untouched.
+    ///
+    /// The term is reported in [`TotalLoss::auxiliary_loss`] by
+    /// [`TransformerLm::train_step`] and [`TransformerLm::accumulate_step`];
+    /// [`TransformerLm::evaluate`] and the masked-language-model step leave
+    /// it out. Like the precision, it is not saved with the model.
+    pub fn z_loss(mut self, weight: f32) -> Self {
+        self.z_loss = weight;
+        self
+    }
+
     /// Parameter counts for what this builder would produce.
     pub fn parameter_counts(&self) -> ParameterCounts {
         self.config.parameter_counts()
@@ -563,6 +579,10 @@ pub struct TransformerLm {
     #[serde(skip)]
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     mixed_precision: bool,
+    /// Set by [`TransformerBuilder::z_loss`]. Not serialized, for the same
+    /// reason as `mixed_precision`.
+    #[serde(skip)]
+    pub(crate) z_loss: f32,
 }
 
 /// Weights and configuration, not transient training or device state: two
@@ -643,6 +663,7 @@ impl TransformerLm {
             #[cfg(feature = "cuda")]
             device: None,
             mixed_precision: builder.mixed_precision,
+            z_loss: builder.z_loss,
         };
         if let Some(lora) = model.config.lora {
             model.attach_lora(lora);
@@ -1446,7 +1467,8 @@ impl TransformerLm {
         }
 
         let (logits, cache) = self.forward_batch(batch)?;
-        let loss = causal_lm_loss_batch(&logits, batch)?;
+        let mut loss = causal_lm_loss_batch(&logits, batch)?;
+        let z_loss = add_z_loss(&logits, batch, self.z_loss, &mut loss.grad_logits);
 
         self.zero_grad();
         self.backward(&cache, &loss.grad_logits)?;
@@ -1455,7 +1477,7 @@ impl TransformerLm {
 
         Ok(TotalLoss {
             lm_loss: loss.loss,
-            auxiliary_loss: cache.auxiliary_loss(),
+            auxiliary_loss: cache.auxiliary_loss() + z_loss,
         })
     }
 
@@ -1567,12 +1589,13 @@ impl TransformerLm {
         }
 
         let (logits, cache) = self.forward_batch(batch)?;
-        let loss = causal_lm_loss_batch(&logits, batch)?;
+        let mut loss = causal_lm_loss_batch(&logits, batch)?;
+        let z_loss = add_z_loss(&logits, batch, self.z_loss, &mut loss.grad_logits);
         self.backward(&cache, &loss.grad_logits)?;
 
         Ok(TotalLoss {
             lm_loss: loss.loss,
-            auxiliary_loss: cache.auxiliary_loss(),
+            auxiliary_loss: cache.auxiliary_loss() + z_loss,
         })
     }
 
@@ -1708,6 +1731,12 @@ impl TransformerLm {
     /// say so again, before [`TransformerLm::to_cuda`].
     pub fn set_mixed_precision(&mut self, mixed_precision: bool) {
         self.mixed_precision = mixed_precision;
+    }
+
+    /// Overrides the z-loss weight chosen at build time. See
+    /// [`TransformerBuilder::z_loss`]; a restored model comes back with none.
+    pub fn set_z_loss(&mut self, weight: f32) {
+        self.z_loss = weight;
     }
 
     /// Writes the Adam moments to `path`, in the order
@@ -1962,7 +1991,7 @@ impl TransformerLm {
             config: header.config,
             optimizer: header.optimizer,
             seed: Some(0),
-            mixed_precision: TransformerBuilder::new().mixed_precision,
+            ..TransformerBuilder::new()
         })?;
         model.optimizer_step = header.optimizer_step as usize;
 

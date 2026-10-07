@@ -1852,6 +1852,50 @@ mod tests {
         }
     }
 
+    /// The fused head kernels carry the z-loss term and its gradient, in both
+    /// widths. The weight is large so the term moves the gradient far outside
+    /// the tolerance if either the value or the gradient is wrong.
+    #[test]
+    fn a_z_loss_step_on_the_device_matches_the_host_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let batch = [vec![3u32, 8, 1, 5, 2, 7], vec![9, 4, 4, 0, 11, 6]];
+        let without = tiny().build().unwrap().train_step(&batch).unwrap();
+        for (mixed, tolerance) in [(false, 1e-3), (true, 1e-2)] {
+            let mut cpu = tiny().z_loss(0.1).build().unwrap();
+            let mut gpu = cpu.clone();
+            gpu.set_mixed_precision(mixed);
+            gpu.to_cuda(0, 8192).unwrap();
+
+            let host = cpu.train_step(&batch).unwrap();
+            let device = gpu.train_step(&batch).unwrap();
+            assert!(host.auxiliary_loss > without.auxiliary_loss + 0.5);
+            assert!((host.lm_loss - device.lm_loss).abs() < tolerance);
+            assert!(
+                (host.auxiliary_loss - device.auxiliary_loss).abs() < tolerance,
+                "mixed {mixed}: {} on the device vs {} on the host",
+                device.auxiliary_loss,
+                host.auxiliary_loss
+            );
+            // As in the LoRA test: under BF16 only the loss is comparable.
+            if mixed {
+                continue;
+            }
+            gpu.sync_from_device().unwrap();
+            for (index, (device_param, host_param)) in
+                gpu.params_mut().iter().zip(cpu.params_mut()).enumerate()
+            {
+                assert_close(
+                    &format!("parameter {index}"),
+                    &device_param.value.data,
+                    &host_param.value.data,
+                    1e-3,
+                );
+            }
+        }
+    }
+
     /// Adam's moments cross with the weights in both directions, so a run
     /// that moves mid-training takes the steps it would have taken in place.
     #[test]
