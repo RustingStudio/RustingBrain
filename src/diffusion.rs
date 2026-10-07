@@ -163,6 +163,47 @@ impl Scheduler {
         Ok(sigmas)
     }
 
+    /// The noise levels a latent consistency model (LCM) was distilled at,
+    /// for [`sample_consistency`].
+    ///
+    /// An LCM learns its jump to the image only at the 50 timesteps its
+    /// teacher ran, every twentieth of a 1000-step schedule; this picks `steps`
+    /// of them evenly from the noisy end, as diffusers' `LCMScheduler` does:
+    /// four steps are timesteps 999, 759, 499 and 259. More than 50 steps is
+    /// refused, and so is a flow-matching schedule.
+    pub fn lcm_sigmas(&self, steps: usize) -> Result<Vec<f32>, NetworkError> {
+        const ORIGINAL_STEPS: usize = 50;
+        let Self::Ddim {
+            beta_start,
+            beta_end,
+            train_steps,
+        } = *self
+        else {
+            return Err(NetworkError::InvalidConfig(
+                "LCM timesteps are for a DDIM schedule".into(),
+            ));
+        };
+        self.sigmas(steps)?;
+        let stride = train_steps / ORIGINAL_STEPS;
+        if steps > ORIGINAL_STEPS || stride == 0 {
+            return Err(NetworkError::InvalidConfig(format!(
+                "an LCM runs at most {ORIGINAL_STEPS} steps over a schedule of at least {ORIGINAL_STEPS} timesteps"
+            )));
+        }
+        let alphas = alphas_cumprod(beta_start, beta_end, train_steps);
+        let mut sigmas: Vec<f32> = (0..steps)
+            .map(|step| {
+                // `floor(linspace(0, 50, steps))` into the teacher's timesteps,
+                // noisiest first.
+                let index = step * ORIGINAL_STEPS / steps;
+                let alpha = alphas[(ORIGINAL_STEPS - index) * stride - 1];
+                ((1.0 - alpha) / alpha).sqrt()
+            })
+            .collect();
+        sigmas.push(0.0);
+        Ok(sigmas)
+    }
+
     /// One update: `latents` moves from `sigma` to `next_sigma` given the
     /// model's `prediction`.
     pub fn step(
@@ -392,24 +433,7 @@ pub fn sample_with_sigmas<D: Denoiser>(
 
     for step in first.min(steps)..steps {
         let (sigma, next) = (sigmas[step], sigmas[step + 1]);
-        let mut prediction = denoiser.denoise(&latents, sigma)?;
-
-        if config.guidance != 1.0
-            && let Some(unconditional) = denoiser.denoise_unconditional(&latents, sigma)?
-        {
-            if unconditional.data.len() != prediction.data.len() {
-                return Err(NetworkError::InvalidTarget {
-                    expected: prediction.data.len(),
-                    actual: unconditional.data.len(),
-                });
-            }
-            // Push away from what the model would have predicted with no
-            // prompt, which is what "follow the prompt harder" means.
-            for (conditional, unconditional) in prediction.data.iter_mut().zip(&unconditional.data)
-            {
-                *conditional = unconditional + config.guidance * (*conditional - unconditional);
-            }
-        }
+        let prediction = predict(denoiser, &latents, sigma, config.guidance)?;
 
         match config.solver {
             Solver::Euler => scheduler.step(&mut latents, &prediction, sigma, next)?,
@@ -474,6 +498,78 @@ pub fn sample_with_sigmas<D: Denoiser>(
     Ok(latents)
 }
 
+/// The model's prediction at `sigma`, guided when `guidance` is not 1.0 and
+/// the model has an unconditional prediction to push away from.
+fn predict<D: Denoiser>(
+    denoiser: &mut D,
+    latents: &Matrix,
+    sigma: f32,
+    guidance: f32,
+) -> Result<Matrix, NetworkError> {
+    let mut prediction = denoiser.denoise(latents, sigma)?;
+    if guidance != 1.0
+        && let Some(unconditional) = denoiser.denoise_unconditional(latents, sigma)?
+    {
+        if unconditional.data.len() != prediction.data.len() {
+            return Err(NetworkError::InvalidTarget {
+                expected: prediction.data.len(),
+                actual: unconditional.data.len(),
+            });
+        }
+        // Push away from what the model would have predicted with no
+        // prompt, which is what "follow the prompt harder" means.
+        for (conditional, unconditional) in prediction.data.iter_mut().zip(&unconditional.data) {
+            *conditional = unconditional + guidance * (*conditional - unconditional);
+        }
+    }
+    Ok(prediction)
+}
+
+/// Multistep consistency sampling, the loop a latent consistency model (LCM)
+/// and its relatives (LCM-LoRA, TCD) run in two to eight steps.
+///
+/// Each step takes the model's answer as the finished image, then noises that
+/// image afresh down to the next level with [`Scheduler::add_noise`]; the last
+/// step returns the image itself. Unlike the [`Solver`]s, no step follows the
+/// path the previous one was on, which is what a model distilled to jump
+/// straight to the image wants. Run it over [`Scheduler::lcm_sigmas`] for an
+/// LCM; `config.solver` is not read, and `config.seed` seeds the noise.
+///
+/// NOTE: diffusers also blends a `c_skip` share of the noisy input back
+/// into the answer, but below `1e-5` at every LCM timestep, so it is left out.
+pub fn sample_consistency<D: Denoiser>(
+    denoiser: &mut D,
+    scheduler: Scheduler,
+    mut latents: Matrix,
+    sigmas: &[f32],
+    config: &SamplingConfig,
+    mut on_step: impl FnMut(usize, &Matrix) -> bool,
+) -> Result<Matrix, NetworkError> {
+    let Some(steps) = sigmas.len().checked_sub(1).filter(|&steps| steps > 0) else {
+        return Err(NetworkError::InvalidConfig(
+            "a sampling run needs at least two noise levels".into(),
+        ));
+    };
+    for step in 0..steps {
+        let (sigma, next) = (sigmas[step], sigmas[step + 1]);
+        let prediction = predict(denoiser, &latents, sigma, config.guidance)?;
+        // Either schedule's prediction points away from the image, so moving
+        // all the way to zero noise lands on the model's answer.
+        scheduler.step(&mut latents, &prediction, sigma, 0.0)?;
+        if next > 0.0 {
+            let seed = config
+                .seed
+                .map(|seed| seed ^ (step as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let fresh = noise(latents.rows, latents.cols, seed);
+            scheduler.add_noise(&mut latents, &fresh, next)?;
+        }
+        if !on_step(step, &latents) {
+            break;
+        }
+    }
+    Ok(latents)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +620,110 @@ mod tests {
         assert_eq!(model.calls, 30);
         for (value, target) in image.data.iter().zip(&target) {
             assert!((value - target).abs() < 0.05, "{value} vs {target}");
+        }
+    }
+
+    #[test]
+    fn lcm_sigmas_sit_on_the_timesteps_diffusers_picks() {
+        let alphas = alphas_cumprod(0.00085, 0.012, 1000);
+        let level = |t: usize| ((1.0 - alphas[t]) / alphas[t]).sqrt();
+        let sigmas = Scheduler::ddim().lcm_sigmas(4).unwrap();
+        let expected: Vec<f32> = [999, 759, 499, 259]
+            .map(level)
+            .into_iter()
+            .chain([0.0])
+            .collect();
+        assert_eq!(sigmas, expected);
+        assert_eq!(
+            Scheduler::ddim().lcm_sigmas(1).unwrap(),
+            vec![level(999), 0.0]
+        );
+        assert_eq!(Scheduler::ddim().lcm_sigmas(50).unwrap()[49], level(19));
+        assert!(Scheduler::ddim().lcm_sigmas(51).is_err());
+        assert!(Scheduler::ddim().lcm_sigmas(0).is_err());
+        assert!(Scheduler::flow_match(1.0).lcm_sigmas(4).is_err());
+    }
+
+    /// A noise-predicting model whose idea of the image is half its input, and
+    /// which keeps every input it was shown.
+    struct Halving {
+        inputs: Vec<Vec<f32>>,
+    }
+
+    impl Denoiser for Halving {
+        fn denoise(&mut self, latents: &Matrix, sigma: f32) -> Result<Matrix, NetworkError> {
+            self.inputs.push(latents.data.clone());
+            let data = latents.data.iter().map(|x| 0.5 * x / sigma).collect();
+            Ok(Matrix::from_vec(latents.rows, latents.cols, data))
+        }
+    }
+
+    #[test]
+    fn consistency_sampling_renoises_each_answer_to_the_next_level() {
+        let sigmas = Scheduler::ddim().lcm_sigmas(4).unwrap();
+        let config = SamplingConfig {
+            seed: Some(3),
+            ..SamplingConfig::default()
+        };
+        let run = |seed| {
+            let mut model = Halving { inputs: Vec::new() };
+            let start = noise(64, 64, Some(1));
+            let config = SamplingConfig { seed, ..config };
+            let image = sample_consistency(
+                &mut model,
+                Scheduler::ddim(),
+                start,
+                &sigmas,
+                &config,
+                |_, _| true,
+            )
+            .unwrap();
+            (image, model.inputs)
+        };
+        let (image, inputs) = run(Some(3));
+        assert_eq!(inputs.len(), 4);
+        // Each input after the first is the last answer plus fresh noise at
+        // exactly the next level.
+        for step in 1..4 {
+            let residual: Vec<f32> = inputs[step]
+                .iter()
+                .zip(&inputs[step - 1])
+                .map(|(x, before)| x - 0.5 * before)
+                .collect();
+            let spread =
+                (residual.iter().map(|r| r * r).sum::<f32>() / residual.len() as f32).sqrt();
+            assert!(
+                (spread / sigmas[step] - 1.0).abs() < 0.05,
+                "step {step}: noise {spread} vs level {}",
+                sigmas[step]
+            );
+        }
+        // The last step returns the answer with no noise on it.
+        for (value, input) in image.data.iter().zip(&inputs[3]) {
+            assert!((value - 0.5 * input).abs() < 1e-4);
+        }
+        assert_eq!(run(Some(3)).0, image);
+        assert_ne!(run(Some(4)).0, image);
+
+        // A flow model that knows its image lands on it whatever the noise.
+        let target = vec![0.5, -0.25, 1.0, 0.0];
+        let mut model = Straight {
+            target: target.clone(),
+            calls: 0,
+        };
+        let start = Matrix::from_vec(1, 4, vec![2.0, -3.0, 0.5, 1.5]);
+        let image = sample_consistency(
+            &mut model,
+            Scheduler::flow_match(1.0),
+            start,
+            &[1.0, 0.6, 0.3, 0.0],
+            &config,
+            |_, _| true,
+        )
+        .unwrap();
+        assert_eq!(model.calls, 3);
+        for (value, target) in image.data.iter().zip(&target) {
+            assert!((value - target).abs() < 1e-5, "{value} vs {target}");
         }
     }
 
