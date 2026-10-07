@@ -14,6 +14,9 @@
 
 ### Added
 
+- `SpikeGuard`: flags a training loss that is not finite or jumps above a
+  multiple of its moving mean, so a loop can skip that step and, after
+  several in a row, roll back to its last checkpoint.
 - `Bpe::train_json`: trains a byte-level BPE tokenizer on a text corpus and
   writes a `tokenizer.json` that `Bpe::from_json` loads.
 - `TransformerLm::step_with_update_ratios`: one optimizer step that returns

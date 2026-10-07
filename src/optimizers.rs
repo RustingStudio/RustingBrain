@@ -283,9 +283,113 @@ pub fn zero_grad(params: &mut [&mut Param]) {
     params.par_iter_mut().for_each(|param| param.zero_grad());
 }
 
+/// Flags a training step whose loss jumps well above the recent average, so
+/// the caller can drop it before the optimizer sees it.
+///
+/// The average is an exponential moving mean of the accepted losses. A loss
+/// that is not finite, or more than `ratio` times that mean once `warmup`
+/// losses have been accepted, is a spike: it is not folded into the mean, and
+/// [`SpikeGuard::consecutive`] counts how many came in a row. Skip a spike by
+/// clearing the gradients instead of stepping; after several in a row, roll
+/// back to the last checkpoint and its optimizer state.
+///
+/// ```
+/// use rusting_brain::SpikeGuard;
+///
+/// let mut guard = SpikeGuard::new(2.0, 0.99, 10);
+/// for loss in [3.0, 2.9, 2.8, 2.9, 2.7, 2.8, 2.6, 2.7, 2.6, 2.5] {
+///     assert!(!guard.is_spike(loss));
+/// }
+/// assert!(guard.is_spike(9.0));
+/// assert!(guard.is_spike(f32::NAN));
+/// assert_eq!(guard.consecutive(), 2);
+/// assert!(!guard.is_spike(2.6));
+/// assert_eq!(guard.consecutive(), 0);
+///
+/// // In a training loop:
+/// // let loss = model.accumulate_step(&batch)?;
+/// // if guard.is_spike(loss.lm_loss) {
+/// //     model.zero_grad();
+/// //     if guard.consecutive() >= 3 {
+/// //         model = TransformerLm::load_bin("last.bin")?;
+/// //         model.load_optimizer_state("last.opt")?;
+/// //     }
+/// // } else {
+/// //     model.step_clipped(1.0, 1.0)?;
+/// // }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpikeGuard {
+    ratio: f32,
+    beta: f32,
+    warmup: usize,
+    mean: f32,
+    accepted: usize,
+    consecutive: usize,
+}
+
+impl SpikeGuard {
+    /// A loss above `ratio` times the moving mean is a spike. `beta` is the
+    /// mean's decay per accepted loss (0.99 averages about the last hundred),
+    /// and no loss is a spike on size alone until `warmup` have been accepted.
+    pub fn new(ratio: f32, beta: f32, warmup: usize) -> Self {
+        Self {
+            ratio,
+            beta,
+            warmup,
+            mean: 0.0,
+            accepted: 0,
+            consecutive: 0,
+        }
+    }
+
+    /// Records `loss` and says whether it is a spike.
+    pub fn is_spike(&mut self, loss: f32) -> bool {
+        let spike =
+            !loss.is_finite() || (self.accepted >= self.warmup && loss > self.ratio * self.mean);
+        if spike {
+            self.consecutive += 1;
+            return true;
+        }
+        self.consecutive = 0;
+        self.accepted += 1;
+        // Bias-corrected, so the first losses are not pulled toward zero.
+        let weight = (1.0 - self.beta) / (1.0 - self.beta.powi(self.accepted as i32));
+        self.mean += weight * (loss - self.mean);
+        false
+    }
+
+    /// Spikes seen in a row since the last accepted loss.
+    pub fn consecutive(&self) -> usize {
+        self.consecutive
+    }
+
+    /// The moving mean of the accepted losses, 0 before the first.
+    pub fn mean(&self) -> f32 {
+        self.mean
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spike_is_skipped_without_moving_the_mean() {
+        let mut guard = SpikeGuard::new(2.0, 0.9, 3);
+        // A large first loss is accepted: the warm-up has no mean to compare.
+        assert!(!guard.is_spike(10.0));
+        assert!((guard.mean() - 10.0).abs() < 1e-6);
+        assert!(!guard.is_spike(4.0));
+        assert!(!guard.is_spike(4.0));
+        let mean = guard.mean();
+        assert!(guard.is_spike(2.0 * mean + 0.1));
+        assert!(guard.is_spike(f32::INFINITY));
+        assert_eq!(guard.mean(), mean);
+        assert_eq!(guard.consecutive(), 2);
+        assert!(!guard.is_spike(2.0 * mean - 0.1));
+        assert_eq!(guard.consecutive(), 0);
+    }
 
     #[test]
     fn warmup_rises_to_the_peak_and_the_cosine_falls_to_the_floor() {
