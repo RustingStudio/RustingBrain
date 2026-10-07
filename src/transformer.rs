@@ -1137,6 +1137,8 @@ impl TransformerLm {
         let lora = self.config.lora.ok_or_else(|| {
             NetworkError::InvalidConfig("this model has no LoRA adapter to save".into())
         })?;
+        #[cfg(feature = "cuda")]
+        self.sync_from_device()?;
         let header = serde_json::to_vec(&lora)?;
 
         let file = std::fs::File::create(path)?;
@@ -1859,6 +1861,8 @@ impl TransformerLm {
         precision: Precision,
     ) -> Result<(), NetworkError> {
         self.check_not_quantized("be saved")?;
+        #[cfg(feature = "cuda")]
+        self.sync_from_device()?;
         let header = serde_json::to_vec(&BinHeader {
             config: self.config.clone(),
             optimizer: self.optimizer.clone(),

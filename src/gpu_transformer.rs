@@ -1634,6 +1634,26 @@ mod tests {
     }
 
     #[test]
+    fn save_bin_writes_the_device_weights_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let mut gpu = tiny().build().unwrap();
+        gpu.to_cuda(0, 8192).unwrap();
+        gpu.train_step(&[&[3u32, 8, 1, 5, 2, 7][..]]).unwrap();
+        let path = std::env::temp_dir().join("rb_gpu_save_bin.rbw");
+        gpu.save_bin(&path, crate::transformer::Precision::F32)
+            .unwrap();
+        let mut saved = TransformerLm::load_bin(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        gpu.sync_from_device().unwrap();
+        for (device, loaded) in gpu.params_mut().iter().zip(saved.params_mut()) {
+            assert_eq!(device.value.data, loaded.value.data);
+        }
+    }
+
+    #[test]
     fn gpu_forward_matches_cpu_or_skips_without_device() {
         if !cuda_or_skip() {
             return;
