@@ -2,10 +2,6 @@
 
 ## Unreleased
 
-### Added
-
-- CI runs `cargo semver-checks` against the latest release tag.
-
 ### Changed
 
 - The fused attention query-gradient kernel at head width 128 uses 34 KiB
@@ -67,6 +63,7 @@
 
 ### Added
 
+- CI runs `cargo semver-checks` against the latest release tag.
 - `cuda_mmdit::DeviceDit` runs the FLUX-style MMDiT denoiser on the device
   with BF16 weights, FP32 residual streams and the fused attention kernel.
   A small FLUX-shaped model over a 512x512 image takes about 16 ms a pass
