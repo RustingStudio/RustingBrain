@@ -28,7 +28,8 @@
 //! unaffected.
 
 use crate::network::NetworkError;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 /// Ids at or above this are refused. The token table is sized by the largest
 /// id, so a corrupt id would otherwise allocate gigabytes; the largest
@@ -413,24 +414,53 @@ impl Bpe {
         Ok(())
     }
 
-    /// Repeatedly joins the best-ranked adjacent pair, which is the whole of
-    /// byte-pair encoding.
+    /// Repeatedly joins the best-ranked adjacent pair, leftmost first on a
+    /// tie, which is the whole of byte-pair encoding. The pairs wait in a heap
+    /// over a linked list, so a sentencepiece file, which hands over the whole
+    /// text as one piece, costs `n log n` and not `n^2`.
     fn merge(&self, symbols: &mut Vec<String>) {
-        while symbols.len() > 1 {
-            let best = symbols
-                .windows(2)
-                .enumerate()
-                .filter_map(|(index, pair)| {
-                    let rank = self.ranks.get(&(pair[0].clone(), pair[1].clone()))?;
-                    Some((*rank, index))
-                })
-                .min();
-            let Some((_, index)) = best else {
-                return;
-            };
-            let second = symbols.remove(index + 1);
-            symbols[index].push_str(&second);
+        let n = symbols.len();
+        if n < 2 {
+            return;
         }
+        // `n` marks the end of the list in `next`, `usize::MAX` its start in `prev`.
+        let mut next: Vec<usize> = (1..=n).collect();
+        let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
+        // A pair goes stale when either side grows, and sides only grow, so
+        // its lengths at push time tell a live entry from a stale one.
+        let mut heap = BinaryHeap::new();
+        let push = |heap: &mut BinaryHeap<_>, symbols: &[String], left: usize, right: usize| {
+            let key = (symbols[left].clone(), symbols[right].clone());
+            if let Some(&rank) = self.ranks.get(&key) {
+                let lengths = (key.0.len(), key.1.len());
+                heap.push(Reverse((rank, left, right, lengths)));
+            }
+        };
+        for i in 0..n - 1 {
+            push(&mut heap, symbols, i, i + 1);
+        }
+        while let Some(Reverse((_, left, right, lengths))) = heap.pop() {
+            if next[left] != right || lengths != (symbols[left].len(), symbols[right].len()) {
+                continue;
+            }
+            let second = std::mem::take(&mut symbols[right]);
+            symbols[left].push_str(&second);
+            next[left] = next[right];
+            if next[left] < n {
+                prev[next[left]] = left;
+                push(&mut heap, symbols, left, next[left]);
+            }
+            if prev[left] != usize::MAX {
+                push(&mut heap, symbols, prev[left], left);
+            }
+        }
+        let mut merged = Vec::new();
+        let mut i = 0;
+        while i < n {
+            merged.push(std::mem::take(&mut symbols[i]));
+            i = next[i];
+        }
+        *symbols = merged;
     }
 
     /// Turns ids back into text, which is what a round-trip check needs.
@@ -926,6 +956,8 @@ fn pre_tokenizer(json: &serde_json::Value, kind: &str) -> Option<serde_json::Val
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     /// A vocabulary over the byte alphabet, plus whatever merges a test needs.
     pub(crate) fn tokenizer(merges: &[&str], extra: &[&str], suffix: Option<&str>) -> Bpe {
@@ -1236,5 +1268,58 @@ pub(crate) mod tests {
     #[test]
     fn unigram_refuses_a_file_that_is_not_one() {
         assert!(Unigram::from_json(&tokenizer_json(&[], &[], None)).is_err());
+    }
+
+    #[test]
+    fn the_heap_merge_matches_the_pair_by_pair_loop() {
+        // The merge before E8: rescan every pair, join the leftmost best one.
+        fn rescan(bpe: &Bpe, symbols: &mut Vec<String>) {
+            while symbols.len() > 1 {
+                let best = symbols
+                    .windows(2)
+                    .enumerate()
+                    .filter_map(|(index, pair)| {
+                        let rank = bpe.ranks.get(&(pair[0].clone(), pair[1].clone()))?;
+                        Some((*rank, index))
+                    })
+                    .min();
+                let Some((_, index)) = best else {
+                    return;
+                };
+                let second = symbols.remove(index + 1);
+                symbols[index].push_str(&second);
+            }
+        }
+
+        // Random merges grown from a four-letter alphabet, the way training
+        // grows them, so merged tokens merge again and ties are common.
+        let mut rng = StdRng::seed_from_u64(8);
+        let mut tokens: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let mut merges = Vec::new();
+        while merges.len() < 60 {
+            let first = tokens[rng.gen_range(0..tokens.len())].clone();
+            let second = tokens[rng.gen_range(0..tokens.len())].clone();
+            let merge = format!("{first} {second}");
+            if !merges.contains(&merge) {
+                merges.push(merge);
+                tokens.push(first + &second);
+            }
+        }
+        let merges: Vec<&str> = merges.iter().map(String::as_str).collect();
+        let bpe = Bpe::from_json(&tokenizer_json(&merges, &[], None)).unwrap();
+
+        for length in [0, 1, 2, 3, 10, 100, 1_000, 50_000] {
+            let text: String = (0..length)
+                .map(|_| ['a', 'b', 'c', 'd'][rng.gen_range(0..4)])
+                .collect();
+            let mut fast: Vec<String> = text.chars().map(String::from).collect();
+            let mut slow = fast.clone();
+            bpe.merge(&mut fast);
+            if length <= 1_000 {
+                rescan(&bpe, &mut slow);
+                assert_eq!(fast, slow, "{text}");
+            }
+            assert_eq!(fast.concat(), text);
+        }
     }
 }
