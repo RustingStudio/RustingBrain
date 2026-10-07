@@ -930,3 +930,22 @@ before and after, second (warm) round:
 
 Not adopted: no gain at batch 1 and +3% at batch 16 do not pay for a global
 unsafe switch.
+
+## Activation checkpointing (A10, 2026-10-07)
+
+`examples/checkpoint_memory.rs <batch> <seq_len>`: default model, every block
+checkpointed or none, peak of the device's default memory pool over one
+training step (`CU_MEMPOOL_ATTR_USED_MEM_HIGH`, weights and optimizer state
+included), then the mean of three timed steps. GPU idle (gnome-clocks only)
+before and after; host load average about 11 from other work.
+
+| Shape | Peak kept | Peak checkpointed | ms/step kept | ms/step checkpointed |
+|---|---|---|---|---|
+| 4 x 512 | 1508 MiB | 1078 MiB | 47.9, 43.6 | 53.3, 53.8 |
+| 8 x 512 | 2037 MiB | 1251 MiB | - | - |
+| 4 x 1024 | 2037 MiB | 1251 MiB | - | - |
+| 16 x 512 | 2843 MiB | 1353 MiB | 131.7, 131.8 | 162.1, 160.9 |
+
+Each further 8 x 512 tokens costs about 102 MiB checkpointed against 806 MiB
+kept. The recompute adds 23% at 16 x 512, under the 30% the item estimated.
+An earlier timing run overlapped a `cargo clippy` build and was discarded.

@@ -279,6 +279,7 @@ pub struct TransformerBuilder {
     seed: Option<u64>,
     mixed_precision: bool,
     z_loss: f32,
+    checkpoint: Vec<bool>,
 }
 
 impl TransformerBuilder {
@@ -289,6 +290,7 @@ impl TransformerBuilder {
             seed: None,
             mixed_precision: true,
             z_loss: 0.0,
+            checkpoint: Vec::new(),
         }
     }
 
@@ -462,6 +464,20 @@ impl TransformerBuilder {
         self
     }
 
+    /// Recomputes the listed blocks' forward pass during the backward pass
+    /// instead of keeping their activations, so each of them holds only its
+    /// input between the two. That costs about one more forward pass of those
+    /// blocks per step and frees most of their activation memory, which is
+    /// what lets a longer sequence or a bigger batch fit on the card.
+    ///
+    /// Indexes past the last block are ignored. It applies to training on the
+    /// device; the host path and decoding keep everything. Like the precision,
+    /// it is not saved with the model.
+    pub fn checkpoint(mut self, blocks: impl IntoIterator<Item = usize>) -> Self {
+        self.checkpoint = checkpoint_flags(blocks);
+        self
+    }
+
     /// Parameter counts for what this builder would produce.
     pub fn parameter_counts(&self) -> ParameterCounts {
         self.config.parameter_counts()
@@ -470,6 +486,18 @@ impl TransformerBuilder {
     pub fn build(self) -> Result<TransformerLm, NetworkError> {
         TransformerLm::from_builder(self)
     }
+}
+
+/// One flag per block index up to the largest listed.
+fn checkpoint_flags(blocks: impl IntoIterator<Item = usize>) -> Vec<bool> {
+    let mut flags = Vec::new();
+    for index in blocks {
+        if flags.len() <= index {
+            flags.resize(index + 1, false);
+        }
+        flags[index] = true;
+    }
+    flags
 }
 
 impl Default for TransformerBuilder {
@@ -600,6 +628,11 @@ pub struct TransformerLm {
     /// reason as `mixed_precision`.
     #[serde(skip)]
     pub(crate) z_loss: f32,
+    /// Set by [`TransformerBuilder::checkpoint`]: which blocks recompute
+    /// their forward pass in the backward pass. Not serialized either.
+    #[serde(skip)]
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) checkpoint: Vec<bool>,
 }
 
 /// Weights and configuration, not transient training or device state: two
@@ -681,6 +714,7 @@ impl TransformerLm {
             device: None,
             mixed_precision: builder.mixed_precision,
             z_loss: builder.z_loss,
+            checkpoint: builder.checkpoint,
         };
         if let Some(lora) = model.config.lora {
             model.attach_lora(lora);
@@ -1901,6 +1935,13 @@ impl TransformerLm {
     /// [`TransformerBuilder::z_loss`]; a restored model comes back with none.
     pub fn set_z_loss(&mut self, weight: f32) {
         self.z_loss = weight;
+    }
+
+    /// Overrides the checkpointed blocks chosen at build time. See
+    /// [`TransformerBuilder::checkpoint`]; a restored model comes back with
+    /// none.
+    pub fn set_checkpoint(&mut self, blocks: impl IntoIterator<Item = usize>) {
+        self.checkpoint = checkpoint_flags(blocks);
     }
 
     /// Writes the Adam moments to `path`, in the order

@@ -162,8 +162,21 @@ pub(crate) struct GpuStack {
     seq_len: usize,
     sequences: usize,
     valid_tokens: usize,
-    blocks: Vec<BlockCache>,
+    valid: CudaSlice<i32>,
+    blocks: Vec<Saved>,
+    /// Each routed layer's per-expert share of slots, taken in the forward
+    /// pass because a checkpointed layer drops the cache it is read from.
+    loads: Vec<Vec<f32>>,
     auxiliary_loss: f32,
+}
+
+/// What the forward pass keeps of a block: everything, or only the input it
+/// recomputes the rest from (see [`crate::TransformerBuilder::checkpoint`]).
+/// Unboxed for the same reason as [`FfnCache`].
+#[allow(clippy::large_enum_variant)]
+enum Saved {
+    Cache(BlockCache),
+    Input(CudaSlice<f32>),
 }
 
 impl std::fmt::Debug for GpuStack {
@@ -198,17 +211,7 @@ impl GpuCache {
     }
 
     pub(crate) fn expert_loads(&self) -> Vec<Vec<f32>> {
-        self.stack
-            .blocks
-            .iter()
-            .filter_map(|block| match &block.feed_forward {
-                FfnCache::Moe(moe) => {
-                    let slots = moe.routed.max(1) as f32;
-                    Some(moe.counts.iter().map(|&n| n as f32 / slots).collect())
-                }
-                FfnCache::Dense(_) => None,
-            })
-            .collect()
+        self.stack.loads.clone()
     }
 }
 
@@ -2014,8 +2017,9 @@ fn forward_hidden(
     let (hidden, stack) = forward_stack(
         &gpu,
         &model.blocks,
+        &model.checkpoint,
         hidden,
-        &valid,
+        valid,
         valid_tokens,
         rows,
         seq_len,
@@ -2049,28 +2053,38 @@ fn forward_hidden(
 fn forward_stack(
     gpu: &Gpu<'_>,
     blocks: &[TransformerBlock],
+    checkpoint: &[bool],
     mut hidden: CudaSlice<f32>,
-    valid: &CudaSlice<i32>,
+    valid: CudaSlice<i32>,
     valid_tokens: usize,
     rows: usize,
     seq_len: usize,
     sequences: usize,
 ) -> Result<(CudaSlice<f32>, GpuStack), NetworkError> {
     let mut caches = Vec::with_capacity(blocks.len());
+    let mut loads = Vec::new();
     let mut auxiliary_loss = 0.0;
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
         let (output, cache) = forward_block(
             gpu,
             block,
             hidden,
-            valid,
+            &valid,
             valid_tokens,
             rows,
             seq_len,
             sequences,
             &mut auxiliary_loss,
         )?;
-        caches.push(cache);
+        if let FfnCache::Moe(moe) = &cache.feed_forward {
+            let slots = moe.routed.max(1) as f32;
+            loads.push(moe.counts.iter().map(|&n| n as f32 / slots).collect());
+        }
+        caches.push(if checkpoint.get(index) == Some(&true) {
+            Saved::Input(cache.input)
+        } else {
+            Saved::Cache(cache)
+        });
         hidden = output;
     }
     Ok((
@@ -2080,7 +2094,9 @@ fn forward_stack(
             seq_len,
             sequences,
             valid_tokens,
+            valid,
             blocks: caches,
+            loads,
             auxiliary_loss,
         },
     ))
@@ -2104,8 +2120,9 @@ pub(crate) fn stack_forward(
     let (hidden, stack) = forward_stack(
         &gpu,
         blocks,
+        &[],
         hidden,
-        &valid,
+        valid,
         rows,
         rows,
         seq_len,
@@ -2134,7 +2151,7 @@ pub(crate) fn stack_backward(
     let grad = gpu.upload(&grad_output.data)?;
     // What the final norm's backward would have handed the top block: its own
     // operand copy in whichever precision that block's feed forward reads.
-    let grad_act = match stack_operand(stack, blocks.len().checked_sub(1)) {
+    let grad_act = match stack_operand(&gpu, blocks, blocks.len().checked_sub(1)) {
         Some(narrow) => Some(gpu.narrowed(&grad.slice(..), rows * d_model, narrow)?),
         None => None,
     };
@@ -2150,14 +2167,11 @@ pub(crate) fn stack_backward(
 /// so the norm writes that operand copy itself. Which precision it wants is
 /// the receiving feed forward's; a routed one takes FP32 and narrows the
 /// shared expert's operand on its own, so it asks for no copy at all.
-fn stack_operand(stack: &GpuStack, index: Option<usize>) -> Option<bool> {
-    stack
-        .blocks
-        .get(index?)
-        .and_then(|block| match &block.feed_forward {
-            FfnCache::Dense(_) => Some(block.feed_forward_normed.is_narrow()),
-            FfnCache::Moe(_) => None,
-        })
+fn stack_operand(gpu: &Gpu<'_>, blocks: &[TransformerBlock], index: Option<usize>) -> Option<bool> {
+    match blocks.get(index?)?.feed_forward {
+        FeedForward::SwiGlu(_) => Some(gpu.context.mixed_precision),
+        _ => None,
+    }
 }
 
 /// Every block from the top down, returning `dL/dinput` of the bottom one.
@@ -2169,14 +2183,37 @@ fn backward_stack(
     mut grad_hidden_act: Option<Act>,
     grad_norms: &mut CudaSlice<f32>,
 ) -> Result<CudaSlice<f32>, NetworkError> {
-    for (index, (block, block_cache)) in blocks.iter_mut().zip(&stack.blocks).enumerate().rev() {
+    let operands: Vec<_> = (0..blocks.len())
+        .map(|index| stack_operand(gpu, blocks, index.checked_sub(1)))
+        .collect();
+    for (index, (block, saved)) in blocks.iter_mut().zip(&stack.blocks).enumerate().rev() {
+        let recomputed;
+        let block_cache = match saved {
+            Saved::Cache(cache) => cache,
+            Saved::Input(input) => {
+                // The auxiliary loss was counted on the first pass.
+                recomputed = forward_block(
+                    gpu,
+                    block,
+                    input.clone(),
+                    &stack.valid,
+                    stack.valid_tokens,
+                    stack.rows,
+                    stack.seq_len,
+                    stack.sequences,
+                    &mut 0.0,
+                )?
+                .1;
+                &recomputed
+            }
+        };
         (grad_hidden, grad_hidden_act) = backward_block(
             gpu,
             block,
             block_cache,
             &grad_hidden,
             grad_hidden_act.as_ref(),
-            stack_operand(stack, index.checked_sub(1)),
+            operands[index],
             stack,
             grad_norms,
             index,
@@ -3478,7 +3515,7 @@ fn backward_from_final(
         &mut grad_norms.slice_mut(0..d_model),
         grad_final,
         false,
-        stack_operand(&cache.stack, model.blocks.len().checked_sub(1)),
+        stack_operand(&gpu, &model.blocks, model.blocks.len().checked_sub(1)),
         rows,
         d_model,
     )?;
