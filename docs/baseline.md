@@ -907,3 +907,9 @@ average about 6, `bench_decode 512 128 cuda`, warm runs:
 
 A background run during a `cargo build` on the same machine gave 155-488
 tokens/s and was discarded.
+
+## GGUF export (F3, 2026-10-07)
+
+No measurement: export is a one-off file write, and correctness was checked
+against the `gguf` Python reader instead. The GPU was held by another process
+(RustingEngine tests) this iteration.
