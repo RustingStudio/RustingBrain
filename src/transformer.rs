@@ -2898,7 +2898,9 @@ mod tests {
             }
             Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
         }
-        for (mixed, tolerance) in [(false, 1e-3), (true, 5e-2)] {
+        // BF16 decode lands within about 1.3e-3 of the host here; an attention
+        // output off by half shows up near 4e-2.
+        for (mixed, tolerance) in [(false, 1e-3), (true, 5e-3)] {
             let cpu = tiny().mixed_precision(mixed).build().unwrap();
             let mut gpu = cpu.clone();
             gpu.to_cuda(0, 8192).unwrap();

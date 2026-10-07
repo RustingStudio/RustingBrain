@@ -971,3 +971,22 @@ about 5:
 | fused | 1.16 ms, 864 tokens/s | 2.35 ms, 6819 tokens/s |
 
 The first round's baseline batch-1 run (2.10 ms) was a cold outlier.
+
+## BF16 decode attention output (C9, 2026-10-07)
+
+Profile at `b014141` (`nsys`, `bench_decode 512 128 cuda 1`): the attention
+output projection was the last FP32 GEMV in a mixed-precision decode step,
+1024 calls at a median 6.0 us (5.7% of kernel time), against 5.5 us for the
+BF16 weight GEMVs of four times the size. The merge kernel now writes BF16.
+
+Same-session A/B, `bench_decode 512 128 cuda <sequences>`, three rounds, run
+only once the GPU was idle (gnome-clocks only) and the CPU load average was
+under 2. A first attempt ran beside another session's `rustc` build and a
+`forever_bear` process at load average 9; batch-1 numbers then varied from 349
+to 663 tokens/s and were discarded. Warm rounds (the first `b014141` batch-1
+run, 653 tokens/s, was cold):
+
+| Build | 1 sequence | 16 sequences |
+|---|---|---|
+| `b014141` | 1.11-1.12 ms, 893-898 tokens/s | 2.25-2.27 ms, 7035-7100 tokens/s |
+| BF16 output | 1.07-1.09 ms, 919-931 tokens/s | 2.25-2.26 ms, 7089-7123 tokens/s |
