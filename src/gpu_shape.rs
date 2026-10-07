@@ -58,7 +58,7 @@ fn bytes(buffer: &CudaSlice<f32>) -> CudaView<'_, u8> {
 
 /// One projection's packed weight, with the two dimensions its GEMMs need.
 pub(crate) struct Projection {
-    weights: Act,
+    weights: Arc<Act>,
     units: usize,
     inner: usize,
 }

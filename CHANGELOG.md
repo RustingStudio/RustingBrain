@@ -12,7 +12,7 @@
 - A `Decoder`, and so `generate`, on a model moved to the GPU keeps its
   key/value cache on the device and runs every layer there, instead of
   copying activations to the host for each projection. Cached decode of the
-  default model runs about twice as fast (197 to 384 tokens/s).
+  default model runs about three times as fast (197 to 624 tokens/s).
 - `bench_decode` takes `cuda` as an optional third argument to time cached
   decode of the default model on the GPU.
 - Mixed-precision training runs the routed experts of a MoE layer in BF16, as

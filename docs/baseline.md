@@ -844,3 +844,11 @@ nsys over the whole run, per decoded token: about 2.0 ms of kernels, of which
 `cast_act` is 0.97 ms. That is `Gpu::pack` re-narrowing every weight to BF16
 on every call, the one note left in `decode_block`, `forward_swiglu` and
 `forward_moe`. Device-to-host copies fell from about 174 a token to about 19.
+
+## Device decode with weight packs kept (C2 step 3, 2026-10-07)
+
+Idle GPU (CPU load average about 5), `bench_decode 512 128 cuda`: 1.82, 1.60,
+1.63, 1.62 and 1.61 ms/token, best 624 tokens/s, up from 384. nsys:
+`cast_act` no longer appears; kernel time is 1.01 ms/token, of which the
+LM-head GEMV is 0.20 ms. The remaining 0.6 ms of the 1.6 ms step is launch
+and host overhead, which C1 (CUDA graphs) targets.
