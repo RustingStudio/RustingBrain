@@ -534,3 +534,20 @@ shared-operand pipeline, not by bandwidth. With `DKV_SHARED_BYTES` at 37376 and
 so the fix is not occupancy. The asymmetry between the two mma loops -- 0.44 ms
 against 0.17 ms for identical mma and `LDS.32` counts -- points at the second
 loop's fragment packing, which is where to look next.
+
+## Tokenizer merge (J8, 2026-10-07)
+
+`Bpe::encode` on a sentencepiece-style `tokenizer.json` (Metaspace), release
+build, one paragraph of English repeated. CPU, not a throughput row: it
+only shows the shape of the cost.
+
+| Characters | Ids | Time |
+|---:|---:|---:|
+| 84 | 22 | 0.146 ms |
+| 336 | 85 | 1.733 ms |
+| 1,344 | 337 | 27.1 ms |
+| 5,376 | 1,345 | 432 ms |
+
+Four times the text costs about sixteen times the time: the merge loop is
+quadratic in the length of the piece, and Metaspace hands it the whole text.
+Roadmap item E8.
