@@ -1,11 +1,11 @@
 # The RustingBrain Course
 
-Sixteen chapters, from what a neural network is to training a mixture-of-experts
+Seventeen chapters, from what a neural network is to training a mixture-of-experts
 language model on a GPU. No prior machine-learning knowledge assumed. Rust
 assumed at the level of "I can read a `for` loop".
 
 Every chapter has runnable code in [`code/`](code/) and ends with exercises.
-Chapters 1–10 need nothing but Rust. Chapter 11 and 14–16 are much faster with
+Chapters 1–10 need nothing but Rust. Chapter 11 and 14–17 are much faster with
 an NVIDIA GPU, and all of them still run without one.
 
 ---
@@ -50,6 +50,7 @@ is worse than one that looks bad.
 | 14 | [Tokens and a Transformer Language Model](14_language_model.md) | 1–10 | 2 hr |
 | 15 | [Mixture of Experts](15_mixture_of_experts.md) | 14 | 90 min |
 | 16 | [Training a Language Model End to End](16_training_an_llm.md) | 14–15 | an afternoon |
+| 17 | [Fine-Tuning With LoRA](17_lora_fine_tuning.md) | 16 | 45 min |
 
 ---
 
@@ -70,6 +71,7 @@ is worse than one that looks bad.
 | Fit a bigger model in the same memory | [15](15_mixture_of_experts.md) |
 | Plan a run that takes days | [16](16_training_an_llm.md) |
 | Fine-tune a model to answer questions | [16](16_training_an_llm.md) |
+| Adapt a trained model on a small GPU | [17](17_lora_fine_tuning.md) |
 
 ## Running the code
 

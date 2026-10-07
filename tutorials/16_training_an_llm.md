@@ -571,7 +571,10 @@ the same summation order difference, not from the checkpoint.
 
 ---
 
-That is the course. You have a library that trains dense networks, transformer
+**Next:** [17. Fine-Tuning With LoRA](17_lora_fine_tuning.md) adapts a trained
+model without training every weight again.
+
+That is the core of the course. You have a library that trains dense networks, transformer
 language models, and sparse mixtures of experts, on a CPU or a GPU, from first
 principles with no Python in the loop.
 
