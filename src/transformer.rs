@@ -1170,6 +1170,7 @@ impl TransformerLm {
     /// loading part of an adapter.
     pub fn load_lora<P: AsRef<Path>>(&mut self, path: P) -> Result<(), NetworkError> {
         let file = std::fs::File::open(path)?;
+        let file_length = file.metadata()?.len();
         let mut reader = std::io::BufReader::new(file);
 
         let mut magic = [0u8; 8];
@@ -1181,7 +1182,13 @@ impl TransformerLm {
         }
         let mut word = [0u8; 8];
         reader.read_exact(&mut word)?;
-        let mut header = vec![0u8; u64::from_le_bytes(word) as usize];
+        let header_length = u64::from_le_bytes(word);
+        if header_length > file_length {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "adapter file header claims {header_length} bytes, the file has {file_length}"
+            )));
+        }
+        let mut header = vec![0u8; header_length as usize];
         reader.read_exact(&mut header)?;
         let header: LoraConfig = serde_json::from_slice(&header)?;
         match self.config.lora {
@@ -1898,6 +1905,7 @@ impl TransformerLm {
     /// [`Precision::F32`] for checkpoints you intend to train from.
     pub fn load_bin<P: AsRef<Path>>(path: P) -> Result<Self, NetworkError> {
         let file = std::fs::File::open(path)?;
+        let file_length = file.metadata()?.len();
         let mut reader = std::io::BufReader::new(file);
 
         let mut magic = [0u8; 8];
@@ -1909,10 +1917,25 @@ impl TransformerLm {
         }
         let mut word = [0u8; 8];
         reader.read_exact(&mut word)?;
-        let mut header = vec![0u8; u64::from_le_bytes(word) as usize];
+        let header_length = u64::from_le_bytes(word);
+        if header_length > file_length {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "weight file header claims {header_length} bytes, the file has {file_length}"
+            )));
+        }
+        let mut header = vec![0u8; header_length as usize];
         reader.read_exact(&mut header)?;
         let header: BinHeader = serde_json::from_slice(&header)?;
         header.config.validate()?;
+        // Building the model allocates what the header asks for, so check the
+        // file can hold it first: every weight takes at least one byte.
+        let needed = weights_needed(&header.config);
+        let rope_table = (header.config.max_seq_len as u128) * (header.config.head_dim as u128);
+        if needed > file_length as u128 || rope_table > 1 << 28 {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "weight file header describes a model that does not fit in its {file_length} bytes"
+            )));
+        }
 
         let mut model = Self::from_builder(TransformerBuilder {
             config: header.config,
@@ -1981,6 +2004,51 @@ impl TransformerLm {
         }
         Ok(())
     }
+}
+
+/// [`TransformerConfig::parameter_counts`]'s total, in arithmetic a corrupt
+/// configuration cannot overflow and without a loop over its layers.
+fn weights_needed(config: &TransformerConfig) -> u128 {
+    let [
+        vocab,
+        d_model,
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        d_ff,
+        moe_d_ff,
+        num_experts,
+    ] = [
+        config.vocab_size,
+        config.d_model,
+        config.n_layers,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        config.d_ff,
+        config.moe_d_ff,
+        config.num_experts,
+    ]
+    .map(|value| value as u128);
+    let mut moe_layers = config.moe_layers.clone();
+    moe_layers.sort_unstable();
+    moe_layers.dedup();
+    let moe_count = moe_layers.len() as u128;
+
+    let product = |values: &[u128]| values.iter().fold(1u128, |acc, v| acc.saturating_mul(*v));
+    let attention = product(&[2, d_model, n_heads, head_dim])
+        .saturating_add(product(&[2, d_model, n_kv_heads, head_dim]))
+        .saturating_add(2 * d_model);
+    let expert = product(&[3, d_model, moe_d_ff]);
+    let moe = product(&[num_experts, expert])
+        .saturating_add(product(&[num_experts, d_model]))
+        .saturating_add(if config.shared_expert { expert } else { 0 });
+    let dense = product(&[3, d_model, d_ff]);
+    product(&[vocab, d_model])
+        .saturating_add(product(&[n_layers, attention]))
+        .saturating_add(product(&[moe_count, moe]))
+        .saturating_add(product(&[n_layers.saturating_sub(moe_count), dense]))
 }
 
 /// A decoding session: the KV caches, the ids that filled them, and the logits

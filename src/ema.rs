@@ -204,6 +204,7 @@ impl Ema {
     /// which both refuse a list that does not match.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, NetworkError> {
         let file = std::fs::File::open(path)?;
+        let file_length = file.metadata()?.len() as usize;
         let mut reader = std::io::BufReader::new(file);
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
@@ -217,13 +218,29 @@ impl Ema {
         let count = u64::from_le_bytes(word) as usize;
         reader.read_exact(&mut word)?;
         let updates = u64::from_le_bytes(word) as usize;
+        // Every parameter takes at least its 16-byte shape, so a count the
+        // file cannot hold is corrupt.
+        if count > file_length / 16 {
+            return Err(NetworkError::InvalidSnapshot(format!(
+                "weight-average file claims {count} parameters in {file_length} bytes"
+            )));
+        }
         let mut shadow = Vec::with_capacity(count);
         for _ in 0..count {
             reader.read_exact(&mut word)?;
             let rows = u64::from_le_bytes(word) as usize;
             reader.read_exact(&mut word)?;
             let cols = u64::from_le_bytes(word) as usize;
-            let mut bytes = vec![0u8; rows * cols * 4];
+            let Some(length) = rows
+                .checked_mul(cols)
+                .and_then(|values| values.checked_mul(4))
+                .filter(|length| *length <= file_length)
+            else {
+                return Err(NetworkError::InvalidSnapshot(format!(
+                    "weight-average file claims a {rows}x{cols} parameter in {file_length} bytes"
+                )));
+            };
+            let mut bytes = vec![0u8; length];
             reader.read_exact(&mut bytes)?;
             let data = bytes
                 .chunks_exact(4)

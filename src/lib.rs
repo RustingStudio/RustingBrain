@@ -113,6 +113,8 @@ pub mod ema;
 pub mod embedding;
 pub mod ffn;
 pub mod flow_transformer;
+#[cfg(test)]
+mod fuzz;
 pub mod gltf;
 pub mod hf;
 pub mod interoceptive;
