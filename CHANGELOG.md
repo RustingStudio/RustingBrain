@@ -4,6 +4,9 @@
 
 ### Changed
 
+- `GpuContext` runs on the CUDA default stream, so cudarc no longer records
+  and waits on an event for every kernel argument. Batch-1 int8 decode gains
+  about 2% (1676-1712 to 1711-1747 tokens/s); training is unchanged.
 - Device decode attention issues its cache loads in parallel: 16 sequences
   after a 512-token prompt decode 7780-7980 to 8731-8835 tokens/s.
 - Int8 device decode runs the routed experts with an int8 routed GEMV instead

@@ -120,7 +120,10 @@ impl GpuContext {
         let (context, module) = device_context(device)?;
         // The stream holds its own reference to the context, so the context is
         // not kept here; the module is cached per process by `device_context`.
-        let stream = context.new_stream().map_err(cuda_err("stream creation"))?;
+        // The legacy default stream orders every context's work on the device,
+        // so cudarc stays out of multi-stream mode and skips its per-argument
+        // event waits, which cost more host time than a decode token's kernels.
+        let stream = context.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(cuda_err("cuBLAS initialization"))?;
         if mixed_precision {
             // Storage and accumulation stay FP32; only the multiplier inputs

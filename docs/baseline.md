@@ -1348,3 +1348,28 @@ against 1208-1358 tokens/s, int8 one sequence 1620-1677 against 1428-1681,
 16 sequences 8700-8911 against 8904-8967. No change beyond the noise; the
 uploads overlapped the kernels. Kept as a step toward graph capture.
 
+
+## One CUDA stream for `GpuContext` (C1 part 2a', 2026-10-08)
+
+`nsys profile -t cuda bench_decode 512 256 cuda 1 int8`, kernels in a
+100 ms window near the end of decode, load 6-7:
+
+| | tokens/s under nsys | GPU busy | API calls a token |
+|---|---|---|---|
+| own stream (multi-stream mode) | 637 | 25% | ~1000 `cuStreamWaitEvent`, ~500 `cuEventRecord`, ~260 event create/destroy |
+| legacy default stream | 971 | 62% | none of those |
+
+Unprofiled, five interleaved rounds, load 7 to 10 (tokens/s):
+
+| run | before | after |
+|---|---|---|
+| 1 sequence BF16 | 1200-1406 | 1406-1428 |
+| 1 sequence int8 | 1676-1712 | 1711-1747 |
+| 16 sequences BF16 | 8746-8840 | 8772-8899 |
+| `bench_train_step 4 1024 cuda` | 53392-53428 | 53279-53630 |
+
+The host event work overlapped the kernels, so the unprofiled gain is small.
+Profiles taken under nsys before this change overstate how host-bound decode
+is: nsys slows the API calls the tracking made. An earlier test that called
+`disable_event_tracking` (C1 note) measured the same effect and also found it
+within noise.
