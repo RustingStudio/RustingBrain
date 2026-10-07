@@ -760,3 +760,12 @@ load-balancing loss evens the routing out within about 200 steps; after that
 the busiest expert carries at most 1.35 times an even share, so the uniform
 benchmark is a fair stand-in for the expert GEMM estimate. The GPU had a
 21 MiB test process on it; these are counts, not timings.
+
+## Expert weight packs re-measured (A7 W3, 2026-10-07)
+
+Same idle-GPU trace at `6f48659`. The `cast_act` launches between each MoE
+layer's forward gather and its scatter are the per-step weight packs: 144
+launches (6 layers x 8 experts x gate, up and down) and 0.69 ms a step, out
+of 1.31 ms for all 218 `cast_act` launches and 78.1 ms of kernel time. The
+backward pass reuses the packed copies from the cache. Deferred: the fix
+changes `SwiGlu`'s public fields.
