@@ -60,9 +60,9 @@ fn main() {
     for round in 0..5 {
         for (index, name) in names.iter().enumerate() {
             let (function, grid_y, shared_mem_bytes) = match index {
-                0 => ("flash_attention_fwd", heads, shared(1)),
-                1 => ("flash_attention_dq", heads, shared(1) + 64 * 72 * 2),
-                _ => ("flash_attention_dkv", kv_heads, shared(2) + 2 * 64 * 4),
+                0 => ("flash_attention_fwd_64", heads, shared(1)),
+                1 => ("flash_attention_dq_64", heads, shared(1) + 64 * 72 * 2),
+                _ => ("flash_attention_dkv_64", kv_heads, shared(1) + 2 * 64 * 4),
             };
             let kernel = module.load_function(function).unwrap();
             kernel
@@ -96,7 +96,8 @@ fn main() {
                         .arg(&vbase)
                         .arg(&grouped)
                         .arg(&stride)
-                        .arg(&scale);
+                        .arg(&scale)
+                        .arg(&1i32);
                     unsafe { launch.launch(config) }.unwrap();
                 }
                 stream.synchronize().unwrap();

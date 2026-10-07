@@ -61,11 +61,11 @@ pub(crate) const fn dq_shared_bytes(head_dim: usize) -> u32 {
     let (rows, columns) = tiles(head_dim);
     (2 * rows + columns) as u32
 }
-/// Queries and output gradients, each stored both ways round, plus the
-/// log-sum-exp and delta of the query tile.
+/// Queries and output gradients, query-major, plus the log-sum-exp and delta
+/// of the query tile.
 pub(crate) const fn dkv_shared_bytes(head_dim: usize) -> u32 {
-    let (rows, columns) = tiles(head_dim);
-    (2 * rows + 2 * columns + 2 * TILE * 4) as u32
+    let (rows, _) = tiles(head_dim);
+    (2 * rows + 2 * TILE * 4) as u32
 }
 
 const KERNELS: &str = r#"
@@ -93,6 +93,21 @@ __device__ __forceinline__ unsigned bf16_pair(const unsigned short*p,size_t i){
 }
 __device__ __forceinline__ unsigned pack2(float lo,float hi){
   return (unsigned)bf16_bits(lo)|((unsigned)bf16_bits(hi)<<16);
+}
+// Four 8x8 BF16 matrices out of shared memory in one instruction, each lane
+// naming one 16-byte row: lanes 8m..8m+7 give the rows of matrix m, which
+// lands in r[m] laid out as an mma B operand half (row g, columns 2t, 2t+1).
+__device__ __forceinline__ void ldsm_x4(unsigned r[4],const unsigned short*row){
+  unsigned a=(unsigned)__cvta_generic_to_shared(row);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3},[%4];\n"
+    : "=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]) : "r"(a));
+}
+// The same with each matrix transposed on the way: a thread gets column g at
+// rows 2t, 2t+1, so a k-major tile serves as the B operand of its transpose.
+__device__ __forceinline__ void ldsm_x4_trans(unsigned r[4],const unsigned short*row){
+  unsigned a=(unsigned)__cvta_generic_to_shared(row);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3},[%4];\n"
+    : "=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]) : "r"(a));
 }
 
 // D[16x8] += A[16x16] * B[16x8], A row-major, B k-major, accumulating in FP32.
@@ -697,11 +712,11 @@ template<int D> __device__ __forceinline__ void flash_dkv(
     int lse_head_stride, float scale, int causal)
 {
   extern __shared__ unsigned short smem[];
+  // Both tiles query-major; the products that want them dimension-major read
+  // them through `ldsm_x4_trans`.
   unsigned short* qs  = smem;                       // [query][dim]
-  unsigned short* qtr = qs + 64*DROW;               // [dim][query]
-  unsigned short* gs  = qtr + D*FA_ROW;             // [query][dim]
-  unsigned short* gtr = gs + 64*DROW;               // [dim][query]
-  float* lse_s = (float*)(gtr + D*FA_ROW);
+  unsigned short* gs  = qs + 64*DROW;               // [query][dim]
+  float* lse_s = (float*)(gs + 64*DROW);
   float* del_s = lse_s + 64;
 
   const int jt = blockIdx.x, kvh = blockIdx.y, b = blockIdx.z;
@@ -759,11 +774,7 @@ template<int D> __device__ __forceinline__ void flash_dkv(
         // The queries are stored unscaled, so the scores carry the scale
         // instead: one multiply per score rather than one per element here.
         *(unsigned*)(qs + r*DROW + c) = qw;
-        qtr[c*FA_ROW + r] = (unsigned short)qw;
-        qtr[(c+1)*FA_ROW + r] = (unsigned short)(qw >> 16);
         *(unsigned*)(gs + r*DROW + c) = gw;
-        gtr[c*FA_ROW + r] = (unsigned short)gw;
-        gtr[(c+1)*FA_ROW + r] = (unsigned short)(gw >> 16);
       }
       if (threadIdx.x < 64) {
         int q = it*64 + threadIdx.x;
@@ -782,14 +793,16 @@ template<int D> __device__ __forceinline__ void flash_dkv(
       #pragma unroll
       for (int n=0;n<8;++n) {
         #pragma unroll
-        for (int kk=0; kk<D/16; ++kk) {
-          const unsigned short* pq = qs + (n*8+g)*DROW + kk*16 + t*2;
-          const unsigned short* pg = gs + (n*8+g)*DROW + kk*16 + t*2;
-          unsigned bq[2], bg[2];
-          bq[0]=*(const unsigned*)pq; bq[1]=*(const unsigned*)(pq+8);
-          bg[0]=*(const unsigned*)pg; bg[1]=*(const unsigned*)(pg+8);
-          MMA(st[n],  kf[kk], bq);
-          MMA(dpt[n], vf[kk], bg);
+        for (int kk=0; kk<D/16; kk+=2) {
+          // Matrix m is columns kk*16 + 8m: both halves of two k steps.
+          int at = (n*8 + (lane&7))*DROW + kk*16 + (lane>>3)*8;
+          unsigned bq[4], bg[4];
+          ldsm_x4(bq, qs + at);
+          ldsm_x4(bg, gs + at);
+          MMA(st[n],  kf[kk],   bq);
+          MMA(dpt[n], vf[kk],   bg);
+          MMA(st[n],  kf[kk+1], (bq+2));
+          MMA(dpt[n], vf[kk+1], (bg+2));
         }
       }
 
@@ -820,14 +833,16 @@ template<int D> __device__ __forceinline__ void flash_dkv(
         sf[2]=pack2(dpt[2*kk+1][0],dpt[2*kk+1][1]);
         sf[3]=pack2(dpt[2*kk+1][2],dpt[2*kk+1][3]);
         #pragma unroll
-        for (int n=0;n<D/8;++n) {
-          const unsigned short* pg = gtr + (n*8+g)*FA_ROW + kk*16 + t*2;
-          const unsigned short* pq = qtr + (n*8+g)*FA_ROW + kk*16 + t*2;
-          unsigned bg[2], bq[2];
-          bg[0]=*(const unsigned*)pg; bg[1]=*(const unsigned*)(pg+8);
-          bq[0]=*(const unsigned*)pq; bq[1]=*(const unsigned*)(pq+8);
-          MMA(dv[n], pf, bg);
-          MMA(dk[n], sf, bq);
+        for (int n=0;n<D/8;n+=2) {
+          // Matrix m is output columns (n + m/2)*8, k (query) half m%2.
+          int at = (kk*16 + ((lane>>3)&1)*8 + (lane&7))*DROW + (n + (lane>>4))*8;
+          unsigned bg[4], bq[4];
+          ldsm_x4_trans(bg, gs + at);
+          ldsm_x4_trans(bq, qs + at);
+          MMA(dv[n],   pf, bg);
+          MMA(dk[n],   sf, bq);
+          MMA(dv[n+1], pf, (bg+2));
+          MMA(dk[n+1], sf, (bq+2));
         }
       }
     }
