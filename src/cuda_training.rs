@@ -323,6 +323,15 @@ extern "C" __global__ void dequantize_q8(const signed char*q,const float*scales,
   size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)units*inner)return;
   store_act(out,i,(float)q[i]*scales[i/inner],narrow);
 }
+// The 4-bit layout of `quantized.rs`: rows padded to blocks of 64, byte j of a
+// block holding weight j low and weight j+32 high, one scale a block, and the
+// codebook's 16 levels in `levels`.
+extern "C" __global__ void dequantize_q4(const unsigned char*packed,const float*scales,const float*levels,void*out,int units,int inner,int narrow){
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)units*inner)return;
+  size_t unit=i/inner;int k=i%inner,blocks=(inner+63)/64,block=k/64,offset=k%64;
+  unsigned char byte=packed[(unit*blocks+block)*32+offset%32];
+  store_act(out,i,levels[(byte>>(offset<32?0:4))&15]*scales[unit*blocks+block],narrow);
+}
 // `y[r, n] = scales[n] * (x[r, ..] . q[n, ..]) + beta * y[r, n]`, one warp per
 // output unit. A lane reads 16 weights at a time and keeps them for up to
 // four rows of `x`, so a decode step reads each weight byte once. `inner` is a

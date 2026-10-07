@@ -281,6 +281,16 @@ impl Quantized {
             Values::Four { .. } => None,
         }
     }
+
+    /// The packed indices, the block scales and the codebook of a 4-bit
+    /// weight; `None` for int8.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn parts_4bit(&self) -> Option<(&[u8], &[f32], Codebook)> {
+        match &self.values {
+            Values::Int8(_) => None,
+            Values::Four { codebook, packed } => Some((packed, &self.scales, *codebook)),
+        }
+    }
 }
 
 /// `f32` activations against `i8` weights.

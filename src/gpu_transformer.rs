@@ -424,6 +424,9 @@ pub struct DeviceParam {
     /// `value` is then a one-element placeholder; the only reader is the
     /// weight pack, which dequantizes these.
     int8: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
+    /// The same for a 4-bit base: packed indices, block scales and the
+    /// codebook's 16 levels, see [`crate::quantized::Quantized::parts_4bit`].
+    four_bit: Option<(CudaSlice<u8>, CudaSlice<f32>, CudaSlice<f32>)>,
 }
 
 impl std::fmt::Debug for DeviceParam {
@@ -467,12 +470,24 @@ impl Clone for DeviceParam {
                 .take()
                 .unwrap_or_else(|| panic!("CUDA allocation failed while cloning a parameter"))
         };
+        let stream = &self.context.stream;
+        fn failed() -> ! {
+            panic!("CUDA allocation failed while cloning a parameter")
+        }
         let int8 = self.int8.as_ref().map(|(bytes, scales)| {
-            let bytes = self.context.stream.clone_dtod(bytes);
-            let scales = self.context.stream.clone_dtod(scales);
-            match (bytes, scales) {
+            match (stream.clone_dtod(bytes), stream.clone_dtod(scales)) {
                 (Ok(bytes), Ok(scales)) => (bytes, scales),
-                _ => panic!("CUDA allocation failed while cloning a parameter"),
+                _ => failed(),
+            }
+        });
+        let four_bit = self.four_bit.as_ref().map(|(packed, scales, levels)| {
+            match (
+                stream.clone_dtod(packed),
+                stream.clone_dtod(scales),
+                stream.clone_dtod(levels),
+            ) {
+                (Ok(packed), Ok(scales), Ok(levels)) => (packed, scales, levels),
+                _ => failed(),
             }
         });
         Self {
@@ -486,6 +501,7 @@ impl Clone for DeviceParam {
             moment2: take(3),
             frozen: self.frozen,
             int8,
+            four_bit,
         }
     }
 }
@@ -509,31 +525,43 @@ impl DeviceParam {
             moment2: context.zeros(len)?,
             frozen,
             int8: None,
+            four_bit: None,
             context,
         })
     }
 
-    /// A frozen weight held as int8, uploaded byte for byte from the host's
-    /// [`Quantized`](crate::quantized::Quantized) copy.
-    pub(crate) fn new_int8(
+    /// A frozen weight held as int8 or 4-bit, uploaded byte for byte from
+    /// the host's [`Quantized`](crate::quantized::Quantized) copy.
+    pub(crate) fn new_quantized(
         context: Arc<GpuContext>,
         weight: &crate::quantized::Quantized,
         rows: usize,
         cols: usize,
     ) -> Result<Self, NetworkError> {
-        let Some((bytes, scales)) = weight.parts() else {
-            return Err(NetworkError::InvalidConfig(
-                "a 4-bit weight on a device: only int8 weights have a device path".into(),
-            ));
+        fn upload<T: cudarc::driver::DeviceRepr>(
+            context: &GpuContext,
+            host: &[T],
+        ) -> Result<CudaSlice<T>, NetworkError> {
+            context.stream.clone_htod(host).map_err(cuda_alloc_err(
+                "host to device copy",
+                std::mem::size_of_val(host),
+            ))
+        }
+        let (int8, four_bit) = match (weight.parts(), weight.parts_4bit()) {
+            (Some((bytes, scales)), _) => (
+                Some((upload(&context, bytes)?, upload(&context, scales)?)),
+                None,
+            ),
+            (None, Some((packed, scales, codebook))) => (
+                None,
+                Some((
+                    upload(&context, packed)?,
+                    upload(&context, scales)?,
+                    upload(&context, &codebook.levels())?,
+                )),
+            ),
+            (None, None) => unreachable!("a quantized weight is int8 or 4-bit"),
         };
-        let bytes = context
-            .stream
-            .clone_htod(bytes)
-            .map_err(cuda_alloc_err("host to device copy", bytes.len()))?;
-        let scales = context
-            .stream
-            .clone_htod(scales)
-            .map_err(cuda_alloc_err("host to device copy", scales.len() * 4))?;
         Ok(Self {
             rows,
             cols,
@@ -543,15 +571,29 @@ impl DeviceParam {
             moment1: context.zeros(1)?,
             moment2: context.zeros(1)?,
             frozen: true,
-            int8: Some((bytes, scales)),
+            int8,
+            four_bit,
             context,
         })
     }
 
     /// The int8 values and row scales of a weight made by
-    /// [`DeviceParam::new_int8`].
+    /// [`DeviceParam::new_quantized`].
     pub(crate) fn int8(&self) -> Option<(&CudaSlice<i8>, &CudaSlice<f32>)> {
         self.int8.as_ref().map(|(bytes, scales)| (bytes, scales))
+    }
+
+    /// Whether the weight is held as int8 or 4-bit rather than FP32.
+    pub(crate) fn is_quantized(&self) -> bool {
+        self.int8.is_some() || self.four_bit.is_some()
+    }
+
+    /// The packed indices, block scales and codebook levels of a 4-bit
+    /// weight made by [`DeviceParam::new_quantized`].
+    pub(crate) fn four_bit(&self) -> Option<(&CudaSlice<u8>, &CudaSlice<f32>, &CudaSlice<f32>)> {
+        self.four_bit
+            .as_ref()
+            .map(|(packed, scales, levels)| (packed, scales, levels))
     }
 
     /// Whether a gradient written here would be thrown away, which is what
@@ -574,7 +616,7 @@ impl DeviceParam {
 
     /// The weight itself, for a caller that sequences its own GEMMs.
     pub(crate) fn value(&self) -> &CudaSlice<f32> {
-        debug_assert!(self.int8.is_none(), "an int8 weight has no FP32 value");
+        debug_assert!(!self.is_quantized(), "a quantized weight has no FP32 value");
         &self.value
     }
 
@@ -605,9 +647,9 @@ impl DeviceParam {
     }
 
     pub(crate) fn download_value(&self, target: &mut Matrix) -> Result<(), NetworkError> {
-        // The host keeps the int8 copy this was uploaded from, and a frozen
-        // weight never changes on the device.
-        if self.int8.is_some() {
+        // The host keeps the quantized copy this was uploaded from, and a
+        // frozen weight never changes on the device.
+        if self.is_quantized() {
             return Ok(());
         }
         self.context.download(&self.value, target)
@@ -616,9 +658,9 @@ impl DeviceParam {
     /// Replaces the resident weights, for a caller that computed new ones on
     /// the host — restoring a snapshot, or standing an averaged weight in.
     pub(crate) fn upload_value(&mut self, value: &Matrix) -> Result<(), NetworkError> {
-        if self.int8.is_some() {
+        if self.is_quantized() {
             return Err(NetworkError::InvalidConfig(
-                "an int8 weight holds bytes, not weights, and cannot be assigned".into(),
+                "a quantized weight holds bytes, not weights, and cannot be assigned".into(),
             ));
         }
         self.value = self.context.upload(value)?;
@@ -1779,7 +1821,7 @@ mod tests {
         }
         // BF16 folds the adapter into a narrow weight, which is its own GEMM.
         for (mixed, tolerance) in [(false, 1e-3), (true, 1e-2)] {
-            lora_step_matches_the_host(mixed, tolerance, false);
+            lora_step_matches_the_host(mixed, tolerance, |_| {});
         }
     }
 
@@ -1791,7 +1833,9 @@ mod tests {
             return;
         }
         for (mixed, tolerance) in [(false, 1e-3), (true, 1e-2)] {
-            lora_step_matches_the_host(mixed, tolerance, true);
+            lora_step_matches_the_host(mixed, tolerance, |model| {
+                model.quantize_lora_base().unwrap();
+            });
         }
         // The int8 bases hold a quarter of the bytes on the device too.
         let mut model = tiny().build().unwrap();
@@ -1800,7 +1844,7 @@ mod tests {
             .unwrap();
         let weights = model.blocks[0].attention.query.weight.len();
         assert!(model.quantize_lora_base().unwrap() > 0);
-        assert!(model.has_int8_base());
+        assert!(model.has_quantized_base());
         model.to_cuda(0, 8192).unwrap();
         let device = model.blocks[0]
             .attention
@@ -1821,13 +1865,55 @@ mod tests {
         );
     }
 
-    fn lora_step_matches_the_host(mixed: bool, tolerance: f32, int8: bool) {
+    /// QLoRA proper: the device widens the same NF4 nibbles through the same
+    /// codebook as the host, and the base takes an eighth of FP32's bytes plus
+    /// a scale per 64 weights.
+    #[test]
+    fn a_gpu_lora_step_on_an_nf4_base_matches_the_host_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let nf4 = |model: &mut TransformerLm| {
+            model
+                .quantize_lora_base_4bit(crate::quantized::Codebook::Nf4)
+                .unwrap();
+        };
+        for (mixed, tolerance) in [(false, 1e-3), (true, 1e-2)] {
+            lora_step_matches_the_host(mixed, tolerance, nf4);
+        }
+        let mut model = tiny().build().unwrap();
+        model
+            .add_lora(crate::transformer::LoraConfig::new(4))
+            .unwrap();
+        nf4(&mut model);
+        assert!(model.has_quantized_base());
+        model.to_cuda(0, 8192).unwrap();
+        let device = model.blocks[0]
+            .attention
+            .query
+            .weight
+            .device
+            .as_ref()
+            .unwrap();
+        assert!(device.int8().is_none());
+        let (packed, scales, levels) = device.four_bit().expect("the base went up as 4-bit");
+        let (rows, cols) = (device.rows(), device.cols());
+        let blocks = cols.div_ceil(crate::quantized::BLOCK);
+        assert_eq!(
+            (packed.len(), scales.len(), levels.len()),
+            (rows * blocks * 32, rows * blocks, 16)
+        );
+    }
+
+    fn lora_step_matches_the_host(
+        mixed: bool,
+        tolerance: f32,
+        quantize: impl Fn(&mut TransformerLm),
+    ) {
         let mut cpu = tiny().build().unwrap();
         cpu.add_lora(crate::transformer::LoraConfig::new(4).alpha(8.0))
             .unwrap();
-        if int8 {
-            cpu.quantize_lora_base().unwrap();
-        }
+        quantize(&mut cpu);
         let mut gpu = cpu.clone();
         gpu.set_mixed_precision(mixed);
         gpu.to_cuda(0, 8192).unwrap();

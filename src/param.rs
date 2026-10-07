@@ -426,7 +426,7 @@ impl Param {
     ) -> Result<(), crate::network::NetworkError> {
         if self.device.is_none() {
             if let Some(quantized) = &self.quantized {
-                self.device = Some(crate::gpu_transformer::DeviceParam::new_int8(
+                self.device = Some(crate::gpu_transformer::DeviceParam::new_quantized(
                     context.clone(),
                     quantized,
                     self.value.rows,
@@ -798,10 +798,10 @@ impl Linear {
     /// The projection without its adapter, whichever of the three weight
     /// representations is live.
     fn base_forward(&self, input: &Matrix) -> Matrix {
-        // An int8 device weight falls through to the host's copy of the same
+        // A quantized device weight falls through to the host's copy of the same
         // bytes.
         #[cfg(feature = "cuda")]
-        if let Some(device) = self.weight.device.as_ref().filter(|d| d.int8().is_none()) {
+        if let Some(device) = self.weight.device.as_ref().filter(|d| !d.is_quantized()) {
             return device.matmul_rhs_transposed(input);
         }
         if let Some(quantized) = &self.weight.quantized {
@@ -841,7 +841,7 @@ impl Linear {
     /// training runs in `gpu_model`, which never calls a `Linear` method.
     fn base_backward(&mut self, input: &Matrix, grad_output: &Matrix) -> Matrix {
         #[cfg(feature = "cuda")]
-        if let Some(device) = self.weight.device.as_mut().filter(|d| d.int8().is_none()) {
+        if let Some(device) = self.weight.device.as_mut().filter(|d| !d.is_quantized()) {
             device.accumulate_grad(grad_output, input);
             return device.matmul(grad_output);
         }
