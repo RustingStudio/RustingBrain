@@ -1241,3 +1241,12 @@ dense variant was measured in a separate session (its before-row read
 but its expert GEMVs rose from 63 to 138 ms of kernel time over the run.
 Load 4 to 10 for the `gemv_routed` rounds, 9 to 20 for the dense ones.
 
+## T5 encoder on the device (C6 part 1, 2026-10-07)
+
+`time_a_t5_base_sized_encoder` (release, ignored): a random T5-base-sized
+gated encoder (d_model 768, 12 heads of 64, 12 layers, mlp 2048) over 512
+tokens. Host `T5Encoder::forward` 528 ms; `DeviceT5::forward`, five runs
+after a warm-up, 33.8, 29.0, 30.1, 28.6, 29.9 ms including the upload of the
+embeddings and the bias and the download of the states. Worst difference
+0.0073 against a largest state of 0.39. Load 32 (other jobs on the host),
+RTX 3060.

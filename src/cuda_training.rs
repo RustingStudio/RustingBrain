@@ -406,13 +406,16 @@ extern "C" __global__ void attention_probs_from_lse(
 // twice as fast on the wider shape, which is why the two projections are not
 // kept apart here.
 __device__ inline float silu_mul(float x,float u){return x*u/(1.f+expf(-x));}
+// `gelu` picks the tanh GELU on the first half instead, the gated feed-forward
+// T5 1.1 trains.
+__device__ inline float gate_mul(float x,float u,int gelu){if(!gelu)return silu_mul(x,u);return 0.5f*x*(1.f+tanhf(0.7978846f*(x+0.044715f*x*x*x)))*u;}
 __device__ inline void silu_mul_grad(float x,float u,float p,float&dg,float&du){float s=1.f/(1.f+expf(-x));dg=p*u*s*(1.f+x*(1.f-s));du=p*x*s;}
 // These two are memory bound, so an even width is read and written four floats
 // at a time. The host picks the thread count to match; the scalar tail below
 // serves an odd width, which no preset uses but a caller may configure.
-extern "C" __global__ void swiglu_fwd(void*h,const float*gu,int rows,int width,int narrow){int i=blockIdx.x*blockDim.x+threadIdx.x;
- if((width&3)==0){int q=width>>2;if(i>=rows*q)return;int r=i/q;size_t b=(size_t)r*2*q+(i-r*q);const float4*s=(const float4*)gu;float4 g=s[b],u=s[b+q];float4 o;o.x=silu_mul(g.x,u.x);o.y=silu_mul(g.y,u.y);o.z=silu_mul(g.z,u.z);o.w=silu_mul(g.w,u.w);store_act4(h,i,o,narrow);return;}
- if(i>=rows*width)return;int r=i/width;size_t b=(size_t)r*2*width+(i-r*width);store_act(h,i,silu_mul(gu[b],gu[b+width]),narrow);}
+extern "C" __global__ void swiglu_fwd(void*h,const float*gu,int rows,int width,int narrow,int gelu){int i=blockIdx.x*blockDim.x+threadIdx.x;
+ if((width&3)==0){int q=width>>2;if(i>=rows*q)return;int r=i/q;size_t b=(size_t)r*2*q+(i-r*q);const float4*s=(const float4*)gu;float4 g=s[b],u=s[b+q];float4 o;o.x=gate_mul(g.x,u.x,gelu);o.y=gate_mul(g.y,u.y,gelu);o.z=gate_mul(g.z,u.z,gelu);o.w=gate_mul(g.w,u.w,gelu);store_act4(h,i,o,narrow);return;}
+ if(i>=rows*width)return;int r=i/width;size_t b=(size_t)r*2*width+(i-r*width);store_act(h,i,gate_mul(gu[b],gu[b+width],gelu),narrow);}
 extern "C" __global__ void swiglu_bwd(void*ggu,const float*gu,const float*gh,int rows,int width,int narrow){int i=blockIdx.x*blockDim.x+threadIdx.x;
  if((width&3)==0){int q=width>>2;if(i>=rows*q)return;int r=i/q;size_t b=(size_t)r*2*q+(i-r*q);const float4*s=(const float4*)gu;float4 g=s[b],u=s[b+q],p=((const float4*)gh)[i];float4 dg,du;silu_mul_grad(g.x,u.x,p.x,dg.x,du.x);silu_mul_grad(g.y,u.y,p.y,dg.y,du.y);silu_mul_grad(g.z,u.z,p.z,dg.z,du.z);silu_mul_grad(g.w,u.w,p.w,dg.w,du.w);store_act4(ggu,b,dg,narrow);store_act4(ggu,b+q,du,narrow);return;}
  if(i>=rows*width)return;int r=i/width;size_t b=(size_t)r*2*width+(i-r*width);float dg,du;silu_mul_grad(gu[b],gu[b+width],gh[i],dg,du);store_act(ggu,b,dg,narrow);store_act(ggu,b+width,du,narrow);}
