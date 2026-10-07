@@ -701,3 +701,15 @@ since W1 halved their bytes and the router work moved. The only redundant
 read left is the gathered output-gradient rows, read by both
 `row_dot_scatter` and the backward gather: about 0.5 ms (0.6%), below the
 run-to-run spread, so W2 parts 1 and 2 are rejected.
+
+## Adam re-measured (A9, 2026-10-07)
+
+Same `nsys` report as "MoE permutation passes re-measured" (`6f48659`, idle
+GPU, 4 steps). `adam`: 828 launches, 20.43 ms in all, so 207 launches and
+5.11 ms a step. Median launch 17.3 µs, largest 1.42 ms. The default model has
+55,181,824 parameters (`parameter_counts().total`). Adam reads the value,
+gradient and both moments and writes the value and both moments: 28 bytes a
+parameter, 32 with the weight-decay re-read. That is 1.55 to 1.77 GB a step,
+302 to 345 GB/s against the RTX 3060's 360 GB/s. A fused multi-tensor kernel
+can only close the gap to the roofline, at most about 0.8 ms (1%), so A9 is
+rejected.
