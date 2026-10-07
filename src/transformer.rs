@@ -1639,6 +1639,53 @@ impl TransformerLm {
         crate::optimizers::apply_step(&mut self.params_mut(), &optimizer, step, scale);
     }
 
+    /// [`TransformerLm::step`], returning how far it moved each parameter
+    /// relative to its size, `|w_after - w_before| / |w_before|`, in the order
+    /// [`TransformerLm::params_mut`] yields them. A frozen or all-zero
+    /// parameter reads 0.
+    ///
+    /// Around `1e-3` is the usual healthy value under Adam. Well above `1e-2`
+    /// the step is too large for that layer; far below `1e-4` the layer has
+    /// stopped learning.
+    ///
+    /// NOTE: copies every weight to the host twice and holds a second
+    /// copy there, so call it every few hundred steps, not every step. Add a
+    /// device-side reduction if it has to run often.
+    pub fn step_with_update_ratios(&mut self, scale: f32) -> Result<Vec<f32>, NetworkError> {
+        #[cfg(feature = "cuda")]
+        self.sync_from_device()?;
+        let before: Vec<Matrix> = self
+            .params_mut()
+            .into_iter()
+            .map(|param| param.value.clone())
+            .collect();
+        self.step(scale);
+        #[cfg(feature = "cuda")]
+        self.sync_from_device()?;
+        Ok(self
+            .params_mut()
+            .into_iter()
+            .zip(&before)
+            .map(|(param, before)| {
+                let (moved, size) = param.value.data.iter().zip(&before.data).fold(
+                    (0.0f64, 0.0f64),
+                    |(moved, size), (&after, &before)| {
+                        let delta = f64::from(after - before);
+                        (
+                            moved + delta * delta,
+                            size + f64::from(before) * f64::from(before),
+                        )
+                    },
+                );
+                if size == 0.0 {
+                    0.0
+                } else {
+                    (moved / size).sqrt() as f32
+                }
+            })
+            .collect())
+    }
+
     /// The L2 norm of the accumulated gradients, over every parameter at once.
     ///
     /// Worth logging on its own: a run that is about to diverge shows it in
@@ -2325,6 +2372,38 @@ mod tests {
         assert_eq!(model.blocks[0].attention.query.weight.value, before);
         assert_eq!(model.optimizer_step(), 0);
         assert_eq!(model.grad_norm().unwrap(), 0.0);
+    }
+
+    /// Under SGD a step moves each weight by `rate * grad`, so the ratio is
+    /// `rate * |grad| / |w|` exactly, and the step itself is an ordinary one.
+    #[test]
+    fn update_ratios_measure_the_step_taken() {
+        let batch = TokenBatch::new(&[[1u32, 2, 3, 4]]).unwrap();
+        let mut model = tiny().optimizer(Optimizer::sgd(0.1)).build().unwrap();
+        model.zero_grad();
+        model.accumulate_step(&batch).unwrap();
+        let mut plain = model.clone();
+        let expected: Vec<f32> = model
+            .params_mut()
+            .into_iter()
+            .map(|param| {
+                let norm = |data: &[f32]| data.iter().map(|v| v * v).sum::<f32>().sqrt();
+                0.1 * norm(&param.grad.data) / norm(&param.value.data)
+            })
+            .collect();
+
+        let ratios = model.step_with_update_ratios(1.0).unwrap();
+        plain.step(1.0);
+
+        assert_eq!(model, plain);
+        assert_eq!(ratios.len(), expected.len());
+        for (ratio, expected) in ratios.iter().zip(&expected) {
+            assert!(
+                (ratio - expected).abs() <= 1e-4 * expected.max(1e-3),
+                "{ratio} vs {expected}"
+            );
+        }
+        assert!(ratios.iter().any(|&ratio| ratio > 0.0));
     }
 
     /// Clipping to a norm the gradients already sit under must leave the step

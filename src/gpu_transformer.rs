@@ -1896,6 +1896,29 @@ mod tests {
         }
     }
 
+    /// The ratios read the device weights, not the stale host copies, which
+    /// would report a step of zero everywhere.
+    #[test]
+    fn update_ratios_on_the_device_match_the_host_or_skip_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let batch = crate::batch::TokenBatch::new(&[[3u32, 8, 1, 5, 2, 7]]).unwrap();
+        let mut cpu = tiny().build().unwrap();
+        let mut gpu = cpu.clone();
+        gpu.to_cuda(0, 8192).unwrap();
+        // Two steps, so the second measures a device step taken after the
+        // host copies went stale.
+        for model in [&mut cpu, &mut gpu] {
+            model.train_step_batch(&batch).unwrap();
+            model.accumulate_step(&batch).unwrap();
+        }
+        let host = cpu.step_with_update_ratios(1.0).unwrap();
+        let device = gpu.step_with_update_ratios(1.0).unwrap();
+        assert!(host.iter().any(|&ratio| ratio > 0.0));
+        assert_close("update ratios", &device, &host, 1e-3);
+    }
+
     /// Adam's moments cross with the weights in both directions, so a run
     /// that moves mid-training takes the steps it would have taken in place.
     #[test]

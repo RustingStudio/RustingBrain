@@ -4,6 +4,10 @@
 
 ### Added
 
+- `TransformerLm::step_with_update_ratios`: one optimizer step that returns
+  each parameter's update-to-weight ratio, for spotting a layer that steps
+  too far or has stopped learning. Copies the weights to the host, so call
+  it occasionally.
 - Karras noise levels for DDIM-schedule models: `Scheduler::karras_sigmas`,
   run through the new `sample_with_sigmas`. With `Solver::DpmPlusPlus2m` this
   is "DPM++ 2M Karras".
