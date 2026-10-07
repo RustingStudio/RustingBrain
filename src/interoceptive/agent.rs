@@ -2,7 +2,7 @@
 
 use super::Tensor;
 use super::buffer::BatchData;
-use super::loss::{double_bellman_targets, td_huber_loss};
+use super::loss::{double_bellman_targets, weighted_td_huber_loss};
 use super::market_sim::Action;
 use super::modulation::{GainCache, InteroceptiveCore, add_column_sums, temperature};
 use super::state::AccountBody;
@@ -121,6 +121,7 @@ pub struct InteroceptiveAgent {
     pub online: QNetwork,
     pub target: QNetwork,
     updates: usize,
+    td_errors: Vec<f32>,
 }
 
 impl InteroceptiveAgent {
@@ -132,6 +133,7 @@ impl InteroceptiveAgent {
             online,
             config,
             updates: 0,
+            td_errors: Vec::new(),
         }
     }
 
@@ -189,6 +191,13 @@ impl InteroceptiveAgent {
     /// One Double DQN update: the online network picks the next action and
     /// the target network scores it. Returns the Huber loss.
     pub fn train_step(&mut self, batch: &BatchData) -> f32 {
+        self.train_step_weighted(batch, &[])
+    }
+
+    /// [`InteroceptiveAgent::train_step`] with each row's loss scaled by
+    /// `weights`, as [`ReplayBuffer::weights`](super::ReplayBuffer::weights)
+    /// reports them; empty means all ones.
+    pub fn train_step_weighted(&mut self, batch: &BatchData, weights: &[f32]) -> f32 {
         let next_online = self.online.forward(&batch.next_obs, &batch.next_body).q;
         let next_q = self.target.forward(&batch.next_obs, &batch.next_body).q;
         let mut targets = vec![0.0; batch.len()];
@@ -203,7 +212,15 @@ impl InteroceptiveAgent {
 
         let cache = self.online.forward(&batch.obs, &batch.body);
         let mut grad = Matrix::new(batch.len(), Action::COUNT);
-        let loss = td_huber_loss(&cache.q, &batch.actions, &targets, &mut grad);
+        self.td_errors.resize(batch.len(), 0.0);
+        let loss = weighted_td_huber_loss(
+            &cache.q,
+            &batch.actions,
+            &targets,
+            weights,
+            &mut grad,
+            &mut self.td_errors,
+        );
         self.online.backward(&batch.obs, &batch.body, &cache, &grad);
 
         self.updates += 1;
@@ -219,6 +236,12 @@ impl InteroceptiveAgent {
             self.target = self.online.clone();
         }
         loss
+    }
+
+    /// The TD error of each row of the last update's batch, for
+    /// [`ReplayBuffer::update_priorities`](super::ReplayBuffer::update_priorities).
+    pub fn last_td_errors(&self) -> &[f32] {
+        &self.td_errors
     }
 
     pub fn updates(&self) -> usize {

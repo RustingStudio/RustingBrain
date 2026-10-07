@@ -61,17 +61,35 @@ pub fn double_bellman_targets(
 /// Mean Huber loss (delta 1) between `Q(s, a_i)` and `targets`, with
 /// `dL/dQ` written into `grad`: non-zero only on the action taken.
 pub fn td_huber_loss(q: &Matrix, actions: &[usize], targets: &[f32], grad: &mut Matrix) -> f32 {
+    let mut errors = vec![0.0; actions.len()];
+    weighted_td_huber_loss(q, actions, targets, &[], grad, &mut errors)
+}
+
+/// [`td_huber_loss`] with row `i` scaled by `weights[i]`, the importance
+/// weights of a prioritized sample; empty `weights` means all ones. Writes
+/// each row's TD error `Q(s, a_i) - y_i` into `errors`.
+pub fn weighted_td_huber_loss(
+    q: &Matrix,
+    actions: &[usize],
+    targets: &[f32],
+    weights: &[f32],
+    grad: &mut Matrix,
+    errors: &mut [f32],
+) -> f32 {
     grad.zeros();
     let n = q.rows as f32;
     let mut loss = 0.0;
     for (i, (&a, &y)) in actions.iter().zip(targets).enumerate() {
+        let weight = weights.get(i).copied().unwrap_or(1.0);
         let error = q.row(i)[a] - y;
-        loss += if error.abs() <= 1.0 {
-            0.5 * error * error
-        } else {
-            error.abs() - 0.5
-        };
-        grad.row_mut(i)[a] = error.clamp(-1.0, 1.0) / n;
+        errors[i] = error;
+        loss += weight
+            * if error.abs() <= 1.0 {
+                0.5 * error * error
+            } else {
+                error.abs() - 0.5
+            };
+        grad.row_mut(i)[a] = weight * error.clamp(-1.0, 1.0) / n;
     }
     loss / n
 }
@@ -108,5 +126,30 @@ mod tests {
         let loss = td_huber_loss(&q, &[1, 0], &y, &mut grad);
         assert!((loss - 0.125 / 2.0).abs() < 1e-6);
         assert_eq!(grad.data, vec![0.0, -0.25, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn weights_scale_each_row_of_the_td_loss() {
+        let q = Matrix::from_vec(2, 2, vec![1.0, 0.0, 0.0, 3.0]);
+        let (actions, targets) = ([0, 1], [0.5, 0.0]);
+        let mut plain = Matrix::new(2, 2);
+        let mut weighted = Matrix::new(2, 2);
+        let mut errors = [0.0; 2];
+        let loss = td_huber_loss(&q, &actions, &targets, &mut plain);
+        let ones = weighted_td_huber_loss(&q, &actions, &targets, &[], &mut weighted, &mut errors);
+        assert_eq!((loss, &plain.data), (ones, &weighted.data));
+        assert_eq!(errors, [0.5, 3.0]);
+
+        let scaled = weighted_td_huber_loss(
+            &q,
+            &actions,
+            &targets,
+            &[0.5, 2.0],
+            &mut weighted,
+            &mut errors,
+        );
+        // Huber of 0.5 is 0.125, of 3 is 2.5.
+        assert!((scaled - (0.5 * 0.125 + 2.0 * 2.5) / 2.0).abs() < 1e-6);
+        assert_eq!(weighted.data, [0.5 * 0.5 / 2.0, 0.0, 0.0, 2.0 * 1.0 / 2.0]);
     }
 }
