@@ -468,6 +468,21 @@ extern "C" __global__ void gemv_routed(const void*w,const void*x,int narrow,floa
   acc=warp_sum(acc);
   if(lane==0){size_t i=(size_t)o*units+n;y[i]=acc+(beta!=0.f?beta*y[i]:0.f);}
 }
+// The same over int8 experts with a scale per row, the `gemv_q8` layout:
+// `w` is `[experts * units, inner]` bytes and `inner` a multiple of 16.
+extern "C" __global__ void gemv_routed_q8(const signed char*w,const float*scales,const void*x,int narrow,float*y,const int*expert_of,const float*gate_of,int gated,int outs,int per,int x_div,int units,int inner,float beta){
+  int warp=(blockIdx.x*blockDim.x+threadIdx.x)/WARP,lane=threadIdx.x%WARP;
+  if(warp>=outs*units)return;
+  int o=warp/units,n=warp%units;float acc=0.f;
+  for(int j=0;j<per;j++){int s=o*per+j,e=expert_of[s];if(e<0)continue;
+    size_t row=(size_t)e*units+n,xrow=(size_t)(s/x_div)*inner;float a=0.f;
+    for(int k=lane*16;k<inner;k+=WARP*16){int4 packed=*(const int4*)(w+row*inner+k);const signed char*b=(const signed char*)&packed;
+      #pragma unroll
+      for(int t=0;t<16;t++)a+=load_act(x,xrow+k+t,narrow)*(float)b[t];}
+    a*=scales[row];acc+=gated?gate_of[s]*a:a;}
+  acc=warp_sum(acc);
+  if(lane==0){size_t i=(size_t)o*units+n;y[i]=acc+(beta!=0.f?beta*y[i]:0.f);}
+}
 extern "C" __global__ void topk_gate(int*expert_of,float*gate_of,const float*p,const int*valid,int rows,int experts,int top_k){int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows)return;int base=r*top_k;if(valid!=0&&valid[r]==0){for(int k=0;k<top_k;k++){expert_of[base+k]=-1;gate_of[base+k]=0;}return;}const float*row=p+(size_t)r*experts;float total=0;for(int k=0;k<top_k;k++){int best=-1;for(int e=0;e<experts;e++){int taken=0;for(int j=0;j<k;j++)if(expert_of[base+j]==e)taken=1;if(taken)continue;if(best<0||row[e]>row[best])best=e;}expert_of[base+k]=best;gate_of[base+k]=row[best];total+=row[best];}if(total>0)for(int k=0;k<top_k;k++)gate_of[base+k]/=total;}
 // The routed layer's gathers: rows of `src` by `rows_of`, times `scale` if
 // `scaled`, read and written at either precision so the expert GEMMs read BF16.

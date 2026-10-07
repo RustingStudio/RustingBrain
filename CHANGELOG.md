@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Int8 device decode runs the routed experts with an int8 routed GEMV instead
+  of downloading the routing each MoE layer: one sequence of the default model
+  decodes 1014-1049 to 1535-1613 tokens/s.
 - `ImagePipeline::to_cuda` also moves a transformer denoiser and a gated T5
   encoder, so FLUX and Stable Diffusion 3 pipelines run on the device. Both
   use the BF16 kernels; the original ungated T5 stays on the host.

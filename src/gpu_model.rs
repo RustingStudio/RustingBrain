@@ -68,6 +68,7 @@ pub(crate) struct ModelKernels {
     softmax_lse: CudaFunction,
     topk_gate: CudaFunction,
     gemv_routed: CudaFunction,
+    gemv_routed_q8: CudaFunction,
     gather: CudaFunction,
     gather_scaled: CudaFunction,
     scatter_scaled: CudaFunction,
@@ -116,6 +117,7 @@ impl ModelKernels {
             softmax_lse: get("softmax_lse")?,
             topk_gate: get("topk_gate")?,
             gemv_routed: get("gemv_routed")?,
+            gemv_routed_q8: get("gemv_routed_q8")?,
             gather: get("gather_rows")?,
             gather_scaled: get("gather_scale_rows")?,
             scatter_scaled: get("scatter_add_scaled")?,
@@ -2830,7 +2832,9 @@ fn route(
 /// expert index on the device instead: one gate/up row per slot, then the down
 /// product summed over a token's slots with their gates. Only the chosen
 /// experts' weights are read. The auxiliary losses are skipped; decode does
-/// not train. Int8 packs keep [`forward_moe`].
+/// not train. Int8 packs read the bytes with `gemv_routed_q8` when both
+/// widths are a multiple of 16, the kernel's load; otherwise they keep
+/// [`forward_moe`].
 fn decode_moe(
     gpu: &Gpu<'_>,
     moe: &MoeLayer,
@@ -2858,10 +2862,20 @@ fn decode_moe(
                        units: usize,
                        inner: usize,
                        beta: f32| unsafe {
-        gpu.context
-            .stream
-            .launch_builder(&gpu.context.model.gemv_routed)
-            .arg(&weights.all())
+        let kernels = &gpu.context.model;
+        let mut launch = match &weights.scales {
+            Some(scales) => {
+                let mut launch = gpu.context.stream.launch_builder(&kernels.gemv_routed_q8);
+                launch.arg(&weights.bytes).arg(scales);
+                launch
+            }
+            None => {
+                let mut launch = gpu.context.stream.launch_builder(&kernels.gemv_routed);
+                launch.arg(&weights.bytes);
+                launch
+            }
+        };
+        launch
             .arg(x)
             .arg(&i32::from(narrow))
             .arg(y)
@@ -3839,7 +3853,9 @@ fn decode_block(
         }
         FeedForward::Gelu(_) => return Err(unsupported("a GELU MLP")),
         FeedForward::Moe(moe)
-            if rows <= ROUTED_GEMV_ROWS && !gpu.context.int8_decode.load(Ordering::Relaxed) =>
+            if rows <= ROUTED_GEMV_ROWS
+                && (!gpu.context.int8_decode.load(Ordering::Relaxed)
+                    || (moe.d_model() % 16 == 0 && moe.config.d_ff % 16 == 0)) =>
         {
             decode_moe(gpu, moe, &normed, &mut output, valid, rows)?;
         }

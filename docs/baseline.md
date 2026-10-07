@@ -1278,3 +1278,22 @@ VAE decode 0.53 s, peak 7.45 GB. Kernel time 1847 ms: FP16 GEMMs 25.2% +
 22.2% + 5.9% + 2.3%, `im2col` 18.7% (2804), `image_attention_fwd` 7.2%,
 `group_apply` 3.6%, `add_plane_bias` 3.5%, `transpose` 0.96% (70 launches,
 17.7 ms). Load 7.5 to 5.7.
+
+## Int8 routed GEMV in decode (C5 slice 4, 2026-10-08)
+
+Int8 decode still sent every MoE layer through `forward_moe`, whose routing
+download drains the stream six times a token (the profile at `79f9aac`, 19
+device-to-host copies a token). `gemv_routed_q8` is `gemv_routed` over int8
+expert rows with a scale per row, so int8 decode now skips the round trip as
+BF16 decode already did. `bench_decode 512 128 cuda <n> int8`, default
+model, old and new binaries interleaved, three rounds, load average 15 to
+40 (other loops building), GPU lock held:
+
+| Build | 1 sequence | 16 sequences |
+|---|---|---|
+| `f97c1fc`, int8 on | 1014-1049 tokens/s | 7732-7895 tokens/s |
+| new, int8 on | 1535-1613 tokens/s | 7675-7804 tokens/s |
+| new, int8 off (one run) | 1074 tokens/s | 8012 tokens/s |
+
+Int8 is now +46% over BF16 at one sequence in this session; 16 sequences
+are unchanged, where the dense GEMMs dominate.
