@@ -226,9 +226,14 @@ impl ClipTextEncoder {
         config: ClipTextConfig,
         precision: Precision,
     ) -> Result<Self, NetworkError> {
-        let base = format!("{prefix}text_model");
-        let tokens = file.matrix(&format!("{base}.embeddings.token_embedding.weight"))?;
-        let positions = file.matrix(&format!("{base}.embeddings.position_embedding.weight"))?;
+        // Transformers 5 saves the tower's keys without `text_model.`.
+        let mut base = format!("{prefix}text_model.");
+        let token_key = |base: &str| format!("{base}embeddings.token_embedding.weight");
+        if !file.names().any(|name| name == token_key(&base)) {
+            base = prefix.to_string();
+        }
+        let tokens = file.matrix(&token_key(&base))?;
+        let positions = file.matrix(&format!("{base}embeddings.position_embedding.weight"))?;
         if tokens.cols != config.d_model {
             return Err(NetworkError::InvalidConfig(format!(
                 "the checkpoint's embeddings are {} wide and the configuration says {}",
@@ -239,7 +244,7 @@ impl ClipTextEncoder {
         let eos = config.eos_token;
         let layers = (0..config.layers)
             .map(|index| {
-                let layer = format!("{base}.encoder.layers.{index}");
+                let layer = format!("{base}encoder.layers.{index}");
                 Ok(Layer {
                     attention_norm: norm(file, &format!("{layer}.layer_norm1"))?,
                     query: dense(file, &format!("{layer}.self_attn.q_proj"), precision)?,
@@ -254,7 +259,7 @@ impl ClipTextEncoder {
             .collect::<Result<Vec<_>, NetworkError>>()?;
 
         Ok(Self {
-            final_norm: norm(file, &format!("{base}.final_layer_norm"))?,
+            final_norm: norm(file, &format!("{base}final_layer_norm"))?,
             // The projection lives outside the tower and only some checkpoints
             // carry it, so its absence is read rather than required.
             projection: file
@@ -686,6 +691,39 @@ pub(crate) mod tests {
         let encoder = ClipTextEncoder::load_at(&path, "", config.clone(), precision).unwrap();
         std::fs::remove_file(path).ok();
         encoder
+    }
+
+    #[test]
+    fn a_tower_saved_without_its_text_model_prefix_loads_alike() {
+        let config = tiny();
+        let path = std::env::temp_dir().join("rusting_brain_clip_unprefixed.safetensors");
+        checkpoint(&config, &path, true);
+        let mut file = crate::safetensors::SafeTensors::open(&path).unwrap();
+        let names: Vec<String> = file.names().map(str::to_string).collect();
+        let tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)> = names
+            .into_iter()
+            .map(|name| {
+                let (data, shape) = file.tensor(&name).unwrap();
+                (
+                    name.trim_start_matches("text_model.").to_string(),
+                    (shape, data),
+                )
+            })
+            .collect();
+        crate::safetensors::write_checkpoint(&path, &tensors);
+        let unprefixed = ClipTextEncoder::load(&path, "", config.clone()).unwrap();
+        std::fs::remove_file(path).ok();
+
+        let prefixed = encoder(
+            &config,
+            "rusting_brain_clip_prefixed.safetensors",
+            Precision::F32,
+        );
+        let ids = [20, 3, 7, 21];
+        assert_eq!(
+            unprefixed.forward(&ids).unwrap().data,
+            prefixed.forward(&ids).unwrap().data
+        );
     }
 
     #[test]
