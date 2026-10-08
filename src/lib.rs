@@ -277,7 +277,7 @@ pub use transformer::{
     TransformerConfig, TransformerLm,
 };
 pub use transformer_block::{FeedForward, TransformerBlock};
-pub use unet::{Unet, UnetConfig};
+pub use unet::{Control, ControlNet, Unet, UnetConfig};
 pub use vae::{VaeConfig, VaeDecoder, VaeEncoder, to_rgb8};
 pub use vision::{VisionTransformer, VitConfig};
 #[cfg(feature = "images")]
