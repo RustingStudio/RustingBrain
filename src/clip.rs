@@ -159,6 +159,9 @@ pub struct ClipTextEncoder {
     pub(crate) layers: Vec<Layer>,
     pub(crate) final_norm: Norm,
     projection: Option<Dense>,
+    /// The token a prompt is padded with, which is the end token unless the
+    /// tokenizer names another.
+    pad: u32,
     /// The same weights on a CUDA device, when one was attached.
     #[cfg(feature = "cuda")]
     device: Option<crate::cuda_image::DeviceClip>,
@@ -210,6 +213,7 @@ impl ClipTextEncoder {
             )));
         }
 
+        let eos = config.eos_token;
         let layers = (0..config.layers)
             .map(|index| {
                 let layer = format!("{base}.encoder.layers.{index}");
@@ -237,6 +241,7 @@ impl ClipTextEncoder {
                 .transpose()?,
             config,
             tokens,
+            pad: eos,
             positions,
             layers,
             #[cfg(feature = "cuda")]
@@ -249,17 +254,25 @@ impl ClipTextEncoder {
     ///
     /// Padding is what the published pipelines feed, and the pooled vector is
     /// read from the end token rather than the last position because of it.
-    /// The padding is end tokens: attention here is causal, so nothing after
-    /// the first end token can reach the state that is pooled, whatever the
-    /// padding is.
+    /// The padding is end tokens unless [`ClipTextEncoder::set_pad_token`]
+    /// said otherwise. Attention is causal, so the padding cannot change the
+    /// pooled state, but a denoiser cross-attends to every position, padding
+    /// included, so it has to be the token the model was trained with.
     pub fn tokenize(&self, tokenizer: &Bpe, prompt: &str) -> Result<Vec<u32>, NetworkError> {
         let mut ids = vec![self.config.bos_token];
         // Two of the positions are the start and end tokens.
         let room = self.config.max_positions.saturating_sub(2);
         ids.extend(tokenizer.encode(prompt)?.into_iter().take(room));
         ids.push(self.config.eos_token);
-        ids.resize(self.config.max_positions, self.config.eos_token);
+        ids.resize(self.config.max_positions, self.pad);
         Ok(ids)
+    }
+
+    /// Pads prompts with this token from now on. Stable Diffusion XL's second
+    /// tokenizer pads with `!` rather than the end token, and its UNet reads
+    /// the padded positions.
+    pub fn set_pad_token(&mut self, id: u32) {
+        self.pad = id;
     }
 
     /// The hidden states for a sequence of token ids, `[tokens, d_model]`.
@@ -597,6 +610,22 @@ pub(crate) mod tests {
         let long = encoder.tokenize(&tokenizer, "hihihihihihi").unwrap();
         assert_eq!(long.len(), config.max_positions);
         assert_eq!(long[config.max_positions - 1], config.eos_token);
+    }
+
+    #[test]
+    fn a_named_pad_token_fills_after_the_end_token() {
+        let config = tiny();
+        let mut encoder = encoder(
+            &config,
+            "rusting_brain_clip_pad.safetensors",
+            Precision::F32,
+        );
+        let tokenizer = crate::tokenizer::tests::tokenizer(&["h i"], &["hi"], None);
+        encoder.set_pad_token(0);
+        let ids = encoder.tokenize(&tokenizer, "hi").unwrap();
+
+        let end = ids.iter().position(|id| *id == config.eos_token).unwrap();
+        assert!(ids[end + 1..].iter().all(|id| *id == 0));
     }
 
     #[test]

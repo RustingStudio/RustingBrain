@@ -182,6 +182,11 @@
 
 ### Fixed
 
+- Stable Diffusion XL, 2.x and 3 prompts are padded with the pad token the
+  tokenizer names (`!` for SDXL's second tower) instead of the end token. The
+  UNet reads the padded positions, so the wrong token gave every SDXL image
+  a cross-hatched texture and made image-to-image repaint far more than its
+  strength asked. New `ClipTextEncoder::set_pad_token`.
 - The device VAE decoder returns an error when an FP16 overflow leaves
   non-finite values in the image, instead of a black image.
 - Byte-level BPE encoding no longer slows down quadratically on long text:

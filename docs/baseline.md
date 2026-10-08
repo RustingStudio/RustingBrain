@@ -1417,3 +1417,32 @@ Quiet GPU, load 4-6, `SIZES=512,1024 CPU=0 QUANTIZE=1 cuda_image_bench
 the latent pixels costs 3.6 times the time, so a batch-2 pass at 512 can be
 at most about 10% quicker than two passes; at 1024 the pass is already as
 large. Not built.
+
+## Image pipeline reference check (C11, 2026-10-08)
+
+Pony Diffusion V6 XL (SDXL), 512x512, prompt "score_9, a lighthouse on a
+rocky coast in fog". Reference: ComfyUI at `1a510f04`, run on the CPU in FP32
+from the same diffusers files (UNet through `comfy.sd.load_diffusion_model`
+and `BaseModel.apply_model`, CLIP through `comfy.sd.load_clip`, VAE through
+`convert_vae_state_dict`). Ours: device Q8 unless marked. Relative L2 error.
+
+| Part | Before C11 | After C11 |
+|---|---|---|
+| UNet eps, sigma 14.6 / 1 / 0.1 (same inputs) | 0.0010 / 0.0013 / 0.0060 | unchanged |
+| VAE encoder, host F32 | 0.012 | unchanged |
+| CLIP-L hidden states, host F32 | 7.5e-5 | unchanged |
+| CLIP-G hidden states, device Q8 | 1.07 | 0.025 |
+| CLIP-G hidden states, host F32 | | 0.021 |
+| Pooled vector, device Q8 | 0.0066 | 0.0066 |
+| Image-to-image, same prompt, strength 0.3, rel to the input image | 0.37 | 0.147 |
+
+CLIP-G positions after the end token were off by rel 3 to 6 before the fix
+(wrong padding token); after it, 0.07-0.09 in FP32, which is the tanh GELU
+against the checkpoint's exact `gelu`. The VAE check against ComfyUI's
+default CPU dtype (BF16) reads rel 0.108; that is ComfyUI's rounding. Load
+1.3-1.7.
+
+Tutorial program (`tutorials/code/18_text_to_image.rs`), 1024x1024, DPM++ 2M
+25 steps, Q8, RTX 3060 shared with another job, load 1.4-1.7: loaded in 6.3 s,
+text-to-image 13.2 s, image-to-image at strength 0.5 117.2 s, nearly all of
+it the CPU VAE encoder (C12).
