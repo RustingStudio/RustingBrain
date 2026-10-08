@@ -535,9 +535,9 @@ fn predict<D: Denoiser>(
 /// rows walk their own noise path down to the picture under every solver and
 /// schedule, while the model still sees them and paints the rest to match.
 ///
-/// NOTE: this is the blending kind of inpainting, which any model runs.
-/// The checkpoints trained for it read the mask and the masked picture as
-/// extra input channels; load those when someone needs their sharper seams.
+/// This is the blending kind of inpainting, which any model runs. A UNet
+/// trained for it reads the mask itself instead; see
+/// [`crate::ImagePipeline::generate_inpaint`], which picks between the two.
 pub struct Inpaint<'a, D> {
     pub denoiser: &'a mut D,
     pub image: &'a Matrix,

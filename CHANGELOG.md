@@ -93,6 +93,10 @@
 - Inpainting: `Inpaint` wraps any `Denoiser` with a picture latent and a
   keep weight a latent row, and `ImagePipeline::sample_latent_inpaint`
   repaints only where the weight is zero, under every solver and schedule.
+- `ImagePipeline::generate_inpaint` repaints a picture under a pixel mask.
+  Inpainting UNets (nine input channels) load and read the mask and the
+  masked picture as diffusers feeds them, matching diffusers within 6e-7;
+  other models are steered through `Inpaint`.
 - `TransformerLm::log_probabilities` gives each token's log-probability
   after the ones before it, for scoring and ranking texts.
 - `TransformerLm::generate_beam` runs beam search, with an optional end
