@@ -65,6 +65,9 @@ pub(crate) struct ImageTrainKernels {
     pub(crate) maxpool: CudaFunction,
     pub(crate) maxpool_bwd: CudaFunction,
     pub(crate) add: CudaFunction,
+    pub(crate) dw_fwd: CudaFunction,
+    pub(crate) dw_bwd_input: CudaFunction,
+    pub(crate) dw_bwd_weight: CudaFunction,
 }
 
 /// One device, its stream, cuBLAS handle and the kernels the transformer uses.
@@ -218,6 +221,9 @@ impl GpuContext {
                 maxpool: get("maxpool_same")?,
                 maxpool_bwd: get("maxpool_same_bwd")?,
                 add: get("add_f32")?,
+                dw_fwd: get("dw_fwd")?,
+                dw_bwd_input: get("dw_bwd_input")?,
+                dw_bwd_weight: get("dw_bwd_weight")?,
             },
             transfers: std::sync::atomic::AtomicUsize::new(0),
             model: crate::gpu_model::ModelKernels::load(&module)?,
