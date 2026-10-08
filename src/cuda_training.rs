@@ -164,6 +164,42 @@ extern "C" __global__ void gn_bwd_apply(float*dx,const float*g,const float*xhat,
   int c=i%C,bg=(i/C/pixels)*(C/cg)+c/cg;
   dx[i]=inv[bg]*(g[i]*gamma[c]-m1[bg]-xhat[i]*m2[bg]);
 }
+__device__ float img_block_max(float v){
+  __shared__ float s[32];int l=threadIdx.x&31,w=threadIdx.x>>5;
+  for(int o=16;o>0;o>>=1)v=fmaxf(v,__shfl_xor_sync(0xffffffff,v,o));
+  __syncthreads();if(l==0)s[w]=v;__syncthreads();
+  v=threadIdx.x<(blockDim.x>>5)?s[threadIdx.x]:-3.402823466e38f;
+  if(w==0)for(int o=16;o>0;o>>=1)v=fmaxf(v,__shfl_xor_sync(0xffffffff,v,o));
+  if(threadIdx.x==0)s[0]=v;__syncthreads();float r=s[0];__syncthreads();return r;
+}
+__device__ float unit_coord(int i,int n){return n==1?0.f:-1.f+2.f*(float)i/(float)(n-1);}
+// One block per (sample, channel): the softmax over that channel's pixels and
+// its expected x and y. `out` is `[batch, 2 * C]`, every x before every y.
+extern "C" __global__ void ssm_fwd(float*prob,float*out,const float*x,int h,int w,int C){
+  int b=blockIdx.x/C,c=blockIdx.x%C,n=h*w;long long base=(long long)b*n*C+c;
+  float m=-3.402823466e38f;for(int p=threadIdx.x;p<n;p+=blockDim.x)m=fmaxf(m,x[base+(long long)p*C]);
+  m=img_block_max(m);
+  float s=0.f;for(int p=threadIdx.x;p<n;p+=blockDim.x){float e=expf(x[base+(long long)p*C]-m);prob[base+(long long)p*C]=e;s+=e;}
+  s=img_block_sum(s);
+  float ex=0.f,ey=0.f;for(int p=threadIdx.x;p<n;p+=blockDim.x){long long at=base+(long long)p*C;float q=prob[at]/s;prob[at]=q;ex+=q*unit_coord(p%w,w);ey+=q*unit_coord(p/w,h);}
+  ex=img_block_sum(ex);ey=img_block_sum(ey);
+  if(threadIdx.x==0){out[b*2*C+c]=ex;out[b*2*C+C+c]=ey;}
+}
+extern "C" __global__ void ssm_bwd(float*dx,const float*prob,const float*g,const float*out,int total,int h,int w,int C){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C,r=i/C,p=r%(h*w),b=r/(h*w);const float*gs=g+b*2*C;const float*es=out+b*2*C;
+  dx[i]=prob[i]*(gs[c]*(unit_coord(p%w,w)-es[c])+gs[C+c]*(unit_coord(p/w,h)-es[C+c]));
+}
+// One block per (sample, channel), the mean over its pixels.
+extern "C" __global__ void gap_fwd(float*out,const float*x,int n,int C){
+  int b=blockIdx.x/C,c=blockIdx.x%C;long long base=(long long)b*n*C+c;
+  float s=0.f;for(int p=threadIdx.x;p<n;p+=blockDim.x)s+=x[base+(long long)p*C];
+  s=img_block_sum(s);if(threadIdx.x==0)out[blockIdx.x]=s/(float)n;
+}
+extern "C" __global__ void gap_bwd(float*dx,const float*g,int total,int n,int C){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  dx[i]=g[(i/C/n)*C+i%C]/(float)n;
+}
 extern "C" __global__ void mul_f32(float*out,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]*b[i];}
 extern "C" __global__ void silu_f32(float*y,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];y[i]=v/(1.f+expf(-v));}}
 extern "C" __global__ void silu_bwd_f32(float*dx,const float*g,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i],s=1.f/(1.f+expf(-v));dx[i]=g[i]*s*(1.f+v*(1.f-s));}}

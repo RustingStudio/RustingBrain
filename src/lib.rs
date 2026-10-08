@@ -226,7 +226,11 @@ pub use conv::{
     TrainableConv2d, TrainableGroupNorm, pixel_shuffle, pixel_unshuffle, upsample_nearest,
 };
 #[cfg(feature = "cuda")]
-pub use conv::{DeviceGroupNormCache, DeviceImageBatch, silu_backward_device, silu_device};
+pub use conv::{
+    DeviceGroupNormCache, DeviceImageBatch, DeviceSpatialSoftmaxCache,
+    global_avg_pool_backward_device, global_avg_pool_device, silu_backward_device, silu_device,
+    spatial_softmax_backward_device, spatial_softmax_device,
+};
 #[cfg(feature = "cuda")]
 pub use cuda_training::{CudaDoctorReport, CudaTrainingSession, CudaTrainingStats, cuda_doctor};
 pub use dataset::{

@@ -1460,6 +1460,149 @@ pub fn silu_backward_device(
     silu_launch(input, Some(grad))
 }
 
+/// What [`spatial_softmax_backward_device`] needs from the forward pass.
+#[cfg(feature = "cuda")]
+pub struct DeviceSpatialSoftmaxCache {
+    probabilities: DeviceImageBatch,
+    expected: cudarc::driver::CudaSlice<f32>,
+}
+
+/// [`spatial_softmax`] on the device. The output is a `[batch, 1, 1,
+/// 2 * channels]` batch, laid out like the host `Matrix`.
+#[cfg(feature = "cuda")]
+pub fn spatial_softmax_device(
+    input: &DeviceImageBatch,
+) -> Result<(DeviceImageBatch, DeviceSpatialSoftmaxCache), NetworkError> {
+    let context = &input.context;
+    let channels = input.channels;
+    let mut probabilities = context.zeros(input.data.len())?;
+    let mut expected = context.zeros(input.batch * 2 * channels)?;
+    let [height, width, channels_arg] = [input.height, input.width, channels].map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.ssm_fwd)
+            .arg(&mut probabilities)
+            .arg(&mut expected)
+            .arg(&input.data)
+            .arg(&height)
+            .arg(&width)
+            .arg(&channels_arg)
+            .launch(group_blocks(input.batch * channels))
+            .map_err(crate::cuda_training::cuda_err("spatial softmax kernel"))?;
+    }
+    let output = DeviceImageBatch {
+        batch: input.batch,
+        height: 1,
+        width: 1,
+        channels: 2 * channels,
+        data: expected.clone(),
+        context: context.clone(),
+    };
+    let probabilities = input.with_data(probabilities);
+    Ok((
+        output,
+        DeviceSpatialSoftmaxCache {
+            probabilities,
+            expected,
+        },
+    ))
+}
+
+/// [`spatial_softmax_backward`] on the device.
+#[cfg(feature = "cuda")]
+pub fn spatial_softmax_backward_device(
+    cache: &DeviceSpatialSoftmaxCache,
+    grad: &DeviceImageBatch,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let probabilities = &cache.probabilities;
+    let context = &probabilities.context;
+    let total = probabilities.data.len();
+    let mut out = context.zeros(total)?;
+    let [n, height, width, channels] = [
+        total,
+        probabilities.height,
+        probabilities.width,
+        probabilities.channels,
+    ]
+    .map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.ssm_bwd)
+            .arg(&mut out)
+            .arg(&probabilities.data)
+            .arg(&grad.data)
+            .arg(&cache.expected)
+            .arg(&n)
+            .arg(&height)
+            .arg(&width)
+            .arg(&channels)
+            .launch(crate::cuda_training::cfg(total))
+            .map_err(crate::cuda_training::cuda_err(
+                "spatial softmax backward kernel",
+            ))?;
+    }
+    Ok(probabilities.with_data(out))
+}
+
+/// [`global_avg_pool`] on the device: a `[batch, 1, 1, channels]` batch.
+#[cfg(feature = "cuda")]
+pub fn global_avg_pool_device(input: &DeviceImageBatch) -> Result<DeviceImageBatch, NetworkError> {
+    let context = &input.context;
+    let mut out = context.zeros(input.batch * input.channels)?;
+    let [pixels, channels] = [input.pixels(), input.channels].map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.gap_fwd)
+            .arg(&mut out)
+            .arg(&input.data)
+            .arg(&pixels)
+            .arg(&channels)
+            .launch(group_blocks(input.batch * input.channels))
+            .map_err(crate::cuda_training::cuda_err("average pool kernel"))?;
+    }
+    Ok(DeviceImageBatch {
+        height: 1,
+        width: 1,
+        ..input.with_data(out)
+    })
+}
+
+/// [`global_avg_pool_backward`] on the device, back to a `height` by `width`
+/// batch.
+#[cfg(feature = "cuda")]
+pub fn global_avg_pool_backward_device(
+    grad: &DeviceImageBatch,
+    height: usize,
+    width: usize,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let context = &grad.context;
+    let total = grad.batch * height * width * grad.channels;
+    let mut out = context.zeros(total)?;
+    let [n, pixels, channels] = [total, height * width, grad.channels].map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.gap_bwd)
+            .arg(&mut out)
+            .arg(&grad.data)
+            .arg(&n)
+            .arg(&pixels)
+            .arg(&channels)
+            .launch(crate::cuda_training::cfg(total))
+            .map_err(crate::cuda_training::cuda_err(
+                "average pool backward kernel",
+            ))?;
+    }
+    Ok(DeviceImageBatch {
+        height,
+        width,
+        ..grad.with_data(out)
+    })
+}
+
 #[cfg(feature = "cuda")]
 fn silu_launch(
     input: &DeviceImageBatch,
@@ -2288,6 +2431,67 @@ mod tests {
             "gamma grad",
         );
         close(&resident.beta.grad.data, &host.beta.grad.data, "beta grad");
+    }
+
+    /// Spatial softmax and average pooling on the device against the host.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_spatial_softmax_and_pooling_match_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let input = noise(3, 17, 19, 5, 1);
+        let (expected, cache) = spatial_softmax(&input);
+        let grad = noise(3, 1, 1, 10, 2).tokens;
+        let expected_grad = spatial_softmax_backward(&cache, &grad);
+        let pooled = global_avg_pool(&input);
+        let pool_grad = noise(3, 1, 1, 5, 3).tokens;
+        let expected_pool_grad = global_avg_pool_backward(&pool_grad, 17, 19);
+
+        let context = device.context();
+        let on_card = device.upload(&input).unwrap();
+        let on_card_grad = device
+            .upload(&ImageBatch::from_tokens(3, 1, 1, grad))
+            .unwrap();
+        let on_card_pool_grad = device
+            .upload(&ImageBatch::from_tokens(3, 1, 1, pool_grad))
+            .unwrap();
+        let before = context.transfers();
+        let (output, cache) = spatial_softmax_device(&on_card).unwrap();
+        let back = spatial_softmax_backward_device(&cache, &on_card_grad).unwrap();
+        let mean = global_avg_pool_device(&on_card).unwrap();
+        let spread = global_avg_pool_backward_device(&on_card_pool_grad, 17, 19).unwrap();
+        assert_eq!(
+            context.transfers(),
+            before,
+            "nothing crosses inside the chain"
+        );
+
+        let close = |a: &[f32], b: &[f32], what: &str| {
+            assert_eq!(a.len(), b.len(), "{what}");
+            for (index, (a, b)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-5 + 1e-4 * b.abs(),
+                    "{what}[{index}]: {a} against {b}"
+                );
+            }
+        };
+        close(
+            &output.download().unwrap().tokens.data,
+            &expected.data,
+            "keypoints",
+        );
+        close(
+            &back.download().unwrap().tokens.data,
+            &expected_grad.tokens.data,
+            "keypoint grad",
+        );
+        close(&mean.download().unwrap().tokens.data, &pooled.data, "pool");
+        close(
+            &spread.download().unwrap().tokens.data,
+            &expected_pool_grad.tokens.data,
+            "pool grad",
+        );
     }
 
     /// The host path is unchanged by a device being present, which is what
