@@ -1005,6 +1005,157 @@ impl GroupNorm {
     }
 }
 
+/// [`GroupNorm`] with a backward pass, over an [`ImageBatch`].
+///
+/// Statistics are summed channel by channel in the same order as
+/// [`GroupNorm::forward`], so the two agree to the bit.
+#[derive(Clone, Debug)]
+pub struct TrainableGroupNorm {
+    pub groups: usize,
+    pub eps: f32,
+    pub gamma: Param,
+    pub beta: Param,
+}
+
+/// What [`TrainableGroupNorm::backward`] needs from the forward pass.
+#[derive(Clone, Debug)]
+pub struct GroupNormCache {
+    normalized: Matrix,
+    /// `1 / sqrt(variance + eps)` per sample and group.
+    inv_std: Vec<f32>,
+}
+
+impl TrainableGroupNorm {
+    /// Scale ones, shift zeros.
+    pub fn new(groups: usize, channels: usize, eps: f32) -> Result<Self, NetworkError> {
+        if groups == 0 || channels == 0 || channels % groups != 0 {
+            return Err(NetworkError::InvalidConfig(format!(
+                "{channels} channels do not divide into {groups} groups"
+            )));
+        }
+        Ok(Self {
+            groups,
+            eps,
+            gamma: Param::filled(1, channels, 1.0),
+            beta: Param::zeros(1, channels),
+        })
+    }
+
+    pub fn forward(
+        &self,
+        input: &ImageBatch,
+    ) -> Result<(ImageBatch, GroupNormCache), NetworkError> {
+        let channels = self.gamma.value.cols;
+        if input.channels() != channels {
+            return Err(NetworkError::InvalidTarget {
+                expected: channels,
+                actual: input.channels(),
+            });
+        }
+        let (per_group, pixels) = (channels / self.groups, input.pixels());
+        let span = (per_group * pixels) as f32;
+        let mut normalized = Matrix::new(input.tokens.rows, channels);
+        let mut inv_std = vec![0f32; input.batch * self.groups];
+        normalized
+            .data
+            .par_chunks_mut(pixels * channels)
+            .zip(input.tokens.data.par_chunks(pixels * channels))
+            .zip(inv_std.par_chunks_mut(self.groups))
+            .for_each(|((out, sample), inv_std)| {
+                for (group, inv_std) in inv_std.iter_mut().enumerate() {
+                    let range = group * per_group..(group + 1) * per_group;
+                    let values = || {
+                        range.clone().flat_map(|channel| {
+                            (0..pixels).map(move |p| sample[p * channels + channel])
+                        })
+                    };
+                    let mean = values().sum::<f32>() / span;
+                    let variance = values().map(|value| (value - mean).powi(2)).sum::<f32>() / span;
+                    *inv_std = (variance + self.eps).sqrt().recip();
+                    for p in 0..pixels {
+                        for channel in range.clone() {
+                            let at = p * channels + channel;
+                            out[at] = (sample[at] - mean) * *inv_std;
+                        }
+                    }
+                }
+            });
+        let (gamma, beta) = (&self.gamma.value.data, &self.beta.value.data);
+        let mut output = input.like(channels);
+        for (out, row) in output
+            .tokens
+            .data
+            .chunks_exact_mut(channels)
+            .zip(normalized.data.chunks_exact(channels))
+        {
+            for channel in 0..channels {
+                out[channel] = row[channel] * gamma[channel] + beta[channel];
+            }
+        }
+        Ok((
+            output,
+            GroupNormCache {
+                normalized,
+                inv_std,
+            },
+        ))
+    }
+
+    /// Adds to `gamma` and `beta`'s gradients and returns the input's.
+    pub fn backward(&mut self, cache: &GroupNormCache, grad: &ImageBatch) -> ImageBatch {
+        let channels = grad.channels();
+        let (per_group, pixels) = (channels / self.groups, grad.pixels());
+        let span = (per_group * pixels) as f32;
+        for (g, row) in grad
+            .tokens
+            .data
+            .chunks_exact(channels)
+            .zip(cache.normalized.data.chunks_exact(channels))
+        {
+            for channel in 0..channels {
+                self.gamma.grad.data[channel] += g[channel] * row[channel];
+                self.beta.grad.data[channel] += g[channel];
+            }
+        }
+        let gamma = &self.gamma.value.data;
+        let mut input_grad = grad.like(channels);
+        input_grad
+            .tokens
+            .data
+            .par_chunks_mut(pixels * channels)
+            .zip(grad.tokens.data.par_chunks(pixels * channels))
+            .zip(cache.normalized.data.par_chunks(pixels * channels))
+            .zip(cache.inv_std.par_chunks(self.groups))
+            .for_each(|(((out, g), normalized), inv_std)| {
+                for (group, &inv_std) in inv_std.iter().enumerate() {
+                    let range = group * per_group..(group + 1) * per_group;
+                    let (mut mean, mut along) = (0f32, 0f32);
+                    for p in 0..pixels {
+                        for channel in range.clone() {
+                            let at = p * channels + channel;
+                            let d = g[at] * gamma[channel];
+                            mean += d;
+                            along += d * normalized[at];
+                        }
+                    }
+                    let (mean, along) = (mean / span, along / span);
+                    for p in 0..pixels {
+                        for channel in range.clone() {
+                            let at = p * channels + channel;
+                            out[at] =
+                                inv_std * (g[at] * gamma[channel] - mean - normalized[at] * along);
+                        }
+                    }
+                }
+            });
+        input_grad
+    }
+
+    pub fn params_mut(&mut self) -> Vec<&mut Param> {
+        vec![&mut self.gamma, &mut self.beta]
+    }
+}
+
 /// SiLU over a whole map, the activation every one of these decoders uses.
 pub fn silu(map: &mut FeatureMap) {
     map.data
@@ -1357,6 +1508,76 @@ mod tests {
         let (expected, _) = spatial_softmax(&spike);
         assert!((expected.data[2] - 1.0).abs() < 1e-4);
         assert!((expected.data[5 + 2] + 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn trainable_group_norm_matches_the_inference_one_and_finite_differences() {
+        let input = noise(2, 3, 4, 8, 3);
+        let mut norm = TrainableGroupNorm::new(4, 8, 1e-5).unwrap();
+        norm.gamma.value.data = noise(1, 1, 8, 1, 4)
+            .tokens
+            .data
+            .iter()
+            .map(|v| v + 1.5)
+            .collect();
+        norm.beta.value.data = noise(1, 1, 8, 1, 5).tokens.data;
+        let fixed = GroupNorm::new(
+            4,
+            norm.gamma.value.data.clone(),
+            norm.beta.value.data.clone(),
+            1e-5,
+        )
+        .unwrap();
+        let (output, cache) = norm.forward(&input).unwrap();
+        for sample in 0..2 {
+            let rows = 12 * sample..12 * (sample + 1);
+            let tokens = Matrix::from_vec(
+                12,
+                8,
+                input.tokens.data[rows.start * 8..rows.end * 8].to_vec(),
+            );
+            let mut map = FeatureMap::from_tokens(&tokens, 3, 4).unwrap();
+            fixed.forward(&mut map).unwrap();
+            assert_eq!(
+                map.to_tokens().data,
+                output.tokens.data[rows.start * 8..rows.end * 8]
+            );
+        }
+
+        let weights = noise(2, 3, 4, 8, 6);
+        let grad = norm.backward(&cache, &weights);
+        let through = |input: &ImageBatch| norm.forward(input).unwrap().0.tokens;
+        let gap = pooled_gap(through, &input, &weights.tokens.data, &grad.tokens.data);
+        assert!(gap < 1e-3, "input {gap}");
+        for (which, analytic) in [(0, &norm.gamma.grad.data), (1, &norm.beta.grad.data)] {
+            let params = ImageBatch::from_tokens(
+                1,
+                1,
+                8,
+                Matrix::from_vec(
+                    8,
+                    1,
+                    if which == 0 {
+                        norm.gamma.value.data.clone()
+                    } else {
+                        norm.beta.value.data.clone()
+                    },
+                ),
+            );
+            let through = |params: &ImageBatch| {
+                let mut moved = norm.clone();
+                let target = if which == 0 {
+                    &mut moved.gamma
+                } else {
+                    &mut moved.beta
+                };
+                target.value.data.copy_from_slice(&params.tokens.data);
+                moved.forward(&input).unwrap().0.tokens
+            };
+            let gap = pooled_gap(through, &params, &weights.tokens.data, analytic);
+            assert!(gap < 1e-3, "param {which}: {gap}");
+        }
+        assert!(TrainableGroupNorm::new(3, 8, 1e-5).is_err());
     }
 
     #[test]
