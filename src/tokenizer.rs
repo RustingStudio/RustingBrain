@@ -65,6 +65,9 @@ pub struct Bpe {
     split_digits: Option<usize>,
     /// A word that is already a token is emitted whole, without merging.
     ignore_merges: bool,
+    /// How many ids follow a token added by [`Bpe::add_token`] with more than
+    /// one vector, keyed by its first id.
+    expansions: HashMap<u32, u32>,
     byte_encoder: Vec<char>,
     byte_decoder: HashMap<char, u8>,
 }
@@ -242,6 +245,7 @@ impl Bpe {
             byte_fallback,
             split_digits,
             ignore_merges,
+            expansions: HashMap::new(),
             byte_encoder,
             byte_decoder,
         })
@@ -256,6 +260,44 @@ impl Bpe {
     /// special token such as `<|endoftext|>`.
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.vocab.get(token).copied()
+    }
+
+    /// Adds `token` to the vocabulary as a token matched whole, standing for
+    /// `count` ids in a row, and returns the first id. The ids follow the
+    /// vocabulary, which is where a textual inversion's rows go in the
+    /// embedding table.
+    ///
+    /// Spelled as diffusers does: the extra ids are `token_1`, `token_2` and
+    /// so on, and writing `token` in a prompt stands for all of them.
+    pub fn add_token(&mut self, token: &str, count: usize) -> Result<u32, NetworkError> {
+        let token = match self.lowercase {
+            true => token.to_lowercase(),
+            false => token.to_string(),
+        };
+        let first = self.tokens.len() as u32;
+        let names: Vec<String> = (0..count)
+            .map(|index| match index {
+                0 => token.clone(),
+                _ => format!("{token}_{index}"),
+            })
+            .collect();
+        if token.is_empty() || count == 0 || names.iter().any(|name| self.vocab.contains_key(name))
+        {
+            return Err(NetworkError::InvalidConfig(format!(
+                "cannot add {count} ids as `{token}`: it is empty or already a token"
+            )));
+        }
+        for (id, name) in (first..).zip(names) {
+            self.vocab.insert(name.clone(), id);
+            self.tokens.push(name.clone());
+            self.specials.push((name, id));
+        }
+        self.specials
+            .sort_by_key(|(token, _)| std::cmp::Reverse(token.len()));
+        if count > 1 {
+            self.expansions.insert(first, count as u32 - 1);
+        }
+        Ok(first)
     }
 
     /// Tokenizes text.
@@ -284,6 +326,8 @@ impl Bpe {
                     let tail = &rest[at + token.len()..];
                     self.encode_plain(head, rest.len() == text.len(), &mut ids)?;
                     ids.push(id);
+                    let more = self.expansions.get(&id).copied().unwrap_or(0);
+                    ids.extend(id + 1..=id + more);
                     ("", tail)
                 }
                 None => (rest, ""),
@@ -1238,6 +1282,24 @@ pub(crate) mod tests {
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[1], end);
         assert_eq!(bpe.decode(&ids), "hi<|end|>hi");
+    }
+
+    #[test]
+    fn an_added_token_stands_for_all_its_ids_and_cannot_be_added_twice() {
+        let mut bpe = tokenizer(&["h i"], &["hi"], None);
+        let hi = bpe.encode("hi").unwrap();
+        let first = bpe.add_token("<x>", 3).unwrap();
+        assert_eq!(first as usize, bpe.vocab_size() - 3);
+        assert_eq!(bpe.token_id("<x>_2"), Some(first + 2));
+
+        let ids = bpe.encode("hi<x>hi").unwrap();
+        assert_eq!(
+            ids,
+            [&hi[..], &[first, first + 1, first + 2], &hi[..]].concat()
+        );
+        assert!(bpe.add_token("<x>", 1).is_err());
+        assert!(bpe.add_token("<x>_1", 1).is_err());
+        assert!(bpe.add_token("<y>", 0).is_err());
     }
 
     #[test]

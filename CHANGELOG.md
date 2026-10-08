@@ -90,6 +90,12 @@
 
 ### Added
 
+- Textual inversion: `ImagePipeline::add_embedding` adds a learned prompt
+  token from a diffusers, A1111 or SDXL (`clip_l`/`clip_g`) safetensors file
+  to every CLIP tower, and a multi-vector token stands for all its vectors,
+  as diffusers expands it. Hidden states and pooled vectors match diffusers
+  on a tiny tower with the SDXL tokenizers within 1e-5. Legacy CLIP configs
+  (`eos_token_id = 2`) now pool at the highest id, as Transformers does.
 - Inpainting: `Inpaint` wraps any `Denoiser` with a picture latent and a
   keep weight a latent row, and `ImagePipeline::sample_latent_inpaint`
   repaints only where the weight is zero, under every solver and schedule.

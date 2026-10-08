@@ -853,6 +853,57 @@ impl ImagePipeline {
         }
     }
 
+    /// Adds a textual inversion file as `token`, which prompts can then use
+    /// like a word. Every CLIP tower the pipeline reads with, the pooled one
+    /// included, takes the file's tensor as wide as it is; see
+    /// [`crate::clip::read_embedding`].
+    pub fn add_embedding(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        token: &str,
+    ) -> Result<(), NetworkError> {
+        let mut towers = match &mut self.encoder {
+            PromptEncoder::Sequence { .. } | PromptEncoder::T5 { .. } => Vec::new(),
+            PromptEncoder::Clip {
+                tokenizer, encoder, ..
+            } => vec![(tokenizer, encoder)],
+            PromptEncoder::ClipPair {
+                tokenizer,
+                encoder,
+                second_tokenizer,
+                second,
+                ..
+            }
+            | PromptEncoder::ClipPairAndT5 {
+                tokenizer,
+                encoder,
+                second_tokenizer,
+                second,
+                ..
+            } => {
+                vec![(tokenizer, encoder), (second_tokenizer, second)]
+            }
+        };
+        if let Some(part) = &mut self.pooled {
+            towers.push((&mut part.tokenizer, &mut part.encoder));
+        }
+        if towers.is_empty() {
+            return Err(NetworkError::InvalidConfig(
+                "textual inversion needs a CLIP text encoder".into(),
+            ));
+        }
+        // Every tower's vectors are read before any is added, so a file that
+        // fits one tower and not another changes nothing.
+        let vectors = towers
+            .iter()
+            .map(|(_, encoder)| crate::clip::read_embedding(&path, encoder.config().d_model))
+            .collect::<Result<Vec<_>, _>>()?;
+        for ((tokenizer, encoder), vectors) in towers.into_iter().zip(vectors) {
+            encoder.add_token(tokenizer, token, &vectors)?;
+        }
+        Ok(())
+    }
+
     /// Moves everything that has a device path onto CUDA device `device`.
     ///
     /// That is the denoiser, both halves of the VAE, every CLIP tower and a gated
