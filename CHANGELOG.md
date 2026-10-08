@@ -96,6 +96,7 @@
 
 ### Added
 
+- `TrainableConv2d::without_bias()`: a convolution that adds, gathers and trains no bias, for one before a norm (asked by RustingChop). A builder rather than `bias: Option<Param>`, so the public `bias` field keeps its type.
 - `losses::bce_with_logits`, `losses::soft_cross_entropy` and `losses::huber` take logits (or raw predictions) and optional per-sample weights, reduce as `sum(w * loss) / batch`, and return the gradient with the loss (asked by RustingChop and RustingCS2).
 - `ffn::silu_derivative` is public, for hand-written backward passes through SiLU (asked by RustingChop and RustingCS2).
 - FP16 device backward kernels for UNet adapter training in `cuda_image`: convolution input gradients, group and layer norm, the gated GELU, SiLU and nearest upsampling, each matched to the host `unet_lora` functions.
