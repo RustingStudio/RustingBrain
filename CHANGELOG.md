@@ -269,6 +269,8 @@
 
 ### Fixed
 
+- A device convolution asked to add into a map with a different channel
+  count is an error, instead of writing past the end of that map.
 - A CLIP text or image tower saved by Transformers 5, whose keys leave off
   the `text_model.` or `vision_model.` prefix, loads instead of failing on a
   missing tensor.
