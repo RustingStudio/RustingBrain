@@ -1650,6 +1650,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_kohya_lora_for_the_reference_names_adapts_both_spellings_alike() {
+        let config = tiny();
+        let dir = std::env::temp_dir().join("rusting_brain_dit_lora");
+        std::fs::create_dir_all(&dir).unwrap();
+        let reference = tensors(&config);
+        // kohya names FLUX's modules as the reference code does, so its
+        // fused projections reach diffusers' split ones in parts.
+        let mut lora = BTreeMap::new();
+        for (index, (name, (shape, _))) in reference.iter().enumerate() {
+            let Some(stem) = name.strip_suffix(".weight") else {
+                continue;
+            };
+            if shape.len() != 2 || stem.starts_with("final_layer.adaLN") {
+                continue;
+            }
+            let flat = format!("lora_unet_{}", stem.replace('.', "_"));
+            let values = |count: usize, salt: usize| -> Vec<f32> {
+                (0..count)
+                    .map(|i| ((i * 7 + salt * 13) as f32 * 0.37).sin() * 0.1)
+                    .collect()
+            };
+            lora.insert(
+                format!("{flat}.lora_down.weight"),
+                (vec![2, shape[1]], values(2 * shape[1], index)),
+            );
+            lora.insert(
+                format!("{flat}.lora_up.weight"),
+                (vec![shape[0], 2], values(2 * shape[0], index + 1)),
+            );
+        }
+        let lora_path = dir.join("lora.safetensors");
+        crate::safetensors::write_checkpoint(&lora_path, &lora);
+
+        let patches = Matrix::from_vec(
+            6,
+            config.in_channels,
+            (0..6 * config.in_channels)
+                .map(|index| (index as f32 * 0.2).sin())
+                .collect(),
+        );
+        let mut outputs = Vec::new();
+        for (name, weights) in [
+            ("reference.safetensors", reference.clone()),
+            ("diffusers.safetensors", diffusers_tensors(&config)),
+        ] {
+            let path = dir.join(name);
+            crate::safetensors::write_checkpoint(&path, &weights);
+            for scale in [0.0, 0.8] {
+                let mut file = ShardedSafeTensors::open(&path).unwrap();
+                file.add_lora(&lora_path, &["lora_unet"], scale).unwrap();
+                let mut model = Dit::read(&mut file, "", config.clone()).unwrap();
+                model.set_conditioning(conditioning(&config, 2, 3));
+                outputs.push(model.denoise(&patches, 0.7).unwrap().data);
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-5);
+        assert!(close(&outputs[0], &outputs[2]));
+        assert!(!close(&outputs[0], &outputs[1]), "the LoRA changes nothing");
+        assert!(close(&outputs[1], &outputs[3]), "the spellings disagree");
+    }
+
+    #[test]
     fn a_distilled_guidance_scale_reaches_the_prediction() {
         let config = DitConfig {
             guidance: true,
