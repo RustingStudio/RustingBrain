@@ -74,6 +74,9 @@
 
 ### Added
 
+- `Decoder::logits` and `Decoder::push`, and the same on `BatchDecoder`:
+  read the next-token logits and append an id of the caller's choosing, for
+  constrained decoding, logit biases and log-probabilities.
 - `BatchDecoder::feed` accepts prompts of different lengths. On a device the
   shorter ones are padded on the left and the padding is masked out of
   attention; later feeds still give every sequence the same number of

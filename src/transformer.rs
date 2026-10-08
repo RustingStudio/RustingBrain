@@ -2567,6 +2567,42 @@ impl Decoder<'_> {
         Ok(next)
     }
 
+    /// The next token's logits, for choices [`Sampler`] does not make:
+    /// constrained output, a logit bias, log-probabilities. Append the chosen
+    /// id with [`push`](Decoder::push):
+    ///
+    /// ```no_run
+    /// # use rusting_brain::TransformerLm;
+    /// # let model = TransformerLm::load_bin("model.rbw")?;
+    /// # let allowed = [7u32, 9, 12];
+    /// let mut decoder = model.decoder();
+    /// decoder.feed(&[1, 2, 3])?;
+    /// let logits = decoder.logits()?;
+    /// let id = *allowed.iter().max_by(|a, b| {
+    ///     logits[**a as usize].total_cmp(&logits[**b as usize])
+    /// }).unwrap();
+    /// decoder.push(id)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// [`Sampler`]: crate::Sampler
+    pub fn logits(&mut self) -> Result<&[f32], NetworkError> {
+        self.catch_up()?;
+        let logits = self.logits.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig("decoding needs a prompt fed in first".into())
+        })?;
+        Ok(logits.row(logits.rows - 1))
+    }
+
+    /// Appends `id` as if [`next`](Decoder::next) had sampled it, deferring
+    /// its forward pass the same way.
+    pub fn push(&mut self, id: u32) -> Result<(), NetworkError> {
+        self.catch_up()?;
+        self.history.push(id);
+        self.pending = Some(id);
+        Ok(())
+    }
+
     /// [`next`](Decoder::next), also returning the distribution it drew from.
     fn propose(
         &mut self,
@@ -2740,6 +2776,34 @@ impl BatchDecoder<'_> {
             .collect();
         self.pending = Some(next.clone());
         Ok(next)
+    }
+
+    /// Sequence `sequence`'s next-token logits, as [`Decoder::logits`] gives
+    /// them. Panics past the last sequence.
+    pub fn logits(&mut self, sequence: usize) -> Result<&[f32], NetworkError> {
+        self.catch_up()?;
+        let logits = self.logits.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig("decoding needs a prompt fed in first".into())
+        })?;
+        Ok(logits.row(sequence))
+    }
+
+    /// Appends `ids[s]` to sequence `s` as if [`next`](BatchDecoder::next)
+    /// had sampled them.
+    pub fn push(&mut self, ids: &[u32]) -> Result<(), NetworkError> {
+        if ids.len() != self.histories.len() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "expected one id for each of {} sequences, got {}",
+                self.histories.len(),
+                ids.len()
+            )));
+        }
+        self.catch_up()?;
+        for (history, &id) in self.histories.iter_mut().zip(ids) {
+            history.push(id);
+        }
+        self.pending = Some(ids.to_vec());
+        Ok(())
     }
 
     /// Every id sequence `sequence` has seen. Panics past the last sequence.
@@ -3367,6 +3431,34 @@ mod tests {
         let model = tiny().build().unwrap();
         assert_batch_matches_single(&model, &model, 1e-5);
         assert!(model.batch_decoder(0).is_err());
+    }
+
+    #[test]
+    fn pushing_the_argmax_of_the_logits_decodes_greedily() {
+        let model = tiny().build().unwrap();
+        let argmax = |logits: &[f32]| {
+            (0..logits.len())
+                .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+                .unwrap() as u32
+        };
+        let mut sampler = Sampler::greedy();
+        let (mut sampled, mut pushed) = (model.decoder(), model.decoder());
+        assert!(pushed.logits().is_err());
+        sampled.feed(&[3, 8, 1]).unwrap();
+        pushed.feed(&[3, 8, 1]).unwrap();
+        let mut batch = model.batch_decoder(2).unwrap();
+        batch.feed(&[&[3, 8, 1], &[5]]).unwrap();
+        for _ in 0..6 {
+            let id = argmax(pushed.logits().unwrap());
+            assert_eq!(batch.logits(0).unwrap(), pushed.logits().unwrap());
+            let other = argmax(batch.logits(1).unwrap());
+            assert_eq!(sampled.next(&mut sampler).unwrap(), id);
+            pushed.push(id).unwrap();
+            batch.push(&[id, other]).unwrap();
+        }
+        assert_eq!(pushed.history(), sampled.history());
+        assert_eq!(batch.history(0), sampled.history());
+        assert!(batch.push(&[1]).is_err());
     }
 
     #[cfg(feature = "cuda")]
