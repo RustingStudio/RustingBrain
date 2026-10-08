@@ -288,16 +288,20 @@ impl SafeTensors {
             _ => return Err(bad("data_offsets that are not a pair")),
         };
 
-        let info = TensorInfo {
+        // A header names any shape, so its byte count is multiplied with
+        // checks; every later `len` then fits.
+        let bytes = shape
+            .iter()
+            .try_fold(dtype.size(), |total, size| total.checked_mul(*size));
+        if end < start || bytes.map(|bytes| bytes as u64) != Some(end - start) {
+            return Err(bad("a byte range that does not match its shape and dtype"));
+        }
+        Ok(TensorInfo {
             dtype,
             shape,
             start,
             end,
-        };
-        if end < start || end - start != (info.len() * dtype.size()) as u64 {
-            return Err(bad("a byte range that does not match its shape and dtype"));
-        }
-        Ok(info)
+        })
     }
 
     /// Every tensor name in the file, sorted.
@@ -561,18 +565,24 @@ impl ShardedSafeTensors {
 
             let (down, down_shape) = file.tensor(name)?;
             let (up, up_shape) = file.tensor(&up_name)?;
-            let rank = down_shape[0];
+            let rank = down_shape.first().copied().unwrap_or(0);
             let alpha = match file.tensor(&format!("{stem}.alpha")) {
-                Ok((alpha, _)) => alpha[0],
+                Ok((alpha, _)) => alpha.first().copied().unwrap_or(rank as f32),
                 Err(_) => rank as f32,
             };
-            let inputs = down.len() / rank.max(1);
-            let outputs = up_shape[0];
+            let inputs = down.len().checked_div(rank).unwrap_or(0);
+            let outputs = up_shape.first().copied().unwrap_or(0);
             let base = self.map.get(&format!("{target}.weight")).cloned();
             let base_len = base
                 .and_then(|file| self.size_of(&file, &format!("{target}.weight")))
                 .unwrap_or(0);
-            if up.len() != outputs * rank || outputs * inputs != base_len {
+            // The shapes come from the file, so every product is checked: a
+            // wrapped one would size the multiply below past its buffers.
+            if rank == 0
+                || down.len() != rank * inputs
+                || Some(up.len()) != outputs.checked_mul(rank)
+                || Some(base_len) != outputs.checked_mul(inputs)
+            {
                 return Err(NetworkError::InvalidDataset(format!(
                     "the LoRA for {target} is {up_shape:?} by {down_shape:?}, which does not \
                      make its {base_len} weights"
@@ -601,8 +611,7 @@ impl ShardedSafeTensors {
             let shard = SafeTensors::open(self.directory.join(file)).ok()?;
             self.shards.insert(file.to_string(), shard);
         }
-        let info = self.shards.get(file)?.info(name)?;
-        Some(info.shape.iter().product())
+        Some(self.shards.get(file)?.info(name)?.len())
     }
 
     /// Reads one tensor as `f32`, opening its shard if this is the first
@@ -866,6 +875,29 @@ mod tests {
             assert_eq!(weights.matrix("mid.to_q.weight").unwrap().data, values);
             assert_eq!(weights.tensor("mid.to_q.bias").unwrap().0, vec![0.0; 2]);
         }
+        // Shapes whose products wrap, a rank that does not divide its values
+        // and a scalar rank are errors rather than a multiply past the
+        // buffers. Written by hand, since the writer refuses such shapes.
+        let wraps = usize::MAX / 2 + 2;
+        let hostile = [
+            ("[1,3]", 12, format!("[{wraps},2]"), 8),
+            ("[3,1]", 8, "[1,3]".to_string(), 12),
+            ("[]", 4, "[1,1]".to_string(), 4),
+        ];
+        for (index, (down_shape, down_bytes, up_shape, up_bytes)) in hostile.iter().enumerate() {
+            let header = format!(
+                r#"{{"unet.mid.to_q.lora_A.weight":{{"dtype":"F32","shape":{down_shape},"data_offsets":[0,{down_bytes}]}},"unet.mid.to_q.lora_B.weight":{{"dtype":"F32","shape":{up_shape},"data_offsets":[{down_bytes},{}]}}}}"#,
+                down_bytes + up_bytes
+            );
+            let path = dir.join(format!("hostile_{index}.safetensors"));
+            write(&path, &header, &vec![0u8; down_bytes + up_bytes]);
+            let mut weights = ShardedSafeTensors::open(&base).unwrap();
+            assert!(
+                weights.add_lora(&path, &["unet"], 1.0).is_err(),
+                "case {index}"
+            );
+        }
+
         let mut weights = ShardedSafeTensors::open(&base).unwrap();
         assert!(weights.add_lora(&stray, &["unet"], 1.0).is_err());
         assert!(weights.add_lora(&other, &["unet"], 1.0).is_err());
