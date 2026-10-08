@@ -1057,6 +1057,53 @@ impl DeviceDit {
         Ok(())
     }
 
+    /// One rectified-flow training step on `lora`: `latent` (packed, like the
+    /// sampler's) is moved to noise level `sigma` along the straight path to
+    /// `noise`, the model regresses the velocity `noise - latent`, and the
+    /// optimizer steps on the adapters with the gradient clipped to a norm of
+    /// 1. Returns the mean squared error before the step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flow_step(
+        &self,
+        dit: &Dit,
+        lora: &mut DitLora,
+        latent: &Matrix,
+        noise: &Matrix,
+        sigma: f32,
+        conditioning: &Conditioning,
+        optimizer: &crate::optimizers::Optimizer,
+        step: usize,
+    ) -> Result<f32, NetworkError> {
+        let noisy = Matrix::from_vec(
+            latent.rows,
+            latent.cols,
+            latent
+                .data
+                .iter()
+                .zip(&noise.data)
+                .map(|(x, n)| (1.0 - sigma) * x + sigma * n)
+                .collect(),
+        );
+        let (prediction, tape) = self.forward_train(dit, lora, &noisy, sigma, conditioning)?;
+        let count = prediction.data.len() as f32;
+        let error: Vec<f32> = prediction
+            .data
+            .iter()
+            .zip(latent.data.iter().zip(&noise.data))
+            .map(|(p, (x, n))| p - (n - x))
+            .collect();
+        let loss = error.iter().map(|e| e * e).sum::<f32>() / count;
+        let grad = Matrix::from_vec(
+            prediction.rows,
+            prediction.cols,
+            error.iter().map(|e| 2.0 * e / count).collect(),
+        );
+        self.backward(dit, lora, &tape, &grad)?;
+        crate::optimizers::step_clipped(&mut lora.params_mut(), optimizer, step, 1.0, 1.0)?;
+        crate::optimizers::zero_grad(&mut lora.params_mut());
+        Ok(loss)
+    }
+
     /// A host matrix through an input layer, FP32 out.
     fn input(
         &self,
@@ -1863,6 +1910,55 @@ mod tests {
             error < moved / 5.0,
             "error {error}, the adapters move it {moved}"
         );
+    }
+
+    #[test]
+    fn flow_steps_fit_one_latent_or_skip_without_device() {
+        let Some(context) = cuda_or_skip() else {
+            return;
+        };
+        let config = config();
+        let path = std::env::temp_dir().join("rusting_brain_cuda_mmdit_flow.safetensors");
+        random_checkpoint(&config, &path);
+        let dit = Dit::load(&path, "", config.clone()).unwrap();
+        std::fs::remove_file(&path).ok();
+        let (height, width) = (3, 5);
+        let wave = |phase: f32| {
+            Matrix::from_vec(
+                height * width,
+                config.in_channels,
+                (0..height * width * config.in_channels)
+                    .map(|index| (index as f32 * 0.23 + phase).cos())
+                    .collect(),
+            )
+        };
+        let (latent, noise) = (wave(0.0), wave(1.7));
+        let conditioning = conditioning(&config, height, width);
+        let mut rng = rand::SeedableRng::seed_from_u64(7);
+        let mut lora = DitLora::new(&dit, 4, 4.0, &mut rng);
+        lora.move_to_cuda(&context).unwrap();
+        let device = DeviceDit::upload(&context, &dit).unwrap();
+        let optimizer = crate::optimizers::Optimizer::adam(1e-2);
+        let losses: Vec<f32> = (1..=40)
+            .map(|step| {
+                device
+                    .flow_step(
+                        &dit,
+                        &mut lora,
+                        &latent,
+                        &noise,
+                        0.5,
+                        &conditioning,
+                        &optimizer,
+                        step,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        println!("flow losses {:?} .. {:?}", &losses[..3], &losses[37..]);
+        // One sample at one noise level: the adapters can fit it, so a step
+        // that pushes the wrong way or does not reach them shows as a flat loss.
+        assert!(losses[39] < 0.5 * losses[0], "{losses:?}");
     }
 
     #[test]

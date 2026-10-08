@@ -95,6 +95,10 @@
 
 ### Added
 
+- `examples/train_dit_lora.rs` trains a LoRA on a FLUX-style DiT from a
+  folder of captioned images on the CUDA device (`DitLora::new`,
+  `DeviceDit::flow_step`) and writes a diffusers PEFT file. diffusers loads
+  it to within 1.1e-6 of this crate's own prediction with it.
 - `DeviceDit` runs DiT LoRA adapters on CUDA and returns their gradients
   from a device backward, within 2e-2 of the host reference. One step at
   1024 image tokens on a 768-wide, six-block DiT takes 45-56 ms.

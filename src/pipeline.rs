@@ -2562,6 +2562,33 @@ mod tests {
         assert!(0.0 < error && error < 5e-2, "image: relative error {error}");
     }
 
+    /// Writes a FLUX.1-shaped pipeline (CLIP and T5, two of each block kind)
+    /// with 64-wide heads, which the device DiT takes, into `RB_TINY_FLUX`:
+    /// the model `scripts/dit_lora_trained_check.py` runs `train_dit_lora` on.
+    #[test]
+    #[ignore]
+    fn publish_a_tiny_flux() {
+        let directory = std::path::PathBuf::from(std::env::var("RB_TINY_FLUX").unwrap());
+        let clip = crate::clip::ClipTextConfig {
+            vocab_size: 320,
+            bos_token: 300,
+            eos_token: 301,
+            ..crate::clip::tests::tiny()
+        };
+        let t5 = crate::t5::tests::tiny();
+        let (_, _, vae, dit) = sd3_parts(128, 2, vec![16, 24, 24]);
+        let dit = DitConfig {
+            double_blocks: 2,
+            single_blocks: 2,
+            mlp_ratio: 4.0,
+            text_dim: t5.d_model,
+            pooled_dim: clip.d_model,
+            ..dit
+        };
+        publish_parts(&dit, &vae, &directory, Some(&clip), Some(&t5), None);
+        ImagePipeline::load(&directory).unwrap();
+    }
+
     #[test]
     fn a_t5_encoder_is_read_where_the_directory_holds_one() {
         let (reference, _) = pipeline("directory_t5");

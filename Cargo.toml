@@ -90,6 +90,10 @@ required-features = ["cuda"]
 name = "cuda_image_bench"
 required-features = ["cuda"]
 
+[[example]]
+name = "train_dit_lora"
+required-features = ["cuda", "images"]
+
 [profile.release]
 opt-level = 3
 lto = true

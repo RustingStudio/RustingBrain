@@ -74,6 +74,45 @@ fn peft_target(module: &str, d_model: usize, mlp: usize) -> Option<(String, Rang
     Some((format!("double.{block}.{stream}.{projection}"), rows))
 }
 
+/// The diffusers FLUX modules [`peft_target`] places, under a block's prefix.
+const DOUBLE_MODULES: [&str; 12] = [
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "ff.net.0.proj",
+    "ff.net.2",
+    "attn.add_q_proj",
+    "attn.add_k_proj",
+    "attn.add_v_proj",
+    "attn.to_add_out",
+    "ff_context.net.0.proj",
+    "ff_context.net.2",
+];
+const SINGLE_MODULES: [&str; 5] = [
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "proj_mlp",
+    "proj_out",
+];
+
+/// Every diffusers module of the model's blocks.
+fn peft_modules(dit: &Dit) -> Vec<String> {
+    let config = dit.config();
+    let double = (0..config.double_blocks).flat_map(|block| {
+        DOUBLE_MODULES
+            .iter()
+            .map(move |name| format!("transformer_blocks.{block}.{name}"))
+    });
+    let single = (0..config.single_blocks).flat_map(|block| {
+        SINGLE_MODULES
+            .iter()
+            .map(move |name| format!("single_transformer_blocks.{block}.{name}"))
+    });
+    double.chain(single).collect()
+}
+
 /// The projection an adapter key names, if the model has that block.
 pub(crate) fn projection<'a>(dit: &'a Dit, key: &str) -> Option<&'a Dense> {
     let mut parts = key.split('.');
@@ -100,6 +139,80 @@ pub(crate) fn projection<'a>(dit: &'a Dit, key: &str) -> Option<&'a Dense> {
 }
 
 impl DitLora {
+    /// Fresh adapters of `rank` on every module a diffusers FLUX LoRA covers,
+    /// `up` at zero so the model starts unchanged.
+    pub fn new(dit: &Dit, rank: usize, alpha: f32, rng: &mut rand::rngs::StdRng) -> Self {
+        let config = dit.config();
+        let mut result = Self::default();
+        for module in peft_modules(dit) {
+            let (key, rows) = peft_target(&module, config.d_model, config.mlp_dim())
+                .expect("every listed module has a target");
+            let inner = projection(dit, &key)
+                .expect("the module's block exists")
+                .in_dim();
+            let lora = Lora::new(inner, rows.len(), rank, alpha, rng);
+            result
+                .adapters
+                .entry(key)
+                .or_default()
+                .push(Adapter { lora, rows });
+        }
+        result
+    }
+
+    /// Writes the adapters as a diffusers FLUX PEFT file, with each adapter's
+    /// scale folded into `lora_B`, so [`read_peft`](Self::read_peft) at scale
+    /// 1 and diffusers' `load_lora_weights` (alpha defaults to the rank) give
+    /// back the same model. Each adapter must cover one module's rows, with
+    /// its factors on the host.
+    pub fn write_peft(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        dit: &Dit,
+    ) -> Result<(), NetworkError> {
+        self.check(dit)?;
+        let config = dit.config();
+        let targets: Vec<_> = peft_modules(dit)
+            .into_iter()
+            .filter_map(|module| {
+                let target = peft_target(&module, config.d_model, config.mlp_dim())?;
+                Some((target, module))
+            })
+            .collect();
+        let mut tensors = Vec::new();
+        for (key, list) in &self.adapters {
+            for adapter in list {
+                let module = targets
+                    .iter()
+                    .find(|((k, rows), _)| k == key && *rows == adapter.rows)
+                    .map(|(_, module)| module)
+                    .ok_or_else(|| {
+                        NetworkError::InvalidConfig(format!(
+                            "rows {:?} of {key} are no one diffusers module",
+                            adapter.rows
+                        ))
+                    })?;
+                let (down, up) = (&adapter.lora.down.value, &adapter.lora.up.value);
+                let scaled: Vec<f32> = up.data.iter().map(|v| v * adapter.lora.scale).collect();
+                tensors.push((
+                    format!("transformer.{module}.lora_A.weight"),
+                    vec![down.rows, down.cols],
+                    down.data.clone(),
+                ));
+                tensors.push((
+                    format!("transformer.{module}.lora_B.weight"),
+                    vec![up.rows, up.cols],
+                    scaled,
+                ));
+            }
+        }
+        let views: Vec<_> = tensors
+            .iter()
+            .map(|(name, shape, data)| (name.as_str(), &shape[..], &data[..]))
+            .collect();
+        crate::safetensors::write(path, &views, &BTreeMap::new())
+    }
+
     /// Reads a PEFT file trained against diffusers' FLUX (`{module}.lora_A`
     /// and `lora_B`), with `scale` the `alpha / rank` it was trained at, which
     /// a PEFT file does not record.
@@ -188,6 +301,15 @@ impl DitLora {
             adapter.lora.up.move_to_cpu()?;
         }
         Ok(())
+    }
+
+    /// Every adapter factor, for an optimizer.
+    pub fn params_mut(&mut self) -> Vec<&mut Param> {
+        self.adapters
+            .values_mut()
+            .flatten()
+            .flat_map(|adapter| adapter.lora.params_mut())
+            .collect()
     }
 
     pub(crate) fn get(&self, key: &str) -> &[Adapter] {
@@ -879,6 +1001,61 @@ mod tests {
         assert!(read("single_transformer_blocks.0.norm.linear", d).is_err());
     }
 
+    #[test]
+    fn written_adapters_read_back_to_the_same_prediction() {
+        use rand::SeedableRng;
+        let config = crate::mmdit::tests::tiny();
+        let dir = std::env::temp_dir();
+        let path = dir.join("rusting_brain_dit_lora_write_model.safetensors");
+        crate::mmdit::tests::checkpoint(&config, &path);
+        let dit = Dit::load(&path, "", config.clone()).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut lora = DitLora::new(&dit, 2, 4.0, &mut rng);
+        let modules = config.double_blocks * 12 + config.single_blocks * 5;
+        assert_eq!(lora.adapters.values().map(Vec::len).sum::<usize>(), modules);
+        for (index, adapter) in lora.adapters.values_mut().flatten().enumerate() {
+            let up = &mut adapter.lora.up.value.data;
+            up.iter_mut()
+                .enumerate()
+                .for_each(|(i, v)| *v = ((i + index) as f32 * 0.7).sin() * 0.05);
+        }
+        let path = dir.join("rusting_brain_dit_lora_written.safetensors");
+        lora.write_peft(&path, &dit).unwrap();
+        let read = DitLora::read_peft(&path, &dit, 1.0).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let (height, width) = (2, 3);
+        let patches = Matrix::from_vec(
+            height * width,
+            config.in_channels,
+            (0..height * width * config.in_channels)
+                .map(|i| (i as f32 * 0.3).cos())
+                .collect(),
+        );
+        let conditioning = crate::mmdit::tests::conditioning(&config, height, width);
+        let plain = dit.forward_with(&patches, 0.5, &conditioning).unwrap();
+        let (expected, _) = lora.forward(&dit, &patches, 0.5, &conditioning).unwrap();
+        let (actual, _) = read.forward(&dit, &patches, 0.5, &conditioning).unwrap();
+        let distance = |a: &Matrix, b: &Matrix| {
+            let pairs = a.data.iter().zip(&b.data);
+            pairs.map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+        assert!(
+            distance(&expected, &plain) > 1e-3,
+            "the adapters change nothing"
+        );
+        assert!(distance(&expected, &actual) < 1e-5);
+
+        // An adapter over two modules' rows has no one name to be written under.
+        lora.adapters.get_mut("double.0.image.qkv").unwrap()[0].rows = 0..2 * config.d_model;
+        let up = &mut lora.adapters.get_mut("double.0.image.qkv").unwrap()[0]
+            .lora
+            .up;
+        *up = Param::new(Matrix::new(2 * config.d_model, 2));
+        assert!(lora.write_peft(&path, &dit).is_err());
+    }
+
     /// Needs `RB_DIT_LORA_REF` from `scripts/dit_lora_reference.py`.
     #[test]
     #[ignore]
@@ -956,5 +1133,91 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 68);
+    }
+
+    /// Needs `RB_DIT_LORA_TRAINED` from `scripts/dit_lora_trained_check.py
+    /// check`, run on what `train_dit_lora` wrote.
+    #[test]
+    #[ignore]
+    fn a_trained_lora_loads_as_diffusers_loads_it() {
+        let dir = std::path::PathBuf::from(std::env::var("RB_DIT_LORA_TRAINED").unwrap());
+        let reference: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
+                .unwrap();
+        let floats = |value: &serde_json::Value| -> Vec<f32> {
+            let values = value.as_array().unwrap().iter();
+            values.map(|x| x.as_f64().unwrap() as f32).collect()
+        };
+        let number = |key: &str| reference[key].as_f64().unwrap();
+        let model = std::path::PathBuf::from(reference["model"].as_str().unwrap());
+        let file = std::path::PathBuf::from(reference["lora"].as_str().unwrap());
+        let config =
+            crate::mmdit::DitConfig::from_file(model.join("transformer/config.json")).unwrap();
+        let dit = Dit::load(
+            model.join("transformer/diffusion_pytorch_model.safetensors"),
+            "",
+            config.clone(),
+        )
+        .unwrap();
+        let (height, width) = (number("height") as usize, number("width") as usize);
+        let text = floats(&reference["text"]);
+        let conditioning = Conditioning {
+            text: Matrix::from_vec(text.len() / config.text_dim, config.text_dim, text),
+            pooled: floats(&reference["pooled"]),
+            height,
+            width,
+            guidance: 0.0,
+        };
+        let patches = Matrix::from_vec(
+            height * width,
+            config.in_channels,
+            floats(&reference["patches"]),
+        );
+        let timestep = number("timestep") as f32;
+        let worst = |got: &[f32], want: &[f32]| {
+            let largest = want.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+            let error = got
+                .iter()
+                .zip(want)
+                .fold(0.0f32, |max, (got, want)| max.max((got - want).abs()));
+            error / largest
+        };
+        let (plain, adapted) = (floats(&reference["plain"]), floats(&reference["adapted"]));
+        // Training has to have moved the model, or matching says nothing.
+        let moved = worst(&adapted, &plain);
+        assert!(
+            moved > 1e-3,
+            "the LoRA moves diffusers' prediction by {moved}"
+        );
+        assert_eq!(number("adapters") as usize, peft_modules(&dit).len());
+
+        let lora = DitLora::read_peft(&file, &dit, 1.0).unwrap();
+        let (ours, _) = lora
+            .forward(&dit, &patches, timestep, &conditioning)
+            .unwrap();
+        let error = worst(&ours.data, &adapted);
+        assert!(
+            error < 1e-4,
+            "read_peft is off diffusers by {error}, moved {moved}"
+        );
+
+        let pipeline = crate::pipeline::ImagePipeline::load_with_loras(
+            &model,
+            crate::transformer::Precision::F32,
+            &[(file, 1.0)],
+        )
+        .unwrap();
+        let crate::pipeline::ImageDenoiser::Transformer(merged) = &pipeline.denoiser else {
+            panic!("the model is a DiT");
+        };
+        let merged = merged
+            .forward_with(&patches, timestep, &conditioning)
+            .unwrap();
+        let error = worst(&merged.data, &adapted);
+        assert!(
+            error < 1e-4,
+            "load_with_loras is off diffusers by {error}, moved {moved}"
+        );
+        println!("moved {moved}, merged off diffusers by {error}");
     }
 }
