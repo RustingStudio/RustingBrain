@@ -1090,14 +1090,14 @@ impl TransformerLm {
     /// One token per sequence is one forward pass over `sequences` rows, so
     /// on a device the weights are read once for all of them instead of once
     /// each, which is where a single sequence's decode spends its time.
-    /// Every call feeds every sequence the same number of tokens:
+    /// Prompts may differ in length:
     ///
     /// ```no_run
     /// # use rusting_brain::{Sampler, TransformerLm};
     /// # let model = TransformerLm::load_bin("model.rbw")?;
     /// # let mut sampler = Sampler::greedy();
     /// let mut decoder = model.batch_decoder(2)?;
-    /// decoder.feed(&[&[1, 2, 3], &[4, 5, 6]])?;
+    /// decoder.feed(&[&[1, 2, 3], &[4, 5]])?;
     /// let step: Vec<u32> = decoder.next(&mut sampler)?; // one id per sequence
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -2652,7 +2652,8 @@ impl Decoder<'_> {
             }
             let kv = self.device.as_mut().expect("allocated above");
             self.model.check_length(ids.len(), kv.len())?;
-            let logits = crate::gpu_model::decode(self.model, context, ids, kv, positions)?;
+            let valid = vec![1; ids.len()];
+            let logits = crate::gpu_model::decode(self.model, context, ids, kv, positions, &valid)?;
             self.model.check_device()?;
             return Ok(logits);
         }
@@ -2676,8 +2677,17 @@ pub struct BatchDecoder<'a> {
 }
 
 impl BatchDecoder<'_> {
-    /// Appends `ids[s]` to sequence `s`. Every sequence takes the same number
-    /// of tokens; pad a ragged batch, or decode it in separate sessions.
+    /// Appends `ids[s]` to sequence `s`. The prompts, the first tokens fed,
+    /// may differ in length; after them every call feeds every sequence the
+    /// same number of tokens.
+    ///
+    /// On a device, a shorter prompt is padded on the left to the longest,
+    /// with the padding masked out of attention. Rotary positions are
+    /// relative, so its logits are what it would get decoded alone, up to
+    /// rounding; but the padding still takes cache positions, so every
+    /// sequence's `max_seq_len` budget is spent at the longest one's rate.
+    /// Padding later in the history would change the distance from earlier
+    /// tokens, which is why only the prompts may be uneven.
     pub fn feed(&mut self, ids: &[&[u32]]) -> Result<(), NetworkError> {
         if ids.len() != self.histories.len() {
             return Err(NetworkError::InvalidConfig(format!(
@@ -2686,10 +2696,16 @@ impl BatchDecoder<'_> {
                 ids.len()
             )));
         }
-        let length = ids[0].len();
-        if ids.iter().any(|sequence| sequence.len() != length) {
+        let length = ids.iter().map(|sequence| sequence.len()).max().unwrap_or(0);
+        if length > 0 && ids.iter().any(|sequence| sequence.is_empty()) {
             return Err(NetworkError::InvalidConfig(
-                "every sequence in a batch decoder takes the same number of tokens".into(),
+                "a batch decoder feeds every sequence at least one token, or none".into(),
+            ));
+        }
+        let prompted = self.histories.iter().any(|history| !history.is_empty());
+        if prompted && ids.iter().any(|sequence| sequence.len() != length) {
+            return Err(NetworkError::InvalidConfig(
+                "only the prompts of a batch decoder may differ in length".into(),
             ));
         }
         self.catch_up()?;
@@ -2751,12 +2767,22 @@ impl BatchDecoder<'_> {
                 )?);
             }
             let kv = self.device.as_mut().expect("allocated above");
-            self.model.check_length(ids[0].len(), kv.len())?;
-            // Position-major, the order the device cache keeps its rows in.
-            let interleaved: Vec<u32> = (0..ids[0].len())
-                .flat_map(|position| ids.iter().map(move |sequence| sequence[position]))
-                .collect();
-            let logits = crate::gpu_model::decode(self.model, context, &interleaved, kv, 1)?;
+            let length = ids.iter().map(|sequence| sequence.len()).max().unwrap_or(0);
+            self.model.check_length(length, kv.len())?;
+            // Position-major, the order the device cache keeps its rows in,
+            // with the shorter sequences padded on the left.
+            let (interleaved, valid): (Vec<u32>, Vec<i32>) = (0..length)
+                .flat_map(|position| {
+                    ids.iter().map(move |sequence| {
+                        match position.checked_sub(length - sequence.len()) {
+                            Some(index) => (sequence[index], 1),
+                            None => (0, 0),
+                        }
+                    })
+                })
+                .unzip();
+            let logits =
+                crate::gpu_model::decode(self.model, context, &interleaved, kv, 1, &valid)?;
             self.model.check_device()?;
             return Ok(logits);
         }
@@ -3277,18 +3303,23 @@ mod tests {
         let mut gpu = cpu.clone();
         gpu.to_cuda(0, 8192).unwrap();
         let prompt: Vec<u32> = (0..130).map(|i| (i * 7 % 13) as u32).collect();
-        let mut host = cpu.decoder();
+        // The second sequence is padded by 90 positions, so whole chunks of
+        // its history are padding.
+        let prompts = [&prompt[..], &prompt[90..]];
+        let mut hosts = prompts.map(|_| cpu.decoder());
         let mut device = gpu.batch_decoder(2).unwrap();
-        host.feed(&prompt).unwrap();
-        device.feed(&[&prompt, &prompt]).unwrap();
+        for (host, prompt) in hosts.iter_mut().zip(prompts) {
+            host.feed(prompt).unwrap();
+        }
+        device.feed(&prompts).unwrap();
         for step in 0..20u32 {
             let id = step % 13;
-            host.feed(&[id]).unwrap();
             device.feed(&[&[id], &[id]]).unwrap();
-            let host_logits = host.logits.as_ref().unwrap();
-            let expected = host_logits.row(host_logits.rows - 1);
             let device_logits = device.logits.as_ref().unwrap();
-            for sequence in 0..2 {
+            for (sequence, host) in hosts.iter_mut().enumerate() {
+                host.feed(&[id]).unwrap();
+                let host_logits = host.logits.as_ref().unwrap();
+                let expected = host_logits.row(host_logits.rows - 1);
                 for (d, h) in device_logits.row(sequence).iter().zip(expected) {
                     assert!(
                         (d - h).abs() <= 1e-3,
@@ -3300,10 +3331,11 @@ mod tests {
     }
 
     /// Feeds `batched` and one single-sequence host decoder per sequence the
-    /// same turns, and checks every sequence's logits agree after each.
+    /// same turns, and checks every sequence's logits agree after each. The
+    /// prompts differ in length, so a device pads them.
     fn assert_batch_matches_single(host: &TransformerLm, batched: &TransformerLm, tolerance: f32) {
         let turns: [[&[u32]; 3]; 4] = [
-            [&[3, 8, 1, 5], &[9, 4, 11, 2], &[6, 6, 0, 13]],
+            [&[3, 8, 1, 5], &[9, 4], &[6, 6, 0, 13, 7, 2]],
             [&[7], &[2], &[10]],
             [&[2, 12], &[5, 1], &[8, 3]],
             [&[6], &[11], &[4]],
@@ -3326,6 +3358,7 @@ mod tests {
             }
         }
         assert!(batch.feed(&[&[1], &[2]]).is_err());
+        assert!(batch.feed(&[&[1], &[], &[4]]).is_err());
         assert!(batch.feed(&[&[1], &[2, 3], &[4]]).is_err());
     }
 
