@@ -220,6 +220,14 @@ __device__ __forceinline__ float warp_sum(float v){
 // decoder wants. Cross-attention clears the flag: it has two independent
 // lengths and every query sees every key, so `cols` is the key count rather
 // than the query count and the row index carries no position at all.
+// Scores `[heads, sequences, queries, cols]` after `offset` cached positions:
+// a key whose slot is padding is pushed out of the softmax, except a padding
+// query's own key, so its row still has something to normalise.
+extern "C" __global__ void mask_padding(float*s,const int*slots,int rows,int cols,int queries,int sequences,int offset){
+  long i=(long)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(long)rows*cols)return;
+  int r=i/cols,j=i-(long)r*cols,q=r%queries,seq=(r/queries)%sequences;
+  if(j!=offset+q&&slots[(long)j*sequences+seq]==0)s[i]=-3.0e38f;
+}
 extern "C" __global__ void attention_softmax_lse(float*s,float*lse,int rows,int cols,int causal,int queries,int offset){
   int lane=threadIdx.x%WARP,warps=blockDim.x/WARP;
   int stride=gridDim.x*warps;
@@ -257,9 +265,10 @@ extern "C" __global__ void attention_softmax_lse(float*s,float*lse,int rows,int 
 // reading the [query, key, value] rows of the device cache in place, and
 // writes its running max, its exp-sum and its unnormalised weighted sum of
 // values; `decode_attention_merge` rescales and adds the chunks. Position p of
-// sequence `seq` is cache row p*sequences+seq.
+// sequence `seq` is cache row p*sequences+seq, and `slots` at the same index
+// is zero where that position is padding, which no query attends to.
 #define DECODE_CHUNK 64
-extern "C" __global__ void decode_attention(const float*qkv,float*partial,int history,int sequences,int qkv_width,int head_dim,int group,int key_base,int value_base,long start,float scale,int query_width){
+extern "C" __global__ void decode_attention(const float*qkv,float*partial,const int*slots,int history,int sequences,int qkv_width,int head_dim,int group,int key_base,int value_base,long start,float scale,int query_width){
   __shared__ float s[DECODE_CHUNK];
   __shared__ float red[32];
   __shared__ float part[1024];
@@ -277,7 +286,7 @@ extern "C" __global__ void decode_attention(const float*qkv,float*partial,int hi
       #pragma unroll 8
       for(int i=sub;i<head_dim;i+=per)d+=q[i]*kp[i];}
     for(int o=per/2;o>0;o>>=1)d+=__shfl_xor_sync(0xffffffff,d,o);
-    if(sub==0&&p<count)s[p]=d*scale;}
+    if(sub==0&&p<count)s[p]=slots[(long)(first+p)*sequences+seq]?d*scale:-3.0e38f;}
   __syncthreads();
   if(warp==0){
     float m=-3.0e38f;for(int p=lane;p<count;p+=WARP)m=fmaxf(m,s[p]);

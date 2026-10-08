@@ -1564,3 +1564,21 @@ launches (18.5%); after, `im2row` 176 ms over 1038 launches (9.4%), with the
 128x128 nn GEMM rising from 466 ms to 614 ms over 2185 launches. The UNet's
 3x3 convolutions at 128x128 are too small for the gather to matter; the
 decoder's at 512 and 1024 pixels gain.
+
+## Padded batch prompts (C14, 2026-10-08)
+
+`BatchDecoder` now pads uneven prompts and reads a padding flag per cached
+position in `decode_attention`. Cost on equal-length decode, where every
+flag is 1: `bench_decode 512 256 cuda 1 int8` and `bench_decode 512 128 cuda
+16` (BF16), `bfc294e` against the change, three interleaved rounds, load 2.0
+to 2.5, tokens/s:
+
+| run | before | after |
+|---|---|---|
+| 1 sequence int8 | 1742-1751 (first round 1098, warm-up) | 1735-1747 |
+| 16 sequences BF16 | 9276-9319 | 9181-9237 |
+
+One sequence is unchanged. Sixteen sequences are about 1% slower in every
+round: the flag load sits in the score loop of `decode_attention`. Left as
+is; skipping the load when no sequence is padded would win it back if it
+matters.

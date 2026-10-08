@@ -54,6 +54,7 @@ pub(crate) struct ModelKernels {
     probs_from_lse: CudaFunction,
     softmax_lse_rows: CudaFunction,
     decode_attention: CudaFunction,
+    mask_padding: CudaFunction,
     decode_attention_merge: CudaFunction,
     quantize_q8: CudaFunction,
     dequantize_q8: CudaFunction,
@@ -103,6 +104,7 @@ impl ModelKernels {
             probs_from_lse: get("attention_probs_from_lse")?,
             softmax_lse_rows: get("attention_softmax_lse")?,
             decode_attention: get("decode_attention")?,
+            mask_padding: get("mask_padding")?,
             decode_attention_merge: get("decode_attention_merge")?,
             quantize_q8: get("quantize_rows_q8")?,
             dequantize_q8: get("dequantize_q8")?,
@@ -3505,6 +3507,12 @@ pub(crate) struct DeviceKv {
     layers: Vec<CudaSlice<f32>>,
     length: usize,
     sequences: usize,
+    /// One flag per cached row, zero where the row is padding a shorter
+    /// sequence of a batch out to the longest. Attention skips those keys.
+    slots: CudaSlice<i32>,
+    /// Whether any slot so far is padding; until then the prompt path skips
+    /// its mask kernel.
+    padded: bool,
     /// Every weight pack the decode has asked for. The model is borrowed for
     /// the decoder's life, so a pack never goes stale, and repacking on every
     /// token was half of a decode step's kernel time.
@@ -3543,6 +3551,8 @@ impl DeviceKv {
             layers,
             length: 0,
             sequences,
+            slots: gpu.upload_flags(&vec![1; positions])?,
+            padded: false,
             packs: PackMemo::new(),
             head: None,
             int8: model.int8_decode,
@@ -3566,7 +3576,10 @@ impl DeviceKv {
 /// speculative verification scores every new one.
 ///
 /// `ids` holds the same number of new positions for every sequence of `kv`,
-/// position-major: `ids[position * sequences + sequence]`.
+/// position-major: `ids[position * sequences + sequence]`. `valid` flags each
+/// of them, zero for padding: no later position attends to a padding one, and
+/// since rotary positions are relative, a sequence padded on the left scores
+/// as if it started where its real tokens do.
 ///
 /// Everything between the embedding gather and the logits stays on the
 /// device; the host cached path instead round-trips every projection.
@@ -3576,9 +3589,16 @@ pub(crate) fn decode(
     ids: &[u32],
     kv: &mut DeviceKv,
     positions: usize,
+    valid: &[i32],
 ) -> Result<Matrix, NetworkError> {
     let gpu = Gpu { context };
     let rows = ids.len();
+    if valid.len() != rows {
+        return Err(NetworkError::InvalidConfig(format!(
+            "{rows} ids came with {} padding flags",
+            valid.len()
+        )));
+    }
     let sequences = kv.sequences;
     let d_model = model.config.d_model;
     let vocab = model.embedding.vocab_size();
@@ -3604,7 +3624,14 @@ pub(crate) fn decode(
         d_model,
     )?;
 
-    let valid = gpu.upload_flags(&vec![1; rows])?;
+    let first = kv.length * sequences;
+    context
+        .stream
+        .memcpy_htod(valid, &mut kv.slots.slice_mut(first..first + rows))
+        .map_err(cuda_alloc_err("host to device copy", size_of_val(valid)))?;
+    kv.padded |= valid.contains(&0);
+    let padding = kv.padded.then_some(&kv.slots);
+    let valid = gpu.upload_flags(valid)?;
     let lend = |memo: &mut PackMemo, into_context: bool| -> Result<(), NetworkError> {
         let mut slot = context
             .packs
@@ -3626,7 +3653,7 @@ pub(crate) fn decode(
     let blocks = (|| {
         for (block, cache) in model.blocks.iter().zip(&mut kv.layers) {
             hidden = decode_block(
-                &gpu, block, hidden, cache, kv.length, sequences, rows, &valid,
+                &gpu, block, hidden, cache, kv.length, sequences, rows, &valid, &kv.slots, padding,
             )?;
         }
         let final_weight = gpu.decode_norm(&model.final_norm.weight.value.data)?;
@@ -3696,6 +3723,8 @@ fn decode_block(
     sequences: usize,
     rows: usize,
     valid: &CudaSlice<i32>,
+    slots: &CudaSlice<i32>,
+    padding: Option<&CudaSlice<i32>>,
 ) -> Result<CudaSlice<f32>, NetworkError> {
     let attention = &block.attention;
     let d_model = attention.d_model();
@@ -3789,6 +3818,7 @@ fn decode_block(
                 .launch_builder(&gpu.context.model.decode_attention)
                 .arg(&*cache)
                 .arg(&mut partial)
+                .arg(slots)
                 .arg(&(history as i32))
                 .arg(&(sequences as i32))
                 .arg(&(qkv_width as i32))
@@ -3845,6 +3875,23 @@ fn decode_block(
                 qkv_width,
                 block_scores,
             )?;
+        }
+        if let Some(slots) = padding {
+            let rows = heads * rows;
+            unsafe {
+                gpu.context
+                    .stream
+                    .launch_builder(&gpu.context.model.mask_padding)
+                    .arg(&mut scores)
+                    .arg(slots)
+                    .arg(&(rows as i32))
+                    .arg(&(history as i32))
+                    .arg(&(queries as i32))
+                    .arg(&(sequences as i32))
+                    .arg(&(offset as i32))
+                    .launch(cfg(rows * history))
+                    .map_err(cuda_err("padding mask kernel"))?;
+            }
         }
         let mut log_sum_exp = gpu.uninit(heads * rows)?;
         gpu.attention_softmax(

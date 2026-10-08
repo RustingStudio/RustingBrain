@@ -74,6 +74,10 @@
 
 ### Added
 
+- `BatchDecoder::feed` accepts prompts of different lengths. On a device the
+  shorter ones are padded on the left and the padding is masked out of
+  attention; later feeds still give every sequence the same number of
+  tokens.
 - `Sampler::min_p`, `Sampler::presence_penalty` and
   `Sampler::frequency_penalty`.
 - `TransformerLm::generate_speculative_with` runs speculative decoding with
