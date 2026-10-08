@@ -96,6 +96,7 @@
 
 ### Added
 
+- `conv::TrainableGroupNorm`: group norm over an `ImageBatch` with `gamma`/`beta` parameters, `forward -> (ImageBatch, GroupNormCache)`, `backward` and `params_mut` (asked by RustingChop and RustingCS2). Its forward is bit-equal to `conv::GroupNorm`. `new` and `forward` return a `Result` (bad group counts and channel mismatches), and `eps` is an argument where the Chop stopgap fixed Keras' 1e-3.
 - `param::Dropout`: inverted dropout with `forward(&input, &mut rng, training) -> (Matrix, DropoutMask)` and `backward(&mask, &grad)` (asked by RustingChop and RustingCS2). `Dropout::new` returns a `Result`, refusing rates outside [0, 1), where the request had a plain constructor.
 - `conv::spatial_softmax` and `conv::global_avg_pool` over an `ImageBatch`, each with its backward (`spatial_softmax_backward`, `global_avg_pool_backward`) (asked by RustingChop and RustingCS2).
 - `TrainableConv2d::without_bias()`: a convolution that adds, gathers and trains no bias, for one before a norm (asked by RustingChop). A builder rather than `bias: Option<Param>`, so the public `bias` field keeps its type.
