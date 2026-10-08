@@ -67,6 +67,11 @@
 
 ### Added
 
+- `TransformerLm::set_8bit_optimizer_state` holds the device Adam moments at
+  one byte each (block-wise, bitsandbytes' dynamic map). The default model
+  trains in 1723 MiB instead of 2037 at the same speed, and its loss over
+  2000 steps tracks the FP32 state.
+
 - `VaeEncoder::attach_device`, and `ImagePipeline::to_cuda` moves the VAE
   encoder too: image-to-image encodes a 1024x1024 picture in 0.25 s instead
   of about two minutes on the CPU.

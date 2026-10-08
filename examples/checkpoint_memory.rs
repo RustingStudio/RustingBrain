@@ -5,7 +5,9 @@
 //!
 //! A third argument `lora` compares a rank-16 LoRA run on an FP32 base with
 //! one on an int8 base (`quantize_lora_base`) and one on an NF4 base
-//! (`quantize_lora_base_4bit`) instead, none checkpointed.
+//! (`quantize_lora_base_4bit`) instead, none checkpointed. A third argument
+//! `adam8` compares FP32 Adam state with 8-bit state
+//! (`set_8bit_optimizer_state`), none checkpointed.
 
 #[cfg(feature = "cuda")]
 fn main() {
@@ -47,8 +49,9 @@ fn main() {
     };
 
     let lora = std::env::args().nth(3).is_some_and(|a| a == "lora");
+    let adam8 = std::env::args().nth(3).is_some_and(|a| a == "adam8");
     for variant in 0..if lora { 3 } else { 2 } {
-        let checkpoint = variant == 1 && !lora;
+        let checkpoint = variant == 1 && !lora && !adam8;
         let mut model = TransformerLm::builder()
             .optimizer(Optimizer::adam(1e-4))
             .max_seq_len(seq_len.max(256))
@@ -65,6 +68,9 @@ fn main() {
             }
         }
         model.to_cuda(0, 16384).unwrap();
+        model
+            .set_8bit_optimizer_state(adam8 && variant == 1)
+            .unwrap();
         model.train_step(&batch).unwrap();
         pool_high(true);
         model.train_step(&batch).unwrap();
@@ -76,6 +82,7 @@ fn main() {
         println!(
             "batch {batch_size} x seq {seq_len}, {}: peak {peak:.0} MiB, {:.1} ms/step",
             match (lora, variant) {
+                _ if adam8 => format!("8-bit Adam state {}", variant == 1),
                 (false, _) => format!("checkpoint {checkpoint}"),
                 (true, 0) => "LoRA on FP32 base".into(),
                 (true, 1) => "LoRA on int8 base".into(),
