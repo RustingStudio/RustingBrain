@@ -63,6 +63,8 @@
 
 ### Added
 
+- Tutorial chapter 18, generating images from text with a published
+  diffusion model, and a new Part V in the course index.
 - CI runs `cargo semver-checks` against the latest release tag.
 - `cuda_mmdit::DeviceDit` runs the FLUX-style MMDiT denoiser on the device
   with BF16 weights, FP32 residual streams and the fused attention kernel.
