@@ -256,6 +256,9 @@
 
 ### Fixed
 
+- A `.safetensors` header whose shape product overflows, and a LoRA file
+  with a scalar, empty or mismatched rank, are now errors. Before, release
+  builds could wrap the product and read past a buffer.
 - `ClipTextConfig::from_file` read the legacy `bos 0, eos 2` of older CLIP
   configurations (OpenAI CLIP, Stable Diffusion 1.x, FLUX.1's CLIP-L) as
   real tokens, so prompts started with `!` and pooled at the wrong row. It
