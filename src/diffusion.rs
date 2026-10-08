@@ -525,6 +525,72 @@ fn predict<D: Denoiser>(
     Ok(prediction)
 }
 
+/// Inpainting: a [`Denoiser`] that repaints only part of a latent and keeps
+/// the rest of `image`.
+///
+/// `keep` holds one weight a latent row (a packed latent's rows are its
+/// positions): 1.0 keeps the picture there, 0.0 repaints it, and anything
+/// between blends the two predictions, which softens a seam. Where it keeps,
+/// the prediction is the one whose clean image is exactly `image`, so those
+/// rows walk their own noise path down to the picture under every solver and
+/// schedule, while the model still sees them and paints the rest to match.
+///
+/// NOTE: this is the blending kind of inpainting, which any model runs.
+/// The checkpoints trained for it read the mask and the masked picture as
+/// extra input channels; load those when someone needs their sharper seams.
+pub struct Inpaint<'a, D> {
+    pub denoiser: &'a mut D,
+    pub image: &'a Matrix,
+    pub keep: &'a [f32],
+}
+
+impl<D: Denoiser> Inpaint<'_, D> {
+    fn blend(
+        &self,
+        latents: &Matrix,
+        sigma: f32,
+        mut prediction: Matrix,
+    ) -> Result<Matrix, NetworkError> {
+        if self.image.data.len() != latents.data.len() || self.keep.len() != latents.rows {
+            return Err(NetworkError::InvalidConfig(format!(
+                "inpainting a {}x{} latent needs an image of that shape and {} weights, \
+                 not {}x{} and {}",
+                latents.rows,
+                latents.cols,
+                latents.rows,
+                self.image.rows,
+                self.image.cols,
+                self.keep.len()
+            )));
+        }
+        let cols = latents.cols;
+        for (i, value) in prediction.data.iter_mut().enumerate() {
+            let keep = self.keep[i / cols];
+            let known = (latents.data[i] - self.image.data[i]) / sigma.max(1e-6);
+            *value = keep * known + (1.0 - keep) * *value;
+        }
+        Ok(prediction)
+    }
+}
+
+impl<D: Denoiser> Denoiser for Inpaint<'_, D> {
+    fn denoise(&mut self, latents: &Matrix, sigma: f32) -> Result<Matrix, NetworkError> {
+        let prediction = self.denoiser.denoise(latents, sigma)?;
+        self.blend(latents, sigma, prediction)
+    }
+
+    fn denoise_unconditional(
+        &mut self,
+        latents: &Matrix,
+        sigma: f32,
+    ) -> Result<Option<Matrix>, NetworkError> {
+        match self.denoiser.denoise_unconditional(latents, sigma)? {
+            Some(prediction) => self.blend(latents, sigma, prediction).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Multistep consistency sampling, the loop a latent consistency model (LCM)
 /// and its relatives (LCM-LoRA, TCD) run in two to eight steps.
 ///
@@ -1171,6 +1237,54 @@ mod tests {
         for (value, target) in image.data.iter().zip(&target) {
             assert!((value - target).abs() < 1e-3, "{value} vs {target}");
         }
+    }
+
+    #[test]
+    fn inpainting_keeps_the_picture_and_repaints_the_rest() {
+        // The model paints a solid 0.5; the picture is two rows of its own.
+        let image = Matrix::from_vec(3, 2, vec![1.0, -1.0, 2.0, -2.0, 0.0, 0.0]);
+        let keep = [1.0, 0.0, 0.5];
+        for (scheduler, solver) in [
+            (Scheduler::flow_match(1.0), Solver::Euler),
+            (Scheduler::flow_match(3.0), Solver::DpmPlusPlus2m),
+            (Scheduler::ddim(), Solver::EulerAncestral),
+        ] {
+            let mut model = Straight {
+                target: vec![0.5; 6],
+                calls: 0,
+            };
+            let start = noise(3, 2, Some(7));
+            let mut inpaint = Inpaint {
+                denoiser: &mut model,
+                image: &image,
+                keep: &keep,
+            };
+            let config = SamplingConfig {
+                steps: 20,
+                solver,
+                seed: Some(3),
+                ..SamplingConfig::default()
+            };
+            let out = sample(&mut inpaint, scheduler, start, &config, |_, _| true).unwrap();
+            let expected = [1.0, -1.0, 0.5, 0.5, 0.25, 0.25];
+            for (value, expected) in out.data.iter().zip(expected) {
+                assert!(
+                    (value - expected).abs() < 1e-3,
+                    "{scheduler:?} {solver:?}: {:?}",
+                    out.data
+                );
+            }
+        }
+        let mut model = Straight {
+            target: vec![0.5; 6],
+            calls: 0,
+        };
+        let mut wrong = Inpaint {
+            denoiser: &mut model,
+            image: &image,
+            keep: &keep[..2],
+        };
+        assert!(wrong.denoise(&image, 0.5).is_err());
     }
 
     #[test]

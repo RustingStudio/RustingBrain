@@ -31,7 +31,9 @@
 
 use crate::clip::ClipTextEncoder;
 use crate::conv::{FeatureMap, pixel_shuffle, pixel_unshuffle};
-use crate::diffusion::{Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_from};
+use crate::diffusion::{
+    Denoiser, Inpaint, SamplingConfig, Scheduler, Solver, noise, sample, sample_from,
+};
 use crate::matrix::Matrix;
 use crate::mmdit::{Conditioning, Dit};
 use crate::network::NetworkError;
@@ -1004,6 +1006,57 @@ impl ImagePipeline {
         seed: Option<u64>,
         on_step: impl FnMut(usize, &Matrix) -> bool,
     ) -> Result<Matrix, NetworkError> {
+        self.sample_masked(
+            conditioning,
+            unconditional,
+            latent,
+            None,
+            strength,
+            seed,
+            on_step,
+        )
+    }
+
+    /// Repaints the rows of `latent` where `keep` is 0.0 and keeps the
+    /// picture where it is 1.0, which is inpainting. `keep` holds one weight
+    /// a packed latent row, a patch of the picture, and a value between
+    /// blends; see [`Inpaint`]. `strength` is as in
+    /// [`ImagePipeline::sample_latent_from`]: 1.0 repaints from pure noise,
+    /// less starts from the picture already there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_latent_inpaint(
+        &mut self,
+        conditioning: Conditioning,
+        unconditional: Option<Conditioning>,
+        latent: &Matrix,
+        keep: &[f32],
+        strength: f32,
+        seed: Option<u64>,
+        on_step: impl FnMut(usize, &Matrix) -> bool,
+    ) -> Result<Matrix, NetworkError> {
+        let keep = Some(keep);
+        self.sample_masked(
+            conditioning,
+            unconditional,
+            latent,
+            keep,
+            strength,
+            seed,
+            on_step,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_masked(
+        &mut self,
+        conditioning: Conditioning,
+        unconditional: Option<Conditioning>,
+        latent: &Matrix,
+        keep: Option<&[f32]>,
+        strength: f32,
+        seed: Option<u64>,
+        on_step: impl FnMut(usize, &Matrix) -> bool,
+    ) -> Result<Matrix, NetworkError> {
         let patches = conditioning.height * conditioning.width;
         let channels = self.denoiser.in_channels();
         if latent.rows != patches || latent.cols != channels {
@@ -1032,14 +1085,24 @@ impl ImagePipeline {
             guidance: self.config.guidance,
             seed,
         };
-        sample_from(
-            &mut self.denoiser,
-            scheduler,
-            start,
-            &settings,
-            first,
-            on_step,
-        )
+        match keep {
+            Some(keep) => {
+                let mut inpaint = Inpaint {
+                    denoiser: &mut self.denoiser,
+                    image: latent,
+                    keep,
+                };
+                sample_from(&mut inpaint, scheduler, start, &settings, first, on_step)
+            }
+            None => sample_from(
+                &mut self.denoiser,
+                scheduler,
+                start,
+                &settings,
+                first,
+                on_step,
+            ),
+        }
     }
 
     /// Unpacks a sampled latent and decodes it to an image in `[-1, 1]`.
@@ -1790,6 +1853,25 @@ mod tests {
             .sample_latent_from(conditioning, None, &latent, 0.0, Some(4), |_, _| true)
             .unwrap();
         assert_eq!(untouched.data, latent.data);
+
+        // Inpainting from pure noise keeps the rows it is told to keep and
+        // repaints the others.
+        let mut keep = vec![1.0; latent.rows];
+        keep[0] = 0.0;
+        let conditioning = loaded.condition("a lighthouse", 8, 8).unwrap();
+        let painted = loaded
+            .sample_latent_inpaint(conditioning, None, &latent, &keep, 1.0, Some(4), |_, _| {
+                true
+            })
+            .unwrap();
+        for (row, &keep) in keep.iter().enumerate() {
+            let same = painted
+                .row(row)
+                .iter()
+                .zip(latent.row(row))
+                .all(|(a, b)| (a - b).abs() < 1e-4);
+            assert_eq!(same, keep == 1.0, "row {row}");
+        }
 
         // A pipeline without the encoder half says so rather than guessing.
         loaded.image_encoder = None;
