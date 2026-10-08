@@ -243,6 +243,16 @@ impl Positions {
         Self { cos, sin, pairs }
     }
 
+    /// The opposite rotation, which carries a gradient back through
+    /// [`Positions::apply`].
+    pub(crate) fn inverse(&self) -> Self {
+        Self {
+            cos: self.cos.clone(),
+            sin: self.sin.iter().map(|sin| -sin).collect(),
+            pairs: self.pairs,
+        }
+    }
+
     /// Rotates every head of a `[tokens, heads * head_dim]` matrix in place.
     pub(crate) fn apply(&self, values: &mut Matrix, num_heads: usize) {
         let head_dim = self.pairs * 2;
@@ -394,7 +404,7 @@ pub(crate) fn modulate(tokens: &Matrix, shift: &[f32], scale: &[f32]) -> Matrix 
 }
 
 /// `target += gate * source`, the gated residual add every block ends with.
-fn gated_add(target: &mut Matrix, source: &Matrix, gate: &[f32]) {
+pub(crate) fn gated_add(target: &mut Matrix, source: &Matrix, gate: &[f32]) {
     let width = target.cols;
     target
         .data
@@ -453,7 +463,7 @@ pub(crate) struct Modulation {
 
 impl Modulation {
     /// Triples of `(shift, scale, gate)`, in the checkpoint's order.
-    fn forward(&self, vector: &[f32]) -> Result<Vec<[Vec<f32>; 3]>, NetworkError> {
+    pub(crate) fn forward(&self, vector: &[f32]) -> Result<Vec<[Vec<f32>; 3]>, NetworkError> {
         let activated: Vec<f32> = vector.iter().map(|value| silu(*value)).collect();
         let values = self.projection.apply(&activated)?;
         let width = values.len() / (self.chunks * 3);
@@ -982,7 +992,7 @@ impl Denoiser for Dit {
 }
 
 /// Two sequences, one after the other.
-fn concatenate(first: &Matrix, second: &Matrix) -> Matrix {
+pub(crate) fn concatenate(first: &Matrix, second: &Matrix) -> Matrix {
     let mut data = Vec::with_capacity(first.data.len() + second.data.len());
     data.extend_from_slice(&first.data);
     data.extend_from_slice(&second.data);
@@ -990,7 +1000,7 @@ fn concatenate(first: &Matrix, second: &Matrix) -> Matrix {
 }
 
 /// Two matrices of the same height, side by side.
-fn concatenate_columns(left: &Matrix, right: &Matrix) -> Matrix {
+pub(crate) fn concatenate_columns(left: &Matrix, right: &Matrix) -> Matrix {
     let mut output = Matrix::new(left.rows, left.cols + right.cols);
     for row in 0..left.rows {
         let target = output.row_mut(row);
@@ -1001,7 +1011,7 @@ fn concatenate_columns(left: &Matrix, right: &Matrix) -> Matrix {
 }
 
 /// The inverse of [`concatenate`].
-fn split(tokens: &Matrix, first: usize) -> (Matrix, Matrix) {
+pub(crate) fn split(tokens: &Matrix, first: usize) -> (Matrix, Matrix) {
     let cut = first * tokens.cols;
     (
         Matrix::from_vec(first, tokens.cols, tokens.data[..cut].to_vec()),
