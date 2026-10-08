@@ -91,6 +91,10 @@ name = "cuda_image_bench"
 required-features = ["cuda"]
 
 [[example]]
+name = "chop_block_step"
+required-features = ["cuda"]
+
+[[example]]
 name = "train_dit_lora"
 required-features = ["cuda", "images"]
 

@@ -1721,3 +1721,21 @@ projection. Load 4.2.
 
 1612 MiB of device memory in use. FLUX.1 itself is not timed: its BF16
 weights (24 GB) do not fit the 12 GB card.
+
+## Device-resident image training (K8d, 2026-10-09)
+
+`examples/chop_block_step.rs` times one forward and backward pass through
+RustingChop's seven convolution blocks (conv 3x3 without bias, GroupNorm with
+min(8, c) groups, SiLU; strides 2, 1, 2, 1, 2, 1, 2; widths 32 to 128) plus
+spatial softmax and global average pooling, on a 128 x 96 x 192 x 15 batch.
+Median of five steps after one warm-up, RTX 3060, at `c8851ce` plus the example.
+Load average 1.5 at the end of the run (another project's GPU job had just
+released the lock).
+
+| Path | Step (ms) |
+|---|---|
+| per-layer: each conv uploads its input and downloads its output, GroupNorm and SiLU on the host | 1002.3 |
+| device-resident: only the input goes up | 98.9 |
+
+The device-resident path is 10.1x faster. The head after the pooled features
+is not in either number.
