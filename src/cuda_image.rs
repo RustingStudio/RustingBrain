@@ -1981,8 +1981,6 @@ impl ImageGpu {
 // The backward operations, for adapters trained on a frozen UNet.
 // ---------------------------------------------------------------------------
 
-// The adapter training pass that calls these is the next step of roadmap G10b.
-#[allow(dead_code)]
 impl ImageGpu {
     /// `dL/d(input)` of [`ImageGpu::conv`] for an input of `height` by
     /// `width`: `weight^T . grad` lowered to columns, a chunk of output rows at
@@ -2375,9 +2373,26 @@ impl ImageGpu {
         (heads, head_dim, first, rows, context): (usize, usize, usize, usize, usize),
     ) -> Result<(), NetworkError> {
         let source = rows_of.data.slice(rows_of.base + first * rows_of.lead..);
-        let (source_pointer, _source) = source.device_ptr(&self.context.stream);
-        let (probability_pointer, _probability) =
-            probabilities.data.device_ptr(&self.context.stream);
+        self.sum_lhs_transposed(
+            (&probabilities.data.slice(..), context, rows * context),
+            (&source, rows_of.lead, head_dim),
+            (out, units, head_dim),
+            (rows, context, head_dim, heads),
+        )
+    }
+
+    /// `out[n, m] += a[k, n]^T . b[k, m]` in FP32, `batch` times. Each
+    /// operand is its buffer, its row pitch and its step from one batch entry
+    /// to the next, in elements.
+    fn sum_lhs_transposed(
+        &self,
+        (a, a_lead, a_step): (&CudaView<'_, f16>, usize, usize),
+        (b, b_lead, b_step): (&CudaView<'_, f16>, usize, usize),
+        (out, out_lead, out_step): (&mut CudaSlice<f32>, usize, usize),
+        (k, n, m, batch): (usize, usize, usize, usize),
+    ) -> Result<(), NetworkError> {
+        let (a_pointer, _a) = a.device_ptr(&self.context.stream);
+        let (b_pointer, _b) = b.device_ptr(&self.context.stream);
         let (out_pointer, _out) = out.device_ptr_mut(&self.context.stream);
         let one = 1.0f32;
         unsafe {
@@ -2385,29 +2400,29 @@ impl ImageGpu {
                 *self.context.blas.handle(),
                 cublasOperation_t::CUBLAS_OP_N,
                 cublasOperation_t::CUBLAS_OP_T,
-                head_dim as i32,
-                context as i32,
-                rows as i32,
+                m as i32,
+                n as i32,
+                k as i32,
                 &one as *const f32 as *const std::ffi::c_void,
-                source_pointer as *const std::ffi::c_void,
+                b_pointer as *const std::ffi::c_void,
                 cublas_sys::cudaDataType_t::CUDA_R_16F,
-                rows_of.lead as i32,
-                head_dim as i64,
-                probability_pointer as *const std::ffi::c_void,
+                b_lead as i32,
+                b_step as i64,
+                a_pointer as *const std::ffi::c_void,
                 cublas_sys::cudaDataType_t::CUDA_R_16F,
-                context as i32,
-                (rows * context) as i64,
+                a_lead as i32,
+                a_step as i64,
                 &one as *const f32 as *const std::ffi::c_void,
                 out_pointer as *mut std::ffi::c_void,
                 cublas_sys::cudaDataType_t::CUDA_R_32F,
-                units as i32,
-                head_dim as i64,
-                heads as i32,
+                out_lead as i32,
+                out_step as i64,
+                batch as i32,
                 cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
         }
-        .map_err(cuda_err("attention backward GEMM"))
+        .map_err(cuda_err("FP32 accumulating GEMM"))
     }
 }
 
