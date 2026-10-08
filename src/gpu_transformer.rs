@@ -66,6 +66,12 @@ pub struct GpuContext {
     scatter: CudaFunction,
     im2col_train: CudaFunction,
     col2im_train: CudaFunction,
+    bias_act: CudaFunction,
+    fill: CudaFunction,
+    /// Host-device copies through [`GpuContext::upload`] and
+    /// [`GpuContext::download`], which is how a test proves a chain of device
+    /// layers never leaves the card.
+    transfers: std::sync::atomic::AtomicUsize,
     /// The fused kernels the device-resident training path uses.
     pub(crate) model: crate::gpu_model::ModelKernels,
     /// The fused attention kernel, present only on Ampere and later. `None`
@@ -162,6 +168,9 @@ impl GpuContext {
             scatter: get("scatter_rows_neg")?,
             im2col_train: get("im2col_train")?,
             col2im_train: get("col2im_train")?,
+            bias_act: get("bias_act")?,
+            fill: get("fill_f32")?,
+            transfers: std::sync::atomic::AtomicUsize::new(0),
             model: crate::gpu_model::ModelKernels::load(&module)?,
             flash: crate::cuda_flash::flash_kernels(device, &context),
             rope: Mutex::new(None),
@@ -209,6 +218,7 @@ impl GpuContext {
     }
 
     pub(crate) fn upload(&self, matrix: &Matrix) -> Result<CudaSlice<f32>, NetworkError> {
+        self.count_transfer();
         self.stream.clone_htod(&matrix.data).map_err(cuda_alloc_err(
             "host to device copy",
             std::mem::size_of_val(&matrix.data[..]),
@@ -220,9 +230,60 @@ impl GpuContext {
         source: &CudaSlice<f32>,
         target: &mut Matrix,
     ) -> Result<(), NetworkError> {
+        self.count_transfer();
         self.stream
             .memcpy_dtoh(source, &mut target.data)
             .map_err(cuda_err("device to host copy"))
+    }
+
+    fn count_transfer(&self) {
+        self.transfers
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many times [`GpuContext::upload`] and [`GpuContext::download`] ran.
+    #[cfg(test)]
+    pub(crate) fn transfers(&self) -> usize {
+        self.transfers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `len` copies of `value`.
+    pub(crate) fn filled(&self, len: usize, value: f32) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut out = self.zeros(len)?;
+        let n = len as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.fill)
+                .arg(&mut out)
+                .arg(&n)
+                .arg(&value)
+                .launch(cfg(len))
+                .map_err(cuda_err("fill kernel"))?;
+        }
+        Ok(out)
+    }
+
+    /// Adds `bias[cols]` to every row of `rows[.., cols]`.
+    pub(crate) fn add_bias_rows(
+        &self,
+        rows: &mut CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        cols: usize,
+    ) -> Result<(), NetworkError> {
+        let len = rows.len();
+        let (count, cols, none) = ((len / cols) as i32, cols as i32, 0i32);
+        unsafe {
+            self.stream
+                .launch_builder(&self.bias_act)
+                .arg(rows)
+                .arg(bias)
+                .arg(&count)
+                .arg(&cols)
+                .arg(&none)
+                .launch(cfg(len))
+                .map_err(cuda_err("bias kernel"))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn zeros(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {

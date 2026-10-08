@@ -71,6 +71,7 @@ extern "C" __global__ void mse_sum(float *out,const float*y,const float*t,int n)
 extern "C" __global__ void mse_epoch_sum(float *out,const float*y,const float*t,int n,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=y[i]-t[i];atomicAdd(out,z*z*scale);}}
 extern "C" __global__ void gather_rows(float*out,const float*all,const unsigned int*order,int start,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*width){int r=i/width,c=i%width;out[i]=all[order[start+r]*width+c];}}
 extern "C" __global__ void scale_inplace(float*g,int n,float s){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)g[i]*=s;}
+extern "C" __global__ void fill_f32(float*x,int n,float v){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)x[i]=v;}
 
 // im2col and its transpose for a trainable convolution, in FP32.
 //

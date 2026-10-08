@@ -450,6 +450,69 @@ impl ImageBatch {
     }
 }
 
+/// An [`ImageBatch`] held on a device, in the same layout, so a chain of
+/// device layers passes activations without crossing the bus. Made by
+/// [`crate::param::CudaDevice::upload`].
+#[cfg(feature = "cuda")]
+pub struct DeviceImageBatch {
+    pub batch: usize,
+    pub height: usize,
+    pub width: usize,
+    channels: usize,
+    pub(crate) data: cudarc::driver::CudaSlice<f32>,
+    context: std::sync::Arc<crate::gpu_transformer::GpuContext>,
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceImageBatch {
+    pub(crate) fn upload(
+        context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
+        batch: &ImageBatch,
+    ) -> Result<Self, NetworkError> {
+        Ok(Self {
+            batch: batch.batch,
+            height: batch.height,
+            width: batch.width,
+            channels: batch.channels(),
+            data: context.upload(&batch.tokens)?,
+            context: context.clone(),
+        })
+    }
+
+    /// Copies the batch back to the host.
+    pub fn download(&self) -> Result<ImageBatch, NetworkError> {
+        let mut tokens = Matrix::new(self.batch * self.pixels(), self.channels);
+        self.context.download(&self.data, &mut tokens)?;
+        Ok(ImageBatch::from_tokens(
+            self.batch,
+            self.height,
+            self.width,
+            tokens,
+        ))
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn pixels(&self) -> usize {
+        self.height * self.width
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl crate::param::CudaDevice {
+    /// Puts a batch on this device for [`TrainableConv2d::forward_device`].
+    pub fn upload(&self, batch: &ImageBatch) -> Result<DeviceImageBatch, NetworkError> {
+        DeviceImageBatch::upload(self.context(), batch)
+    }
+
+    /// [`DeviceImageBatch::download`].
+    pub fn download(&self, batch: &DeviceImageBatch) -> Result<ImageBatch, NetworkError> {
+        batch.download()
+    }
+}
+
 /// Everything `im2col` and `col2im` need to know about one convolution, which
 /// is what the device kernels take as their arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -682,17 +745,17 @@ impl TrainableConv2d {
         self.recompute_columns
     }
 
-    /// Moves the weight onto a device a caller already opened. Every later
-    /// [`TrainableConv2d::forward`] and [`TrainableConv2d::backward`] then
-    /// builds its columns and runs its GEMMs there, and only the activation
-    /// and its gradient cross the bus.
-    ///
-    /// The bias stays on the host: both its use and its gradient are host
-    /// passes over buffers already there. Moving it too left the device copy
-    /// owning the value while the gradient landed in the host copy, so the
-    /// optimizer stepped it with zero and it never trained.
+    /// Moves the weight and the bias onto a device a caller already opened.
+    /// Every later [`TrainableConv2d::forward`] and
+    /// [`TrainableConv2d::backward`] then runs entirely there, and only the
+    /// activation and its gradient cross the bus; `forward_device` and
+    /// `backward_device` skip even that.
     pub fn to_cuda_on(&mut self, device: &crate::param::CudaDevice) -> Result<(), NetworkError> {
-        self.weight.to_cuda_on(device)
+        self.weight.to_cuda_on(device)?;
+        if self.has_bias {
+            self.bias.to_cuda_on(device)?;
+        }
+        Ok(())
     }
 
     /// Brings the weight and the bias back to the host.
@@ -711,8 +774,8 @@ impl TrainableConv2d {
         }
         let shape = self.geometry(input.batch, input.height, input.width);
         #[cfg(feature = "cuda")]
-        if self.weight.weight.device.is_some() {
-            return self.forward_on_device(input, shape);
+        if let Some(device) = &self.weight.weight.device {
+            return self.forward_on_device(input, device);
         }
         let columns = self.im2col(input, &shape);
         let mut tokens = self.weight.forward(&columns);
@@ -742,18 +805,8 @@ impl TrainableConv2d {
                 Ok(self.col2im(&grad_columns, &cache.shape))
             }
             #[cfg(feature = "cuda")]
-            Columns::Device(columns) => self.backward_on_device(columns, &cache.shape, grad_output),
-            #[cfg(feature = "cuda")]
-            Columns::DeviceInput(input) => {
-                let device = self
-                    .weight
-                    .weight
-                    .device
-                    .as_ref()
-                    .expect("a device-resident cache means a device-resident weight");
-                let context = device.context().clone();
-                let columns = context.im2col(input, &cache.shape)?;
-                self.backward_on_device(&columns, &cache.shape, grad_output)
+            Columns::Device(_) | Columns::DeviceInput(_) => {
+                self.backward_on_device(cache, grad_output)
             }
             Columns::Input(input) => {
                 self.accumulate_bias_grad(&grad_output.tokens);
@@ -764,35 +817,45 @@ impl TrainableConv2d {
         }
     }
 
-    /// The forward pass with the columns built and consumed on the device.
+    /// The forward pass for an input that is already on the device, leaving
+    /// the output there too. Needs [`TrainableConv2d::to_cuda_on`] first.
     #[cfg(feature = "cuda")]
-    fn forward_on_device(
+    pub fn forward_device(
         &self,
-        input: &ImageBatch,
-        shape: ConvGeometry,
-    ) -> Result<(ImageBatch, ConvCache), NetworkError> {
-        let device = self
-            .weight
-            .weight
-            .device
-            .as_ref()
-            .expect("the caller checked residency");
+        input: &DeviceImageBatch,
+    ) -> Result<(DeviceImageBatch, ConvCache), NetworkError> {
+        if input.channels != self.in_channels {
+            return Err(NetworkError::InvalidConfig(format!(
+                "this convolution reads {} channels and was given {}",
+                self.in_channels, input.channels
+            )));
+        }
+        let device = self.weight.weight.device.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig("forward_device needs the weight on a device".into())
+        })?;
+        let shape = self.geometry(input.batch, input.height, input.width);
         let context = device.context();
-        let resident_input = context.upload(&input.tokens)?;
-        let columns = context.im2col(&resident_input, &shape)?;
-        let product = device.matmul_rhs_transposed_device(&columns, shape.rows())?;
-        let mut tokens = Matrix::new(shape.rows(), self.out_channels());
-        context.download(&product, &mut tokens)?;
-        self.add_bias(&mut tokens);
+        let columns = context.im2col(&input.data, &shape)?;
+        let mut product = device.matmul_rhs_transposed_device(&columns, shape.rows())?;
+        if let Some(bias) = self.bias.device.as_ref().filter(|_| self.has_bias) {
+            context.add_bias_rows(&mut product, bias.value(), self.out_channels())?;
+        }
         Ok((
-            ImageBatch::from_tokens(input.batch, shape.out_height, shape.out_width, tokens),
+            DeviceImageBatch {
+                batch: input.batch,
+                height: shape.out_height,
+                width: shape.out_width,
+                channels: self.out_channels(),
+                data: product,
+                context: context.clone(),
+            },
             ConvCache {
                 // Dropping the device columns here is the whole point of the
                 // option: they are freed before the next layer allocates its
                 // own, so a deep network holds one layer's worth rather than
                 // every layer's.
                 columns: match self.recompute_columns {
-                    true => Columns::DeviceInput(resident_input),
+                    true => Columns::DeviceInput(input.data.clone()),
                     false => Columns::Device(columns),
                 },
                 shape,
@@ -800,33 +863,80 @@ impl TrainableConv2d {
         ))
     }
 
+    /// The backward pass for a gradient that is already on the device, for a
+    /// cache [`TrainableConv2d::forward_device`] (or a device-resident
+    /// [`TrainableConv2d::forward`]) built. Accumulates the weight and bias
+    /// gradients on the device and returns `dL/dinput` there.
+    #[cfg(feature = "cuda")]
+    pub fn backward_device(
+        &mut self,
+        cache: &ConvCache,
+        grad_output: &DeviceImageBatch,
+    ) -> Result<DeviceImageBatch, NetworkError> {
+        let shape = &cache.shape;
+        let device = self.weight.weight.device.as_mut().ok_or_else(|| {
+            NetworkError::InvalidConfig("backward_device needs the weight on a device".into())
+        })?;
+        let context = device.context().clone();
+        let rebuilt;
+        let columns = match &cache.columns {
+            Columns::Device(columns) => columns,
+            Columns::DeviceInput(input) => {
+                rebuilt = context.im2col(input, shape)?;
+                &rebuilt
+            }
+            _ => {
+                return Err(NetworkError::InvalidConfig(
+                    "backward_device needs a cache from a device forward pass".into(),
+                ));
+            }
+        };
+        device.accumulate_grad_device(&grad_output.data, columns, shape.rows())?;
+        let grad_columns = device.matmul_device(&grad_output.data, shape.rows())?;
+        if let Some(bias) = self.bias.device.as_mut().filter(|_| self.has_bias) {
+            // The column sum as a GEMM against ones, which keeps the negated
+            // accumulate convention in one place.
+            let ones = context.filled(shape.rows(), 1.0)?;
+            bias.accumulate_grad_device(&ones, &grad_output.data, shape.rows())?;
+        }
+        Ok(DeviceImageBatch {
+            batch: shape.batch,
+            height: shape.height,
+            width: shape.width,
+            channels: shape.channels,
+            data: context.col2im(&grad_columns, shape)?,
+            context,
+        })
+    }
+
+    /// [`TrainableConv2d::forward_device`] between an upload and a download.
+    #[cfg(feature = "cuda")]
+    fn forward_on_device(
+        &self,
+        input: &ImageBatch,
+        device: &crate::gpu_transformer::DeviceParam,
+    ) -> Result<(ImageBatch, ConvCache), NetworkError> {
+        let resident = DeviceImageBatch::upload(device.context(), input)?;
+        let (output, cache) = self.forward_device(&resident)?;
+        Ok((output.download()?, cache))
+    }
+
     #[cfg(feature = "cuda")]
     fn backward_on_device(
         &mut self,
-        columns: &cudarc::driver::CudaSlice<f32>,
-        shape: &ConvGeometry,
+        cache: &ConvCache,
         grad_output: &ImageBatch,
     ) -> Result<ImageBatch, NetworkError> {
-        self.accumulate_bias_grad(&grad_output.tokens);
-        let device = self
+        let context = self
             .weight
             .weight
             .device
-            .as_mut()
-            .expect("a device-resident cache means a device-resident weight");
-        let context = device.context().clone();
-        let resident_grad = context.upload(&grad_output.tokens)?;
-        device.accumulate_grad_device(&resident_grad, columns, shape.rows())?;
-        let grad_columns = device.matmul_device(&resident_grad, shape.rows())?;
-        let grad_input = context.col2im(&grad_columns, shape)?;
-        let mut tokens = Matrix::new(shape.batch * shape.height * shape.width, shape.channels);
-        context.download(&grad_input, &mut tokens)?;
-        Ok(ImageBatch::from_tokens(
-            shape.batch,
-            shape.height,
-            shape.width,
-            tokens,
-        ))
+            .as_ref()
+            .expect("a device-resident cache means a device-resident weight")
+            .context()
+            .clone();
+        let resident = DeviceImageBatch::upload(&context, grad_output)?;
+        self.backward_device(cache, &resident)?.download()
     }
 
     fn add_bias(&self, tokens: &mut Matrix) {
@@ -1800,6 +1910,86 @@ mod tests {
                 (a - b).abs() < 1e-3,
                 "weight[{index}]: {a} on the host against {b} on the device"
             );
+        }
+    }
+
+    /// Two biased convolutions chained on the device: activations and
+    /// gradients cross the bus only at the two ends, and every output and
+    /// gradient matches the host chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_device_chain_stays_on_the_card_and_matches_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(31);
+        let mut first = TrainableConv2d::new(6, 8, 3, 2, &mut rng).unwrap();
+        let mut second = TrainableConv2d::new(8, 5, 3, 1, &mut rng).unwrap();
+        first.bias.value.data = noise(1, 1, 8, 1, 3).tokens.data;
+        second.bias.value.data = noise(1, 1, 5, 1, 4).tokens.data;
+        second.set_recompute_columns(true);
+        let (mut host_first, mut host_second) = (first.clone(), second.clone());
+        first.to_cuda_on(&device).unwrap();
+        second.to_cuda_on(&device).unwrap();
+
+        let input = noise(3, 11, 9, 6, 1);
+        let (middle, first_cache) = host_first.forward(&input).unwrap();
+        let (expected, second_cache) = host_second.forward(&middle).unwrap();
+        let grad = noise(3, expected.height, expected.width, 5, 2);
+        let expected_grad = host_first
+            .backward(
+                &first_cache,
+                &host_second.backward(&second_cache, &grad).unwrap(),
+            )
+            .unwrap();
+
+        let context = device.context();
+        let resident = device.upload(&input).unwrap();
+        let resident_grad = device.upload(&grad).unwrap();
+        let before = context.transfers();
+        let (middle, first_cache) = first.forward_device(&resident).unwrap();
+        let (output, second_cache) = second.forward_device(&middle).unwrap();
+        let back = second
+            .backward_device(&second_cache, &resident_grad)
+            .unwrap();
+        let input_grad = first.backward_device(&first_cache, &back).unwrap();
+        assert_eq!(
+            context.transfers(),
+            before,
+            "nothing crosses inside the chain"
+        );
+
+        let close = |a: &[f32], b: &[f32], what: &str| {
+            assert_eq!(a.len(), b.len(), "{what}");
+            for (index, (a, b)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-4 + 1e-4 * b.abs(),
+                    "{what}[{index}]: {a} against {b}"
+                );
+            }
+        };
+        close(
+            &device.download(&output).unwrap().tokens.data,
+            &expected.tokens.data,
+            "output",
+        );
+        close(
+            &input_grad.download().unwrap().tokens.data,
+            &expected_grad.tokens.data,
+            "input grad",
+        );
+        first.to_cpu().unwrap();
+        second.to_cpu().unwrap();
+        for (device_side, host_side, what) in [
+            (&first, &host_first, "first"),
+            (&second, &host_second, "second"),
+        ] {
+            close(
+                &device_side.weight.weight.grad.data,
+                &host_side.weight.weight.grad.data,
+                what,
+            );
+            close(&device_side.bias.grad.data, &host_side.bias.grad.data, what);
         }
     }
 
