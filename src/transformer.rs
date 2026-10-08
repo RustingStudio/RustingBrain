@@ -1821,6 +1821,33 @@ impl TransformerLm {
         Ok(())
     }
 
+    /// The natural-log probability the model gives each token of `ids` after
+    /// the ones before it: `ids.len() - 1` values, the first for `ids[1]`.
+    ///
+    /// Their sum scores a whole continuation, for ranking candidates or
+    /// classifying by the most probable label; minus their mean is the loss
+    /// [`evaluate`](TransformerLm::evaluate) reports for this one sequence.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::TransformerLm;
+    /// # let model = TransformerLm::load_bin("model.rbw")?;
+    /// let score: f32 = model.log_probabilities(&[1, 2, 3, 4])?.iter().sum();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn log_probabilities(&self, ids: &[u32]) -> Result<Vec<f32>, NetworkError> {
+        let (logits, _) = self.forward_train(&[ids])?;
+        Ok(ids
+            .windows(2)
+            .enumerate()
+            .map(|(row, pair)| {
+                let logits = logits.row(row);
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let log_sum = max + logits.iter().map(|l| (l - max).exp()).sum::<f32>().ln();
+                logits[pair[1] as usize] - log_sum
+            })
+            .collect())
+    }
+
     /// The loss over a batch, without gradients and without a step.
     ///
     /// This is what a held-out split is for: training loss falls whether or not
@@ -3541,6 +3568,53 @@ mod tests {
         let model = tiny().build().unwrap();
         assert_batch_matches_single(&model, &model, 1e-5);
         assert!(model.batch_decoder(0).is_err());
+    }
+
+    /// Checks per-token log-probabilities against the loss `evaluate` takes
+    /// over the same sequence, and each one against a decoder's logits.
+    fn assert_log_probabilities_match_the_loss(model: &TransformerLm, tolerance: f32) {
+        let ids = [3, 8, 1, 5, 9, 4, 11];
+        let scores = model.log_probabilities(&ids).unwrap();
+        assert_eq!(scores.len(), ids.len() - 1);
+        let loss = model
+            .evaluate(&TokenBatch::new(&[ids]).unwrap())
+            .unwrap()
+            .lm_loss;
+        let mean = -scores.iter().sum::<f32>() / scores.len() as f32;
+        assert!(
+            (mean - loss).abs() <= tolerance,
+            "{mean} against loss {loss}"
+        );
+        let mut decoder = model.decoder();
+        decoder.feed(&ids[..3]).unwrap();
+        let logits = decoder.logits().unwrap();
+        let log_sum = logits.iter().map(|l| l.exp()).sum::<f32>().ln();
+        let expected = logits[ids[3] as usize] - log_sum;
+        assert!(
+            (scores[2] - expected).abs() <= tolerance,
+            "{} against {expected}",
+            scores[2]
+        );
+    }
+
+    #[test]
+    fn log_probabilities_match_the_loss_and_the_decoder() {
+        assert_log_probabilities_match_the_loss(&tiny().build().unwrap(), 1e-5);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_log_probabilities_match_the_loss_or_skip_without_device() {
+        match crate::cuda_training::cuda_doctor(0, 8192) {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("skipping: {err}");
+                return;
+            }
+        }
+        let mut model = tiny().build().unwrap();
+        model.to_cuda(0, 8192).unwrap();
+        assert_log_probabilities_match_the_loss(&model, 1e-3);
     }
 
     #[test]

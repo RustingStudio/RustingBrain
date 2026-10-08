@@ -77,6 +77,8 @@
 
 ### Added
 
+- `TransformerLm::log_probabilities` gives each token's log-probability
+  after the ones before it, for scoring and ranking texts.
 - `TransformerLm::generate_beam` runs beam search, with an optional end
   token.
 - `Decoder::fork` copies a session, so a shared prefix is prefilled once
