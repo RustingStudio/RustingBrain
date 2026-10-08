@@ -192,7 +192,6 @@ impl Dense {
     /// The weight as `f32`, widening it first if it is stored quantized.
     ///
     /// Borrowed in the common case, so a float layer costs nothing to ask.
-    #[cfg(feature = "cuda")]
     pub(crate) fn weight_f32(&self) -> std::borrow::Cow<'_, Matrix> {
         match &self.quantized {
             Some(quantized) => std::borrow::Cow::Owned(quantized.dequantize()),

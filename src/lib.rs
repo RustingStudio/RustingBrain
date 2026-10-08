@@ -109,6 +109,7 @@ pub mod clip;
 pub mod conv;
 pub mod dataset;
 pub mod diffusion;
+pub mod dit_lora;
 pub mod ema;
 pub mod embedding;
 pub mod ffn;

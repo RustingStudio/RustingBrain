@@ -90,6 +90,10 @@
 
 ### Added
 
+- `dit_lora::DitLora`: LoRA adapters on a DiT's block projections, read from
+  a diffusers-FLUX PEFT file, with a host forward and backward pass whose
+  adapter gradients match PyTorch autograd within 6e-5. It is the reference
+  for DiT LoRA training on the GPU.
 - Textual inversion: `ImagePipeline::add_embedding` adds a learned prompt
   token from a diffusers, A1111 or SDXL (`clip_l`/`clip_g`) safetensors file
   to every CLIP tower, and a multi-vector token stands for all its vectors,

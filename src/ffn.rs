@@ -244,7 +244,7 @@ pub fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + (COEFFICIENT * (x + 0.044_715 * x * x * x)).tanh())
 }
 
-fn gelu_derivative(x: f32) -> f32 {
+pub(crate) fn gelu_derivative(x: f32) -> f32 {
     const COEFFICIENT: f32 = 0.797_884_6;
     let inner = COEFFICIENT * (x + 0.044_715 * x * x * x);
     let tanh = inner.tanh();
