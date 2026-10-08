@@ -624,6 +624,21 @@ extern "C" __global__ void upsample_bwd(half_t*out,const half_t*in,
     for(int dx=0;dx<factor;dx++)sum+=h2f(source[dy*wide+dx]);
   out[i]=f2h(sum);
 }
+
+// `dL/ds` of each softmax row times `scale`, in place over `dL/dp` in `g`:
+// `scale * p * (g - p . g)`. A warp a row.
+extern "C" __global__ void softmax_bwd(half_t*__restrict__ g,const half_t*__restrict__ p,
+    int context,int rows,float scale){
+  int row=blockIdx.x*WARPS+(threadIdx.x>>5);
+  if(row>=rows)return;
+  int lane=threadIdx.x&31;
+  half_t*gr=g+(long long)row*context;
+  const half_t*pr=p+(long long)row*context;
+  float dot=0.f;
+  for(int i=lane;i<context;i+=32)dot+=h2f(pr[i])*h2f(gr[i]);
+  dot=warp_sum(dot);
+  for(int i=lane;i<context;i+=32)gr[i]=f2h(scale*h2f(pr[i])*(h2f(gr[i])-dot));
+}
 "#;
 
 mod lora;
@@ -668,6 +683,7 @@ pub struct ImageGpu {
     gelu_gate_bwd: CudaFunction,
     silu_bwd: CudaFunction,
     upsample_bwd: CudaFunction,
+    softmax_bwd: CudaFunction,
 }
 
 impl std::fmt::Debug for ImageGpu {
@@ -715,6 +731,7 @@ impl ImageGpu {
             gelu_gate_bwd: get("gelu_gate_bwd")?,
             silu_bwd: get("silu_bwd")?,
             upsample_bwd: get("upsample_bwd")?,
+            softmax_bwd: get("softmax_bwd")?,
         }))
     }
 
@@ -1778,11 +1795,6 @@ impl ImageGpu {
             return Ok(output);
         }
         let chunk = (SCORE_BUDGET / (heads * context).max(1)).clamp(1, tokens);
-        // Nothing is masked and the row packs into whole quads, so the
-        // softmax can move four scores per load. A short row goes to a warp,
-        // a long one to a whole block.
-        let packed = !causal && context % 4 == 0;
-        let by_warp = !causal && context <= WARP_SCORES;
         let mut scores = self.uninit(heads * chunk, context)?;
         let mut output = self.uninit(tokens, queries.cols)?;
 
@@ -1799,31 +1811,7 @@ impl ImageGpu {
                 context,
                 scale,
             )?;
-            let lines = heads * rows;
-            unsafe {
-                match by_warp {
-                    true => self
-                        .context
-                        .stream
-                        .launch_builder(&self.softmax_warp)
-                        .arg(&mut scores.data)
-                        .arg(&(context as i32))
-                        .arg(&(lines as i32))
-                        .launch(grid(lines.div_ceil(THREADS as usize / 32))),
-                    false => self
-                        .context
-                        .stream
-                        .launch_builder(&self.softmax_rows)
-                        .arg(&mut scores.data)
-                        .arg(&(context as i32))
-                        .arg(&(rows as i32))
-                        .arg(&i32::from(causal))
-                        .arg(&(first as i32))
-                        .arg(&i32::from(packed))
-                        .launch(grid(lines)),
-                }
-                .map_err(cuda_err("attention softmax kernel"))?;
-            }
+            self.softmax(&mut scores, heads, rows, first, context, causal)?;
             self.merge(
                 &scores,
                 values,
@@ -1836,6 +1824,50 @@ impl ImageGpu {
             )?;
         }
         Ok(output)
+    }
+
+    /// Each of the `heads * rows` score rows of a chunk starting at query
+    /// `first`, in place, to its softmax.
+    fn softmax(
+        &self,
+        scores: &mut Tensor,
+        heads: usize,
+        rows: usize,
+        first: usize,
+        context: usize,
+        causal: bool,
+    ) -> Result<(), NetworkError> {
+        // Nothing is masked and the row packs into whole quads, so the
+        // softmax can move four scores per load. A short row goes to a warp,
+        // a long one to a whole block.
+        let packed = !causal && context % 4 == 0;
+        let by_warp = !causal && context <= WARP_SCORES;
+        let lines = heads * rows;
+        unsafe {
+            match by_warp {
+                true => self
+                    .context
+                    .stream
+                    .launch_builder(&self.softmax_warp)
+                    .arg(&mut scores.data)
+                    .arg(&(context as i32))
+                    .arg(&(lines as i32))
+                    .launch(grid(lines.div_ceil(THREADS as usize / 32))),
+                false => self
+                    .context
+                    .stream
+                    .launch_builder(&self.softmax_rows)
+                    .arg(&mut scores.data)
+                    .arg(&(context as i32))
+                    .arg(&(rows as i32))
+                    .arg(&i32::from(causal))
+                    .arg(&(first as i32))
+                    .arg(&i32::from(packed))
+                    .launch(grid(lines)),
+            }
+            .map_err(cuda_err("attention softmax kernel"))?;
+        }
+        Ok(())
     }
 
     /// `scores[h, i, j] = scale * q[first + i, h] . k[j, h]`.
@@ -2071,23 +2103,33 @@ impl ImageGpu {
                 }
             }
         }
-        let mut output = self.uninit(inputs, height * width)?;
+        Ok(Map {
+            tensor: self.narrowed(&sums, inputs, height * width)?,
+            height,
+            width,
+        })
+    }
+
+    /// FP32 `sums` as a `[rows, cols]` FP16 tensor.
+    fn narrowed(
+        &self,
+        sums: &CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Tensor, NetworkError> {
+        let mut output = self.uninit(rows, cols)?;
         let len = output.len();
         unsafe {
             self.context
                 .stream
                 .launch_builder(&self.narrow)
                 .arg(&mut output.data)
-                .arg(&sums)
+                .arg(sums)
                 .arg(&(len as i64))
                 .launch(lanes(len, 1))
                 .map_err(cuda_err("narrowing kernel"))?;
         }
-        Ok(Map {
-            tensor: output,
-            height,
-            width,
-        })
+        Ok(output)
     }
 
     /// `dL/dx` of [`ImageGpu::group_norm`] with no activation, given its
@@ -2233,6 +2275,139 @@ impl ImageGpu {
             height,
             width,
         })
+    }
+
+    /// `dL/dq`, `dL/dk` and `dL/dv` of unmasked [`ImageGpu::attention`],
+    /// given `dL/d(output)`. The probabilities are worked out again, a chunk
+    /// of query rows at a time within `budget` scores; the key and value
+    /// gradients sum over every chunk, so they stay FP32 until the end.
+    fn attention_backward(
+        &self,
+        queries: View<'_>,
+        keys: View<'_>,
+        values: View<'_>,
+        heads: usize,
+        grad: &Tensor,
+        budget: usize,
+    ) -> Result<[Tensor; 3], NetworkError> {
+        let (tokens, context, units) = (queries.rows, keys.rows, queries.cols);
+        let head_dim = units / heads;
+        let scale = (head_dim as f32).sqrt().recip();
+        let chunk = (budget / (heads * context).max(1)).clamp(1, tokens);
+        let mut probabilities = self.uninit(heads * chunk, context)?;
+        let mut grad_scores = self.uninit(heads * chunk, context)?;
+        let mut grad_queries = self.uninit(tokens, units)?;
+        let zeros = || {
+            let stream = &self.context.stream;
+            stream
+                .alloc_zeros::<f32>(context * units)
+                .map_err(cuda_err("device allocation"))
+        };
+        let (mut grad_keys, mut grad_values) = (zeros()?, zeros()?);
+        for first in (0..tokens).step_by(chunk) {
+            let rows = chunk.min(tokens - first);
+            let shape = (heads, head_dim, first, rows, context);
+            self.scores(
+                queries,
+                keys,
+                &mut probabilities,
+                heads,
+                head_dim,
+                first,
+                rows,
+                context,
+                scale,
+            )?;
+            self.softmax(&mut probabilities, heads, rows, first, context, false)?;
+            self.scores(
+                grad.view(),
+                values,
+                &mut grad_scores,
+                heads,
+                head_dim,
+                first,
+                rows,
+                context,
+                1.0,
+            )?;
+            self.sum_transposed(&probabilities, grad.view(), &mut grad_values, units, shape)?;
+            let lines = (heads * rows) as i32;
+            unsafe {
+                self.context
+                    .stream
+                    .launch_builder(&self.softmax_bwd)
+                    .arg(&mut grad_scores.data)
+                    .arg(&probabilities.data)
+                    .arg(&(context as i32))
+                    .arg(&lines)
+                    .arg(&scale)
+                    .launch(grid((lines as usize).div_ceil(THREADS as usize / 32)))
+                    .map_err(cuda_err("softmax backward kernel"))?;
+            }
+            self.merge(
+                &grad_scores,
+                keys,
+                &mut grad_queries,
+                heads,
+                head_dim,
+                first,
+                rows,
+                context,
+            )?;
+            self.sum_transposed(&grad_scores, queries, &mut grad_keys, units, shape)?;
+        }
+        Ok([
+            grad_queries,
+            self.narrowed(&grad_keys, context, units)?,
+            self.narrowed(&grad_values, context, units)?,
+        ])
+    }
+
+    /// `out[j, h] += sum_i p[h, i, j] * x[first + i, h]` over a chunk's
+    /// `rows`, in FP32: the per-head product that sums a chunk of attention
+    /// back onto the keys and values.
+    fn sum_transposed(
+        &self,
+        probabilities: &Tensor,
+        rows_of: View<'_>,
+        out: &mut CudaSlice<f32>,
+        units: usize,
+        (heads, head_dim, first, rows, context): (usize, usize, usize, usize, usize),
+    ) -> Result<(), NetworkError> {
+        let source = rows_of.data.slice(rows_of.base + first * rows_of.lead..);
+        let (source_pointer, _source) = source.device_ptr(&self.context.stream);
+        let (probability_pointer, _probability) =
+            probabilities.data.device_ptr(&self.context.stream);
+        let (out_pointer, _out) = out.device_ptr_mut(&self.context.stream);
+        let one = 1.0f32;
+        unsafe {
+            cublas::gemm_strided_batched_ex(
+                *self.context.blas.handle(),
+                cublasOperation_t::CUBLAS_OP_N,
+                cublasOperation_t::CUBLAS_OP_T,
+                head_dim as i32,
+                context as i32,
+                rows as i32,
+                &one as *const f32 as *const std::ffi::c_void,
+                source_pointer as *const std::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
+                rows_of.lead as i32,
+                head_dim as i64,
+                probability_pointer as *const std::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
+                context as i32,
+                (rows * context) as i64,
+                &one as *const f32 as *const std::ffi::c_void,
+                out_pointer as *mut std::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_32F,
+                units as i32,
+                head_dim as i64,
+                heads as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        }
+        .map_err(cuda_err("attention backward GEMM"))
     }
 }
 
@@ -3736,6 +3911,62 @@ mod tests {
                 &expected.data,
                 0.02,
             );
+        }
+    }
+
+    #[test]
+    fn device_attention_backward_matches_the_host_or_skips_without_a_device() {
+        let Some(gpu) = device() else { return };
+        // SD 1.5's 40-wide heads on stacked self-attention, and narrow heads
+        // across a five-token prompt; each in one chunk and in chunks of five
+        // query rows with a short last one.
+        for (heads, head_dim, context) in [(2usize, 40usize, None), (3, 8, Some(5usize))] {
+            let (tokens, units) = (37, heads * head_dim);
+            let context_rows = context.unwrap_or(tokens);
+            let queries = Matrix::from_vec(tokens, units, ramp(tokens * units, 0.15));
+            let keys = Matrix::from_vec(context_rows, units, ramp(context_rows * units, 0.35));
+            let values = Matrix::from_vec(context_rows, units, ramp(context_rows * units, 0.55));
+            let grad = Matrix::from_vec(tokens, units, ramp(tokens * units, 0.75));
+            let expected =
+                crate::dit_lora::attention_backward(&queries, &keys, &values, heads, &grad);
+            let stacked = |parts: &[&Matrix]| {
+                let rows = parts[0].rows;
+                let data = (0..rows)
+                    .flat_map(|row| parts.iter().flat_map(move |part| part.row(row).to_vec()))
+                    .collect();
+                gpu.upload_matrix(&Matrix::from_vec(rows, parts.len() * units, data))
+                    .expect("an upload")
+            };
+            let (own, query, kv) = match context {
+                None => (Some(stacked(&[&queries, &keys, &values])), None, None),
+                Some(_) => (
+                    None,
+                    Some(gpu.upload_matrix(&queries).expect("an upload")),
+                    Some(stacked(&[&keys, &values])),
+                ),
+            };
+            let (q, k, v) = match (&own, &query, &kv) {
+                (Some(own), _, _) => (own.part(0, units), own.part(1, units), own.part(2, units)),
+                (_, Some(query), Some(kv)) => (query.view(), kv.part(0, units), kv.part(1, units)),
+                _ => unreachable!(),
+            };
+            let grad_device = gpu.upload_matrix(&grad).expect("an upload");
+            for budget in [SCORE_BUDGET, 5 * heads * context_rows] {
+                let actual = gpu
+                    .attention_backward(q, k, v, heads, &grad_device, budget)
+                    .expect("a device attention backward");
+                let (dq, dk, dv) = &expected;
+                for ((name, actual), expected) in
+                    ["dq", "dk", "dv"].iter().zip(&actual).zip([dq, dk, dv])
+                {
+                    assert_close(
+                        &format!("{name}, {heads}x{head_dim}, budget {budget}"),
+                        &gpu.download(actual).expect("a download").data,
+                        &expected.data,
+                        0.02,
+                    );
+                }
+            }
         }
     }
 
