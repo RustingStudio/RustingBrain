@@ -655,6 +655,22 @@ impl ImagePipeline {
                 precision,
             )
         };
+        // A CLIP tower and its tokenizer, padding with whatever token the
+        // tokenizer names: the UNet reads the padded positions too.
+        let clip_tower =
+            |words: &str, name: &str| -> Result<(Bpe, ClipTextEncoder), NetworkError> {
+                let tokenizer = Bpe::from_file(part(&format!("{words}/tokenizer.json")))?;
+                let mut encoder = tower(name)?;
+                let pad =
+                    read_json(&part(&format!("{words}/tokenizer_config.json"))).and_then(|json| {
+                        let pad = json.get("pad_token")?;
+                        tokenizer.token_id(pad.get("content").unwrap_or(pad).as_str()?)
+                    });
+                if let Some(pad) = pad {
+                    encoder.set_pad_token(pad);
+                }
+                Ok((tokenizer, encoder))
+            };
         // How long a T5 prompt is padded to is what the model was tuned for,
         // and its tokenizer says what that is.
         let padded_to = |words: &std::path::Path| -> usize {
@@ -667,34 +683,45 @@ impl ImagePipeline {
         let encoder = match (clip, two) {
             // Stable Diffusion 3: two CLIP towers padded out to T5's width and
             // stacked on top of the T5 states, all in one sequence.
-            _ if three => PromptEncoder::ClipPairAndT5 {
-                tokenizer: Bpe::from_file(part("tokenizer/tokenizer.json"))?,
-                encoder: tower("text_encoder")?,
-                second_tokenizer: Bpe::from_file(part("tokenizer_2/tokenizer.json"))?,
-                second: tower("text_encoder_2")?,
-                skip: 1,
-                third_tokenizer: Unigram::from_file(part("tokenizer_3/tokenizer.json"))?,
-                third: crate::t5::T5Encoder::load_at(
-                    weights(&part(states))?,
-                    crate::t5::T5Config::from_file(&states_config)?,
-                    precision,
-                )?,
-                length: padded_to(&part("tokenizer_3")),
-            },
+            _ if three => {
+                let (tokenizer, encoder) = clip_tower("tokenizer", "text_encoder")?;
+                let (second_tokenizer, second) = clip_tower("tokenizer_2", "text_encoder_2")?;
+                PromptEncoder::ClipPairAndT5 {
+                    tokenizer,
+                    encoder,
+                    second_tokenizer,
+                    second,
+                    skip: 1,
+                    third_tokenizer: Unigram::from_file(part("tokenizer_3/tokenizer.json"))?,
+                    third: crate::t5::T5Encoder::load_at(
+                        weights(&part(states))?,
+                        crate::t5::T5Config::from_file(&states_config)?,
+                        precision,
+                    )?,
+                    length: padded_to(&part("tokenizer_3")),
+                }
+            }
             // Stable Diffusion XL: two towers, read second to last because
             // that is the layer it was trained against.
-            (true, true) => PromptEncoder::ClipPair {
-                tokenizer: Bpe::from_file(part("tokenizer/tokenizer.json"))?,
-                encoder: tower("text_encoder")?,
-                second_tokenizer: Bpe::from_file(part("tokenizer_2/tokenizer.json"))?,
-                second: tower(states)?,
-                skip: 1,
-            },
-            (true, false) => PromptEncoder::Clip {
-                tokenizer: Bpe::from_file(part("tokenizer/tokenizer.json"))?,
-                encoder: tower("text_encoder")?,
-                skip: 0,
-            },
+            (true, true) => {
+                let (tokenizer, encoder) = clip_tower("tokenizer", "text_encoder")?;
+                let (second_tokenizer, second) = clip_tower("tokenizer_2", states)?;
+                PromptEncoder::ClipPair {
+                    tokenizer,
+                    encoder,
+                    second_tokenizer,
+                    second,
+                    skip: 1,
+                }
+            }
+            (true, false) => {
+                let (tokenizer, encoder) = clip_tower("tokenizer", "text_encoder")?;
+                PromptEncoder::Clip {
+                    tokenizer,
+                    encoder,
+                    skip: 0,
+                }
+            }
             (false, _) => {
                 let mut encoder_file =
                     crate::safetensors::ShardedSafeTensors::open(weights(&part(states))?)?;
@@ -1790,14 +1817,33 @@ mod tests {
         };
         let directory = std::env::temp_dir().join("rusting_brain_pipeline_xl");
         publish_unet(&directory, &unet, &clip, Some(&second));
+        // XL's second tokenizer pads with `!`, and its UNet reads the padding.
+        std::fs::write(
+            directory.join("tokenizer_2/tokenizer_config.json"),
+            r#"{"pad_token": "!"}"#,
+        )
+        .unwrap();
 
         let mut loaded = ImagePipeline::load(&directory).unwrap();
         std::fs::remove_dir_all(&directory).ok();
 
-        assert!(matches!(
-            loaded.encoder,
-            PromptEncoder::ClipPair { skip: 1, .. }
-        ));
+        let PromptEncoder::ClipPair {
+            tokenizer,
+            encoder,
+            second_tokenizer,
+            second,
+            skip: 1,
+        } = &loaded.encoder
+        else {
+            panic!("an XL model reads two CLIP towers");
+        };
+        let pad = second_tokenizer.token_id("!").unwrap();
+        let ids = second.tokenize(second_tokenizer, "").unwrap();
+        assert!(ids[2..].iter().all(|id| *id == pad));
+        assert_eq!(
+            *encoder.tokenize(tokenizer, "").unwrap().last().unwrap(),
+            clip.eos_token
+        );
         // The pooled vector comes from the second tower's projection, not from
         // a tower attached beside the pipeline.
         assert!(loaded.pooled.is_none());
