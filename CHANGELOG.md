@@ -100,6 +100,9 @@
 - `ControlNet` loads diffusers ControlNets for UNet models, and
   `Unet::set_controls` lets one or more of them steer the layout from an edge,
   depth or pose picture; matches diffusers within 9e-7.
+- `ImagePipeline::load_with_loras` and `ShardedSafeTensors::add_lora` merge
+  published LoRA files (PEFT/diffusers and kohya spellings) into a UNet or
+  DiT as it loads; matches PEFT's `fuse_lora` within 1.1e-6.
 - `TransformerLm::log_probabilities` gives each token's log-probability
   after the ones before it, for scoring and ranking texts.
 - `TransformerLm::generate_beam` runs beam search, with an optional end

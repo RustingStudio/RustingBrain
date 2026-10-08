@@ -564,6 +564,17 @@ impl ImagePipeline {
         directory: impl AsRef<std::path::Path>,
         precision: Precision,
     ) -> Result<Self, NetworkError> {
+        Self::load_with_loras(directory, precision, &[])
+    }
+
+    /// The same, with LoRA files merged into the denoiser at the strength
+    /// paired with each; see [`crate::safetensors::ShardedSafeTensors::add_lora`].
+    /// What a file adapts in the text encoders is left out.
+    pub fn load_with_loras(
+        directory: impl AsRef<std::path::Path>,
+        precision: Precision,
+        loras: &[(std::path::PathBuf, f32)],
+    ) -> Result<Self, NetworkError> {
         let directory = directory.as_ref();
         let part = |name: &str| directory.join(name);
 
@@ -770,17 +781,29 @@ impl ImagePipeline {
             }
         };
 
+        let denoiser_file = |name: &str| {
+            let mut file = crate::safetensors::ShardedSafeTensors::open(weights(&part(name))?)?;
+            for (path, scale) in loras {
+                if file.add_lora(path, &[name, &format!("lora_{name}"), ""], *scale)? == 0 {
+                    return Err(NetworkError::InvalidDataset(format!(
+                        "{} adapts nothing in the {name}",
+                        path.display()
+                    )));
+                }
+            }
+            Ok::<_, NetworkError>(file)
+        };
         let denoiser: ImageDenoiser = match denoiser_config {
-            Some(denoiser_config) => Dit::load_at(
-                weights(&part("transformer"))?,
+            Some(denoiser_config) => Dit::read_at(
+                &mut denoiser_file("transformer")?,
                 "",
                 denoiser_config,
                 precision,
             )?
             .into(),
             None => {
-                let mut model = Unet::load_at(
-                    weights(&part("unet"))?,
+                let mut model = Unet::read_at(
+                    &mut denoiser_file("unet")?,
                     UnetConfig::from_file(part("unet/config.json"))?,
                     precision,
                 )?;
@@ -1959,6 +1982,50 @@ mod tests {
             let plain = loaded.generate("a lighthouse", 8, 8, Some(4), |_, _| true);
             assert_eq!(plain.is_err(), in_channels == 9);
         }
+    }
+
+    #[test]
+    fn a_lora_file_changes_the_denoiser_it_is_loaded_into() {
+        let unet = UnetConfig {
+            cross_dim: 16,
+            ..crate::unet::tests::tiny()
+        };
+        let clip = crate::clip::ClipTextConfig {
+            vocab_size: 320,
+            bos_token: 300,
+            eos_token: 301,
+            ..crate::clip::tests::tiny()
+        };
+        let directory = std::env::temp_dir().join("rusting_brain_pipeline_lora");
+        publish_unet(&directory, &unet, &clip, None);
+        let file = |name: &str, stem: &str| {
+            let path = directory.join(name);
+            let tensors = [
+                (
+                    format!("{stem}.lora_down.weight"),
+                    vec![1, 36],
+                    vec![0.1; 36],
+                ),
+                (format!("{stem}.lora_up.weight"), vec![8, 1], vec![0.5; 8]),
+            ]
+            .into_iter()
+            .map(|(name, shape, values)| (name, (shape, values)))
+            .collect();
+            crate::safetensors::write_checkpoint(&path, &tensors);
+            path
+        };
+        let conv_in = file("conv_in.safetensors", "lora_unet_conv_in");
+        let text = file("text.safetensors", "lora_te_text_model_fc1");
+        let run = |loras: &[(std::path::PathBuf, f32)]| {
+            let mut loaded = ImagePipeline::load_with_loras(&directory, Precision::F32, loras)?;
+            loaded.config.steps = 2;
+            loaded.generate("a lighthouse", 8, 8, Some(4), |_, _| true)
+        };
+        let plain = run(&[]).unwrap();
+        assert_eq!(run(&[(conv_in.clone(), 0.0)]).unwrap().data, plain.data);
+        assert_ne!(run(&[(conv_in, 1.0)]).unwrap().data, plain.data);
+        assert!(run(&[(text, 1.0)]).is_err());
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]
