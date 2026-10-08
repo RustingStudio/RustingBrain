@@ -1548,3 +1548,19 @@ The first build of the separate-buffer flash kernels cost the LM step 1-2%
 690 us, while `flash_attention_dq_64` went 485 to 460 us, so the backward pair
 is even and the step is back within run-to-run spread.
 
+
+## Row-wise convolution lowering (C10 part 1, 2026-10-08)
+
+`SIZES=1024 CPU=0 QUANTIZE=1 cuda_image_bench pony-v6-xl`, old and new
+binaries alternated three rounds under the GPU lock, load 3.1-4.5.
+
+| | UNet pass | VAE decode |
+|---|---|---|
+| `im2col` + one GEMM | 0.244, 0.244, 0.247 s | 0.52, 0.52, 0.52 s |
+| `im2row` + k GEMMs | 0.241, 0.247, 0.242 s | 0.49, 0.49, 0.49 s |
+
+`nsys` kernel sums (same command): before, `im2col` 346 ms over 2804
+launches (18.5%); after, `im2row` 176 ms over 1038 launches (9.4%), with the
+128x128 nn GEMM rising from 466 ms to 614 ms over 2185 launches. The UNet's
+3x3 convolutions at 128x128 are too small for the gather to matter; the
+decoder's at 512 and 1024 pixels gain.

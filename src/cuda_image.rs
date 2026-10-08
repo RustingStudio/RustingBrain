@@ -37,7 +37,9 @@
 //! * **im2col happens here**, one chunk of output pixels at a time. The column
 //!   matrix for a 1024x1024 VAE layer is 2.4 GB if materialized whole, which is
 //!   more than the weights; chunking bounds it at `COLUMN_BUDGET` and costs
-//!   one extra GEMM launch per chunk.
+//!   one extra GEMM launch per chunk. A stride-1 convolution expands only
+//!   its horizontal taps (`im2row`) and runs one accumulating GEMM per kernel
+//!   row, which writes a third of the scratch a 3x3 im2col would.
 //!
 //! The host keeps its own copy of every weight. That is what lets the parity
 //! tests below run both paths against one another, and it is what a machine
@@ -163,6 +165,29 @@ extern "C" __global__ void im2col(half_t*__restrict__ columns,const half_t*__res
       if(inside&&x>=0&&x<in_w)v=h2f(source[(long long)y*in_w+x]);
       target[(long long)(ky*kernel+kx)*pitch]=f2h(v);
     }
+  }
+}
+
+// The stride-one gather, which expands only the horizontal taps. Line `l` of
+// the buffer is input row `row - pad + l`, so the vertical tap `ky` of output
+// line `l` is line `l + ky`: a whole-row offset into the same buffer. The
+// convolution is then one accumulating GEMM per vertical tap, and the buffer
+// holds `kernel` copies of the input instead of `kernel * kernel`.
+extern "C" __global__ void im2row(half_t*__restrict__ columns,const half_t*__restrict__ input,
+    int in_h,int in_w,int kernel,int pad,int out_w,int row,int span,long long pitch){
+  int s=blockIdx.x*blockDim.x+threadIdx.x;
+  if(s>=span)return;
+  int line=s/out_w,ox=s-line*out_w;
+  int c=blockIdx.y;
+  int y=row-pad+line,x0=ox-pad;
+  const half_t*source=input+((long long)c*in_h+y)*in_w;
+  half_t*target=columns+(long long)c*kernel*pitch+s;
+  int inside=(y>=0&&y<in_h);
+  for(int kx=0;kx<kernel;kx++){
+    int x=x0+kx;
+    float v=0.f;
+    if(inside&&x>=0&&x<in_w)v=h2f(source[x]);
+    target[(long long)kx*pitch]=f2h(v);
   }
 }
 
@@ -461,6 +486,7 @@ fn image_ptx() -> Result<&'static Ptx, NetworkError> {
 pub struct ImageGpu {
     context: Arc<GpuContext>,
     im2col: CudaFunction,
+    im2row: CudaFunction,
     add_bias_rows: CudaFunction,
     add_channel: CudaFunction,
     add_plane_bias: CudaFunction,
@@ -499,6 +525,7 @@ impl ImageGpu {
         Ok(Arc::new(Self {
             context: GpuContext::half_accumulate(device)?,
             im2col: get("im2col")?,
+            im2row: get("im2row")?,
             add_bias_rows: get("add_bias_rows")?,
             add_channel: get("add_channel")?,
             add_plane_bias: get("add_plane_bias")?,
@@ -732,9 +759,16 @@ fn grid(count: usize) -> LaunchConfig {
 // The layers, as they sit on the device.
 // ---------------------------------------------------------------------------
 
+/// Whether a convolution runs as one GEMM per vertical tap over `im2row`
+/// rather than one GEMM over `im2col`.
+fn rowwise(kernel: usize, stride: usize) -> bool {
+    kernel > 1 && stride == 1
+}
+
 struct DeviceConv {
     /// `[out_channels, in_channels * kernel * kernel]`, the same flattening the
-    /// host layer holds.
+    /// host layer holds, or for a [`rowwise`] convolution the vertical taps
+    /// pulled out front: `[kernel][out_channels][in_channels * kernel]`.
     weight: Tensor,
     /// Always present. A convolution without one gets zeros, which keeps the
     /// epilogue kernel branchless.
@@ -786,8 +820,27 @@ enum DeviceProjection {
 }
 
 fn upload_conv(gpu: &ImageGpu, conv: &Conv2d) -> Result<DeviceConv, NetworkError> {
+    let (k, out) = (conv.kernel, conv.weight.rows);
+    let weight = match rowwise(k, conv.stride) {
+        // `[ky][out][in * k + kx]`, one `[out, in * k]` matrix per vertical
+        // tap, which is the layout the `im2row` path multiplies by.
+        true => {
+            let patch = conv.weight.cols;
+            let mut data = Vec::with_capacity(conv.weight.data.len());
+            for ky in 0..k {
+                for o in 0..out {
+                    for c in 0..conv.in_channels {
+                        let base = o * patch + (c * k + ky) * k;
+                        data.extend_from_slice(&conv.weight.data[base..base + k]);
+                    }
+                }
+            }
+            gpu.upload(k * out, patch / k, &data)?
+        }
+        false => gpu.upload_matrix(&conv.weight)?,
+    };
     Ok(DeviceConv {
-        weight: gpu.upload_matrix(&conv.weight)?,
+        weight,
         bias: gpu.upload_f32(&match &conv.bias {
             Some(bias) => bias.clone(),
             None => vec![0.0; conv.weight.rows],
@@ -969,6 +1022,62 @@ impl ImageGpu {
                 1.0,
                 beta,
             )?;
+        } else if rowwise(conv.kernel, conv.stride) {
+            let k = conv.kernel;
+            let patch = conv.in_channels * k;
+            let group = if width % 8 == 0 { 1 } else { 8 };
+            let stack = (budget / (patch * width).max(1))
+                .saturating_sub(k - 1)
+                .max(group)
+                .next_multiple_of(group)
+                .min(height);
+            // The `k - 1` lines past the chunk are the halo its lower taps read.
+            let pitch = (stack + k - 1) * width;
+            let mut columns = self.uninit(patch, pitch)?;
+            let taps = conv.weight.bytes();
+            let tap = conv.out_channels * patch * 2;
+            for row in (0..height).step_by(stack) {
+                let rows = stack.min(height - row);
+                let span = rows * width;
+                let lines = (rows + k - 1) * width;
+                unsafe {
+                    self.context
+                        .stream
+                        .launch_builder(&self.im2row)
+                        .arg(&mut columns.data)
+                        .arg(&input.tensor.data)
+                        .arg(&(input.height as i32))
+                        .arg(&(input.width as i32))
+                        .arg(&(k as i32))
+                        .arg(&(conv.padding as i32))
+                        .arg(&(width as i32))
+                        .arg(&(row as i32))
+                        .arg(&(lines as i32))
+                        .arg(&(pitch as i64))
+                        .launch(plane(lines, conv.in_channels))
+                        .map_err(cuda_err("im2row kernel"))?;
+                }
+                let bytes = columns.bytes();
+                let mut target = output.data.slice_mut(row * width..);
+                for ky in 0..k {
+                    act_plain::<f16, _>(
+                        &self.context,
+                        &taps.slice(ky * tap..(ky + 1) * tap),
+                        patch,
+                        &bytes.slice(ky * width * 2..),
+                        pitch,
+                        true,
+                        true,
+                        &mut target,
+                        pixels,
+                        conv.out_channels,
+                        span,
+                        patch,
+                        1.0,
+                        if ky == 0 { beta } else { 1.0 },
+                    )?;
+                }
+            }
         } else {
             let patch = conv.in_channels * conv.kernel * conv.kernel;
             // Chunks are whole output rows, so the grid can address a pixel by
@@ -2657,10 +2766,15 @@ mod tests {
     #[test]
     fn a_device_convolution_matches_the_host_or_skips_without_a_device() {
         let Some(gpu) = device() else { return };
-        // A 3x3 with padding, a 1x1 (the GEMM-only path) and a stride of two.
-        for (kernel, stride, padding, in_channels, out_channels) in
-            [(3, 1, 1, 3, 5), (1, 1, 0, 4, 6), (3, 2, 1, 2, 4)]
-        {
+        // A 3x3 with padding, a 1x1 (the GEMM-only path) and a stride of two;
+        // then the row-wise path unpadded and with a wider kernel and padding.
+        for (kernel, stride, padding, in_channels, out_channels) in [
+            (3, 1, 1, 3, 5),
+            (1, 1, 0, 4, 6),
+            (3, 2, 1, 2, 4),
+            (3, 1, 0, 3, 5),
+            (5, 1, 2, 2, 3),
+        ] {
             let weight = Matrix::from_vec(
                 out_channels,
                 in_channels * kernel * kernel,
