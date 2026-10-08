@@ -264,8 +264,9 @@
 
 ### Fixed
 
-- A CLIP text tower saved by Transformers 5, whose keys leave off the
-  `text_model.` prefix, loads instead of failing on a missing tensor.
+- A CLIP text or image tower saved by Transformers 5, whose keys leave off
+  the `text_model.` or `vision_model.` prefix, loads instead of failing on a
+  missing tensor.
 - A `.safetensors` header whose shape product overflows, and a LoRA file
   with a scalar, empty or mismatched rank, are now errors. Before, release
   builds could wrap the product and read past a buffer.

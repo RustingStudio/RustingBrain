@@ -107,9 +107,14 @@ impl VitEncoder {
                 "an image tower needs at least one attention head".into(),
             ));
         }
-        let base = format!("{prefix}vision_model");
+        // Transformers 5 saves `CLIPVisionModel` without `vision_model.`.
+        let mut base = format!("{prefix}vision_model.");
+        let patches = |base: &str| format!("{base}embeddings.patch_embedding.weight");
+        if !file.names().any(|name| name == patches(&base)) {
+            base = prefix.to_string();
+        }
 
-        let (values, shape) = file.tensor(&format!("{base}.embeddings.patch_embedding.weight"))?;
+        let (values, shape) = file.tensor(&patches(&base))?;
         let [d_model, channels, patch_rows, patch_cols] = shape[..] else {
             return Err(NetworkError::InvalidConfig(format!(
                 "the patch embedding is {shape:?}, which is not a convolution weight"
@@ -126,16 +131,14 @@ impl VitEncoder {
             None,
         )?;
 
-        let class_token = file
-            .tensor(&format!("{base}.embeddings.class_embedding"))?
-            .0;
+        let class_token = file.tensor(&format!("{base}embeddings.class_embedding"))?.0;
         if class_token.len() != d_model {
             return Err(NetworkError::InvalidTarget {
                 expected: d_model,
                 actual: class_token.len(),
             });
         }
-        let positions = file.matrix(&format!("{base}.embeddings.position_embedding.weight"))?;
+        let positions = file.matrix(&format!("{base}embeddings.position_embedding.weight"))?;
         if positions.cols != d_model {
             return Err(NetworkError::InvalidConfig(format!(
                 "the position table is {} wide and the patch embedding produces {d_model}",
@@ -154,8 +157,8 @@ impl VitEncoder {
 
         // Transformers shipped this one misspelled and kept the name for
         // compatibility, so both spellings are in the wild.
-        let pre_norm = norm(file, &format!("{base}.pre_layrnorm"))
-            .or_else(|_| norm(file, &format!("{base}.pre_layernorm")))?;
+        let pre_norm = norm(file, &format!("{base}pre_layrnorm"))
+            .or_else(|_| norm(file, &format!("{base}pre_layernorm")))?;
 
         let mut layers = Vec::new();
         while let Ok(layer) = read_layer(file, &base, layers.len(), precision) {
@@ -163,7 +166,7 @@ impl VitEncoder {
         }
         if layers.is_empty() {
             return Err(NetworkError::InvalidConfig(format!(
-                "{base}.encoder.layers.0 is missing, so this is not an image tower"
+                "{base}encoder.layers.0 is missing, so this is not an image tower"
             )));
         }
         if d_model % config.num_heads != 0 {
@@ -174,7 +177,7 @@ impl VitEncoder {
         }
 
         Ok(Self {
-            post_norm: norm(file, &format!("{base}.post_layernorm"))?,
+            post_norm: norm(file, &format!("{base}post_layernorm"))?,
             projection: file
                 .matrix(&format!("{prefix}visual_projection.weight"))
                 .ok()
@@ -449,7 +452,7 @@ fn read_layer(
     index: usize,
     precision: Precision,
 ) -> Result<Layer, NetworkError> {
-    let layer = format!("{base}.encoder.layers.{index}");
+    let layer = format!("{base}encoder.layers.{index}");
     Ok(Layer {
         attention_norm: norm(file, &format!("{layer}.layer_norm1"))?,
         query: dense(file, &format!("{layer}.self_attn.q_proj"), precision)?,
@@ -584,6 +587,34 @@ pub(crate) mod tests {
         assert_eq!((tokens.rows, tokens.cols), (GRID * GRID + 1, D_MODEL));
         assert!(tokens.data.iter().all(|value| value.is_finite()));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_tower_saved_without_its_vision_model_prefix_loads_alike() {
+        let path = scratch("unprefixed");
+        checkpoint(&path, false);
+        let prefixed = VitEncoder::load(&path, "", tiny(), Precision::F32).unwrap();
+        let mut file = crate::safetensors::SafeTensors::open(&path).unwrap();
+        let names: Vec<String> = file.names().map(str::to_string).collect();
+        let tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)> = names
+            .into_iter()
+            .map(|name| {
+                let (data, shape) = file.tensor(&name).unwrap();
+                (
+                    name.trim_start_matches("vision_model.").to_string(),
+                    (shape, data),
+                )
+            })
+            .collect();
+        crate::safetensors::write_checkpoint(&path, &tensors);
+        let unprefixed = VitEncoder::load(&path, "", tiny(), Precision::F32).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let image = ramp(prefixed.image_size());
+        assert_eq!(
+            unprefixed.encode(&image).unwrap().data,
+            prefixed.encode(&image).unwrap().data
+        );
     }
 
     #[test]
