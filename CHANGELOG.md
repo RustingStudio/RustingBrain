@@ -97,6 +97,7 @@
 
 ### Added
 
+- Device group norm and SiLU for `DeviceImageBatch`: `TrainableGroupNorm::to_cuda_on`/`to_cpu`/`forward_device`/`backward_device` (with `DeviceGroupNormCache`), `conv::silu_device` and `conv::silu_backward_device` (K8b). The request named the layer `GroupNormTrainable`; it is `TrainableGroupNorm`, with the device pass as methods.
 - `conv::DeviceImageBatch` with `CudaDevice::upload`/`download`, and `TrainableConv2d::forward_device`/`backward_device`: a convolution chain whose activations and gradients stay on the device (K8a, asked by RustingChop and RustingCS2). The wanted `ConvCache` return is kept; the conv bias and its gradient now run on the device too.
 - `conv::TrainableGroupNorm`: group norm over an `ImageBatch` with `gamma`/`beta` parameters, `forward -> (ImageBatch, GroupNormCache)`, `backward` and `params_mut` (asked by RustingChop and RustingCS2). Its forward is bit-equal to `conv::GroupNorm`. `new` and `forward` return a `Result` (bad group counts and channel mismatches), and `eps` is an argument where the Chop stopgap fixed Keras' 1e-3.
 - `param::Dropout`: inverted dropout with `forward(&input, &mut rng, training) -> (Matrix, DropoutMask)` and `backward(&mask, &grad)` (asked by RustingChop and RustingCS2). `Dropout::new` returns a `Result`, refusing rates outside [0, 1), where the request had a plain constructor.

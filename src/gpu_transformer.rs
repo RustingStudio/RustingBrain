@@ -43,6 +43,16 @@ use cudarc::driver::{
 use std::any::TypeId;
 use std::sync::{Arc, Mutex};
 
+pub(crate) struct ImageTrainKernels {
+    pub(crate) gn_stats: CudaFunction,
+    pub(crate) gn_apply: CudaFunction,
+    pub(crate) gn_bwd_stats: CudaFunction,
+    pub(crate) gn_bwd_apply: CudaFunction,
+    pub(crate) mul: CudaFunction,
+    pub(crate) silu: CudaFunction,
+    pub(crate) silu_bwd: CudaFunction,
+}
+
 /// One device, its stream, cuBLAS handle and the kernels the transformer uses.
 ///
 /// Shared by every parameter of one model, so a session uploads weights once
@@ -68,6 +78,8 @@ pub struct GpuContext {
     col2im_train: CudaFunction,
     bias_act: CudaFunction,
     fill: CudaFunction,
+    /// The group norm and SiLU kernels `conv`'s device layers launch.
+    pub(crate) image: ImageTrainKernels,
     /// Host-device copies through [`GpuContext::upload`] and
     /// [`GpuContext::download`], which is how a test proves a chain of device
     /// layers never leaves the card.
@@ -170,6 +182,15 @@ impl GpuContext {
             col2im_train: get("col2im_train")?,
             bias_act: get("bias_act")?,
             fill: get("fill_f32")?,
+            image: ImageTrainKernels {
+                gn_stats: get("gn_stats")?,
+                gn_apply: get("gn_apply")?,
+                gn_bwd_stats: get("gn_bwd_stats")?,
+                gn_bwd_apply: get("gn_bwd_apply")?,
+                mul: get("mul_f32")?,
+                silu: get("silu_f32")?,
+                silu_bwd: get("silu_bwd_f32")?,
+            },
             transfers: std::sync::atomic::AtomicUsize::new(0),
             model: crate::gpu_model::ModelKernels::load(&module)?,
             flash: crate::cuda_flash::flash_kernels(device, &context),
