@@ -45,6 +45,10 @@ pub struct ClipTextConfig {
     pub projection_dim: Option<usize>,
     pub bos_token: u32,
     pub eos_token: u32,
+    /// Pool at the highest id rather than the first end token, which is what
+    /// Transformers does for a legacy configuration. The two differ only once
+    /// a token past the end token has been added.
+    pub argmax_pool: bool,
 }
 
 impl Default for ClipTextConfig {
@@ -63,6 +67,7 @@ impl Default for ClipTextConfig {
             projection_dim: None,
             bos_token: 49406,
             eos_token: 49407,
+            argmax_pool: true,
         }
     }
 }
@@ -112,6 +117,7 @@ impl ClipTextConfig {
                 .map(|value| value as usize),
             bos_token: token("bos_token_id", default.bos_token),
             eos_token: token("eos_token_id", default.eos_token),
+            argmax_pool: false,
         }
         .legacy_special_tokens())
     }
@@ -125,6 +131,7 @@ impl ClipTextConfig {
         if self.eos_token == 2 && self.vocab_size >= 2 {
             self.bos_token = self.vocab_size as u32 - 2;
             self.eos_token = self.vocab_size as u32 - 1;
+            self.argmax_pool = true;
         }
         self
     }
@@ -284,6 +291,30 @@ impl ClipTextEncoder {
         Ok(ids)
     }
 
+    /// Adds a textual inversion: `token` joins the tokenizer and stands for
+    /// the rows of `vectors`, which join the embedding table.
+    pub fn add_token(
+        &mut self,
+        tokenizer: &mut Bpe,
+        token: &str,
+        vectors: &Matrix,
+    ) -> Result<u32, NetworkError> {
+        if vectors.cols != self.config.d_model || tokenizer.vocab_size() != self.tokens.rows {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a {}-wide embedding for a tokenizer of {} ids cannot join a {}-wide table of {} rows",
+                vectors.cols,
+                tokenizer.vocab_size(),
+                self.config.d_model,
+                self.tokens.rows
+            )));
+        }
+        let first = tokenizer.add_token(token, vectors.rows)?;
+        self.tokens.data.extend_from_slice(&vectors.data);
+        self.tokens.rows += vectors.rows;
+        self.config.vocab_size = self.tokens.rows;
+        Ok(first)
+    }
+
     /// Pads prompts with this token from now on. Stable Diffusion XL's second
     /// tokenizer pads with `!` rather than the end token, and its UNet reads
     /// the padded positions.
@@ -382,11 +413,17 @@ impl ClipTextEncoder {
     /// projection if the checkpoint has one.
     pub fn pool(&self, ids: &[u32], hidden: &Matrix) -> Result<Vec<f32>, NetworkError> {
         // The first end token, because everything after it is padding.
-        let position = ids
-            .iter()
-            .position(|id| *id == self.config.eos_token)
-            .unwrap_or(hidden.rows - 1)
-            .min(hidden.rows - 1);
+        let position = match self.config.argmax_pool {
+            true => ids
+                .iter()
+                .enumerate()
+                .rev()
+                .max_by_key(|(_, id)| **id)
+                .map(|(at, _)| at),
+            false => ids.iter().position(|id| *id == self.config.eos_token),
+        }
+        .unwrap_or(hidden.rows - 1)
+        .min(hidden.rows - 1);
         let pooled = hidden.row(position).to_vec();
         match &self.projection {
             Some(projection) => projection.apply(&pooled),
@@ -460,6 +497,34 @@ pub(crate) fn add(target: &mut Matrix, source: &Matrix) {
 
 /// The temperature a full CLIP checkpoint learned, `exp(logit_scale)`, which
 /// is the multiplier [`zero_shot`] takes. About 100 for the published models.
+/// Reads the vectors a textual inversion file holds for a tower `width` wide,
+/// one per row.
+///
+/// The file is the one tensor of that width, whatever it is called: diffusers
+/// names it after the token, A1111 `emb_params`, and a Stable Diffusion XL file
+/// holds `clip_l` and `clip_g`, which differ in width.
+pub fn read_embedding(
+    path: impl AsRef<std::path::Path>,
+    width: usize,
+) -> Result<Matrix, NetworkError> {
+    let mut file = crate::safetensors::SafeTensors::open(path)?;
+    let names: Vec<String> = file
+        .names()
+        .filter(|name| {
+            let shape = &file.info(name).expect("listed").shape;
+            matches!(shape.len(), 1 | 2) && shape.last() == Some(&width)
+        })
+        .map(str::to_string)
+        .collect();
+    let [name] = names.as_slice() else {
+        return Err(NetworkError::InvalidConfig(format!(
+            "a textual inversion needs one tensor {width} wide, and this file has {names:?}"
+        )));
+    };
+    let (data, _) = file.tensor(name)?;
+    Ok(Matrix::from_vec(data.len() / width, width, data))
+}
+
 pub fn logit_scale(file: &mut ShardedSafeTensors, prefix: &str) -> Result<f32, NetworkError> {
     let (values, _) = file.tensor(&format!("{prefix}logit_scale"))?;
     match values[..] {
@@ -551,6 +616,7 @@ pub(crate) mod tests {
             projection_dim: None,
             bos_token: 20,
             eos_token: 21,
+            argmax_pool: false,
         }
     }
 
@@ -806,5 +872,68 @@ pub(crate) mod tests {
         let (states, end) = encoder.forward_skipping(&ids, 0).unwrap();
         assert_eq!(states.data, end.data);
         assert_eq!(end.data, normalized.data);
+    }
+
+    /// Needs `RB_TI_REF` from `scripts/textual_inversion_reference.py`.
+    #[test]
+    #[ignore]
+    fn textual_inversion_matches_diffusers() {
+        let dir = std::path::PathBuf::from(std::env::var("RB_TI_REF").unwrap());
+        let reference: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
+                .unwrap();
+        let floats = |value: &serde_json::Value| -> Vec<f32> {
+            let values = value.as_array().unwrap().iter();
+            values.map(|x| x.as_f64().unwrap() as f32).collect()
+        };
+        let prompt = reference["prompt"].as_str().unwrap();
+        // The first tower takes all three layouts, the second only the
+        // Stable Diffusion XL file, as in the script.
+        let towers = [
+            (
+                "tokenizer",
+                &["diffusers", "a1111", "sdxl"][..],
+                &["<cat-toy>", "<style>", "<sdxl>"][..],
+            ),
+            ("tokenizer_2", &["sdxl"][..], &["<sdxl>"][..]),
+        ];
+        for (name, files, tokens) in towers {
+            let tower = dir.join(name);
+            let config = ClipTextConfig::from_file(tower.join("config.json")).unwrap();
+            let mut encoder =
+                ClipTextEncoder::load(tower.join("model.safetensors"), "", config).unwrap();
+            let mut tokenizer = Bpe::from_file(tower.join("tokenizer.json")).unwrap();
+            // Stable Diffusion XL's second tokenizer pads with `!`.
+            if name == "tokenizer_2" {
+                encoder.set_pad_token(tokenizer.token_id("!").unwrap());
+            }
+            for (file, token) in files.iter().zip(tokens) {
+                let path = dir.join(format!("{file}.safetensors"));
+                let vectors = read_embedding(&path, encoder.config().d_model).unwrap();
+                encoder.add_token(&mut tokenizer, token, &vectors).unwrap();
+            }
+            let expected = &reference[name];
+            let ids = encoder.tokenize(&tokenizer, prompt).unwrap();
+            let want: Vec<u32> = expected["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(ids, want, "{name}");
+            let (hidden, pooled) = encoder.encode(&tokenizer, prompt).unwrap();
+            for (got, want) in [
+                (hidden.data, floats(&expected["hidden"])),
+                (pooled, floats(&expected["pooled"])),
+            ] {
+                assert_eq!(got.len(), want.len());
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(worst < 1e-5, "{name}: off by {worst}");
+            }
+        }
     }
 }
