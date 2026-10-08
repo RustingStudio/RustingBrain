@@ -59,9 +59,20 @@ fn main() {
         panic!("rebuild with --features cuda to benchmark the device path");
     }
 
-    let mut decoder = model.batch_decoder(sequences).unwrap();
     let ids: Vec<u32> = (0..prompt).map(|t| (t * 17 % 32_000) as u32).collect();
-    decoder.feed(&vec![&ids[..]; sequences]).unwrap();
+    let prompts = vec![&ids[..]; sequences];
+    // A first prefill warms the device up; the second is the one timed.
+    model
+        .batch_decoder(sequences)
+        .unwrap()
+        .feed(&prompts)
+        .unwrap();
+    model.synchronize().unwrap();
+    let mut decoder = model.batch_decoder(sequences).unwrap();
+    let start = Instant::now();
+    decoder.feed(&prompts).unwrap();
+    model.synchronize().unwrap();
+    let prefill = start.elapsed().as_secs_f64();
 
     let start = Instant::now();
     for t in 0..new_tokens {
@@ -75,8 +86,9 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64();
     let tokens = (new_tokens * sequences) as f64;
     println!(
-        "prompt {prompt} + {new_tokens} x {sequences} decoded on {}: {:.2} ms/step, {:.0} tokens/s",
+        "prompt {prompt} + {new_tokens} x {sequences} decoded on {}: prefill {:.1} ms, {:.2} ms/step, {:.0} tokens/s",
         if device { "cuda" } else { "cpu" },
+        1e3 * prefill,
         1e3 * elapsed / new_tokens as f64,
         tokens / elapsed
     );

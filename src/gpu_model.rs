@@ -3870,8 +3870,55 @@ fn decode_block(
     // Only the fused path writes `merged` narrow; the cuBLAS path below
     // accumulates into FP32.
     let fused = queries == 1 && head_dim <= THREADS && group <= DECODE_GROUP;
-    let mut merged = gpu.act(rows * query_width, fused && narrow)?;
-    if fused {
+    // A whole even prompt under mixed precision takes the training flash
+    // kernel instead of a `[history, history]` score matrix a head.
+    let flash = gpu.context.flash.as_ref().filter(|_| {
+        queries > 1
+            && offset == 0
+            && padding.is_none()
+            && crate::cuda_flash::eligible(narrow, head_dim)
+    });
+    let mut merged = gpu.act(rows * query_width, (fused || flash.is_some()) && narrow)?;
+    if let Some(flash) = flash {
+        // One launch a sequence: its rows are `sequences` rows apart, which
+        // the kernel takes as rows `sequences` times as wide.
+        let qkv = gpu.narrowed(&cache.slice(..rows * qkv_width), rows * qkv_width, true)?;
+        let mut log_sum_exp = gpu.uninit(heads * queries)?;
+        let forward = &flash.width(head_dim).forward;
+        for seq in 0..sequences {
+            let qkv = qkv.bytes.slice(seq * qkv_width * 2..);
+            unsafe {
+                gpu.context
+                    .stream
+                    .launch_builder(forward)
+                    .arg(&qkv)
+                    .arg(&qkv)
+                    .arg(&mut merged.bytes.slice_mut(seq * query_width * 2..))
+                    .arg(&mut log_sum_exp)
+                    .arg(&(queries as i32))
+                    .arg(&(queries as i32))
+                    .arg(&(row_stride as i32))
+                    .arg(&(row_stride as i32))
+                    .arg(&((sequences * query_width) as i32))
+                    .arg(&(key_base as i32))
+                    .arg(&(value_base as i32))
+                    .arg(&(group as i32))
+                    .arg(&(queries as i32))
+                    .arg(&scale)
+                    .arg(&1i32)
+                    .launch(cudarc::driver::LaunchConfig {
+                        grid_dim: (
+                            queries.div_ceil(crate::cuda_flash::TILE) as u32,
+                            heads as u32,
+                            1,
+                        ),
+                        block_dim: (crate::cuda_flash::THREADS, 1, 1),
+                        shared_mem_bytes: crate::cuda_flash::forward_shared_bytes(head_dim),
+                    })
+                    .map_err(cuda_err("prompt attention kernel"))?;
+            }
+        }
+    } else if fused {
         let chunks = history.div_ceil(DECODE_CHUNK);
         let mut partial = gpu.uninit(heads * sequences * chunks * (head_dim + 2))?;
         unsafe {

@@ -1630,3 +1630,23 @@ change, two interleaved rounds, load 1.2 to 1.5, tokens/s:
 Before, nsys put `decode_attention` at 23% of kernel time for the 4000-token
 int8 run and 31% for 2000 x 16. The grid shrinks fourfold, but at 64
 positions it still runs no slower.
+
+## Flash attention for decoder prompts (C20, 2026-10-08)
+
+`bench_decode` now times a second prefill after a warm-up one. `65355e8`
+against the change, two interleaved rounds plus a recheck, load 2.8 to 3.4,
+prefill ms:
+
+| run | score matrix | flash |
+|---|---|---|
+| `64 16 cuda 1` | 3.5-4.1 | 3.0 |
+| `512 16 cuda 1` | 6.0-7.0 | 4.9 |
+| `2000 16 cuda 1` | 27.2-30.0 | 12.5-12.6 |
+| `4000 16 cuda 1 int8` | 96.5-98.4 | 32.1-37.6 |
+| `512 16 cuda 16` | 43.8-44.9 | 35.0-42.5 |
+| `1000 16 cuda 16` | 109.9-111.1 | 67.1-69.5 |
+| `2000 16 cuda 16` | 363.5-365.2 | 148.5-148.6 |
+
+Decode steps match (`512 128 cuda 16` 1.53-1.60 ms/step both); one round
+showed 1.78 ms/step for `512 16 cuda 16` with the change, which the recheck
+did not repeat.
