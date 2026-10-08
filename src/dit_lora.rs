@@ -74,6 +74,31 @@ fn peft_target(module: &str, d_model: usize, mlp: usize) -> Option<(String, Rang
     Some((format!("double.{block}.{stream}.{projection}"), rows))
 }
 
+/// The projection an adapter key names, if the model has that block.
+fn projection<'a>(dit: &'a Dit, key: &str) -> Option<&'a Dense> {
+    let mut parts = key.split('.');
+    let (kind, block) = (parts.next()?, parts.next()?.parse::<usize>().ok()?);
+    if kind == "single" {
+        let block = dit.single.get(block)?;
+        return match parts.next()? {
+            "fused_in" => Some(&block.fused_in),
+            "fused_out" => Some(&block.fused_out),
+            _ => None,
+        };
+    }
+    let block = dit.double.get(block)?;
+    let stream = match parts.next()? {
+        "image" => &block.image,
+        _ => &block.text,
+    };
+    match parts.next()? {
+        "qkv" => Some(&stream.qkv),
+        "projection" => Some(&stream.projection),
+        "mlp_in" => Some(&stream.mlp_in),
+        _ => Some(&stream.mlp_out),
+    }
+}
+
 impl DitLora {
     /// Reads a PEFT file trained against diffusers' FLUX (`{module}.lora_A`
     /// and `lora_B`), with `scale` the `alpha / rank` it was trained at, which
@@ -98,13 +123,22 @@ impl DitLora {
                 })?;
             let down = file.matrix(name)?;
             let up = file.matrix(&name.replace(".lora_A.", ".lora_B."))?;
-            if up.rows != rows.len() || up.cols != down.rows {
+            let dense = projection(dit, &key).ok_or_else(|| {
+                NetworkError::InvalidConfig(format!("{name} names a block the model lacks"))
+            })?;
+            if down.cols != dense.in_dim()
+                || rows.end > dense.out_dim()
+                || up.rows != rows.len()
+                || up.cols != down.rows
+            {
                 return Err(NetworkError::InvalidConfig(format!(
-                    "{name}: an up factor of {}x{} cannot feed {} rows from rank {}",
+                    "{name}: factors of {}x{} and {}x{} do not fit a {}x{} projection's rows {rows:?}",
+                    down.rows,
+                    down.cols,
                     up.rows,
                     up.cols,
-                    rows.len(),
-                    down.rows
+                    dense.out_dim(),
+                    dense.in_dim(),
                 )));
             }
             let lora = Lora {
@@ -766,6 +800,44 @@ fn add(target: &mut Matrix, source: &Matrix) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peft_file_must_fit_the_projections_it_names() {
+        let config = crate::mmdit::tests::tiny();
+        let dir = std::env::temp_dir();
+        let path = dir.join("rusting_brain_dit_lora_model.safetensors");
+        crate::mmdit::tests::checkpoint(&config, &path);
+        let dit = Dit::load(&path, "", config.clone()).unwrap();
+        std::fs::remove_file(&path).ok();
+        let (d, rank) = (config.d_model, 2);
+        let read = |module: &str, inner: usize| {
+            let path = dir.join("rusting_brain_dit_lora_peft.safetensors");
+            let (down, up) = (vec![0.1; rank * inner], vec![0.1; d * rank]);
+            let names = [
+                format!("transformer.{module}.lora_A.weight"),
+                format!("transformer.{module}.lora_B.weight"),
+            ];
+            crate::safetensors::write(
+                &path,
+                &[
+                    (&names[0], &[rank, inner][..], &down[..]),
+                    (&names[1], &[d, rank][..], &up[..]),
+                ],
+                &Default::default(),
+            )
+            .unwrap();
+            let lora = DitLora::read_peft(&path, &dit, 1.0);
+            std::fs::remove_file(&path).ok();
+            lora
+        };
+        let lora = read("transformer_blocks.1.attn.to_k", d).unwrap();
+        assert_eq!(lora.adapters["double.1.image.qkv"][0].rows, d..2 * d);
+        // The feed-forward's way out reads the wide hidden layer, not the stream.
+        assert!(read("transformer_blocks.0.ff.net.2", d).is_err());
+        assert!(read("transformer_blocks.0.ff.net.2", config.mlp_dim()).is_ok());
+        assert!(read("transformer_blocks.2.attn.to_q", d).is_err());
+        assert!(read("single_transformer_blocks.0.norm.linear", d).is_err());
+    }
 
     /// Needs `RB_DIT_LORA_REF` from `scripts/dit_lora_reference.py`.
     #[test]
