@@ -74,6 +74,8 @@
 
 ### Added
 
+- `TransformerLm::generate_beam` runs beam search, with an optional end
+  token.
 - `Decoder::fork` copies a session, so a shared prefix is prefilled once
   and each request continues its own fork.
 - `Decoder::logits` and `Decoder::push`, and the same on `BatchDecoder`:
