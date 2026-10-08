@@ -989,7 +989,11 @@ impl ImageGpu {
         let pixels = height * width;
         let mut fresh = None;
         let (output, beta): (&mut Tensor, f32) = match target {
-            Some(target) if target.height == height && target.width == width => {
+            Some(target)
+                if target.channels() == conv.out_channels
+                    && target.height == height
+                    && target.width == width =>
+            {
                 (&mut target.tensor, 1.0)
             }
             Some(target) => {
@@ -2933,6 +2937,16 @@ mod tests {
                 &actual.data,
                 &expected.data,
                 0.01,
+            );
+            // Adding into a map with fewer channels than the convolution
+            // makes would write past it.
+            let mut short = upload_map(
+                &gpu,
+                &map(out_channels - 1, actual.height, actual.width, 0.0),
+            );
+            assert!(
+                gpu.conv_add(&device, &upload_map(&gpu, &input), &mut short)
+                    .is_err()
             );
         }
     }
