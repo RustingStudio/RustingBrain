@@ -97,6 +97,7 @@
 
 ### Added
 
+- `Glb::base_color_image(mesh, primitive) -> Option<(&[u8], &str)>`, `Glb::json()` and `Glb::binary()` (asked by RustingMedia). The request left the primitive's type open; it is the pair of indices into `meshes` and that mesh's `primitives`. Images held by URI return `None`.
 - Device group norm and SiLU for `DeviceImageBatch`: `TrainableGroupNorm::to_cuda_on`/`to_cpu`/`forward_device`/`backward_device` (with `DeviceGroupNormCache`), `conv::silu_device` and `conv::silu_backward_device` (K8b). The request named the layer `GroupNormTrainable`; it is `TrainableGroupNorm`, with the device pass as methods.
 - `conv::DeviceImageBatch` with `CudaDevice::upload`/`download`, and `TrainableConv2d::forward_device`/`backward_device`: a convolution chain whose activations and gradients stay on the device (K8a, asked by RustingChop and RustingCS2). The wanted `ConvCache` return is kept; the conv bias and its gradient now run on the device too.
 - `conv::TrainableGroupNorm`: group norm over an `ImageBatch` with `gamma`/`beta` parameters, `forward -> (ImageBatch, GroupNormCache)`, `backward` and `params_mut` (asked by RustingChop and RustingCS2). Its forward is bit-equal to `conv::GroupNorm`. `new` and `forward` return a `Result` (bad group counts and channel mismatches), and `eps` is an argument where the Chop stopgap fixed Keras' 1e-3.

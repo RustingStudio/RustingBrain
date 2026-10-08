@@ -13,7 +13,7 @@
 //! or animation the file also carries.
 //!
 //! NOTE: no Draco, no sparse accessors, no external buffer files, no
-//! materials or textures. Draco is a whole decompressor and is refused by name
+//! materials or textures beyond [`Glb::base_color_image`]'s raw bytes. Draco is a whole decompressor and is refused by name
 //! rather than silently producing an empty mesh; the others are rare enough in
 //! published asset sets that the error message is a better use of the lines
 //! than the implementation.
@@ -407,6 +407,34 @@ impl Glb {
         Self { json, binary }
     }
 
+    /// The scene description, for anything [`Glb::mesh`] does not read.
+    pub fn json(&self) -> &Value {
+        &self.json
+    }
+
+    /// The binary chunk the description's buffer views point into.
+    pub fn binary(&self) -> &[u8] {
+        &self.binary
+    }
+
+    /// The encoded base-colour image of `primitive` of `mesh` and its MIME
+    /// type, as stored: `images[textures[material.pbrMetallicRoughness
+    /// .baseColorTexture.index].source]`. `None` for an untextured primitive
+    /// or an image held outside the binary chunk (a URI).
+    pub fn base_color_image(&self, mesh: usize, primitive: usize) -> Option<(&[u8], &str)> {
+        let json = &self.json;
+        let material = json["meshes"][mesh]["primitives"][primitive]["material"].as_u64()?;
+        let texture = json["materials"][material as usize]["pbrMetallicRoughness"]
+            ["baseColorTexture"]["index"]
+            .as_u64()?;
+        let source = json["textures"][texture as usize]["source"].as_u64()?;
+        let image = &json["images"][source as usize];
+        let view = &json["bufferViews"][image["bufferView"].as_u64()? as usize];
+        let start = view["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let end = start.checked_add(view["byteLength"].as_u64()? as usize)?;
+        Some((self.binary.get(start..end)?, image["mimeType"].as_str()?))
+    }
+
     /// The container: header, JSON chunk, binary chunk.
     ///
     /// Both chunks are padded to four bytes — the JSON with spaces so it still
@@ -757,6 +785,32 @@ fn transform_normal(matrix: [f32; 16], normal: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_textured_primitive_hands_back_its_embedded_image() {
+        let png = b"\x89PNG\r\n\x1a\nnot really";
+        let mut binary = vec![7u8; 8];
+        binary.extend_from_slice(png);
+        let json = format!(
+            r#"{{
+              "meshes": [{{"primitives": [{{"material": 0}}, {{"material": 1}}, {{}}]}}],
+              "materials": [
+                {{"pbrMetallicRoughness": {{"baseColorTexture": {{"index": 0}}}}}},
+                {{"pbrMetallicRoughness": {{"baseColorFactor": [1, 0, 0, 1]}}}}
+              ],
+              "textures": [{{"source": 0}}],
+              "images": [{{"bufferView": 0, "mimeType": "image/png"}}],
+              "bufferViews": [{{"buffer": 0, "byteOffset": 8, "byteLength": {}}}]
+            }}"#,
+            png.len()
+        );
+        let file = Glb::parse(glb(&json, &binary)).unwrap();
+        assert_eq!(file.base_color_image(0, 0), Some((&png[..], "image/png")));
+        assert_eq!(file.base_color_image(0, 1), None, "a flat colour");
+        assert_eq!(file.base_color_image(0, 2), None, "no material");
+        assert_eq!(file.json()["textures"][0]["source"], 0);
+        assert_eq!(&file.binary()[8..8 + png.len()], png);
+    }
 
     /// Builds a GLB out of a JSON description and a binary chunk, the way a
     /// real exporter would, so the tests exercise the actual byte layout.
