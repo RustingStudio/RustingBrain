@@ -1353,7 +1353,7 @@ pub(crate) mod tests {
     }
 
     /// The same weights, under the reference implementation's names.
-    fn tensors(config: &DitConfig) -> BTreeMap<String, (Vec<usize>, Vec<f32>)> {
+    pub(crate) fn tensors(config: &DitConfig) -> BTreeMap<String, (Vec<usize>, Vec<f32>)> {
         let mut tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
         let mut add = |name: String, shape: Vec<usize>| {
             let count = shape.iter().product::<usize>();

@@ -1705,3 +1705,19 @@ dropped, load 5.4 to 6.5:
 Multi-row turns read the cache in place through the flash kernel instead of
 a BF16 copy of the whole history, which is where the small-turn and short
 decode gains come from.
+
+## DiT LoRA step on the device (G3 2b, 2026-10-08)
+
+One adapter training step on CUDA (forward with adapters, device tape,
+backward to every adapter gradient), `cuda_mmdit::tests::time_a_dit_adapter_step`
+in a release build: d_model 768, 6 heads of 128, 2 double and 4 single
+blocks, 1024 image tokens and 256 text tokens, adapters on every block
+projection. Load 4.2.
+
+| step | ms |
+|---|---|
+| first | 130 |
+| next five | 56, 56, 56, 48, 45 |
+
+1612 MiB of device memory in use. FLUX.1 itself is not timed: its BF16
+weights (24 GB) do not fit the 12 GB card.

@@ -75,7 +75,7 @@ fn peft_target(module: &str, d_model: usize, mlp: usize) -> Option<(String, Rang
 }
 
 /// The projection an adapter key names, if the model has that block.
-fn projection<'a>(dit: &'a Dit, key: &str) -> Option<&'a Dense> {
+pub(crate) fn projection<'a>(dit: &'a Dit, key: &str) -> Option<&'a Dense> {
     let mut parts = key.split('.');
     let (kind, block) = (parts.next()?, parts.next()?.parse::<usize>().ok()?);
     if kind == "single" {
@@ -123,24 +123,6 @@ impl DitLora {
                 })?;
             let down = file.matrix(name)?;
             let up = file.matrix(&name.replace(".lora_A.", ".lora_B."))?;
-            let dense = projection(dit, &key).ok_or_else(|| {
-                NetworkError::InvalidConfig(format!("{name} names a block the model lacks"))
-            })?;
-            if down.cols != dense.in_dim()
-                || rows.end > dense.out_dim()
-                || up.rows != rows.len()
-                || up.cols != down.rows
-            {
-                return Err(NetworkError::InvalidConfig(format!(
-                    "{name}: factors of {}x{} and {}x{} do not fit a {}x{} projection's rows {rows:?}",
-                    down.rows,
-                    down.cols,
-                    up.rows,
-                    up.cols,
-                    dense.out_dim(),
-                    dense.in_dim(),
-                )));
-            }
             let lora = Lora {
                 down: Param::new(down),
                 up: Param::new(up),
@@ -152,10 +134,63 @@ impl DitLora {
                 .or_default()
                 .push(Adapter { lora, rows });
         }
+        result.check(dit)?;
         Ok(result)
     }
 
-    fn get(&self, key: &str) -> &[Adapter] {
+    /// Checks that every adapter fits the projection its key names. The
+    /// device path writes where an adapter's rows say, so it refuses one
+    /// that does not.
+    pub(crate) fn check(&self, dit: &Dit) -> Result<(), NetworkError> {
+        for (key, list) in &self.adapters {
+            let dense = projection(dit, key).ok_or_else(|| {
+                NetworkError::InvalidConfig(format!("{key} names a block the model lacks"))
+            })?;
+            for adapter in list {
+                let (down, up) = (&adapter.lora.down.value, &adapter.lora.up.value);
+                if down.cols != dense.in_dim()
+                    || adapter.rows.is_empty()
+                    || adapter.rows.end > dense.out_dim()
+                    || up.rows != adapter.rows.len()
+                    || up.cols != down.rows
+                {
+                    return Err(NetworkError::InvalidConfig(format!(
+                        "an adapter on {key} does not fit its {}x{} projection",
+                        dense.out_dim(),
+                        dense.in_dim()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts every adapter on the device, for
+    /// [`DeviceDit::forward_adapted`](crate::cuda_mmdit::DeviceDit::forward_adapted)
+    /// and its backward pass.
+    #[cfg(feature = "cuda")]
+    pub fn move_to_cuda(
+        &mut self,
+        context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
+    ) -> Result<(), NetworkError> {
+        for adapter in self.adapters.values_mut().flatten() {
+            adapter.lora.down.move_to_cuda(context)?;
+            adapter.lora.up.move_to_cuda(context)?;
+        }
+        Ok(())
+    }
+
+    /// Brings every adapter back, values and gradients.
+    #[cfg(feature = "cuda")]
+    pub fn move_to_cpu(&mut self) -> Result<(), NetworkError> {
+        for adapter in self.adapters.values_mut().flatten() {
+            adapter.lora.down.move_to_cpu()?;
+            adapter.lora.up.move_to_cpu()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, key: &str) -> &[Adapter] {
         self.adapters.get(key).map_or(&[], Vec::as_slice)
     }
 
@@ -499,7 +534,7 @@ impl DitLora {
         Ok(())
     }
 
-    fn adapters_mut(&mut self, key: &str) -> &mut [Adapter] {
+    pub(crate) fn adapters_mut(&mut self, key: &str) -> &mut [Adapter] {
         self.adapters
             .get_mut(key)
             .map_or(&mut [], Vec::as_mut_slice)
@@ -597,7 +632,7 @@ fn project_backward(
 }
 
 /// `dL/dx` of the affine-free [`layer_norm`].
-fn layer_norm_backward(input: &Matrix, eps: f32, grad: &Matrix) -> Matrix {
+pub(crate) fn layer_norm_backward(input: &Matrix, eps: f32, grad: &Matrix) -> Matrix {
     let mut output = Matrix::new(input.rows, input.cols);
     let width = input.cols as f32;
     for ((row, grad), target) in input
@@ -624,7 +659,12 @@ fn layer_norm_backward(input: &Matrix, eps: f32, grad: &Matrix) -> Matrix {
 }
 
 /// `dL/dx` of [`HeadNorm::apply`], given the values it was applied to.
-fn head_norm_backward(norm: &HeadNorm, input: &Matrix, heads: usize, grad: &Matrix) -> Matrix {
+pub(crate) fn head_norm_backward(
+    norm: &HeadNorm,
+    input: &Matrix,
+    heads: usize,
+    grad: &Matrix,
+) -> Matrix {
     let head_dim = norm.scale.len();
     let mut output = Matrix::new(input.rows, input.cols);
     for ((row, grad), target) in input
@@ -733,7 +773,7 @@ fn thirds(qkv: &Matrix) -> (Matrix, Matrix, Matrix) {
     )
 }
 
-fn columns(matrix: &Matrix, range: Range<usize>) -> Matrix {
+pub(crate) fn columns(matrix: &Matrix, range: Range<usize>) -> Matrix {
     let mut output = Matrix::new(matrix.rows, range.len());
     for row in 0..matrix.rows {
         output

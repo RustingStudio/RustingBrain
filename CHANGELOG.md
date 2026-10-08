@@ -95,6 +95,9 @@
 
 ### Added
 
+- `DeviceDit` runs DiT LoRA adapters on CUDA and returns their gradients
+  from a device backward, within 2e-2 of the host reference. One step at
+  1024 image tokens on a 768-wide, six-block DiT takes 45-56 ms.
 - `dit_lora::DitLora`: LoRA adapters on a DiT's block projections, read from
   a diffusers-FLUX PEFT file, with a host forward and backward pass whose
   adapter gradients match PyTorch autograd within 6e-5. It is the reference
