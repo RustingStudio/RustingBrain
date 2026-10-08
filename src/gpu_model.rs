@@ -3769,6 +3769,10 @@ pub(crate) fn decode(
 /// kernel source.
 const DECODE_CHUNK: usize = 64;
 
+/// Most query heads one fused decode attention block serves per key-value
+/// head, `DECODE_GROUP` in the kernel source.
+const DECODE_GROUP: usize = 8;
+
 /// [`forward_block`] for `rows` new rows, interleaved over `sequences`, after
 /// `offset` cached positions, without anything kept for a backward pass.
 #[allow(clippy::too_many_arguments)]
@@ -3865,7 +3869,7 @@ fn decode_block(
     let group = heads / kv_heads;
     // Only the fused path writes `merged` narrow; the cuBLAS path below
     // accumulates into FP32.
-    let fused = queries == 1 && head_dim <= THREADS;
+    let fused = queries == 1 && head_dim <= THREADS && group <= DECODE_GROUP;
     let mut merged = gpu.act(rows * query_width, fused && narrow)?;
     if fused {
         let chunks = history.div_ceil(DECODE_CHUNK);
@@ -3888,7 +3892,7 @@ fn decode_block(
                 .arg(&scale)
                 .arg(&(query_width as i32))
                 .launch(cudarc::driver::LaunchConfig {
-                    grid_dim: (heads as u32, sequences as u32, chunks as u32),
+                    grid_dim: (kv_heads as u32, sequences as u32, chunks as u32),
                     block_dim: (THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 })

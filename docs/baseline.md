@@ -1609,3 +1609,24 @@ tokens/s, first round of each binary dropped as warm-up:
 Sixteen sequences are 0.3-0.8% lower, about one rounding step of the
 ms/step figure; the two growths (512 then 641 positions here) copy the
 prefix once each.
+
+## Grouped-query decode attention (C19, 2026-10-08)
+
+The fused decode attention block now serves every query head of a key-value
+head (four on the default model), so each cached key and value is loaded
+once a block instead of four times. `bench_decode`, `2f02760` against the
+change, two interleaved rounds, load 1.2 to 1.5, tokens/s:
+
+| run | per query head | per key-value head |
+|---|---|---|
+| `64 256 cuda 1 int8` | 1774 (first round 1038, warm-up) | 1783-1810 |
+| `512 256 cuda 1` | 1420-1449 | 1467-1477 |
+| `2000 128 cuda 1` | 1259-1291 | 1389-1390 |
+| `4000 256 cuda 1 int8` | 1197-1212 | 1425-1437 |
+| `64 128 cuda 16` | 11964-12058 | 12523-12629 |
+| `512 128 cuda 16` | 9163-9182 | 10348-10452 |
+| `2000 128 cuda 16` | 5016-5024 | 6906-6915 |
+
+Before, nsys put `decode_attention` at 23% of kernel time for the 4000-token
+int8 run and 31% for 2000 x 16. The grid shrinks fourfold, but at 64
+positions it still runs no slower.
