@@ -7,7 +7,8 @@
 - A device decoder's first prompt runs the fused flash attention kernel
   under mixed precision at head widths 64 and 128, instead of a full score
   matrix a head: 16 prompts of 2000 tokens prefill in 149 ms instead of
-  364 ms. `bench_decode` prints the prefill time.
+  364 ms, and with every other prompt half as long in 125 ms instead of
+  438 ms. `bench_decode` prints the prefill time.
 - Device decode attention runs one block per key-value head, scoring every
   query head of its group against each cached key and value it loads,
   instead of one block per query head. On the default model (8 heads over

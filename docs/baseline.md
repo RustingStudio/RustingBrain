@@ -1650,3 +1650,17 @@ prefill ms:
 Decode steps match (`512 128 cuda 16` 1.53-1.60 ms/step both); one round
 showed 1.78 ms/step for `512 16 cuda 16` with the change, which the recheck
 did not repeat.
+
+Padded prompts, the same day: `bench_decode` with every other prompt half
+as long (a throwaway copy of the example), `6566c19` against the change,
+two interleaved rounds, load 2.3 to 2.5, prefill ms:
+
+| run | score matrix | flash |
+|---|---|---|
+| `512 32 cuda 2` | 9.0-16.8 | 6.8 |
+| `2000 32 cuda 2` | 59.1-91.5 | 19.0-19.1 |
+| `512 32 cuda 16` | 47.2-48.4 | 31.7-32.3 |
+| `2000 32 cuda 16` | 438.3-439.7 | 125.1-125.9 |
+
+Decode steps match within noise (2000 x 16: 2.44-2.50 against 2.45-2.48
+ms/step).

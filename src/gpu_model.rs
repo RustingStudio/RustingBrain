@@ -3689,6 +3689,14 @@ pub(crate) fn decode(
         .map_err(cuda_alloc_err("host to device copy", size_of_val(valid)))?;
     kv.padded |= valid.contains(&0);
     let padding = kv.padded.then_some(&kv.slots);
+    // Each sequence's leading padding, which in a first prompt is all of it.
+    let lead: Vec<usize> = (0..sequences)
+        .map(|seq| {
+            (0..rows / sequences)
+                .take_while(|&p| valid[p * sequences + seq] == 0)
+                .count()
+        })
+        .collect();
     let valid = gpu.upload_flags(valid)?;
     let lend = |memo: &mut PackMemo, into_context: bool| -> Result<(), NetworkError> {
         let mut slot = context
@@ -3712,6 +3720,7 @@ pub(crate) fn decode(
         for (block, cache) in model.blocks.iter().zip(&mut kv.layers) {
             hidden = decode_block(
                 &gpu, block, hidden, cache, kv.length, sequences, rows, &valid, &kv.slots, padding,
+                &lead,
             )?;
         }
         let final_weight = gpu.decode_norm(&model.final_norm.weight.value.data)?;
@@ -3787,6 +3796,7 @@ fn decode_block(
     valid: &CudaSlice<i32>,
     slots: &CudaSlice<i32>,
     padding: Option<&CudaSlice<i32>>,
+    lead: &[usize],
 ) -> Result<CudaSlice<f32>, NetworkError> {
     let attention = &block.attention;
     let d_model = attention.d_model();
@@ -3870,33 +3880,41 @@ fn decode_block(
     // Only the fused path writes `merged` narrow; the cuBLAS path below
     // accumulates into FP32.
     let fused = queries == 1 && head_dim <= THREADS && group <= DECODE_GROUP;
-    // A whole even prompt under mixed precision takes the training flash
-    // kernel instead of a `[history, history]` score matrix a head.
-    let flash = gpu.context.flash.as_ref().filter(|_| {
-        queries > 1
-            && offset == 0
-            && padding.is_none()
-            && crate::cuda_flash::eligible(narrow, head_dim)
-    });
+    // A first prompt under mixed precision takes the training flash kernel
+    // instead of a `[history, history]` score matrix a head.
+    let flash =
+        gpu.context.flash.as_ref().filter(|_| {
+            queries > 1 && offset == 0 && crate::cuda_flash::eligible(narrow, head_dim)
+        });
     let mut merged = gpu.act(rows * query_width, (fused || flash.is_some()) && narrow)?;
     if let Some(flash) = flash {
-        // One launch a sequence: its rows are `sequences` rows apart, which
-        // the kernel takes as rows `sequences` times as wide.
+        // One launch a sequence over its real positions: its rows are
+        // `sequences` rows apart, which the kernel takes as rows `sequences`
+        // times as wide. Padding rows get zeros, so no later kernel reads
+        // garbage from them.
         let qkv = gpu.narrowed(&cache.slice(..rows * qkv_width), rows * qkv_width, true)?;
         let mut log_sum_exp = gpu.uninit(heads * queries)?;
         let forward = &flash.width(head_dim).forward;
-        for seq in 0..sequences {
-            let qkv = qkv.bytes.slice(seq * qkv_width * 2..);
+        if lead.iter().any(|&pad| pad > 0) {
+            gpu.context
+                .stream
+                .memset_zeros(merged.destination())
+                .map_err(cuda_err("attention output clear"))?;
+        }
+        for (seq, &pad) in lead.iter().enumerate() {
+            let length = queries - pad;
+            let first = pad * sequences + seq;
+            let qkv = qkv.bytes.slice(first * qkv_width * 2..);
             unsafe {
                 gpu.context
                     .stream
                     .launch_builder(forward)
                     .arg(&qkv)
                     .arg(&qkv)
-                    .arg(&mut merged.bytes.slice_mut(seq * query_width * 2..))
+                    .arg(&mut merged.bytes.slice_mut(first * query_width * 2..))
                     .arg(&mut log_sum_exp)
-                    .arg(&(queries as i32))
-                    .arg(&(queries as i32))
+                    .arg(&(length as i32))
+                    .arg(&(length as i32))
                     .arg(&(row_stride as i32))
                     .arg(&(row_stride as i32))
                     .arg(&((sequences * query_width) as i32))
@@ -3908,7 +3926,7 @@ fn decode_block(
                     .arg(&1i32)
                     .launch(cudarc::driver::LaunchConfig {
                         grid_dim: (
-                            queries.div_ceil(crate::cuda_flash::TILE) as u32,
+                            length.div_ceil(crate::cuda_flash::TILE) as u32,
                             heads as u32,
                             1,
                         ),
