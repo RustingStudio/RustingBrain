@@ -9,6 +9,9 @@
   matrix a head: 16 prompts of 2000 tokens prefill in 149 ms instead of
   364 ms, and with every other prompt half as long in 125 ms instead of
   438 ms. `bench_decode` prints the prefill time.
+- A device decoder's later turns of 128 tokens or more take the same flash
+  kernel: 16 sequences feeding 512 tokens after 2000 run 140 to 60 ms.
+  `bench_decode` takes a sixth argument, the length of a timed second turn.
 - Device decode attention runs one block per key-value head, scoring every
   query head of its group against each cached key and value it loads,
   instead of one block per query head. On the default model (8 heads over

@@ -1,13 +1,14 @@
 //! Times cached single-token decode, the inference hot loop.
 //!
-//! `cargo run --release --example bench_decode -- <prompt_len> <new_tokens> [cuda|cpu] [sequences] [int8|nf4]`
+//! `cargo run --release --example bench_decode -- <prompt_len> <new_tokens> [cuda|cpu] [sequences] [int8|nf4] [turn]`
 //!
 //! The host run uses a small model; `cuda` decodes the default model on the
 //! device instead. `sequences` decodes that many in step, and tokens/s counts
 //! the tokens of all of them. `int8` turns on
 //! [`TransformerLm::set_int8_decode`] for the device run and
 //! [`TransformerLm::quantize`] for the host run; `nf4` is
-//! [`TransformerLm::quantize_4bit`] on the host.
+//! [`TransformerLm::quantize_4bit`] on the host. `turn` times one more feed of
+//! that many ids a sequence after the decode, a second chat turn.
 
 use rusting_brain::TransformerLm;
 use std::time::Instant;
@@ -28,8 +29,13 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .unwrap_or(1);
 
+    let turn: usize = std::env::args()
+        .nth(6)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0);
+
     let builder = TransformerLm::builder()
-        .max_seq_len(prompt + new_tokens + 1)
+        .max_seq_len(prompt + new_tokens + turn + 1)
         .seed(7);
     let builder = if device {
         builder
@@ -61,12 +67,15 @@ fn main() {
 
     let ids: Vec<u32> = (0..prompt).map(|t| (t * 17 % 32_000) as u32).collect();
     let prompts = vec![&ids[..]; sequences];
-    // A first prefill warms the device up; the second is the one timed.
-    model
-        .batch_decoder(sequences)
-        .unwrap()
-        .feed(&prompts)
-        .unwrap();
+    let turn_ids: Vec<u32> = (0..turn).map(|t| (t * 13 % 32_000) as u32).collect();
+    let turns = vec![&turn_ids[..]; sequences];
+    // A first prefill (and turn) warms the device up; the second is the one
+    // timed.
+    let mut warm = model.batch_decoder(sequences).unwrap();
+    warm.feed(&prompts).unwrap();
+    if turn > 0 {
+        warm.feed(&turns).unwrap();
+    }
     model.synchronize().unwrap();
     let mut decoder = model.batch_decoder(sequences).unwrap();
     let start = Instant::now();
@@ -92,4 +101,13 @@ fn main() {
         1e3 * elapsed / new_tokens as f64,
         tokens / elapsed
     );
+    if turn > 0 {
+        let start = Instant::now();
+        decoder.feed(&turns).unwrap();
+        model.synchronize().unwrap();
+        println!(
+            "then a {turn}-id turn: {:.1} ms",
+            1e3 * start.elapsed().as_secs_f64()
+        );
+    }
 }
