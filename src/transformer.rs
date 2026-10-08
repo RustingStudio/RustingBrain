@@ -2070,6 +2070,29 @@ impl TransformerLm {
         self.z_loss = weight;
     }
 
+    /// Holds the Adam moments of every trainable weight on the device at one
+    /// byte each instead of four, or puts them back in FP32. The moments
+    /// carry over either way.
+    ///
+    /// Each block of 256 values keeps its largest magnitude and every value as
+    /// one of 256 logarithmically spaced levels of it, the scheme of
+    /// bitsandbytes' block-wise 8-bit Adam. A weight then costs 10 bytes on
+    /// the device to train instead of 16. Only Adam reads 8-bit state: a Lion
+    /// step on it fails.
+    ///
+    /// Device only, and it lasts while the model stays there: call it after
+    /// [`TransformerLm::to_cuda`]. A model on the host ignores it, and
+    /// [`TransformerLm::to_cpu`] brings the moments back as FP32.
+    pub fn set_8bit_optimizer_state(&mut self, enabled: bool) -> Result<(), NetworkError> {
+        #[cfg(feature = "cuda")]
+        for param in self.params_mut() {
+            param.set_8bit_moments(enabled)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = enabled;
+        Ok(())
+    }
+
     /// Overrides the checkpointed blocks chosen at build time. See
     /// [`TransformerBuilder::checkpoint`]; a restored model comes back with
     /// none.

@@ -457,6 +457,19 @@ impl Param {
         Ok(())
     }
 
+    /// Holds the device Adam moments at one byte each, or back in FP32. See
+    /// [`TransformerLm::set_8bit_optimizer_state`](crate::transformer::TransformerLm::set_8bit_optimizer_state).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn set_8bit_moments(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), crate::network::NetworkError> {
+        match &mut self.device {
+            Some(device) => device.set_8bit_moments(enabled),
+            None => Ok(()),
+        }
+    }
+
     /// Refreshes the host value (and gradient) without giving up residency.
     #[cfg(feature = "cuda")]
     pub(crate) fn sync_from_device(&mut self) -> Result<(), crate::network::NetworkError> {

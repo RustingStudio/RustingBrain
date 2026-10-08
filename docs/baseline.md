@@ -1499,3 +1499,33 @@ at every sync (threshold 0). `keep_freed_memory` in `device_context` sets
 `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` to `u64::MAX`. The LM step allocates
 little per step, so it does not move.
 
+## 8-bit Adam state (A11, 2026-10-08)
+
+`checkpoint_memory <batch> <seq> adam8`, default model, Adam, mixed
+precision, under the GPU lock, load 1.5-2.1. Peak is the device pool's high
+mark over one step, resident weights included.
+
+| Shape | FP32 state | 8-bit state |
+|---|---|---|
+| 4 x 1024, peak | 2037 MiB | 1723 MiB |
+| 4 x 1024, step (two runs) | 75.6, 75.6 ms | 75.2, 75.6 ms |
+| 16 x 256, peak | 2037 MiB | 1723 MiB |
+| 16 x 256, step | 68.4 ms | 68.1 ms |
+
+`adam8_loss_check 2000`: the repository's markdown (192,562 training
+tokens, 21,395 held out), BPE 4096, default model, 16 x 256, Adam 3e-4,
+seed 7.
+
+| Step | FP32 state | 8-bit state |
+|---:|---:|---:|
+| 0 | 8.3532 | 8.3532 |
+| 250 | 4.4934 | 4.4767 |
+| 500 | 2.9560 | 2.9508 |
+| 1000 | 0.6764 | 0.6204 |
+| 1500 | 0.2060 | 0.2075 |
+| 1999 | 0.1723 | 0.1824 |
+| Held-out | 6.5538 | 6.6180 |
+
+Both runs memorize the small corpus (42 passes), so the held-out loss rises
+for both; the 8-bit run stays within 1% of it.
+

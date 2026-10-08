@@ -37,7 +37,8 @@ use cudarc::cublas::{
     sys::cublasOperation_t,
 };
 use cudarc::driver::{
-    CudaFunction, CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut, PushKernelArg,
+    CudaFunction, CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut, LaunchConfig,
+    PushKernelArg,
 };
 use std::any::TypeId;
 use std::sync::{Arc, Mutex};
@@ -57,6 +58,7 @@ pub struct GpuContext {
     /// rather than BF16 and the accumulator is FP16 too.
     pub(crate) half_accumulate: bool,
     adam: CudaFunction,
+    adam8: CudaFunction,
     lion: CudaFunction,
     sgd: CudaFunction,
     scale: CudaFunction,
@@ -152,6 +154,7 @@ impl GpuContext {
             mixed_precision,
             half_accumulate: false,
             adam: get("adam")?,
+            adam8: get("adam8")?,
             lion: get("lion")?,
             sgd: get("sgd")?,
             scale: get("scale_inplace")?,
@@ -415,6 +418,10 @@ pub struct DeviceParam {
     grad_dirty: bool,
     moment1: CudaSlice<f32>,
     moment2: CudaSlice<f32>,
+    /// The Adam moments at one byte each, in place of `moment1` and
+    /// `moment2`, after [`DeviceParam::set_8bit_moments`]. The two FP32
+    /// buffers are then one-element placeholders.
+    moments8: Option<Moments8>,
     /// Whether the parameter is held for its value alone. A frozen parameter
     /// is what a LoRA adapter leaves behind, and the point of freezing is that
     /// its gradient and both Adam moments never get allocated, so the base
@@ -430,6 +437,94 @@ pub struct DeviceParam {
     /// The same for a 4-bit base: packed indices, block scales and the
     /// codebook's 16 levels, see [`crate::quantized::Quantized::parts_4bit`].
     four_bit: Option<(CudaSlice<u8>, CudaSlice<f32>, CudaSlice<f32>)>,
+}
+
+/// Values per scale in 8-bit optimizer state, and the threads per block of
+/// the `adam8` kernel, which reduces each block's largest magnitude itself.
+const STATE_BLOCK: usize = 256;
+
+/// The two Adam moments as byte codes, one FP32 scale per block of
+/// [`STATE_BLOCK`] values, and the 256-level map each code indexes: signed
+/// for the first moment, unsigned for the second.
+struct Moments8 {
+    codes: [CudaSlice<u8>; 2],
+    absmax: [CudaSlice<f32>; 2],
+    maps: [CudaSlice<f32>; 2],
+}
+
+fn duplicate<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    source: &CudaSlice<T>,
+) -> CudaSlice<T> {
+    stream
+        .clone_dtod(source)
+        .unwrap_or_else(|_| panic!("CUDA allocation failed while cloning a parameter"))
+}
+
+/// bitsandbytes' dynamic quantization map: seven decades from 1e-6 to 1, each
+/// split linearly, plus zero and one, sorted. The signed map spends half its
+/// levels on negatives, the unsigned map twice the levels per decade.
+fn dynamic_map(signed: bool) -> Vec<f32> {
+    let mut map = vec![0.0f32, 1.0];
+    for decade in 0..7 {
+        let items = if signed {
+            1usize << decade
+        } else {
+            2usize << decade
+        };
+        let scale = 10f32.powi(decade - 6);
+        for item in 0..items {
+            // The midpoints of `items` equal steps over [0.1, 1].
+            let mean = 0.1 + 0.9 * (item as f32 + 0.5) / items as f32;
+            map.push(scale * mean);
+            if signed {
+                map.push(-scale * mean);
+            }
+        }
+    }
+    map.sort_by(f32::total_cmp);
+    map
+}
+
+/// The index of the level in the sorted `map` nearest `value`, the lower one
+/// on a tie. The `adam8` kernel's `nearest8` searches the same way.
+fn nearest_code(map: &[f32], value: f32) -> u8 {
+    let mut code = 0;
+    let mut step = 128;
+    while step > 0 {
+        if code + step < 256 && map[code + step] <= value {
+            code += step;
+        }
+        step >>= 1;
+    }
+    if code < 255 && map[code + 1] - value < value - map[code] {
+        code += 1;
+    }
+    code as u8
+}
+
+fn quantize8(values: &[f32], map: &[f32]) -> (Vec<u8>, Vec<f32>) {
+    let mut codes = Vec::with_capacity(values.len());
+    let mut absmax = Vec::with_capacity(values.len().div_ceil(STATE_BLOCK));
+    for block in values.chunks(STATE_BLOCK) {
+        let largest = block
+            .iter()
+            .fold(0.0f32, |largest, value| largest.max(value.abs()));
+        absmax.push(largest);
+        codes.extend(block.iter().map(|&value| match largest > 0.0 {
+            true => nearest_code(map, value / largest),
+            false => nearest_code(map, 0.0),
+        }));
+    }
+    (codes, absmax)
+}
+
+fn dequantize8(codes: &[u8], absmax: &[f32], map: &[f32]) -> Vec<f32> {
+    codes
+        .iter()
+        .enumerate()
+        .map(|(index, &code)| map[code as usize] * absmax[index / STATE_BLOCK])
+        .collect()
 }
 
 impl std::fmt::Debug for DeviceParam {
@@ -503,6 +598,14 @@ impl Clone for DeviceParam {
             moment1: take(2),
             moment2: take(3),
             frozen: self.frozen,
+            moments8: self.moments8.as_ref().map(|state| Moments8 {
+                codes: state.codes.each_ref().map(|codes| duplicate(stream, codes)),
+                absmax: state
+                    .absmax
+                    .each_ref()
+                    .map(|absmax| duplicate(stream, absmax)),
+                maps: state.maps.each_ref().map(|map| duplicate(stream, map)),
+            }),
             int8,
             four_bit,
         }
@@ -526,6 +629,7 @@ impl DeviceParam {
             grad_dirty: false,
             moment1: context.zeros(len)?,
             moment2: context.zeros(len)?,
+            moments8: None,
             frozen,
             int8: None,
             four_bit: None,
@@ -573,6 +677,7 @@ impl DeviceParam {
             grad_dirty: false,
             moment1: context.zeros(1)?,
             moment2: context.zeros(1)?,
+            moments8: None,
             frozen: true,
             int8,
             four_bit,
@@ -683,9 +788,25 @@ impl DeviceParam {
         if self.frozen {
             return Ok(());
         }
-        self.context.download(&self.moment1, first)?;
+        if let Some(state) = &self.moments8 {
+            let stream = &self.context.stream;
+            for (index, target) in [&mut *first, &mut *second].into_iter().enumerate() {
+                let codes = stream.clone_dtoh(&state.codes[index]);
+                let absmax = stream.clone_dtoh(&state.absmax[index]);
+                let map = stream.clone_dtoh(&state.maps[index]);
+                let (codes, absmax, map) = (
+                    codes.map_err(cuda_err("device to host copy"))?,
+                    absmax.map_err(cuda_err("device to host copy"))?,
+                    map.map_err(cuda_err("device to host copy"))?,
+                );
+                target.data = dequantize8(&codes, &absmax, &map);
+            }
+        } else {
+            self.context.download(&self.moment1, first)?;
+            self.context.download(&self.moment2, second)?;
+        }
         first.data.iter_mut().for_each(|value| *value = -*value);
-        self.context.download(&self.moment2, second)
+        Ok(())
     }
 
     /// Restores moments read back from such a file.
@@ -698,6 +819,22 @@ impl DeviceParam {
             return Ok(());
         }
         let negated: Vec<f32> = first.data.iter().map(|value| -value).collect();
+        if let Some(state) = &mut self.moments8 {
+            let stream = &self.context.stream;
+            for (index, values) in [&negated, &second.data].into_iter().enumerate() {
+                let map = stream
+                    .clone_dtoh(&state.maps[index])
+                    .map_err(cuda_err("device to host copy"))?;
+                let (codes, absmax) = quantize8(values, &map);
+                stream
+                    .memcpy_htod(&codes, &mut state.codes[index])
+                    .map_err(cuda_err("host to device copy"))?;
+                stream
+                    .memcpy_htod(&absmax, &mut state.absmax[index])
+                    .map_err(cuda_err("host to device copy"))?;
+            }
+            return Ok(());
+        }
         self.context
             .stream
             .memcpy_htod(&negated, &mut self.moment1)
@@ -706,6 +843,53 @@ impl DeviceParam {
             .stream
             .memcpy_htod(&second.data, &mut self.moment2)
             .map_err(cuda_err("host to device copy"))
+    }
+
+    /// Holds the Adam moments at one byte each instead of four, or back in
+    /// FP32. The moments carry over, rounded to the 8-bit grid on the way in.
+    ///
+    /// Each block of 256 values keeps its largest magnitude in FP32 and every
+    /// value as the nearest of 256 levels of that, spaced logarithmically
+    /// like bitsandbytes' dynamic map, so a block's small second moments keep
+    /// their relative precision next to a large one.
+    pub(crate) fn set_8bit_moments(&mut self, enabled: bool) -> Result<(), NetworkError> {
+        if self.frozen || self.is_quantized() || enabled == self.moments8.is_some() {
+            return Ok(());
+        }
+        let len = self.rows * self.cols;
+        let mut first = Matrix::new(self.rows, self.cols);
+        let mut second = Matrix::new(self.rows, self.cols);
+        self.download_moments(&mut first, &mut second)?;
+        let (moments, state) = match enabled {
+            true => {
+                let stream = &self.context.stream;
+                let blocks = len.div_ceil(STATE_BLOCK);
+                let bytes = |len| {
+                    stream
+                        .alloc_zeros::<u8>(len)
+                        .map_err(cuda_alloc_err("device allocation", len))
+                };
+                let maps = [dynamic_map(true), dynamic_map(false)];
+                let state = Moments8 {
+                    codes: [bytes(len)?, bytes(len)?],
+                    absmax: [self.context.zeros(blocks)?, self.context.zeros(blocks)?],
+                    maps: [
+                        stream
+                            .clone_htod(&maps[0])
+                            .map_err(cuda_err("host to device copy"))?,
+                        stream
+                            .clone_htod(&maps[1])
+                            .map_err(cuda_err("host to device copy"))?,
+                    ],
+                };
+                (1, Some(state))
+            }
+            false => (len, None),
+        };
+        self.moment1 = self.context.zeros(moments)?;
+        self.moment2 = self.context.zeros(moments)?;
+        self.moments8 = state;
+        self.upload_moments(&first, &second)
     }
 
     /// The L2 norm of this parameter's gradient, computed on the device.
@@ -1019,6 +1203,39 @@ impl DeviceParam {
                 } => {
                     let correction1 = 1.0 - beta1.powi(step as i32);
                     let correction2 = 1.0 - beta2.powi(step as i32);
+                    if let Some(state) = &mut self.moments8 {
+                        let [codes1, codes2] = &mut state.codes;
+                        let [absmax1, absmax2] = &mut state.absmax;
+                        unsafe {
+                            self.context
+                                .stream
+                                .launch_builder(&self.context.adam8)
+                                .arg(&mut self.value)
+                                .arg(&self.negated_grad)
+                                .arg(codes1)
+                                .arg(codes2)
+                                .arg(absmax1)
+                                .arg(absmax2)
+                                .arg(&state.maps[0])
+                                .arg(&state.maps[1])
+                                .arg(&(elements as i32))
+                                .arg(&learning_rate)
+                                .arg(&beta1)
+                                .arg(&beta2)
+                                .arg(&epsilon)
+                                .arg(&correction1)
+                                .arg(&correction2)
+                                .arg(&weight_decay)
+                                .launch(LaunchConfig {
+                                    grid_dim: (elements.div_ceil(STATE_BLOCK) as u32, 1, 1),
+                                    block_dim: (STATE_BLOCK as u32, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })
+                                .map_err(cuda_err("8-bit Adam update kernel"))?;
+                        }
+                        self.grad_dirty = false;
+                        return Ok(());
+                    }
                     unsafe {
                         self.context
                             .stream
@@ -1040,6 +1257,11 @@ impl DeviceParam {
                     }
                 }
                 // Like Adam's here, the moment averages the negated gradient.
+                Optimizer::Lion { .. } if self.moments8.is_some() => {
+                    return Err(NetworkError::UnsupportedCuda(
+                        "8-bit optimizer state is for Adam; Lion keeps FP32 moments".into(),
+                    ));
+                }
                 Optimizer::Lion {
                     learning_rate,
                     beta1,
@@ -2056,6 +2278,135 @@ mod tests {
                 1e-3,
             );
         }
+    }
+
+    /// The `adam8` kernel against the same block-wise 8-bit Adam on the host,
+    /// over steps whose gradients span six decades, with a partial last
+    /// block. A kernel that rescales with the previous step's block maximum,
+    /// or rounds to the wrong level, fails it.
+    #[test]
+    fn an_8bit_adam_step_matches_the_host_or_skips_without_device() {
+        use super::{DeviceParam, GpuContext, dequantize8, dynamic_map, quantize8};
+        use crate::matrix::Matrix;
+        if !cuda_or_skip() {
+            return;
+        }
+        let (rows, cols) = (3, 300);
+        let mut value = Matrix::new(rows, cols);
+        for (index, weight) in value.data.iter_mut().enumerate() {
+            *weight = ((index * 37 % 101) as f32 / 50.0) - 1.0;
+        }
+        let context = GpuContext::new(0).unwrap();
+        let mut device = DeviceParam::new(context.clone(), &value, false).unwrap();
+        device.set_8bit_moments(true).unwrap();
+        let (learning_rate, beta1, beta2, epsilon, weight_decay) = (1e-2, 0.9, 0.999, 1e-8, 0.01);
+        let optimizer = Optimizer::Adam {
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+        };
+        let maps = [dynamic_map(true), dynamic_map(false)];
+        let len = rows * cols;
+        let mut host = value.data.clone();
+        let mut state = [
+            quantize8(&vec![0.0; len], &maps[0]),
+            quantize8(&vec![0.0; len], &maps[1]),
+        ];
+        for step in 1..=5 {
+            // The device holds -dL/dw; the host reference works in the same sign.
+            let negated: Vec<f32> = (0..len)
+                .map(|index| {
+                    let decade = 10f32.powi((index % 7) as i32 - 6);
+                    decade * (((index * 13 + step * 29) % 17) as f32 - 8.0)
+                })
+                .collect();
+            device.grad_beta();
+            context
+                .stream
+                .memcpy_htod(&negated, device.negated_grad_mut())
+                .unwrap();
+            device.step(&optimizer, step, 1.0);
+
+            let first = dequantize8(&state[0].0, &state[0].1, &maps[0]);
+            let second = dequantize8(&state[1].0, &state[1].1, &maps[1]);
+            let correction1 = 1.0 - beta1.powi(step as i32);
+            let correction2 = 1.0 - beta2.powi(step as i32);
+            let (mut new_first, mut new_second) = (vec![0.0; len], vec![0.0; len]);
+            for index in 0..len {
+                let gradient = negated[index];
+                let moment1 = beta1 * first[index] + (1.0 - beta1) * gradient;
+                let moment2 = beta2 * second[index] + (1.0 - beta2) * gradient * gradient;
+                host[index] -= learning_rate * weight_decay * host[index];
+                host[index] += learning_rate * (moment1 / correction1)
+                    / ((moment2 / correction2).sqrt() + epsilon);
+                new_first[index] = moment1;
+                new_second[index] = moment2;
+            }
+            state = [
+                quantize8(&new_first, &maps[0]),
+                quantize8(&new_second, &maps[1]),
+            ];
+        }
+        context.check().unwrap();
+
+        let mut weights = Matrix::new(rows, cols);
+        device.download_value(&mut weights).unwrap();
+        assert_close("weights", &weights.data, &host, 1e-5);
+        let (mut first, mut second) = (Matrix::new(rows, cols), Matrix::new(rows, cols));
+        device.download_moments(&mut first, &mut second).unwrap();
+        let expected_first: Vec<f32> = dequantize8(&state[0].0, &state[0].1, &maps[0])
+            .iter()
+            .map(|v| -v)
+            .collect();
+        assert_close("first moment", &first.data, &expected_first, 1e-6);
+        let expected_second = dequantize8(&state[1].0, &state[1].1, &maps[1]);
+        assert_close("second moment", &second.data, &expected_second, 1e-9);
+
+        // Back to FP32 the moments carry over as they were.
+        device.set_8bit_moments(false).unwrap();
+        let (mut again1, mut again2) = (Matrix::new(rows, cols), Matrix::new(rows, cols));
+        device.download_moments(&mut again1, &mut again2).unwrap();
+        assert_eq!(again1.data, first.data);
+        assert_eq!(again2.data, second.data);
+    }
+
+    /// The whole model with 8-bit Adam state trains like the FP32 state on the
+    /// device: the losses stay within a few percent over 30 steps.
+    #[test]
+    fn a_model_with_8bit_optimizer_state_trains_like_fp32_or_skips_without_device() {
+        if !cuda_or_skip() {
+            return;
+        }
+        let mut full = tiny().build().unwrap();
+        full.to_cuda(0, 8192).unwrap();
+        let mut small = full.clone();
+        small.set_8bit_optimizer_state(true).unwrap();
+        let batch = [
+            vec![3u32, 8, 1, 5, 2, 7, 9, 4],
+            vec![9, 4, 4, 0, 11, 6, 2, 1],
+        ];
+        let (mut first, mut last) = (0.0, (0.0, 0.0));
+        for step in 0..30 {
+            let a = full.train_step(&batch).unwrap().lm_loss;
+            let b = small.train_step(&batch).unwrap().lm_loss;
+            if step == 0 {
+                first = a;
+            }
+            last = (a, b);
+        }
+        assert!(
+            last.0 < 0.5 * first,
+            "FP32 state did not train: {first} to {}",
+            last.0
+        );
+        assert!(
+            (last.1 - last.0).abs() <= 0.05 * last.0 + 0.02,
+            "8-bit state ends at {} against {} for FP32",
+            last.1,
+            last.0
+        );
     }
 
     /// The fused head kernels carry the z-loss term and its gradient, in both
