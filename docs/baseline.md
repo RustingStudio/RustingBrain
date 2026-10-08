@@ -1664,3 +1664,25 @@ two interleaved rounds, load 2.3 to 2.5, prefill ms:
 
 Decode steps match within noise (2000 x 16: 2.44-2.50 against 2.45-2.48
 ms/step).
+
+Later turns, the same day: `bench_decode 2000 8 cuda <n> "" <turn>` times a
+second feed of `turn` ids a sequence after the decode (warmed by the same
+turn on the warm-up decoder). Flash on every multi-row turn against the
+score matrix, three interleaved rounds, load 19 to 38 (another loop's
+`rustc`), ms:
+
+| sequences, turn | score matrix | flash |
+|---|---|---|
+| 1, 8 | 1.9-3.6 | 2.2-4.1 |
+| 1, 32 | 3.3-4.1 | 4.4-4.8 |
+| 1, 128 | 5.1-6.1 | 4.1-6.7 |
+| 1, 512 | 18.4-19.9 | 8.7-16.5 |
+| 16, 8 | 10.0-11.1 | 24.8-26.0 |
+| 16, 32 | 13.3-13.4 | 26.0-26.2 |
+| 16, 128 | 34.9-35.4 | 32.5-34.1 |
+| 16, 512 | 140.5-160.5 | 60.1-70.2 |
+
+The flash path converts the whole cached history to BF16 each layer, which
+a short turn does not earn back, so later turns take it from 128 rows. The
+training kernel's extra mask test costs nothing: `bench_train_step 4 1024
+cuda` 54321-54404 tokens/s, load 17.

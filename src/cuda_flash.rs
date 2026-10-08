@@ -385,9 +385,13 @@ template<int D> __device__ __forceinline__ void flash_fwd(
   // Running maximum and sum of the two query rows this thread holds.
   float m_a=NEG_INF, m_b=NEG_INF, l_a=0.f, l_b=0.f;
 
-  // Causal: query tile `qt` sees key tiles 0..qt and nothing beyond.
-  // Bidirectional: every query tile sees every key tile.
-  const int last = causal ? qt : ((kv_len + 63) >> 6) - 1;
+  // Causal: `causal` is one more than the key position of query row 0, zero
+  // in training, so query row r sees keys up to r + shift and query tile `qt`
+  // sees key tiles up to the one holding its last row's. Bidirectional: every
+  // query tile sees every key tile.
+  const int shift = causal ? causal - 1 : 0;
+  const int key_tiles = ((kv_len + 63) >> 6) - 1;
+  const int last = causal ? min((qt*64 + 63 + shift) >> 6, key_tiles) : key_tiles;
   for (int kt=0; kt<=last; ++kt) {
     __syncthreads();
     // One element a thread, not two: the value tile is stored transposed, and
@@ -425,17 +429,19 @@ template<int D> __device__ __forceinline__ void flash_fwd(
       }
     }
 
-    // Only the last tile is partly masked - the diagonal under a causal mask,
-    // the end of the sequence without one - and only it can hold keys past
-    // the end of a sequence whose length is not a multiple of 64.
-    if (kt == last) {
+    // Only the tiles the diagonal crosses are partly masked under a causal
+    // mask - the last one in training, up to two with a shift - and only the
+    // last can hold keys past the end of a sequence whose length is not a
+    // multiple of 64.
+    if (kt == last || (causal && kt*64 + 63 > qt*64 + shift)) {
+      const int see_a = causal ? row_a + shift : kv_len, see_b = causal ? row_b + shift : kv_len;
       #pragma unroll
       for (int n=0;n<8;++n) {
         int key = kt*64 + n*8 + t*2;
-        if ((causal && key   > row_a) || key   >= kv_len) s[n][0]=NEG_INF;
-        if ((causal && key+1 > row_a) || key+1 >= kv_len) s[n][1]=NEG_INF;
-        if ((causal && key   > row_b) || key   >= kv_len) s[n][2]=NEG_INF;
-        if ((causal && key+1 > row_b) || key+1 >= kv_len) s[n][3]=NEG_INF;
+        if (key   > see_a || key   >= kv_len) s[n][0]=NEG_INF;
+        if (key+1 > see_a || key+1 >= kv_len) s[n][1]=NEG_INF;
+        if (key   > see_b || key   >= kv_len) s[n][2]=NEG_INF;
+        if (key+1 > see_b || key+1 >= kv_len) s[n][3]=NEG_INF;
       }
     }
 
