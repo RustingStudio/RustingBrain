@@ -654,7 +654,7 @@ fn resnet_backward(resnet: &Resnet, tape: &ResnetTape, grad: &FeatureMap) -> Fea
 }
 
 /// `dL/d(input)` of `conv.forward(input)`; only `input`'s shape is read.
-fn conv_backward(conv: &Conv2d, grad: &FeatureMap, input: &FeatureMap) -> FeatureMap {
+pub(crate) fn conv_backward(conv: &Conv2d, grad: &FeatureMap, input: &FeatureMap) -> FeatureMap {
     let (kernel, stride, padding) = (conv.kernel, conv.stride, conv.padding);
     let patch = conv.in_channels * kernel * kernel;
     let mut columns = Matrix::new(grad.pixels(), patch);
@@ -688,7 +688,11 @@ fn conv_backward(conv: &Conv2d, grad: &FeatureMap, input: &FeatureMap) -> Featur
 }
 
 /// `dL/dx` of [`GroupNorm::forward`], given `x`.
-fn group_norm_backward(norm: &GroupNorm, input: &FeatureMap, grad: &FeatureMap) -> FeatureMap {
+pub(crate) fn group_norm_backward(
+    norm: &GroupNorm,
+    input: &FeatureMap,
+    grad: &FeatureMap,
+) -> FeatureMap {
     let pixels = input.pixels();
     let per_group = input.channels / norm.groups;
     let span = per_group * pixels;
@@ -727,7 +731,12 @@ fn group_norm_backward(norm: &GroupNorm, input: &FeatureMap, grad: &FeatureMap) 
 }
 
 /// `dL/dx` of the affine layer norm [`crate::clip::Norm`].
-fn norm_backward(norm: &crate::clip::Norm, input: &Matrix, eps: f32, grad: &Matrix) -> Matrix {
+pub(crate) fn norm_backward(
+    norm: &crate::clip::Norm,
+    input: &Matrix,
+    eps: f32,
+    grad: &Matrix,
+) -> Matrix {
     let mut scaled = grad.clone();
     scaled.data.chunks_mut(grad.cols).for_each(|row| {
         row.iter_mut()
@@ -753,7 +762,7 @@ fn geglu(projected: &Matrix) -> Matrix {
     hidden
 }
 
-fn geglu_backward(projected: &Matrix, grad: &Matrix) -> Matrix {
+pub(crate) fn geglu_backward(projected: &Matrix, grad: &Matrix) -> Matrix {
     let inner = grad.cols;
     let mut output = Matrix::new(projected.rows, projected.cols);
     for ((target, row), grad) in output
@@ -779,7 +788,7 @@ fn dense_backward(dense: &Dense, grad: &Matrix) -> Matrix {
     output
 }
 
-fn silu_backward(grad: &FeatureMap, pre: &FeatureMap) -> FeatureMap {
+pub(crate) fn silu_backward(grad: &FeatureMap, pre: &FeatureMap) -> FeatureMap {
     let mut output = grad.clone();
     output
         .data
@@ -790,7 +799,7 @@ fn silu_backward(grad: &FeatureMap, pre: &FeatureMap) -> FeatureMap {
 }
 
 /// Each output pixel's gradient goes back to the one it was copied from.
-fn upsample_backward(grad: &FeatureMap) -> FeatureMap {
+pub(crate) fn upsample_backward(grad: &FeatureMap) -> FeatureMap {
     let (height, width) = (grad.height / 2, grad.width / 2);
     let mut output = FeatureMap::new(grad.channels, height, width);
     for channel in 0..grad.channels {
