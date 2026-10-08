@@ -1,11 +1,11 @@
 # The RustingBrain Course
 
-Seventeen chapters, from what a neural network is to training a mixture-of-experts
-language model on a GPU. No prior machine-learning knowledge assumed. Rust
+Eighteen chapters, from what a neural network is to training a mixture-of-experts
+language model on a GPU and generating images with a published diffusion model. No prior machine-learning knowledge assumed. Rust
 assumed at the level of "I can read a `for` loop".
 
 Every chapter has runnable code in [`code/`](code/) and ends with exercises.
-Chapters 1–10 need nothing but Rust. Chapter 11 and 14–17 are much faster with
+Chapters 1–10 need nothing but Rust. Chapters 11 and 14–18 are much faster with
 an NVIDIA GPU, and all of them still run without one.
 
 ---
@@ -52,6 +52,12 @@ is worse than one that looks bad.
 | 16 | [Training a Language Model End to End](16_training_an_llm.md) | 14–15 | an afternoon |
 | 17 | [Fine-Tuning With LoRA](17_lora_fine_tuning.md) | 16 | 45 min |
 
+## Part V — Images
+
+| # | Chapter | You need | Time |
+|---|---|---|---|
+| 18 | [Generating Images From Text](18_text_to_image.md) | 1–10, a downloaded model | 45 min |
+
 ---
 
 ## If you are here for one thing
@@ -72,6 +78,7 @@ is worse than one that looks bad.
 | Plan a run that takes days | [16](16_training_an_llm.md) |
 | Fine-tune a model to answer questions | [16](16_training_an_llm.md) |
 | Adapt a trained model on a small GPU | [17](17_lora_fine_tuning.md) |
+| Turn a prompt into a picture | [18](18_text_to_image.md) |
 
 ## Running the code
 
@@ -87,9 +94,10 @@ to fifty times slower, and chapter 13.8 is a list of people who forgot.
 
 ## What is not here
 
-Convolutions, encoder-decoder models, reinforcement learning, multi-GPU and
-distributed training. None of them are implemented in the library, so none of
-them are taught here.
+Training a convolutional network, encoder-decoder models, reinforcement
+learning, multi-GPU and distributed training. The library runs convolutions
+(chapter 18 is built on them) but no chapter trains one yet; the rest are not
+implemented, so they are not taught here.
 
 The reference documentation is the source. Every public type carries the
 reasoning behind it, which is the part that does not fit in a tutorial.
