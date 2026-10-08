@@ -95,6 +95,7 @@
 
 ### Added
 
+- `ffn::silu_derivative` is public, for hand-written backward passes through SiLU (asked by RustingChop and RustingCS2).
 - FP16 device backward kernels for UNet adapter training in `cuda_image`: convolution input gradients, group and layer norm, the gated GELU, SiLU and nearest upsampling, each matched to the host `unet_lora` functions.
 - `DeviceUnet::forward_adapted` runs a UNet LoRA's attention adapters on the device and keeps a tape for the backward pass, matched to `UnetLora::forward`.
 - A device attention backward for any head width in `cuda_image`, a chunk of query rows at a time with key and value gradients summed in FP32.
