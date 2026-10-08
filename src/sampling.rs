@@ -27,7 +27,10 @@ pub struct Sampler {
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    min_p: f32,
     repetition_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
     rng: StdRng,
 }
 
@@ -39,7 +42,10 @@ impl Sampler {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             rng: StdRng::seed_from_u64(0),
         }
     }
@@ -68,6 +74,28 @@ impl Sampler {
     /// number kept follows how confident the model is. One keeps all of them.
     pub fn top_p(mut self, p: f32) -> Self {
         self.top_p = p;
+        self
+    }
+
+    /// Keeps only the tokens at least `p` times as likely as the most likely
+    /// one, after the temperature, so the cut follows how confident the model
+    /// is from the top down. Zero keeps all of them.
+    pub fn min_p(mut self, p: f32) -> Self {
+        self.min_p = p;
+        self
+    }
+
+    /// Subtracts `penalty` once from the logit of every token already in the
+    /// history, however often it appears there.
+    pub fn presence_penalty(mut self, penalty: f32) -> Self {
+        self.presence_penalty = penalty;
+        self
+    }
+
+    /// Subtracts `penalty` from a token's logit for every time it appears in
+    /// the history.
+    pub fn frequency_penalty(mut self, penalty: f32) -> Self {
+        self.frequency_penalty = penalty;
         self
     }
 
@@ -157,6 +185,20 @@ impl Sampler {
             }
         }
 
+        if self.presence_penalty != 0.0 || self.frequency_penalty != 0.0 {
+            let mut counts = vec![0u32; scores.len()];
+            for &id in history {
+                if let Some(count) = counts.get_mut(id as usize) {
+                    *count += 1;
+                }
+            }
+            for (score, &count) in scores.iter_mut().zip(&counts) {
+                if count > 0 {
+                    *score -= self.presence_penalty + self.frequency_penalty * count as f32;
+                }
+            }
+        }
+
         let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
         // `total_cmp` rather than `partial_cmp`: a NaN logit means the model has
         // diverged, and an ordering that panics or silently shuffles makes that
@@ -190,6 +232,15 @@ impl Sampler {
             .iter()
             .map(|&(_, score)| ((score - max) / self.temperature).exp())
             .collect();
+        // The leading weight is `exp(0)`, one, so a weight is already its
+        // token's probability relative to the top. The argmax always stays.
+        if self.min_p > 0.0 {
+            let kept = weights
+                .iter()
+                .position(|&weight| weight < self.min_p)
+                .map_or(weights.len(), |index| index.max(1));
+            weights.truncate(kept);
+        }
         let total: f32 = weights.iter().sum();
 
         if self.top_p < 1.0 && total > 0.0 {
@@ -281,6 +332,35 @@ mod tests {
         // A negative logit is pushed further down, never up past its peers.
         let mut sampler = Sampler::greedy().repetition_penalty(4.0);
         assert_eq!(sampler.pick(&LOGITS, &[3]), 1);
+    }
+
+    #[test]
+    fn min_p_keeps_the_tokens_at_or_above_its_share_of_the_top() {
+        // Relative to token 1, token 2 is at exp(-2) = 0.135, token 0 at
+        // 0.082, token 4 at 0.064 and token 3 at 0.0067.
+        let sampler = Sampler::temperature(1.0, Some(1)).min_p(0.1);
+        let kept: Vec<bool> = sampler
+            .probabilities(&LOGITS, &[])
+            .iter()
+            .map(|&p| p > 0.0)
+            .collect();
+        assert_eq!(kept, [false, true, true, false, false]);
+        // A threshold above every ratio still leaves the argmax.
+        let sampler = Sampler::temperature(1.0, Some(1)).min_p(2.0);
+        assert_eq!(sampler.probabilities(&LOGITS, &[])[1], 1.0);
+    }
+
+    #[test]
+    fn presence_counts_once_and_frequency_per_occurrence() {
+        // Token 1 leads token 2 by 2.0. Seen twice, a presence penalty of 1.5
+        // leaves it ahead; a frequency penalty of 1.5 takes 3.0 and does not.
+        let history = [1, 1];
+        let mut sampler = Sampler::greedy().presence_penalty(1.5);
+        assert_eq!(sampler.pick(&LOGITS, &history), 1);
+        let mut sampler = Sampler::greedy().frequency_penalty(1.5);
+        assert_eq!(sampler.pick(&LOGITS, &history), 2);
+        let mut sampler = Sampler::greedy().presence_penalty(1.5);
+        assert_eq!(sampler.pick(&LOGITS, &[1, 2]), 1);
     }
 
     #[test]

@@ -74,6 +74,8 @@
 
 ### Added
 
+- `Sampler::min_p`, `Sampler::presence_penalty` and
+  `Sampler::frequency_penalty`.
 - `TransformerLm::generate_speculative_with` runs speculative decoding with
   any `Sampler`, accepting draft proposals by rejection sampling so the
   output is distributed as sampling the target model alone.
