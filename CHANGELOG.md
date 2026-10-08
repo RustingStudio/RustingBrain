@@ -105,7 +105,8 @@
   other models are steered through `Inpaint`.
 - `ControlNet` loads diffusers ControlNets for UNet models, and
   `Unet::set_controls` lets one or more of them steer the layout from an edge,
-  depth or pose picture; matches diffusers within 9e-7.
+  depth or pose picture, on the CPU or a CUDA device; matches diffusers
+  within 9e-7.
 - `ImagePipeline::load_with_loras` and `ShardedSafeTensors::add_lora` merge
   published LoRA files (PEFT/diffusers and kohya spellings, including
   kohya's SDXL and FLUX files that use the original models' module names,

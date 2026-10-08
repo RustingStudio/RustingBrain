@@ -1796,15 +1796,15 @@ struct DeviceBlock {
     resampler: Option<DeviceConv>,
 }
 
-/// A UNet, resident on the device.
+/// A UNet, resident on the device. A ControlNet's copy of the way down is
+/// one with no way up.
 pub struct DeviceUnet {
     gpu: Arc<ImageGpu>,
     conv_in: DeviceConv,
     down: Vec<DeviceBlock>,
     middle: (DeviceResnet, DeviceTransformer, DeviceResnet),
     up: Vec<DeviceBlock>,
-    norm_out: DeviceGroupNorm,
-    conv_out: DeviceConv,
+    out: Option<(DeviceGroupNorm, DeviceConv)>,
     eps: f32,
 }
 
@@ -1814,31 +1814,93 @@ impl std::fmt::Debug for DeviceUnet {
     }
 }
 
+/// A ControlNet on the device, with its strength folded into the
+/// convolutions its corrections leave through.
+pub struct DeviceControlNet {
+    body: DeviceUnet,
+    hint: Vec<DeviceConv>,
+    zero: Vec<DeviceConv>,
+    zero_middle: DeviceConv,
+}
+
+impl std::fmt::Debug for DeviceControlNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceControlNet").finish_non_exhaustive()
+    }
+}
+
+impl DeviceControlNet {
+    pub fn upload(
+        gpu: &Arc<ImageGpu>,
+        control: &crate::unet::Control,
+    ) -> Result<Self, NetworkError> {
+        let net = &control.net;
+        let scaled = |conv: &Conv2d| {
+            let mut conv = conv.clone();
+            conv.weight
+                .data
+                .iter_mut()
+                .for_each(|value| *value *= control.scale);
+            if let Some(bias) = &mut conv.bias {
+                bias.iter_mut().for_each(|value| *value *= control.scale);
+            }
+            upload_conv(gpu, &conv)
+        };
+        Ok(Self {
+            body: DeviceUnet::upload_encoder(gpu, &net.encoder, net.config.eps)?,
+            hint: net
+                .hint
+                .iter()
+                .map(|conv| upload_conv(gpu, conv))
+                .collect::<Result<_, _>>()?,
+            zero: net.zero.iter().map(scaled).collect::<Result<_, _>>()?,
+            zero_middle: scaled(&net.zero_middle)?,
+        })
+    }
+}
+
 impl DeviceUnet {
     /// Uploads every weight once. A failure part way through drops whatever was
     /// already on the device, so the caller is left on the CPU path intact.
     pub fn upload(gpu: &Arc<ImageGpu>, model: &Unet) -> Result<Self, NetworkError> {
         Ok(Self {
-            conv_in: upload_conv(gpu, &model.encoder.conv_in)?,
-            down: model
-                .encoder
-                .down
-                .iter()
-                .map(|block| upload_block(gpu, block))
-                .collect::<Result<_, _>>()?,
-            middle: (
-                upload_resnet(gpu, &model.encoder.middle.0)?,
-                upload_transformer(gpu, &model.encoder.middle.1)?,
-                upload_resnet(gpu, &model.encoder.middle.2)?,
-            ),
             up: model
                 .up
                 .iter()
                 .map(|block| upload_block(gpu, block))
                 .collect::<Result<_, _>>()?,
-            norm_out: upload_group_norm(gpu, &model.norm_out)?,
-            conv_out: upload_conv(gpu, &model.conv_out)?,
-            eps: model.config().eps,
+            out: Some((
+                upload_group_norm(gpu, &model.norm_out)?,
+                upload_conv(gpu, &model.conv_out)?,
+            )),
+            ..Self::upload_encoder(gpu, &model.encoder, model.config().eps)?
+        })
+    }
+
+    pub(crate) fn gpu(&self) -> &Arc<ImageGpu> {
+        &self.gpu
+    }
+
+    fn upload_encoder(
+        gpu: &Arc<ImageGpu>,
+        encoder: &crate::unet::Encoder,
+        eps: f32,
+    ) -> Result<Self, NetworkError> {
+        Ok(Self {
+            conv_in: upload_conv(gpu, &encoder.conv_in)?,
+            down: encoder
+                .down
+                .iter()
+                .map(|block| upload_block(gpu, block))
+                .collect::<Result<_, _>>()?,
+            middle: (
+                upload_resnet(gpu, &encoder.middle.0)?,
+                upload_transformer(gpu, &encoder.middle.1)?,
+                upload_resnet(gpu, &encoder.middle.2)?,
+            ),
+            up: Vec::new(),
+            out: None,
+            eps,
             gpu: gpu.clone(),
         })
     }
@@ -1848,43 +1910,45 @@ impl DeviceUnet {
     /// `latent` is already scaled for the noise level and `time` is already the
     /// embedded, conditioned vector: both are a handful of flops that the host
     /// does once per pass, and keeping them there means the device path and the
-    /// CPU path share that code rather than reimplementing it.
+    /// CPU path share that code rather than reimplementing it. Each control
+    /// comes with its own embedded time and its picture, and reads `noisy`,
+    /// the latent without an inpainting checkpoint's extra channels.
     pub fn forward(
         &self,
         latent: &FeatureMap,
         time: &[f32],
         text: &Matrix,
+        noisy: &FeatureMap,
+        controls: &[(&DeviceControlNet, Vec<f32>, &FeatureMap)],
     ) -> Result<FeatureMap, NetworkError> {
         let gpu = &self.gpu;
-        let mut time = gpu.upload(1, time.len(), time)?;
-        gpu.activate(&mut time, 0)?;
+        let time = self.time(time)?;
         let text = gpu.upload_matrix(text)?;
+        let (mut sample, mut skips) = self.down(latent, &time, &text, None)?;
 
-        let input = Map {
-            tensor: gpu.upload(latent.channels, latent.pixels(), &latent.data)?,
-            height: latent.height,
-            width: latent.width,
-        };
-        let mut sample = gpu.conv(&self.conv_in, &input)?;
-        let mut skips = vec![clone_map(gpu, &sample)?];
-
-        for block in &self.down {
-            for (index, resnet) in block.resnets.iter().enumerate() {
-                sample = self.resnet(resnet, sample, &time)?;
-                if let Some(transformer) = block.attentions.get(index) {
-                    sample = self.transformer(transformer, &sample, &text)?;
-                }
-                skips.push(clone_map(gpu, &sample)?);
+        for (net, control_time, image) in controls {
+            let mut hint = upload_map(gpu, image)?;
+            let (last, stack) = net.hint.split_last().expect("a hint stack has an output");
+            for conv in stack {
+                hint = gpu.conv(conv, &hint)?;
+                gpu.activate(&mut hint.tensor, 0)?;
             }
-            if let Some(resampler) = &block.resampler {
-                sample = gpu.conv(resampler, &sample)?;
-                skips.push(clone_map(gpu, &sample)?);
+            let (middle, corrections) = net.body.down(
+                noisy,
+                &net.body.time(control_time)?,
+                &text,
+                Some((last, &hint)),
+            )?;
+            if corrections.len() != skips.len() || corrections.len() != net.zero.len() {
+                return Err(NetworkError::InvalidConfig(
+                    "the ControlNet does not have the UNet's rungs".into(),
+                ));
             }
+            for ((skip, correction), zero) in skips.iter_mut().zip(&corrections).zip(&net.zero) {
+                gpu.conv_add(zero, correction, skip)?;
+            }
+            gpu.conv_add(&net.zero_middle, &middle, &mut sample)?;
         }
-
-        sample = self.resnet(&self.middle.0, sample, &time)?;
-        sample = self.transformer(&self.middle.1, &sample, &text)?;
-        sample = self.resnet(&self.middle.2, sample, &time)?;
 
         for block in &self.up {
             for (index, resnet) in block.resnets.iter().enumerate() {
@@ -1908,9 +1972,62 @@ impl DeviceUnet {
             }
         }
 
-        gpu.group_norm(&self.norm_out, &mut sample, 0)?;
-        let output = gpu.conv(&self.conv_out, &sample)?;
+        let (norm_out, conv_out) = self.out.as_ref().expect("a UNet has an output");
+        gpu.group_norm(norm_out, &mut sample, 0)?;
+        let output = gpu.conv(conv_out, &sample)?;
         download_map(gpu, &output)
+    }
+
+    /// The embedded time on the device, through the SiLU every resnet reads
+    /// it after.
+    fn time(&self, time: &[f32]) -> Result<Tensor, NetworkError> {
+        let mut time = self.gpu.upload(1, time.len(), time)?;
+        self.gpu.activate(&mut time, 0)?;
+        Ok(time)
+    }
+
+    /// The stem, the way down and the middle, keeping every rung's output for
+    /// the way up. A ControlNet adds its picture after the stem, through the
+    /// last convolution of its hint stack.
+    fn down(
+        &self,
+        latent: &FeatureMap,
+        time: &Tensor,
+        text: &Tensor,
+        hint: Option<(&DeviceConv, &Map)>,
+    ) -> Result<(Map, Vec<Map>), NetworkError> {
+        let gpu = &self.gpu;
+        let mut sample = gpu.conv(&self.conv_in, &upload_map(gpu, latent)?)?;
+        if let Some((conv, hint)) = hint {
+            if (conv.out_channels, hint.height, hint.width)
+                != (sample.channels(), sample.height, sample.width)
+            {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "a ControlNet picture that becomes {}x{} does not match a {}x{} latent; it is \
+                     the size of the image being made",
+                    hint.height, hint.width, sample.height, sample.width
+                )));
+            }
+            gpu.conv_add(conv, hint, &mut sample)?;
+        }
+        let mut skips = vec![clone_map(gpu, &sample)?];
+        for block in &self.down {
+            for (index, resnet) in block.resnets.iter().enumerate() {
+                sample = self.resnet(resnet, sample, time)?;
+                if let Some(transformer) = block.attentions.get(index) {
+                    sample = self.transformer(transformer, &sample, text)?;
+                }
+                skips.push(clone_map(gpu, &sample)?);
+            }
+            if let Some(resampler) = &block.resampler {
+                sample = gpu.conv(resampler, &sample)?;
+                skips.push(clone_map(gpu, &sample)?);
+            }
+        }
+        sample = self.resnet(&self.middle.0, sample, time)?;
+        sample = self.transformer(&self.middle.1, &sample, text)?;
+        sample = self.resnet(&self.middle.2, sample, time)?;
+        Ok((sample, skips))
     }
 
     /// Takes the input by value, for the reason
@@ -2044,6 +2161,14 @@ fn clone_map(gpu: &ImageGpu, map: &Map) -> Result<Map, NetworkError> {
         .map_err(cuda_err("device to device copy"))?;
     Ok(Map {
         tensor: copy,
+        height: map.height,
+        width: map.width,
+    })
+}
+
+fn upload_map(gpu: &ImageGpu, map: &FeatureMap) -> Result<Map, NetworkError> {
+    Ok(Map {
+        tensor: gpu.upload(map.channels, map.pixels(), &map.data)?,
         height: map.height,
         width: map.width,
     })
@@ -3065,6 +3190,62 @@ mod tests {
             (expected.channels, expected.height, expected.width)
         );
         assert_close("unet", &actual.data, &expected.data, 0.05);
+    }
+
+    #[test]
+    fn a_controlnet_on_the_device_matches_the_host_or_skips_without_a_device() {
+        let Some(gpu) = device() else { return };
+        let config = crate::unet::tests::tiny();
+        let path = std::env::temp_dir().join("rusting_brain_cuda_controlled_unet.safetensors");
+        crate::unet::tests::checkpoint(&config, &path);
+        let mut model = Unet::load_at(&path, config.clone(), Precision::F32).expect("a model");
+        std::fs::remove_file(&path).ok();
+
+        let latent = map(config.in_channels, 8, 8, 0.31);
+        let mut text = Matrix::new(5, config.cross_dim);
+        text.data.copy_from_slice(&ramp(5 * config.cross_dim, 0.62));
+        let conditioning = crate::mmdit::Conditioning {
+            text,
+            pooled: Vec::new(),
+            height: 8,
+            width: 8,
+            guidance: 0.0,
+        };
+        let plain = model
+            .forward(&latent, 1.0, &conditioning)
+            .expect("a host pass");
+        // Two controls, so their corrections have to add up.
+        let net = crate::unet::tests::controlnet(&config);
+        model.set_controls(
+            [(0.43, 0.8), (0.17, 0.5)]
+                .map(|(seed, scale)| crate::unet::Control {
+                    net: net.clone(),
+                    image: map(3, 64, 64, seed),
+                    scale,
+                })
+                .to_vec(),
+        );
+        let expected = model
+            .forward(&latent, 1.0, &conditioning)
+            .expect("a host pass");
+        model.attach_device(gpu).expect("an upload");
+        let actual = model
+            .forward(&latent, 1.0, &conditioning)
+            .expect("a device pass");
+
+        let farthest = |from: &[f32]| {
+            from.iter()
+                .zip(&expected.data)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+        // A device pass that dropped the controls would land on `plain`.
+        let (moved, error) = (farthest(&plain.data), farthest(&actual.data));
+        assert!(
+            error < moved / 10.0,
+            "the device is {error} off, and the controls move the output {moved}"
+        );
+        assert_close("controlled unet", &actual.data, &expected.data, 0.05);
     }
 
     #[test]
