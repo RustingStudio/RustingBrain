@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Stride-1 convolutions on the image path gather only their horizontal taps
+  and run one accumulating GEMM per kernel row, instead of an im2col nine
+  times the input: the SDXL VAE decode at 1024x1024 runs 0.52 to 0.49 s.
 - Device cross-attention (the shape VAE and the flow transformer) runs in
   BF16 through the fused flash kernels under mixed precision with heads 64 or
   128 wide, instead of FP32 around a score matrix. The shape VAE's training

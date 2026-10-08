@@ -2624,7 +2624,15 @@ fn forward_block(
     // GEMM the fallback path ends with produces FP32.
     let mut merged = gpu.act(rows * query_width, narrow && fused.is_some())?;
     if let Some(flash) = fused {
-        gpu.flash_attention(flash, &qkv, &qkv, &mut merged, &mut log_sum_exp, shape, scale)?;
+        gpu.flash_attention(
+            flash,
+            &qkv,
+            &qkv,
+            &mut merged,
+            &mut log_sum_exp,
+            shape,
+            scale,
+        )?;
     } else {
         let mut wide_merged = merged.wide_mut();
         let qkv = qkv.wide();

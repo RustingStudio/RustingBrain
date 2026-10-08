@@ -675,7 +675,15 @@ impl DeviceDit {
             causal: false,
         };
         let scale = ((width / heads) as f32).sqrt().recip();
-        gpu.flash_attention(flash, &qkv, &qkv, &mut merged, &mut log_sum_exp, shape, scale)?;
+        gpu.flash_attention(
+            flash,
+            &qkv,
+            &qkv,
+            &mut merged,
+            &mut log_sum_exp,
+            shape,
+            scale,
+        )?;
         Ok(merged)
     }
 }
