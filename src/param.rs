@@ -142,7 +142,7 @@ impl CudaDevice {
 
     /// The context the parameters moved through this handle share, for a
     /// caller inside the crate that has its own kernels to launch on it.
-    #[cfg(all(feature = "cuda", test))]
+    #[cfg(feature = "cuda")]
     pub(crate) fn context(&self) -> &std::sync::Arc<crate::gpu_transformer::GpuContext> {
         &self.context
     }

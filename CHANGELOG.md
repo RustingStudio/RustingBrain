@@ -4,6 +4,7 @@
 
 ### Changed
 
+- `TrainableConv2d::to_cuda_on` moves the bias to the device as well; the host-input `forward`/`backward` now run through the device-resident pair, so the bias add and its gradient no longer happen on the host. `bias.value`/`bias.grad` are stale until `to_cpu`, as for the weight.
 - `Param::step` (and so `apply_step` and `step_clipped`) panics on step 0 instead of turning every parameter NaN through Adam's bias correction; steps count from 1 (asked by RustingChop). An assert rather than an error, as the consumer allowed: the signatures stay the same.
 - A device decoder under mixed precision keeps its cache as BF16 keys and
   values, 512 bytes a position a layer on the default model instead of
@@ -96,6 +97,7 @@
 
 ### Added
 
+- `conv::DeviceImageBatch` with `CudaDevice::upload`/`download`, and `TrainableConv2d::forward_device`/`backward_device`: a convolution chain whose activations and gradients stay on the device (K8a, asked by RustingChop and RustingCS2). The wanted `ConvCache` return is kept; the conv bias and its gradient now run on the device too.
 - `conv::TrainableGroupNorm`: group norm over an `ImageBatch` with `gamma`/`beta` parameters, `forward -> (ImageBatch, GroupNormCache)`, `backward` and `params_mut` (asked by RustingChop and RustingCS2). Its forward is bit-equal to `conv::GroupNorm`. `new` and `forward` return a `Result` (bad group counts and channel mismatches), and `eps` is an argument where the Chop stopgap fixed Keras' 1e-3.
 - `param::Dropout`: inverted dropout with `forward(&input, &mut rng, training) -> (Matrix, DropoutMask)` and `backward(&mask, &grad)` (asked by RustingChop and RustingCS2). `Dropout::new` returns a `Result`, refusing rates outside [0, 1), where the request had a plain constructor.
 - `conv::spatial_softmax` and `conv::global_avg_pool` over an `ImageBatch`, each with its backward (`spatial_softmax_backward`, `global_avg_pool_backward`) (asked by RustingChop and RustingCS2).
