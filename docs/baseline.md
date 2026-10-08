@@ -1447,7 +1447,7 @@ Tutorial program (`tutorials/code/18_text_to_image.rs`), 1024x1024, DPM++ 2M
 text-to-image 13.2 s, image-to-image at strength 0.5 117.2 s, nearly all of
 it the CPU VAE encoder (C12).
 
-### Device VAE encoder (C12, 2026-10-08)
+## Device VAE encoder (C12, 2026-10-08)
 
 pony-v6-xl VAE, RTX 3060 shared with another job, load 2.3-2.7, three runs
 each after one warm-up inside the same process:
@@ -1462,3 +1462,23 @@ reads rel 0.066 (per-channel std and mean match to 3 digits; best scale
 0.998). Host F32 reads 0.012 and ComfyUI's default BF16 0.108. Tutorial
 program, load 2.3-3.0: text-to-image 13.2 s, image-to-image at strength 0.5
 6.9 s (117.2 s before).
+
+## Forward and query-gradient kernels after A1 (A2, 2026-10-08)
+
+`examples/flash_probe.rs` (batch 4 x 1024, 12 heads over 4, width 64, best of
+five), idle GPU, load 2.2-2.8. The query-gradient kernel already reads its
+key tile with `ldmatrix.trans` (A3), so only the forward kernel had A1's
+transposed copy left.
+
+| Forward kernel variant | ms |
+|---|---|
+| As is: scalar loads, values stored transposed | 0.446 |
+| Values key-major, read with `ldmatrix.x4.trans` | 0.440-0.442 |
+| The same plus paired (32-bit) tile loads | 0.565-0.570 |
+| Paired loads only, values still transposed | 0.492-0.493 |
+| Values key-major plus `ldmatrix.x4` for the score keys | 0.507-0.509 |
+
+The query gradient reads 0.633 ms and the key/value gradient 0.806 ms in the
+same runs. The best variant saves 5 us a call, about 0.04 ms of a 77 ms step,
+under the run-to-run spread, so nothing was kept.
+
