@@ -95,6 +95,10 @@
 
 ### Added
 
+- `unet_lora::UnetLora`: LoRA adapters on a UNet's attention projections,
+  read from a diffusers PEFT file, with a host forward and backward pass
+  whose adapter gradients match PyTorch autograd within 5e-5. It is the
+  reference for UNet LoRA training on the GPU.
 - `examples/train_dit_lora.rs` trains a LoRA on a FLUX-style DiT from a
   folder of captioned images on the CUDA device (`DitLora::new`,
   `DeviceDit::flow_step`) and writes a diffusers PEFT file. diffusers loads

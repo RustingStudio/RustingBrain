@@ -365,7 +365,7 @@ impl Encoder {
 
     /// The vector a step index, and for XL the pooled prompt and the size,
     /// become.
-    fn time(
+    pub(crate) fn time(
         &self,
         config: &UnetConfig,
         step: f32,
@@ -822,7 +822,7 @@ impl Unet {
 
     /// The step index a noise level stands for, interpolated between the two
     /// the training schedule holds.
-    fn timestep(&self, sigma: f32) -> f32 {
+    pub(crate) fn timestep(&self, sigma: f32) -> f32 {
         // `sigma` rises with the index, so the first index that overtakes it
         // brackets the answer.
         let level = |index: usize| {
@@ -1241,6 +1241,25 @@ pub(crate) mod tests {
         crate::safetensors::write_checkpoint(path, &unet_writer(config).tensors);
     }
 
+    /// A model of that shape with random weights, for a gradient check the
+    /// regular pattern above would leave with near-uniform attention.
+    pub(crate) fn random(config: &UnetConfig, name: &str) -> Unet {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let mut writer = unet_writer(config);
+        for (_, values) in writer.tensors.values_mut() {
+            values
+                .iter_mut()
+                .for_each(|value| *value = rng.gen_range(-0.3..0.3));
+        }
+        let path = std::env::temp_dir().join(name);
+        crate::safetensors::write_checkpoint(&path, &writer.tensors);
+        let model =
+            Unet::load_at(&path, config.clone(), Precision::F32).expect("the model to load");
+        std::fs::remove_file(path).ok();
+        model
+    }
+
     fn unet_writer(config: &UnetConfig) -> Writer {
         let mut writer = Writer {
             tensors: BTreeMap::new(),
@@ -1369,7 +1388,7 @@ pub(crate) mod tests {
         assert!(run(&mut model, 1.0, &FeatureMap::new(3, 32, 32)).is_err());
     }
 
-    fn conditioning(config: &UnetConfig, size: usize, seed: f32) -> Conditioning {
+    pub(crate) fn conditioning(config: &UnetConfig, size: usize, seed: f32) -> Conditioning {
         let mut text = Matrix::new(5, config.cross_dim);
         for (index, value) in text.data.iter_mut().enumerate() {
             *value = ((index % 7) as f32 - 3.0) * 0.1 * seed;
@@ -1383,7 +1402,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn latent(config: &UnetConfig, size: usize) -> FeatureMap {
+    pub(crate) fn latent(config: &UnetConfig, size: usize) -> FeatureMap {
         let mut latent = FeatureMap::new(config.in_channels, size, size);
         for (index, value) in latent.data.iter_mut().enumerate() {
             *value = ((index % 17) as f32 - 8.0) * 0.1;
@@ -1391,7 +1410,7 @@ pub(crate) mod tests {
         latent
     }
 
-    fn load(config: &UnetConfig, name: &str, precision: Precision) -> Unet {
+    pub(crate) fn load(config: &UnetConfig, name: &str, precision: Precision) -> Unet {
         let path = std::env::temp_dir().join(name);
         checkpoint(config, &path);
         let model = Unet::load_at(&path, config.clone(), precision).expect("the model to load");

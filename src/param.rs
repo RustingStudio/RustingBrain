@@ -723,7 +723,7 @@ impl Lora {
         hidden
     }
 
-    fn add_forward(&self, input: &Matrix, output: &mut Matrix) {
+    pub(crate) fn add_forward(&self, input: &Matrix, output: &mut Matrix) {
         let hidden = self.hidden(input);
         let mut delta = Matrix::new(input.rows, self.up.value.rows);
         hidden.dot_rhs_transposed(&self.up.value, &mut delta);
@@ -734,7 +734,12 @@ impl Lora {
 
     /// Accumulates both adapter gradients and adds the adapter's share of
     /// `dL/dinput` to what the base projection already wrote.
-    fn backward(&mut self, input: &Matrix, grad_output: &Matrix, grad_input: &mut Matrix) {
+    pub(crate) fn backward(
+        &mut self,
+        input: &Matrix,
+        grad_output: &Matrix,
+        grad_input: &mut Matrix,
+    ) {
         let hidden = self.hidden(input);
         grad_output.dot_self_transposed_accumulate(&hidden, &mut self.up.grad);
 

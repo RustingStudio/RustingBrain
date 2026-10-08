@@ -818,7 +818,7 @@ pub(crate) fn head_norm_backward(
 
 /// `dL/dq`, `dL/dk` and `dL/dv` of non-causal [`attention`] with as many key
 /// heads as query heads.
-fn attention_backward(
+pub(crate) fn attention_backward(
     queries: &Matrix,
     keys: &Matrix,
     values: &Matrix,

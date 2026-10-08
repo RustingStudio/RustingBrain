@@ -146,6 +146,7 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod transformer_block;
 pub mod unet;
+pub mod unet_lora;
 pub mod vae;
 pub mod vision;
 pub mod vit_encoder;
