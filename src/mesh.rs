@@ -1279,6 +1279,19 @@ fn emit_tetrahedron(
     if table[0] == usize::MAX {
         return;
     }
+    // Outside centroid minus inside centroid, unnormalized: only its sign
+    // against a face normal is read.
+    let outward = corners
+        .iter()
+        .enumerate()
+        .fold([0.0; 3], |sum, (bit, (_, point, _))| {
+            let inside = code & (1 << bit) != 0;
+            let weight = match inside {
+                true => -1.0 / code.count_ones() as f32,
+                false => 1.0 / (4 - code.count_ones()) as f32,
+            };
+            add3(sum, scale(*point, weight))
+        });
 
     let mut vertex = |edge: usize| -> u32 {
         let (from, to) = TETRAHEDRON_EDGES[edge];
@@ -1306,6 +1319,7 @@ fn emit_tetrahedron(
         index
     };
 
+    let mut faces = Vec::with_capacity(2);
     for triangle in table.chunks_exact(3) {
         if triangle[0] == usize::MAX {
             break;
@@ -1318,8 +1332,18 @@ fn emit_tetrahedron(
         // A tetrahedron with two corners at exactly the isovalue can produce a
         // triangle with a repeated vertex, which is not a face.
         if face[0] != face[1] && face[1] != face[2] && face[0] != face[2] {
-            mesh.indices.push(face);
+            faces.push(face);
         }
+    }
+    for face in faces {
+        // Wind it so the normal points from the inside corners to the outside
+        // ones, which the table alone does not guarantee.
+        let [a, b, c] = face.map(|index| mesh.positions[index as usize]);
+        let normal = cross(sub(b, a), sub(c, a));
+        mesh.indices.push(match dot(normal, outward) < 0.0 {
+            true => [face[0], face[2], face[1]],
+            false => face,
+        });
     }
 }
 
@@ -1567,6 +1591,34 @@ mod tests {
             assert!((length(*position) - 0.6).abs() < 0.02, "{position:?}");
         }
         assert_eq!(mesh.normals.len(), mesh.positions.len());
+    }
+
+    #[test]
+    fn marching_tetrahedra_winds_every_face_outward() {
+        let sphere = |points: &Matrix| {
+            Ok((0..points.rows)
+                .map(|row| {
+                    let p = points.row(row);
+                    length([p[0], p[1], p[2]]) - 0.6
+                })
+                .collect())
+        };
+        let bounds = ([-1.0; 3], [1.0; 3]);
+        for mesh in [
+            marching_tetrahedra(sphere, 48, bounds, 0.0).unwrap(),
+            marching_tetrahedra_sparse(sphere, 48, bounds, 0.0, 4).unwrap(),
+        ] {
+            for face in &mesh.indices {
+                let [a, b, c] = face.map(|index| mesh.positions[index as usize]);
+                let centroid = scale(add3(add3(a, b), c), 1.0 / 3.0);
+                // The field's gradient is the direction from the centre.
+                assert!(dot(cross(sub(b, a), sub(c, a)), centroid) > 0.0, "{face:?}");
+            }
+            let inside = Bvh::build(&mesh).winding_number([0.1, -0.2, 0.05]);
+            // The tree approximates far clusters, so this is near one, not exact;
+            // inward faces would give minus one.
+            assert!((inside - 1.0).abs() < 0.05, "winding number {inside}");
+        }
     }
 
     #[test]

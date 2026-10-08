@@ -4,6 +4,7 @@
 
 ### Changed
 
+- `marching_tetrahedra` and `marching_tetrahedra_sparse` now wind every face outward, from the field's inside (below the isovalue) to its outside (K11). Before, the winding followed the tetrahedron table and could point either way.
 - `TrainableConv2d::to_cuda_on` moves the bias to the device as well; the host-input `forward`/`backward` now run through the device-resident pair, so the bias add and its gradient no longer happen on the host. `bias.value`/`bias.grad` are stale until `to_cpu`, as for the weight.
 - `Param::step` (and so `apply_step` and `step_clipped`) panics on step 0 instead of turning every parameter NaN through Adam's bias correction; steps count from 1 (asked by RustingChop). An assert rather than an error, as the consumer allowed: the signatures stay the same.
 - A device decoder under mixed precision keeps its cache as BF16 keys and
