@@ -29,10 +29,10 @@ pub struct UnetLora {
     pub adapters: BTreeMap<String, Lora>,
 }
 
-const PROJECTIONS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
+pub(crate) const PROJECTIONS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
 
 /// Every transformer in the model, under its diffusers name.
-fn transformers(unet: &Unet) -> Vec<(String, &Transformer)> {
+pub(crate) fn transformers(unet: &Unet) -> Vec<(String, &Transformer)> {
     let mut list = Vec::new();
     for (level, block) in unet.encoder.down.iter().enumerate() {
         for (index, transformer) in block.attentions.iter().enumerate() {
@@ -131,15 +131,7 @@ impl UnetLora {
         conditioning: &Conditioning,
     ) -> Result<(FeatureMap, Tape), NetworkError> {
         let config = unet.config();
-        let mut scaled = latent.clone();
-        let scale = (sigma * sigma + 1.0).sqrt().recip();
-        let noisy = config.out_channels.min(latent.channels) * latent.pixels();
-        scaled.data[..noisy]
-            .iter_mut()
-            .for_each(|value| *value *= scale);
-        let time = unet
-            .encoder
-            .time(config, unet.timestep(sigma), latent, &conditioning.pooled)?;
+        let (scaled, time) = prepare(unet, latent, sigma, conditioning)?;
         let text = &conditioning.text;
         let eps = config.eps;
         let names: Vec<String> = transformers(unet)
@@ -561,6 +553,27 @@ impl UnetLora {
     }
 }
 
+/// The latent scaled for its noise level and the embedded time, which is what
+/// [`Unet::forward`] works out on the host before its device pass too.
+pub(crate) fn prepare(
+    unet: &Unet,
+    latent: &FeatureMap,
+    sigma: f32,
+    conditioning: &Conditioning,
+) -> Result<(FeatureMap, Vec<f32>), NetworkError> {
+    let config = unet.config();
+    let mut scaled = latent.clone();
+    let scale = (sigma * sigma + 1.0).sqrt().recip();
+    let noisy = config.out_channels.min(latent.channels) * latent.pixels();
+    scaled.data[..noisy]
+        .iter_mut()
+        .for_each(|value| *value *= scale);
+    let time = unet
+        .encoder
+        .time(config, unet.timestep(sigma), latent, &conditioning.pooled)?;
+    Ok((scaled, time))
+}
+
 /// What [`UnetLora::backward`] reads of a forward pass.
 pub struct Tape {
     down: Vec<(Vec<Rung>, Option<FeatureMap>)>,
@@ -830,12 +843,12 @@ fn add_maps(target: &mut FeatureMap, source: &FeatureMap) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::unet::tests::{conditioning, latent, random, tiny};
     use rand::{Rng, SeedableRng};
 
-    fn adapters(unet: &Unet) -> UnetLora {
+    pub(crate) fn adapters(unet: &Unet) -> UnetLora {
         let mut rng = rand::rngs::StdRng::seed_from_u64(0);
         let mut random = |rows, cols| {
             let data = (0..rows * cols).map(|_| rng.gen_range(-0.3..0.3)).collect();

@@ -96,6 +96,7 @@
 ### Added
 
 - FP16 device backward kernels for UNet adapter training in `cuda_image`: convolution input gradients, group and layer norm, the gated GELU, SiLU and nearest upsampling, each matched to the host `unet_lora` functions.
+- `DeviceUnet::forward_adapted` runs a UNet LoRA's attention adapters on the device and keeps a tape for the backward pass, matched to `UnetLora::forward`.
 - `unet_lora::UnetLora`: LoRA adapters on a UNet's attention projections,
   read from a diffusers PEFT file, with a host forward and backward pass
   whose adapter gradients match PyTorch autograd within 5e-5. It is the

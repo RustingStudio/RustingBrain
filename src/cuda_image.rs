@@ -65,6 +65,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::{Ptx, compile_ptx};
 use half::f16;
+use lora::{AttentionRecord, BlockRecord, DeviceLora, Recorder};
 use std::sync::{Arc, OnceLock};
 
 /// The largest im2col scratch buffer, in FP16 elements: 32 MiB.
@@ -624,6 +625,9 @@ extern "C" __global__ void upsample_bwd(half_t*out,const half_t*in,
   out[i]=f2h(sum);
 }
 "#;
+
+mod lora;
+pub use lora::{DeviceAdapters, DeviceTape};
 
 /// NVRTC compilation costs a few hundred milliseconds and the source never
 /// varies, so a process that loads several pipelines compiles once.
@@ -2403,7 +2407,7 @@ impl DeviceUnet {
         let gpu = &self.gpu;
         let time = self.time(time)?;
         let text = gpu.upload_matrix(text)?;
-        let (mut sample, mut skips) = self.down(latent, &time, &text, None)?;
+        let (mut sample, mut skips) = self.down(latent, &time, &text, None, None)?;
 
         for (net, control_time, image) in controls {
             let mut hint = upload_map(gpu, image)?;
@@ -2417,6 +2421,7 @@ impl DeviceUnet {
                 &net.body.time(control_time)?,
                 &text,
                 Some((last, &hint)),
+                None,
             )?;
             if corrections.len() != skips.len() || corrections.len() != net.zero.len() {
                 return Err(NetworkError::InvalidConfig(
@@ -2429,6 +2434,23 @@ impl DeviceUnet {
             gpu.conv_add(&net.zero_middle, &middle, &mut sample)?;
         }
 
+        let mut sample = self.up(sample, skips, &time, &text, None)?;
+        let (norm_out, conv_out) = self.out.as_ref().expect("a UNet has an output");
+        gpu.group_norm(norm_out, &mut sample, 0)?;
+        let output = gpu.conv(conv_out, &sample)?;
+        download_map(gpu, &output)
+    }
+
+    /// The way up, which reads the way down's rungs from the top.
+    fn up(
+        &self,
+        mut sample: Map,
+        mut skips: Vec<Map>,
+        time: &Tensor,
+        text: &Tensor,
+        mut record: Option<&mut Recorder>,
+    ) -> Result<Map, NetworkError> {
+        let gpu = &self.gpu;
         for block in &self.up {
             for (index, resnet) in block.resnets.iter().enumerate() {
                 let skip = skips.pop().ok_or_else(|| {
@@ -2436,25 +2458,27 @@ impl DeviceUnet {
                         "the way up has more rungs than the way down".into(),
                     )
                 })?;
+                if let Some(record) = record.as_deref_mut() {
+                    record.records.joined.push(sample.channels());
+                }
                 let joined = gpu.concatenate(&sample, &skip)?;
                 drop(skip);
                 drop(sample);
-                sample = self.resnet(resnet, joined, &time)?;
+                sample = self.resnet(resnet, joined, time, record.as_deref_mut())?;
                 if let Some(transformer) = block.attentions.get(index) {
-                    sample = self.transformer(transformer, &sample, &text)?;
+                    sample = self.transformer(transformer, &sample, text, record.as_deref_mut())?;
                 }
             }
             if let Some(resampler) = &block.resampler {
                 let large = gpu.upsample_nearest(&sample, 2)?;
                 drop(sample);
+                if let Some(record) = record.as_deref_mut() {
+                    record.records.resampled.push((large.height, large.width));
+                }
                 sample = gpu.conv(resampler, &large)?;
             }
         }
-
-        let (norm_out, conv_out) = self.out.as_ref().expect("a UNet has an output");
-        gpu.group_norm(norm_out, &mut sample, 0)?;
-        let output = gpu.conv(conv_out, &sample)?;
-        download_map(gpu, &output)
+        Ok(sample)
     }
 
     /// The embedded time on the device, through the SiLU every resnet reads
@@ -2474,6 +2498,7 @@ impl DeviceUnet {
         time: &Tensor,
         text: &Tensor,
         hint: Option<(&DeviceConv, &Map)>,
+        mut record: Option<&mut Recorder>,
     ) -> Result<(Map, Vec<Map>), NetworkError> {
         let gpu = &self.gpu;
         let mut sample = gpu.conv(&self.conv_in, &upload_map(gpu, latent)?)?;
@@ -2492,20 +2517,23 @@ impl DeviceUnet {
         let mut skips = vec![clone_map(gpu, &sample)?];
         for block in &self.down {
             for (index, resnet) in block.resnets.iter().enumerate() {
-                sample = self.resnet(resnet, sample, time)?;
+                sample = self.resnet(resnet, sample, time, record.as_deref_mut())?;
                 if let Some(transformer) = block.attentions.get(index) {
-                    sample = self.transformer(transformer, &sample, text)?;
+                    sample = self.transformer(transformer, &sample, text, record.as_deref_mut())?;
                 }
                 skips.push(clone_map(gpu, &sample)?);
             }
             if let Some(resampler) = &block.resampler {
+                if let Some(record) = record.as_deref_mut() {
+                    record.records.resampled.push((sample.height, sample.width));
+                }
                 sample = gpu.conv(resampler, &sample)?;
                 skips.push(clone_map(gpu, &sample)?);
             }
         }
-        sample = self.resnet(&self.middle.0, sample, time)?;
-        sample = self.transformer(&self.middle.1, &sample, text)?;
-        sample = self.resnet(&self.middle.2, sample, time)?;
+        sample = self.resnet(&self.middle.0, sample, time, record.as_deref_mut())?;
+        sample = self.transformer(&self.middle.1, &sample, text, record.as_deref_mut())?;
+        sample = self.resnet(&self.middle.2, sample, time, record)?;
         Ok((sample, skips))
     }
 
@@ -2517,8 +2545,13 @@ impl DeviceUnet {
         resnet: &DeviceResnet,
         input: Map,
         time: &Tensor,
+        record: Option<&mut Recorder>,
     ) -> Result<Map, NetworkError> {
         let gpu = &self.gpu;
+        let kept = match record {
+            Some(_) => Some(clone_map(gpu, &input)?),
+            None => None,
+        };
         let (mut output, mut hidden) = match &resnet.shortcut {
             Some(shortcut) => (gpu.conv(shortcut, &input)?, input),
             None => {
@@ -2533,6 +2566,10 @@ impl DeviceUnet {
         // The noise level arrives as one number per channel.
         let offsets = gpu.dense(&resnet.time, time)?;
         gpu.add_channel(&mut next, &offsets)?;
+        if let (Some(record), Some(input)) = (record, kept) {
+            let hidden = clone_map(gpu, &next)?;
+            record.records.resnets.push((input, hidden));
+        }
 
         gpu.group_norm(&resnet.norm2, &mut next, 0)?;
         gpu.conv_add(&resnet.conv2, &next, &mut output)?;
@@ -2544,8 +2581,14 @@ impl DeviceUnet {
         transformer: &DeviceTransformer,
         input: &Map,
         text: &Tensor,
+        mut record: Option<&mut Recorder>,
     ) -> Result<Map, NetworkError> {
         let gpu = &self.gpu;
+        let adapters = match record.as_deref_mut() {
+            Some(record) => Some(record.next()?),
+            None => None,
+        };
+        let mut blocks = Vec::new();
         let (height, width) = (input.height, input.width);
         let mut normed = clone_map(gpu, input)?;
         gpu.group_norm(&transformer.norm, &mut normed, -1)?;
@@ -2554,29 +2597,49 @@ impl DeviceUnet {
             DeviceProjection::Linear(dense) => gpu.dense(dense, &gpu.to_tokens(&normed)?)?,
         };
 
-        for block in &transformer.blocks {
+        for (index, block) in transformer.blocks.iter().enumerate() {
+            let lora = adapters.map(|adapters| &adapters[index]);
+            let keep = |tokens: &Tensor| match lora {
+                Some(_) => Ok(Some(clone_tensor(gpu, tokens)?)),
+                None => Ok::<_, NetworkError>(None),
+            };
+            let before_self = keep(&tokens)?;
             let normed = gpu.layer_norm(&block.norm1, &tokens, self.eps)?;
-            self.attend(
+            let own = self.attend(
                 &block.attention,
                 &normed,
                 None,
                 transformer.heads,
                 &mut tokens,
+                lora.map(|lora| &lora[0]),
             )?;
 
+            let before_cross = keep(&tokens)?;
             let normed = gpu.layer_norm(&block.norm2, &tokens, self.eps)?;
-            self.attend(
+            let cross = self.attend(
                 &block.cross,
                 &normed,
                 Some(text),
                 transformer.heads,
                 &mut tokens,
+                lora.map(|lora| &lora[1]),
             )?;
 
+            let before_feed = keep(&tokens)?;
             let normed = gpu.layer_norm(&block.norm3, &tokens, self.eps)?;
             let projected = gpu.dense_unbiased(&block.gate, &normed)?;
             let hidden = gpu.gelu_gate(&projected, block.gate.bias.as_ref())?;
             gpu.dense_add(&block.output, &hidden, &mut tokens)?;
+            if let (Some(before_self), Some(before_cross), Some(before_feed)) =
+                (before_self, before_cross, before_feed)
+            {
+                blocks.push(BlockRecord {
+                    before: [before_self, before_cross, before_feed],
+                    own: own.expect("an adapted attention keeps its record"),
+                    cross: cross.expect("an adapted attention keeps its record"),
+                    projected,
+                });
+            }
         }
 
         let mut output = match &transformer.output {
@@ -2588,9 +2651,17 @@ impl DeviceUnet {
             }
         };
         gpu.add(&mut output.tensor, &input.tensor)?;
+        if let Some(record) = record {
+            let input = clone_map(gpu, input)?;
+            record.records.transformers.push((input, blocks));
+        }
         Ok(output)
     }
 
+    /// With `lora` (the adapters on `to_q`, `to_k`, `to_v` and `to_out.0`,
+    /// any of which may be absent) their products are added and what the
+    /// backward pass reads comes back.
+    #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
         attention: &DeviceAttention,
@@ -2598,51 +2669,84 @@ impl DeviceUnet {
         context: Option<&Tensor>,
         heads: usize,
         residual: &mut Tensor,
-    ) -> Result<(), NetworkError> {
+        lora: Option<&[Option<DeviceLora>; 4]>,
+    ) -> Result<Option<AttentionRecord>, NetworkError> {
         let gpu = &self.gpu;
         let stack = &attention.stacked;
         let units = stack.units();
+        let adapter = |slot: usize| lora.and_then(|lora| lora[slot].as_ref());
         // One GEMM for every projection that reads the same tensor. Three
         // narrow products leave the card's last wave of tiles half empty; one
         // wide product does not, and it is also two fewer launches.
-        let attended = match &attention.query {
+        let (attended, queries, projected) = match &attention.query {
             None => {
-                let qkv = gpu.dense(&stack.dense, tokens)?;
-                gpu.attention(
+                let mut qkv = gpu.dense(&stack.dense, tokens)?;
+                for slot in 0..3 {
+                    if let Some(adapter) = adapter(slot) {
+                        let target = &mut qkv.data.slice_mut(slot * units..);
+                        gpu.lora_add(adapter, tokens, target, 3 * units)?;
+                    }
+                }
+                let attended = gpu.attention(
                     qkv.part(0, units),
                     qkv.part(1, units),
                     qkv.part(2, units),
                     heads,
                     false,
-                )?
+                )?;
+                (attended, None, qkv)
             }
             Some(query) => {
-                let queries = gpu.dense(query, tokens)?;
-                let kv = gpu.dense(&stack.dense, context.unwrap_or(tokens))?;
-                gpu.attention(
+                let mut queries = gpu.dense(query, tokens)?;
+                if let Some(adapter) = adapter(0) {
+                    gpu.lora_add(adapter, tokens, &mut queries.data, units)?;
+                }
+                let source = context.unwrap_or(tokens);
+                let mut kv = gpu.dense(&stack.dense, source)?;
+                for slot in 1..3 {
+                    if let Some(adapter) = adapter(slot) {
+                        let target = &mut kv.data.slice_mut((slot - 1) * units..);
+                        gpu.lora_add(adapter, source, target, 2 * units)?;
+                    }
+                }
+                let attended = gpu.attention(
                     queries.view(),
                     kv.part(0, units),
                     kv.part(1, units),
                     heads,
                     false,
-                )?
+                )?;
+                (attended, Some(queries), kv)
             }
         };
-        gpu.dense_add(&attention.output, &attended, residual)
+        gpu.dense_add(&attention.output, &attended, residual)?;
+        if let Some(adapter) = adapter(3) {
+            let width = residual.cols;
+            gpu.lora_add(adapter, &attended, &mut residual.data, width)?;
+        }
+        Ok(lora.map(|_| AttentionRecord {
+            queries,
+            projected,
+            attended,
+        }))
     }
 }
 
 fn clone_map(gpu: &ImageGpu, map: &Map) -> Result<Map, NetworkError> {
-    let mut copy = gpu.uninit(map.channels(), map.pixels())?;
-    gpu.context
-        .stream
-        .memcpy_dtod(&map.tensor.data, &mut copy.data)
-        .map_err(cuda_err("device to device copy"))?;
     Ok(Map {
-        tensor: copy,
+        tensor: clone_tensor(gpu, &map.tensor)?,
         height: map.height,
         width: map.width,
     })
+}
+
+fn clone_tensor(gpu: &ImageGpu, tensor: &Tensor) -> Result<Tensor, NetworkError> {
+    let mut copy = gpu.uninit(tensor.rows, tensor.cols)?;
+    gpu.context
+        .stream
+        .memcpy_dtod(&tensor.data, &mut copy.data)
+        .map_err(cuda_err("device to device copy"))?;
+    Ok(copy)
 }
 
 fn upload_map(gpu: &ImageGpu, map: &FeatureMap) -> Result<Map, NetworkError> {
@@ -3302,7 +3406,7 @@ mod tests {
 
     /// Same contract as the other CUDA tests: no device means the parity tests
     /// report success without running, a broken device is a failure.
-    fn device() -> Option<Arc<ImageGpu>> {
+    pub(super) fn device() -> Option<Arc<ImageGpu>> {
         match crate::cuda_training::cuda_doctor(0, 512) {
             Ok(_) => Some(ImageGpu::new(0).expect("a device that the doctor cleared")),
             Err(NetworkError::Cuda(message)) if message.contains("initialization") => {
@@ -3333,7 +3437,7 @@ mod tests {
     /// before any accumulation. The bars below are relative to the largest
     /// value in the reference, which is what makes them comparable across
     /// layers of very different scale.
-    fn assert_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
+    pub(super) fn assert_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(actual.len(), expected.len(), "{label}: length");
         let scale = expected
             .iter()
