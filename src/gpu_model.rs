@@ -3505,7 +3505,12 @@ fn head_chunk_rows(rows: usize, vocab: usize, logit_bytes: usize) -> usize {
 /// contiguous and the projection still writes them in place.
 pub(crate) struct DeviceKv {
     layers: Vec<CudaSlice<f32>>,
+    /// Each layer's row width, `(heads + 2 * kv_heads) * head_dim`.
+    widths: Vec<usize>,
     length: usize,
+    /// Positions the buffers hold room for; they grow on demand, doubling,
+    /// up to `max_seq_len`.
+    capacity: usize,
     sequences: usize,
     /// One flag per cached row, zero where the row is padding a shorter
     /// sequence of a batch out to the longest. Attention skips those keys.
@@ -3536,22 +3541,24 @@ impl DeviceKv {
         sequences: usize,
     ) -> Result<Self, NetworkError> {
         let gpu = Gpu { context };
-        let positions = model.config.max_seq_len * sequences;
-        let layers = model
+        let widths: Vec<usize> = model
             .blocks
             .iter()
             .map(|block| {
                 let attention = &block.attention;
-                let width =
-                    (attention.num_heads() + 2 * attention.num_kv_heads()) * attention.head_dim();
-                gpu.uninit(positions * width)
+                (attention.num_heads() + 2 * attention.num_kv_heads()) * attention.head_dim()
             })
-            .collect::<Result<_, _>>()?;
+            .collect();
         Ok(Self {
-            layers,
+            layers: widths
+                .iter()
+                .map(|_| gpu.uninit(0))
+                .collect::<Result<_, _>>()?,
+            widths,
             length: 0,
+            capacity: 0,
             sequences,
-            slots: gpu.upload_flags(&vec![1; positions])?,
+            slots: gpu.upload_flags(&[1])?,
             padded: false,
             packs: PackMemo::new(),
             head: None,
@@ -3569,12 +3576,47 @@ impl DeviceKv {
         self.length = self.length.min(positions);
     }
 
+    /// Makes room for `positions` positions, at least doubling the capacity
+    /// so a session grows its buffers a logarithmic number of times.
+    fn reserve(&mut self, gpu: &Gpu, positions: usize, limit: usize) -> Result<(), NetworkError> {
+        if positions <= self.capacity {
+            return Ok(());
+        }
+        let capacity = positions.max(2 * self.capacity).min(limit);
+        let (kept, rows) = (self.length * self.sequences, capacity * self.sequences);
+        for (cache, width) in self.layers.iter_mut().zip(&self.widths) {
+            let mut grown = gpu.uninit(rows * width)?;
+            if kept > 0 {
+                gpu.context
+                    .stream
+                    .memcpy_dtod(
+                        &cache.slice(..kept * width),
+                        &mut grown.slice_mut(..kept * width),
+                    )
+                    .map_err(cuda_err("KV cache copy"))?;
+            }
+            *cache = grown;
+        }
+        let mut slots = gpu.upload_flags(&vec![1; rows])?;
+        if kept > 0 {
+            gpu.context
+                .stream
+                .memcpy_dtod(&self.slots.slice(..kept), &mut slots.slice_mut(..kept))
+                .map_err(cuda_err("KV cache copy"))?;
+        }
+        self.slots = slots;
+        self.capacity = capacity;
+        Ok(())
+    }
+
     /// A copy of the cached rows that shares the weight packs and the head.
     pub(crate) fn fork(&self) -> Result<Self, NetworkError> {
         let copy = |slice: &CudaSlice<f32>| slice.try_clone().map_err(cuda_err("KV cache copy"));
         Ok(Self {
             layers: self.layers.iter().map(copy).collect::<Result<_, _>>()?,
+            widths: self.widths.clone(),
             length: self.length,
+            capacity: self.capacity,
             sequences: self.sequences,
             slots: self.slots.try_clone().map_err(cuda_err("KV cache copy"))?,
             padded: self.padded,
@@ -3639,6 +3681,7 @@ pub(crate) fn decode(
         d_model,
     )?;
 
+    kv.reserve(&gpu, kv.length + rows / sequences, model.config.max_seq_len)?;
     let first = kv.length * sequences;
     context
         .stream

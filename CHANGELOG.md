@@ -4,6 +4,9 @@
 
 ### Changed
 
+- A decoder's device KV cache grows with the session, doubling up to
+  `max_seq_len`, instead of taking `max_seq_len` positions per sequence when
+  it is made. Forks copy only what the session holds room for.
 - Stride-1 convolutions on the image path gather only their horizontal taps
   and run one accumulating GEMM per kernel row, instead of an im2col nine
   times the input: the SDXL VAE decode at 1024x1024 runs 0.52 to 0.49 s.

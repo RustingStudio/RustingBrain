@@ -1582,3 +1582,30 @@ One sequence is unchanged. Sixteen sequences are about 1% slower in every
 round: the flag load sits in the score loop of `decode_attention`. Left as
 is; skipping the load when no sequence is padded would win it back if it
 matters.
+
+## KV cache grown on demand (C3 part 1, 2026-10-08)
+
+The device decode cache now starts empty and doubles as the session grows,
+up to `max_seq_len`. Memory, from the allocation sizes, on the default
+model (8 layers, rows of (8 + 2 x 2) x 64 FP32 values, 24,576 bytes a
+position a sequence):
+
+| session | before | after |
+|---|---|---|
+| any, at `max_seq_len` 2048 | 50.3 MB a sequence | - |
+| 20-token prompt | 50.3 MB | 0.5 MB |
+| 512 + 256 tokens | 50.3 MB | 25.2 MB |
+| 16 sequences, 512 + 128 | 805 MB | 403 MB (capacity 1024) |
+
+Decode throughput, `54f7581` against the change, interleaved rounds, load 1.3 to 1.5,
+tokens/s, first round of each binary dropped as warm-up:
+
+| run | full allocation | grown |
+|---|---|---|
+| `bench_decode 512 256 cuda 1 int8` | 1744 | 1711-1742 |
+| `bench_decode 512 128 cuda 16` | 9154-9223 | 9094-9144 |
+| `bench_decode 16 1024 cuda 1` | 1468-1470 | 1465-1473 |
+
+Sixteen sequences are 0.3-0.8% lower, about one rounding step of the
+ms/step figure; the two growths (512 then 641 positions here) copy the
+prefix once each.
