@@ -108,6 +108,7 @@ pub mod checkpoint;
 pub mod clip;
 pub mod conv;
 pub mod dataset;
+pub mod detection;
 pub mod diffusion;
 pub mod dit_lora;
 pub mod ema;

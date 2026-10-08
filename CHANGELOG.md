@@ -98,6 +98,7 @@
 
 ### Added
 
+- `detection` module (K13c): `read_yolo_split` and `parse_yolo_labels` for YOLO-format datasets, `rect_shape` for ultralytics' validation batch shape, and `DetectionImage` with `open` (decode and resize the long side), `resized` (OpenCV-style bilinear), `letterbox` and `flip_horizontal`, plus `mosaic` for the four-image mosaic. Boxes match ultralytics' pipeline on the CS2 player dataset.
 - `examples/chop_block_step.rs` times RustingChop's seven convolution blocks on the per-layer and the device-resident paths (K8d). At batch 128 on the RTX 3060 a forward and backward step drops from 1002 ms to 99 ms.
 - Device spatial softmax and global average pooling (K8c): `conv::spatial_softmax_device` and `spatial_softmax_backward_device` with `DeviceSpatialSoftmaxCache`, `conv::global_avg_pool_device` and `global_avg_pool_backward_device`. Outputs are `batch x 1 x 1 x C` device batches (2C for the softmax keypoints) and match the host functions without leaving the card.
 - `Glb::base_color_image(mesh, primitive) -> Option<(&[u8], &str)>`, `Glb::json()` and `Glb::binary()` (asked by RustingMedia). The request left the primitive's type open; it is the pair of indices into `meshes` and that mesh's `primitives`. Images held by URI return `None`.
