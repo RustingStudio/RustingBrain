@@ -200,6 +200,60 @@ extern "C" __global__ void gap_bwd(float*dx,const float*g,int total,int n,int C)
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
   dx[i]=g[(i/C/n)*C+i%C]/(float)n;
 }
+// Batch norm over `[rows, channels]`: the column sums go through cuBLAS, the
+// rest is one thread per element or channel.
+extern "C" __global__ void bn_center_sq(float*out,const float*x,const float*mean,int total,int C){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<total){float d=x[i]-mean[i%C];out[i]=d*d;}}
+extern "C" __global__ void bn_finish(float*mean,float*var,float*inv,float*run,int C,float eps,float momentum,float unbias,int training){
+  int c=blockIdx.x*blockDim.x+threadIdx.x;if(c>=C)return;
+  if(training){run[c]=(1.f-momentum)*run[c]+momentum*mean[c];run[C+c]=(1.f-momentum)*run[C+c]+momentum*var[c]*unbias;}
+  else{mean[c]=run[c];var[c]=run[C+c];}
+  inv[c]=1.f/sqrtf(var[c]+eps);
+}
+extern "C" __global__ void bn_apply(float*y,float*xhat,const float*x,const float*mean,const float*inv,
+    const float*gamma,const float*beta,int total,int C){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C;float h=(x[i]-mean[c])*inv[c];xhat[i]=h;y[i]=h*gamma[c]+beta[c];
+}
+extern "C" __global__ void bn_bwd_apply(float*dx,const float*g,const float*xhat,const float*inv,
+    const float*m1,const float*m2,const float*gamma,int total,int C){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C;dx[i]=inv[c]*gamma[c]*(g[i]-m1[c]-xhat[i]*m2[c]);
+}
+extern "C" __global__ void upsample_nearest(float*y,const float*x,int total,int H,int W,int C,int f){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C,r=i/C,ox=r%(W*f),q=r/(W*f),oy=q%(H*f),b=q/(H*f);
+  y[i]=x[((long long)(b*H+oy/f)*W+ox/f)*C+c];
+}
+extern "C" __global__ void upsample_nearest_bwd(float*dx,const float*g,int total,int H,int W,int C,int f){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C,r=i/C,x=r%W,q=r/W,y=q%H,b=q/H;float s=0.f;
+  for(int dy=0;dy<f;dy++)for(int dx2=0;dx2<f;dx2++)
+    s+=g[((long long)(b*H*f+y*f+dy)*W*f+x*f+dx2)*C+c];
+  dx[i]=s;
+}
+extern "C" __global__ void copy_channels(float*dst,const float*src,int rows,int width,int dC,int doff,int sC,int soff){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*width)return;
+  long long r=i/width;int c=i%width;dst[r*dC+doff+c]=src[r*sC+soff+c];
+}
+// Stride-one max pool padded to keep the size; `arg` is the winner's place in
+// the window, the first maximum on a tie as on the host.
+extern "C" __global__ void maxpool_same(float*y,int*arg,const float*x,int total,int H,int W,int C,int k){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C,r=i/C,px=r%W,q=r/W,py=q%H,b=q/H,pad=k/2;float m=-3.402823466e38f;int a=0;
+  for(int ky=0;ky<k;ky++){int sy=py+ky-pad;if(sy<0||sy>=H)continue;
+    for(int kx=0;kx<k;kx++){int sx=px+kx-pad;if(sx<0||sx>=W)continue;
+      float v=x[((long long)(b*H+sy)*W+sx)*C+c];if(v>m){m=v;a=ky*k+kx;}}}
+  y[i]=m;arg[i]=a;
+}
+extern "C" __global__ void maxpool_same_bwd(float*dx,const float*g,const int*arg,int total,int H,int W,int C,int k){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C,r=i/C,px=r%W,q=r/W,py=q%H,b=q/H,pad=k/2;float s=0.f;
+  for(int ky=0;ky<k;ky++){int oy=py-ky+pad;if(oy<0||oy>=H)continue;
+    for(int kx=0;kx<k;kx++){int ox=px-kx+pad;if(ox<0||ox>=W)continue;
+      long long o=((long long)(b*H+oy)*W+ox)*C+c;if(arg[o]==ky*k+kx)s+=g[o];}}
+  dx[i]=s;
+}
+extern "C" __global__ void add_f32(float*out,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]+b[i];}
 extern "C" __global__ void mul_f32(float*out,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]*b[i];}
 extern "C" __global__ void silu_f32(float*y,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];y[i]=v/(1.f+expf(-v));}}
 extern "C" __global__ void silu_bwd_f32(float*dx,const float*g,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i],s=1.f/(1.f+expf(-v));dx[i]=g[i]*s*(1.f+v*(1.f-s));}}

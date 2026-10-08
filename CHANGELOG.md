@@ -98,6 +98,7 @@
 
 ### Added
 
+- Detection layers (K13a-i) in `conv`: `TrainableBatchNorm2d` with training and evaluating modes, PyTorch's running statistics and `fuse_into` a convolution; `upsample_nearest_batch`, `concat_channels`, `split_channels`, `max_pool_same` and their backwards; each with a device version, plus `add_device`.
 - Detection ops (K13b) in `detection`: `box_iou` with `Overlap::{Iou, Giou, Ciou}` and its gradient, `distribution_focal_loss`, `make_anchors`, `box_to_ltrb`/`ltrb_to_box`, `TaskAlignedAssigner`, `non_max_suppression` and `mean_average_precision`, all matching ultralytics 8.4.174 on exported fixtures. Host only; CUDA NMS waits for the Gate 3 profile.
 - `detection` module (K13c): `read_yolo_split` and `parse_yolo_labels` for YOLO-format datasets, `rect_shape` for ultralytics' validation batch shape, and `DetectionImage` with `open` (decode and resize the long side), `resized` (OpenCV-style bilinear), `letterbox` and `flip_horizontal`, plus `mosaic` for the four-image mosaic. Boxes match ultralytics' pipeline on the CS2 player dataset.
 - `examples/chop_block_step.rs` times RustingChop's seven convolution blocks on the per-layer and the device-resident paths (K8d). At batch 128 on the RTX 3060 a forward and backward step drops from 1002 ms to 99 ms.

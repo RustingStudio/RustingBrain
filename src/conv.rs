@@ -1863,6 +1863,788 @@ pub fn global_avg_pool_backward(grad: &Matrix, height: usize, width: usize) -> I
     out
 }
 
+/// PyTorch's `BatchNorm2d` over an image batch's channels, training on batch
+/// statistics and evaluating on running ones. YOLO's convolutions use it with
+/// [`TrainableBatchNorm2d::yolo`].
+#[derive(Clone, Debug)]
+pub struct TrainableBatchNorm2d {
+    pub eps: f32,
+    /// Weight of the newest batch in the running statistics.
+    pub momentum: f32,
+    pub gamma: Param,
+    pub beta: Param,
+    /// `[2, channels]`: the running mean, then the running unbiased variance.
+    /// A `Param` so it moves to and from a device with the rest; the
+    /// optimizer never sees it.
+    pub running: Param,
+}
+
+/// What [`TrainableBatchNorm2d::backward`] needs from the forward pass.
+#[derive(Clone, Debug)]
+pub struct BatchNormCache {
+    normalized: Matrix,
+    inv_std: Vec<f32>,
+    training: bool,
+}
+
+impl TrainableBatchNorm2d {
+    /// Scale ones, shift zeros, running mean zeros and variance ones.
+    pub fn new(channels: usize, eps: f32, momentum: f32) -> Self {
+        let mut running = Matrix::new(2, channels);
+        running.data[channels..].fill(1.0);
+        Self {
+            eps,
+            momentum,
+            gamma: Param::filled(1, channels, 1.0),
+            beta: Param::zeros(1, channels),
+            running: Param::new(running),
+        }
+    }
+
+    /// ultralytics' settings: eps 1e-3, momentum 0.03.
+    pub fn yolo(channels: usize) -> Self {
+        Self::new(channels, 1e-3, 0.03)
+    }
+
+    pub fn channels(&self) -> usize {
+        self.gamma.value.cols
+    }
+
+    /// Normalizes with this batch's statistics and folds them into the
+    /// running ones when `training`, else with the running ones.
+    pub fn forward(
+        &mut self,
+        input: &ImageBatch,
+        training: bool,
+    ) -> Result<(ImageBatch, BatchNormCache), NetworkError> {
+        let channels = self.channels();
+        if input.channels() != channels {
+            return Err(NetworkError::InvalidTarget {
+                expected: channels,
+                actual: input.channels(),
+            });
+        }
+        let rows = input.tokens.rows;
+        let (mut mean, mut variance) = (vec![0f32; channels], vec![0f32; channels]);
+        if training {
+            for row in input.tokens.data.chunks_exact(channels) {
+                mean.iter_mut().zip(row).for_each(|(m, v)| *m += v);
+            }
+            mean.iter_mut().for_each(|m| *m /= rows as f32);
+            for row in input.tokens.data.chunks_exact(channels) {
+                for c in 0..channels {
+                    variance[c] += (row[c] - mean[c]).powi(2);
+                }
+            }
+            variance.iter_mut().for_each(|v| *v /= rows as f32);
+            let unbias = rows as f32 / (rows as f32 - 1.0).max(1.0);
+            let m = self.momentum;
+            let running = &mut self.running.value.data;
+            for c in 0..channels {
+                running[c] = (1.0 - m) * running[c] + m * mean[c];
+                running[channels + c] =
+                    (1.0 - m) * running[channels + c] + m * variance[c] * unbias;
+            }
+        } else {
+            mean.copy_from_slice(&self.running.value.data[..channels]);
+            variance.copy_from_slice(&self.running.value.data[channels..]);
+        }
+        let inv_std: Vec<f32> = variance
+            .iter()
+            .map(|v| 1.0 / (v + self.eps).sqrt())
+            .collect();
+        let mut normalized = Matrix::new(rows, channels);
+        let mut output = input.like(channels);
+        let (gamma, beta) = (&self.gamma.value.data, &self.beta.value.data);
+        for ((out, h), row) in output
+            .tokens
+            .data
+            .chunks_exact_mut(channels)
+            .zip(normalized.data.chunks_exact_mut(channels))
+            .zip(input.tokens.data.chunks_exact(channels))
+        {
+            for c in 0..channels {
+                h[c] = (row[c] - mean[c]) * inv_std[c];
+                out[c] = h[c] * gamma[c] + beta[c];
+            }
+        }
+        Ok((
+            output,
+            BatchNormCache {
+                normalized,
+                inv_std,
+                training,
+            },
+        ))
+    }
+
+    /// Adds to `gamma` and `beta`'s gradients and returns the input's.
+    pub fn backward(&mut self, cache: &BatchNormCache, grad: &ImageBatch) -> ImageBatch {
+        let channels = self.channels();
+        let rows = grad.tokens.rows as f32;
+        let (mut mean, mut along) = (vec![0f32; channels], vec![0f32; channels]);
+        for (g, h) in grad
+            .tokens
+            .data
+            .chunks_exact(channels)
+            .zip(cache.normalized.data.chunks_exact(channels))
+        {
+            for c in 0..channels {
+                mean[c] += g[c];
+                along[c] += g[c] * h[c];
+            }
+        }
+        for c in 0..channels {
+            self.gamma.grad.data[c] += along[c];
+            self.beta.grad.data[c] += mean[c];
+        }
+        let gamma = &self.gamma.value.data;
+        let mut input_grad = grad.like(channels);
+        for ((out, g), h) in input_grad
+            .tokens
+            .data
+            .chunks_exact_mut(channels)
+            .zip(grad.tokens.data.chunks_exact(channels))
+            .zip(cache.normalized.data.chunks_exact(channels))
+        {
+            for c in 0..channels {
+                let centred = match cache.training {
+                    true => g[c] - (mean[c] + h[c] * along[c]) / rows,
+                    false => g[c],
+                };
+                out[c] = cache.inv_std[c] * gamma[c] * centred;
+            }
+        }
+        input_grad
+    }
+
+    pub fn params_mut(&mut self) -> Vec<&mut Param> {
+        vec![&mut self.gamma, &mut self.beta]
+    }
+
+    /// Moves `gamma`, `beta` and the running statistics onto a device.
+    pub fn to_cuda_on(&mut self, device: &crate::param::CudaDevice) -> Result<(), NetworkError> {
+        self.gamma.to_cuda_on(device)?;
+        self.beta.to_cuda_on(device)?;
+        self.running.to_cuda_on(device)
+    }
+
+    pub fn to_cpu(&mut self) -> Result<(), NetworkError> {
+        self.gamma.to_cpu()?;
+        self.beta.to_cpu()?;
+        self.running.to_cpu()
+    }
+
+    /// The convolution that computes this norm, evaluating, after `conv`:
+    /// each output channel's weights scaled by `gamma / sqrt(var + eps)` and
+    /// the shift folded into the bias. Both must be on the host.
+    pub fn fuse_into(&self, conv: &TrainableConv2d) -> TrainableConv2d {
+        let channels = self.channels();
+        let mut fused = conv.clone();
+        let patch = fused.weight.weight.value.cols;
+        let running = &self.running.value.data;
+        for c in 0..channels {
+            let scale = self.gamma.value.data[c] / (running[channels + c] + self.eps).sqrt();
+            fused.weight.weight.value.data[c * patch..(c + 1) * patch]
+                .iter_mut()
+                .for_each(|w| *w *= scale);
+            let bias = if conv.has_bias {
+                conv.bias.value.data[c]
+            } else {
+                0.0
+            };
+            fused.bias.value.data[c] = (bias - running[c]) * scale + self.beta.value.data[c];
+        }
+        fused.has_bias = true;
+        fused
+    }
+
+    /// [`TrainableBatchNorm2d::forward`] for a batch already on the device.
+    #[cfg(feature = "cuda")]
+    pub fn forward_device(
+        &mut self,
+        input: &DeviceImageBatch,
+        training: bool,
+    ) -> Result<(DeviceImageBatch, DeviceBatchNormCache), NetworkError> {
+        let channels = self.channels();
+        if input.channels != channels {
+            return Err(NetworkError::InvalidTarget {
+                expected: channels,
+                actual: input.channels,
+            });
+        }
+        let (Some(gamma), Some(beta), Some(running)) = (
+            self.gamma.device.as_ref(),
+            self.beta.device.as_ref(),
+            self.running.device.as_mut(),
+        ) else {
+            return Err(NetworkError::InvalidConfig(
+                "forward_device needs the batch norm on a device".into(),
+            ));
+        };
+        let context = &input.context;
+        let err = crate::cuda_training::cuda_err;
+        let (total, rows) = (input.data.len(), input.batch * input.pixels());
+        let (mut mean, mut variance) = (context.zeros(channels)?, context.zeros(channels)?);
+        let mut inv_std = context.zeros(channels)?;
+        if training {
+            let ones = context.filled(rows, 1.0)?;
+            let scale = 1.0 / rows as f32;
+            let sum = |x: &cudarc::driver::CudaSlice<f32>,
+                       out: &mut cudarc::driver::CudaSlice<f32>| {
+                crate::gpu_transformer::gemm_lhs_transposed(
+                    context, &ones, 1, x, channels, out, channels, rows, 1, channels, scale, 0.0,
+                )
+            };
+            sum(&input.data, &mut mean)?;
+            let mut squares = context.zeros(total)?;
+            let [n, c] = [total, channels].map(|v| v as i32);
+            unsafe {
+                context
+                    .stream
+                    .launch_builder(&context.image.bn_center_sq)
+                    .arg(&mut squares)
+                    .arg(&input.data)
+                    .arg(&mean)
+                    .arg(&n)
+                    .arg(&c)
+                    .launch(crate::cuda_training::cfg(total))
+                    .map_err(err("batch norm variance kernel"))?;
+            }
+            sum(&squares, &mut variance)?;
+        }
+        let unbias = rows as f32 / (rows as f32 - 1.0).max(1.0);
+        let [c, train] = [channels as i32, training as i32];
+        unsafe {
+            context
+                .stream
+                .launch_builder(&context.image.bn_finish)
+                .arg(&mut mean)
+                .arg(&mut variance)
+                .arg(&mut inv_std)
+                .arg(running.value_mut())
+                .arg(&c)
+                .arg(&self.eps)
+                .arg(&self.momentum)
+                .arg(&unbias)
+                .arg(&train)
+                .launch(crate::cuda_training::cfg(channels))
+                .map_err(err("batch norm statistics kernel"))?;
+        }
+        let (mut output, mut normalized) = (context.zeros(total)?, context.zeros(total)?);
+        let n = total as i32;
+        unsafe {
+            context
+                .stream
+                .launch_builder(&context.image.bn_apply)
+                .arg(&mut output)
+                .arg(&mut normalized)
+                .arg(&input.data)
+                .arg(&mean)
+                .arg(&inv_std)
+                .arg(gamma.value())
+                .arg(beta.value())
+                .arg(&n)
+                .arg(&c)
+                .launch(crate::cuda_training::cfg(total))
+                .map_err(err("batch norm kernel"))?;
+        }
+        Ok((
+            input.with_data(output),
+            DeviceBatchNormCache {
+                normalized,
+                inv_std,
+                training,
+            },
+        ))
+    }
+
+    /// [`TrainableBatchNorm2d::backward`] on the device.
+    #[cfg(feature = "cuda")]
+    pub fn backward_device(
+        &mut self,
+        cache: &DeviceBatchNormCache,
+        grad: &DeviceImageBatch,
+    ) -> Result<DeviceImageBatch, NetworkError> {
+        let context = grad.context.clone();
+        let err = crate::cuda_training::cuda_err;
+        let (total, rows) = (grad.data.len(), grad.batch * grad.pixels());
+        let channels = self.channels();
+        let (Some(gamma), Some(beta)) = (self.gamma.device.as_mut(), self.beta.device.as_mut())
+        else {
+            return Err(NetworkError::InvalidConfig(
+                "backward_device needs gamma and beta on a device".into(),
+            ));
+        };
+        let ones = context.filled(rows, 1.0)?;
+        let mut product = context.zeros(total)?;
+        let n = total as i32;
+        unsafe {
+            context
+                .stream
+                .launch_builder(&context.image.mul)
+                .arg(&mut product)
+                .arg(&grad.data)
+                .arg(&cache.normalized)
+                .arg(&n)
+                .launch(crate::cuda_training::cfg(total))
+                .map_err(err("multiply kernel"))?;
+        }
+        let (mut mean, mut along) = (context.zeros(channels)?, context.zeros(channels)?);
+        if cache.training {
+            let scale = 1.0 / rows as f32;
+            for (x, out) in [(&grad.data, &mut mean), (&product, &mut along)] {
+                crate::gpu_transformer::gemm_lhs_transposed(
+                    &context, &ones, 1, x, channels, out, channels, rows, 1, channels, scale, 0.0,
+                )?;
+            }
+        }
+        let mut input_grad = context.zeros(total)?;
+        let c = channels as i32;
+        unsafe {
+            context
+                .stream
+                .launch_builder(&context.image.bn_bwd_apply)
+                .arg(&mut input_grad)
+                .arg(&grad.data)
+                .arg(&cache.normalized)
+                .arg(&cache.inv_std)
+                .arg(&mean)
+                .arg(&along)
+                .arg(gamma.value())
+                .arg(&n)
+                .arg(&c)
+                .launch(crate::cuda_training::cfg(total))
+                .map_err(err("batch norm backward kernel"))?;
+        }
+        gamma.accumulate_grad_device(&ones, &product, rows)?;
+        beta.accumulate_grad_device(&ones, &grad.data, rows)?;
+        Ok(grad.with_data(input_grad))
+    }
+}
+
+/// What [`TrainableBatchNorm2d::backward_device`] needs from the forward pass.
+#[cfg(feature = "cuda")]
+pub struct DeviceBatchNormCache {
+    normalized: cudarc::driver::CudaSlice<f32>,
+    inv_std: cudarc::driver::CudaSlice<f32>,
+    training: bool,
+}
+
+/// Nearest-neighbour upsampling by `factor` along both axes.
+pub fn upsample_nearest_batch(input: &ImageBatch, factor: usize) -> ImageBatch {
+    let mut output = ImageBatch::new(
+        input.batch,
+        input.height * factor,
+        input.width * factor,
+        input.channels(),
+    );
+    for b in 0..input.batch {
+        for y in 0..output.height {
+            for x in 0..output.width {
+                let source = input.pixel(b, y / factor, x / factor).to_vec();
+                output.pixel_mut(b, y, x).copy_from_slice(&source);
+            }
+        }
+    }
+    output
+}
+
+/// The gradient of [`upsample_nearest_batch`]: each input pixel sums the
+/// `factor x factor` block it was copied to.
+pub fn upsample_nearest_backward(grad: &ImageBatch, factor: usize) -> ImageBatch {
+    let mut input_grad = ImageBatch::new(
+        grad.batch,
+        grad.height / factor,
+        grad.width / factor,
+        grad.channels(),
+    );
+    for b in 0..grad.batch {
+        for y in 0..grad.height {
+            for x in 0..grad.width {
+                let g = grad.pixel(b, y, x).to_vec();
+                input_grad
+                    .pixel_mut(b, y / factor, x / factor)
+                    .iter_mut()
+                    .zip(g)
+                    .for_each(|(s, g)| *s += g);
+            }
+        }
+    }
+    input_grad
+}
+
+/// The maps side by side along the channels, which must share their size.
+/// Its gradient is [`split_channels`].
+pub fn concat_channels(parts: &[&ImageBatch]) -> ImageBatch {
+    let channels = parts.iter().map(|p| p.channels()).sum();
+    let mut output = parts[0].like(channels);
+    let mut offset = 0;
+    for part in parts {
+        let width = part.channels();
+        for (out, row) in output
+            .tokens
+            .data
+            .chunks_exact_mut(channels)
+            .zip(part.tokens.data.chunks_exact(width))
+        {
+            out[offset..offset + width].copy_from_slice(row);
+        }
+        offset += width;
+    }
+    output
+}
+
+/// The map cut along the channels into parts of the given widths, which must
+/// add up to its channels. Its gradient is [`concat_channels`].
+pub fn split_channels(input: &ImageBatch, widths: &[usize]) -> Vec<ImageBatch> {
+    let mut offset = 0;
+    widths
+        .iter()
+        .map(|&width| {
+            let mut part = input.like(width);
+            for (out, row) in part
+                .tokens
+                .data
+                .chunks_exact_mut(width)
+                .zip(input.tokens.data.chunks_exact(input.channels()))
+            {
+                out.copy_from_slice(&row[offset..offset + width]);
+            }
+            offset += width;
+            part
+        })
+        .collect()
+}
+
+/// Which window position won each output of [`max_pool_same`].
+#[derive(Clone, Debug)]
+pub struct MaxPoolCache {
+    kernel: usize,
+    argmax: Vec<u32>,
+}
+
+/// A `kernel x kernel` max pool with stride one, padded so the size stays,
+/// as SPPF's `nn.MaxPool2d(5, 1, 2)`. The first maximum in the window wins a
+/// tie.
+pub fn max_pool_same(input: &ImageBatch, kernel: usize) -> (ImageBatch, MaxPoolCache) {
+    let (height, width, channels, pad) = (input.height, input.width, input.channels(), kernel / 2);
+    let mut output = input.like(channels);
+    let mut argmax = vec![0u32; input.tokens.data.len()];
+    for b in 0..input.batch {
+        for y in 0..height {
+            for x in 0..width {
+                let at = ((b * height + y) * width + x) * channels;
+                for c in 0..channels {
+                    let (mut best, mut arg) = (f32::MIN, 0);
+                    for ky in 0..kernel {
+                        for kx in 0..kernel {
+                            let (sy, sx) = ((y + ky).wrapping_sub(pad), (x + kx).wrapping_sub(pad));
+                            if sy < height && sx < width {
+                                let v = input.pixel(b, sy, sx)[c];
+                                if v > best {
+                                    (best, arg) = (v, ky * kernel + kx);
+                                }
+                            }
+                        }
+                    }
+                    output.tokens.data[at + c] = best;
+                    argmax[at + c] = arg as u32;
+                }
+            }
+        }
+    }
+    (output, MaxPoolCache { kernel, argmax })
+}
+
+/// Routes each output's gradient to the input that won its window.
+pub fn max_pool_same_backward(cache: &MaxPoolCache, grad: &ImageBatch) -> ImageBatch {
+    let (height, width, channels, kernel) =
+        (grad.height, grad.width, grad.channels(), cache.kernel);
+    let pad = kernel / 2;
+    let mut input_grad = grad.like(channels);
+    for (index, (&g, &arg)) in grad.tokens.data.iter().zip(&cache.argmax).enumerate() {
+        let (c, pixel) = (index % channels, index / channels);
+        let (x, y, b) = (
+            pixel % width,
+            pixel / width % height,
+            pixel / width / height,
+        );
+        let (ky, kx) = (arg as usize / kernel, arg as usize % kernel);
+        let (sy, sx) = (y + ky - pad, x + kx - pad);
+        input_grad.tokens.data[((b * height + sy) * width + sx) * channels + c] += g;
+    }
+    input_grad
+}
+
+/// [`upsample_nearest_batch`] on the device.
+#[cfg(feature = "cuda")]
+pub fn upsample_nearest_device(
+    input: &DeviceImageBatch,
+    factor: usize,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let total = input.data.len() * factor * factor;
+    let out = image_launch(
+        input,
+        total,
+        "upsample kernel",
+        |context| &context.image.upsample,
+        &[input.height, input.width, input.channels, factor],
+    )?;
+    Ok(DeviceImageBatch {
+        height: input.height * factor,
+        width: input.width * factor,
+        ..input.with_data(out)
+    })
+}
+
+/// [`upsample_nearest_backward`] on the device.
+#[cfg(feature = "cuda")]
+pub fn upsample_nearest_backward_device(
+    grad: &DeviceImageBatch,
+    factor: usize,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let (height, width) = (grad.height / factor, grad.width / factor);
+    let total = grad.data.len() / (factor * factor);
+    let out = image_launch(
+        grad,
+        total,
+        "upsample backward kernel",
+        |context| &context.image.upsample_bwd,
+        &[height, width, grad.channels, factor],
+    )?;
+    Ok(DeviceImageBatch {
+        height,
+        width,
+        ..grad.with_data(out)
+    })
+}
+
+/// `a + b` on the device, for residual connections.
+#[cfg(feature = "cuda")]
+pub fn add_device(
+    a: &DeviceImageBatch,
+    b: &DeviceImageBatch,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let context = &a.context;
+    let total = a.data.len();
+    if b.data.len() != total {
+        return Err(NetworkError::InvalidTarget {
+            expected: total,
+            actual: b.data.len(),
+        });
+    }
+    let mut out = context.zeros(total)?;
+    let n = total as i32;
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.add)
+            .arg(&mut out)
+            .arg(&a.data)
+            .arg(&b.data)
+            .arg(&n)
+            .launch(crate::cuda_training::cfg(total))
+            .map_err(crate::cuda_training::cuda_err("add kernel"))?;
+    }
+    Ok(a.with_data(out))
+}
+
+/// [`concat_channels`] on the device.
+#[cfg(feature = "cuda")]
+pub fn concat_channels_device(
+    parts: &[&DeviceImageBatch],
+) -> Result<DeviceImageBatch, NetworkError> {
+    let first = parts[0];
+    let channels: usize = parts.iter().map(|p| p.channels).sum();
+    let rows = first.batch * first.pixels();
+    let mut out = first.context.zeros(rows * channels)?;
+    let mut offset = 0;
+    for part in parts {
+        copy_channels(
+            &first.context,
+            &mut out,
+            channels,
+            offset,
+            &part.data,
+            part.channels,
+            0,
+            part.channels,
+            rows,
+        )?;
+        offset += part.channels;
+    }
+    Ok(DeviceImageBatch {
+        channels,
+        ..first.with_data(out)
+    })
+}
+
+/// [`split_channels`] on the device.
+#[cfg(feature = "cuda")]
+pub fn split_channels_device(
+    input: &DeviceImageBatch,
+    widths: &[usize],
+) -> Result<Vec<DeviceImageBatch>, NetworkError> {
+    let rows = input.batch * input.pixels();
+    let mut offset = 0;
+    widths
+        .iter()
+        .map(|&width| {
+            let mut out = input.context.zeros(rows * width)?;
+            copy_channels(
+                &input.context,
+                &mut out,
+                width,
+                0,
+                &input.data,
+                input.channels,
+                offset,
+                width,
+                rows,
+            )?;
+            offset += width;
+            Ok(DeviceImageBatch {
+                channels: width,
+                ..input.with_data(out)
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn copy_channels(
+    context: &crate::gpu_transformer::GpuContext,
+    dst: &mut cudarc::driver::CudaSlice<f32>,
+    dst_channels: usize,
+    dst_offset: usize,
+    src: &cudarc::driver::CudaSlice<f32>,
+    src_channels: usize,
+    src_offset: usize,
+    width: usize,
+    rows: usize,
+) -> Result<(), NetworkError> {
+    let [rows_arg, width_arg, dc, doff, sc, soff] = [
+        rows,
+        width,
+        dst_channels,
+        dst_offset,
+        src_channels,
+        src_offset,
+    ]
+    .map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.copy_channels)
+            .arg(dst)
+            .arg(src)
+            .arg(&rows_arg)
+            .arg(&width_arg)
+            .arg(&dc)
+            .arg(&doff)
+            .arg(&sc)
+            .arg(&soff)
+            .launch(crate::cuda_training::cfg(rows * width))
+            .map_err(crate::cuda_training::cuda_err("channel copy kernel"))?;
+    }
+    Ok(())
+}
+
+/// What [`max_pool_same_backward_device`] needs from the forward pass.
+#[cfg(feature = "cuda")]
+pub struct DeviceMaxPoolCache {
+    kernel: usize,
+    argmax: cudarc::driver::CudaSlice<i32>,
+}
+
+/// [`max_pool_same`] on the device.
+#[cfg(feature = "cuda")]
+pub fn max_pool_same_device(
+    input: &DeviceImageBatch,
+    kernel: usize,
+) -> Result<(DeviceImageBatch, DeviceMaxPoolCache), NetworkError> {
+    let context = &input.context;
+    let total = input.data.len();
+    let mut out = context.zeros(total)?;
+    let mut argmax = context
+        .stream
+        .alloc_zeros::<i32>(total)
+        .map_err(crate::cuda_training::cuda_err("max pool allocation"))?;
+    let [n, h, w, c, k] =
+        [total, input.height, input.width, input.channels, kernel].map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.maxpool)
+            .arg(&mut out)
+            .arg(&mut argmax)
+            .arg(&input.data)
+            .arg(&n)
+            .arg(&h)
+            .arg(&w)
+            .arg(&c)
+            .arg(&k)
+            .launch(crate::cuda_training::cfg(total))
+            .map_err(crate::cuda_training::cuda_err("max pool kernel"))?;
+    }
+    Ok((input.with_data(out), DeviceMaxPoolCache { kernel, argmax }))
+}
+
+/// [`max_pool_same_backward`] on the device, gathering rather than
+/// scattering so it is deterministic.
+#[cfg(feature = "cuda")]
+pub fn max_pool_same_backward_device(
+    cache: &DeviceMaxPoolCache,
+    grad: &DeviceImageBatch,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let context = &grad.context;
+    let total = grad.data.len();
+    let mut out = context.zeros(total)?;
+    let [n, h, w, c, k] =
+        [total, grad.height, grad.width, grad.channels, cache.kernel].map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.maxpool_bwd)
+            .arg(&mut out)
+            .arg(&grad.data)
+            .arg(&cache.argmax)
+            .arg(&n)
+            .arg(&h)
+            .arg(&w)
+            .arg(&c)
+            .arg(&k)
+            .launch(crate::cuda_training::cfg(total))
+            .map_err(crate::cuda_training::cuda_err("max pool backward kernel"))?;
+    }
+    Ok(grad.with_data(out))
+}
+
+/// One thread per output element of a kernel taking `(out, in, total, dims...)`.
+#[cfg(feature = "cuda")]
+fn image_launch(
+    input: &DeviceImageBatch,
+    total: usize,
+    what: &'static str,
+    kernel: impl Fn(&crate::gpu_transformer::GpuContext) -> &cudarc::driver::CudaFunction,
+    dims: &[usize],
+) -> Result<cudarc::driver::CudaSlice<f32>, NetworkError> {
+    let context = &input.context;
+    let mut out = context.zeros(total)?;
+    let n = total as i32;
+    let dims: Vec<i32> = dims.iter().map(|&d| d as i32).collect();
+    let mut launch = context.stream.launch_builder(kernel(context));
+    launch.arg(&mut out).arg(&input.data).arg(&n);
+    for d in &dims {
+        launch.arg(d);
+    }
+    unsafe { launch.launch(crate::cuda_training::cfg(total)) }
+        .map_err(crate::cuda_training::cuda_err(what))?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2720,5 +3502,243 @@ mod tests {
         assert_eq!(tokens.row(1), &[1.0, 9.0, 17.0]);
         assert_eq!(FeatureMap::from_tokens(&tokens, 2, 4).unwrap(), map);
         assert!(FeatureMap::from_tokens(&tokens, 3, 4).is_err());
+    }
+    fn dot(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(a, b)| a * b).sum()
+    }
+
+    fn batch_norm_for_tests() -> TrainableBatchNorm2d {
+        let mut norm = TrainableBatchNorm2d::yolo(6);
+        norm.gamma.value.data = noise(1, 1, 6, 1, 4)
+            .tokens
+            .data
+            .iter()
+            .map(|v| v + 1.5)
+            .collect();
+        norm.beta.value.data = noise(1, 1, 6, 1, 5).tokens.data;
+        norm.running.value.data = noise(1, 2, 6, 1, 9)
+            .tokens
+            .data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| if i < 6 { *v } else { v.abs() + 0.5 })
+            .collect();
+        norm
+    }
+
+    #[test]
+    fn batch_norm_matches_finite_differences_in_both_modes_and_tracks_running_statistics() {
+        let input = noise(2, 3, 5, 6, 3);
+        let weights = noise(2, 3, 5, 6, 6);
+        for training in [true, false] {
+            let mut norm = batch_norm_for_tests();
+            let before = norm.running.value.data.clone();
+            let (output, cache) = norm.forward(&input, training).unwrap();
+            let grad = norm.backward(&cache, &weights);
+            let through = |input: &ImageBatch| {
+                batch_norm_for_tests()
+                    .forward(input, training)
+                    .unwrap()
+                    .0
+                    .tokens
+            };
+            let gap = pooled_gap(through, &input, &weights.tokens.data, &grad.tokens.data);
+            assert!(gap < 1e-3, "training {training}: input {gap}");
+            // gamma and beta enter linearly, so their gradients are exact sums.
+            let normalized: Vec<f32> = output
+                .tokens
+                .data
+                .iter()
+                .enumerate()
+                .map(|(i, y)| (y - norm.beta.value.data[i % 6]) / norm.gamma.value.data[i % 6])
+                .collect();
+            for c in 0..6 {
+                let (mut dg, mut db) = (0.0, 0.0);
+                for r in 0..30 {
+                    dg += weights.tokens.data[r * 6 + c] * normalized[r * 6 + c];
+                    db += weights.tokens.data[r * 6 + c];
+                }
+                assert!((norm.gamma.grad.data[c] - dg).abs() < 1e-4);
+                assert!((norm.beta.grad.data[c] - db).abs() < 1e-4);
+            }
+            if training {
+                let c = 2;
+                let column: Vec<f32> = (0..30).map(|r| input.tokens.data[r * 6 + c]).collect();
+                let mean = column.iter().sum::<f32>() / 30.0;
+                let unbiased = column.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / 29.0;
+                let running = &norm.running.value.data;
+                assert!((running[c] - (0.97 * before[c] + 0.03 * mean)).abs() < 1e-6);
+                assert!((running[6 + c] - (0.97 * before[6 + c] + 0.03 * unbiased)).abs() < 1e-6);
+            } else {
+                assert_eq!(norm.running.value.data, before);
+            }
+        }
+    }
+
+    #[test]
+    fn a_fused_convolution_equals_the_convolution_then_the_evaluating_norm() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let conv = TrainableConv2d::new(4, 6, 3, 2, &mut rng)
+            .unwrap()
+            .without_bias();
+        let mut norm = batch_norm_for_tests();
+        let input = noise(2, 7, 9, 4, 1);
+        let (expected, _) = norm
+            .forward(&conv.forward(&input).unwrap().0, false)
+            .unwrap();
+        let fused = norm.fuse_into(&conv).forward(&input).unwrap().0;
+        for (a, b) in fused.tokens.data.iter().zip(&expected.tokens.data) {
+            assert!((a - b).abs() < 1e-5, "{a} against {b}");
+        }
+    }
+
+    #[test]
+    fn upsample_concat_split_and_max_pool_backwards_are_their_adjoints() {
+        let input = noise(2, 3, 4, 5, 1);
+        let up = upsample_nearest_batch(&input, 2);
+        assert_eq!((up.height, up.width), (6, 8));
+        assert_eq!(up.pixel(1, 5, 7), input.pixel(1, 2, 3));
+        let grad = noise(2, 6, 8, 5, 2);
+        let back = upsample_nearest_backward(&grad, 2);
+        let gap =
+            dot(&up.tokens.data, &grad.tokens.data) - dot(&input.tokens.data, &back.tokens.data);
+        assert!(gap.abs() < 1e-3, "upsample {gap}");
+
+        let other = noise(2, 3, 4, 2, 7);
+        let joined = concat_channels(&[&input, &other]);
+        assert_eq!(joined.pixel(1, 2, 3)[5..], *other.pixel(1, 2, 3));
+        let parts = split_channels(&joined, &[5, 2]);
+        assert_eq!(parts[0].tokens.data, input.tokens.data);
+        assert_eq!(parts[1].tokens.data, other.tokens.data);
+
+        // Distinct values keep every window's winner clear of a tie.
+        let mut distinct = noise(2, 6, 7, 3, 4);
+        distinct
+            .tokens
+            .data
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v += i as f32 * 1e-3);
+        let (pooled, cache) = max_pool_same(&distinct, 5);
+        assert_eq!(
+            pooled.pixel(0, 0, 0)[0],
+            (0..3)
+                .flat_map(|y| (0..3).map(move |x| (y, x)))
+                .map(|(y, x)| distinct.pixel(0, y, x)[0])
+                .fold(f32::MIN, f32::max)
+        );
+        let weights = noise(2, 6, 7, 3, 8);
+        let back = max_pool_same_backward(&cache, &weights);
+        let through = |input: &ImageBatch| max_pool_same(input, 5).0.tokens;
+        let gap = pooled_gap(through, &distinct, &weights.tokens.data, &back.tokens.data);
+        assert!(gap < 1e-3, "max pool {gap}");
+    }
+
+    /// The detection layers on the device against the host.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_detection_layers_match_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let close = |a: &[f32], b: &[f32], what: &str| {
+            assert_eq!(a.len(), b.len(), "{what}");
+            for (index, (a, b)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-4 + 1e-4 * b.abs(),
+                    "{what}[{index}]: {a} against {b}"
+                );
+            }
+        };
+        let input = noise(3, 9, 11, 6, 1);
+        let weights = noise(3, 9, 11, 6, 2);
+        let on_card = device.upload(&input).unwrap();
+        let on_card_weights = device.upload(&weights).unwrap();
+        for training in [true, false] {
+            let mut host = batch_norm_for_tests();
+            let mut resident = batch_norm_for_tests();
+            resident.to_cuda_on(&device).unwrap();
+            let (expected, cache) = host.forward(&input, training).unwrap();
+            let expected_grad = host.backward(&cache, &weights);
+            let (output, cache) = resident.forward_device(&on_card, training).unwrap();
+            let grad = resident.backward_device(&cache, &on_card_weights).unwrap();
+            close(
+                &output.download().unwrap().tokens.data,
+                &expected.tokens.data,
+                "norm",
+            );
+            close(
+                &grad.download().unwrap().tokens.data,
+                &expected_grad.tokens.data,
+                "norm grad",
+            );
+            resident.to_cpu().unwrap();
+            close(
+                &resident.gamma.grad.data,
+                &host.gamma.grad.data,
+                "gamma grad",
+            );
+            close(&resident.beta.grad.data, &host.beta.grad.data, "beta grad");
+            close(
+                &resident.running.value.data,
+                &host.running.value.data,
+                "running",
+            );
+        }
+
+        let up = upsample_nearest_device(&on_card, 2).unwrap();
+        close(
+            &up.download().unwrap().tokens.data,
+            &upsample_nearest_batch(&input, 2).tokens.data,
+            "upsample",
+        );
+        let back = upsample_nearest_backward_device(&up, 2).unwrap();
+        close(
+            &back.download().unwrap().tokens.data,
+            &upsample_nearest_backward(&upsample_nearest_batch(&input, 2), 2)
+                .tokens
+                .data,
+            "upsample grad",
+        );
+
+        let joined = concat_channels_device(&[&on_card, &on_card_weights]).unwrap();
+        close(
+            &joined.download().unwrap().tokens.data,
+            &concat_channels(&[&input, &weights]).tokens.data,
+            "concat",
+        );
+        let parts = split_channels_device(&joined, &[4, 8]).unwrap();
+        for (part, expected) in parts.iter().zip(split_channels(
+            &concat_channels(&[&input, &weights]),
+            &[4, 8],
+        )) {
+            close(
+                &part.download().unwrap().tokens.data,
+                &expected.tokens.data,
+                "split",
+            );
+        }
+        let sum = add_device(&on_card, &on_card_weights).unwrap();
+        let mut expected = input.clone();
+        expected.add(&weights);
+        close(
+            &sum.download().unwrap().tokens.data,
+            &expected.tokens.data,
+            "add",
+        );
+
+        let (pooled, cache) = max_pool_same(&input, 5);
+        let (on_card_pooled, device_cache) = max_pool_same_device(&on_card, 5).unwrap();
+        close(
+            &on_card_pooled.download().unwrap().tokens.data,
+            &pooled.tokens.data,
+            "max pool",
+        );
+        let back = max_pool_same_backward_device(&device_cache, &on_card_weights).unwrap();
+        close(
+            &back.download().unwrap().tokens.data,
+            &max_pool_same_backward(&cache, &weights).tokens.data,
+            "max pool grad",
+        );
     }
 }
