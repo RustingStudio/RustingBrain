@@ -1560,15 +1560,17 @@ pub(crate) fn act_plain<T, O: DevicePtrMut<T>>(
     unsafe { act_dispatch(context, config, w, x, narrow, out_narrow, out) }
 }
 
-/// [`gemm_lhs_transposed`] over [`act_dispatch`] operands.
+/// [`gemm_lhs_transposed`] over [`act_dispatch`] operands. An FP16-accumulating
+/// context writes only FP16, so its callers want `out_narrow`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn act_lhs_transposed<O: DevicePtrMut<f32>>(
+pub(crate) fn act_lhs_transposed<T, O: DevicePtrMut<T>>(
     context: &GpuContext,
     d: &CudaView<'_, u8>,
     d_stride: usize,
     x: &CudaView<'_, u8>,
     x_stride: usize,
     narrow: bool,
+    out_narrow: bool,
     out: &mut O,
     out_stride: usize,
     rows: usize,
@@ -1589,7 +1591,7 @@ pub(crate) fn act_lhs_transposed<O: DevicePtrMut<f32>>(
         beta,
         ldc: out_stride as i32,
     };
-    unsafe { act_dispatch(context, config, x, d, narrow, false, out) }
+    unsafe { act_dispatch(context, config, x, d, narrow, out_narrow, out) }
 }
 
 /// `out[rows, units] = alpha * x[rows, inner] . w[units, inner]^T + beta * out`

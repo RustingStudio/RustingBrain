@@ -52,7 +52,7 @@
 use crate::clip::{ClipTextEncoder, Layer, Norm};
 use crate::conv::{Conv2d, Dense, FeatureMap, GroupNorm};
 use crate::cuda_training::{cfg, cuda_alloc_err, cuda_err, device_context};
-use crate::gpu_transformer::{GpuContext, act_plain, act_rhs_transposed};
+use crate::gpu_transformer::{GpuContext, act_lhs_transposed, act_plain, act_rhs_transposed};
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::unet::{Projection, Unet};
@@ -468,6 +468,161 @@ extern "C" __global__ void transpose(half_t*out,const half_t*in,long long rows,l
   long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   if(i<rows*cols)out[(i%cols)*rows+i/cols]=in[i];
 }
+
+// The backward pass, for training adapters on a frozen UNet. Gradients are
+// FP16 like the activations they mirror; every reduction runs in FP32.
+
+// The reverse of `im2col`, or with `tap` set of one vertical tap of `im2row`:
+// every column entry is added back to the input value it was read from.
+// Several taps land on one input value, so the sums are FP32 atomics into
+// `out`, which `narrow` turns back into FP16 once every chunk is in.
+extern "C" __global__ void col2im(float*__restrict__ out,const half_t*__restrict__ columns,
+    int in_h,int in_w,int kernel,int stride,int pad,int out_w,int row,int span,long long pitch,
+    int tap){
+  int s=blockIdx.x*blockDim.x+threadIdx.x;
+  if(s>=span)return;
+  int line=s/out_w,ox=s-line*out_w;
+  int c=blockIdx.y,taps=tap<0?kernel:1;
+  float*target=out+(long long)c*in_h*in_w;
+  const half_t*source=columns+(long long)c*taps*kernel*pitch+s;
+  int y0=(row+line)*stride-pad,x0=ox*stride-pad;
+  for(int t=0;t<taps;t++){
+    int y=y0+(tap<0?t:tap);
+    if(y<0||y>=in_h)continue;
+    for(int kx=0;kx<kernel;kx++){
+      int x=x0+kx;
+      if(x>=0&&x<in_w)
+        atomicAdd(target+(long long)y*in_w+x,h2f(source[(long long)(t*kernel+kx)*pitch]));
+    }
+  }
+}
+extern "C" __global__ void narrow(half_t*__restrict__ out,const float*__restrict__ in,long long n){
+  long long base=(long long)blockIdx.x*blockDim.x*LANE+threadIdx.x;
+  for(int k=0;k<LANE;k++){
+    long long i=base+(long long)k*blockDim.x;
+    if(i<n)out[i]=f2h(in[i]);
+  }
+}
+
+// `dL/dx` of a group norm, in place over the incoming gradient `g`:
+// `inv * (g*w - mean(g*w) - xhat * mean(xhat*g*w))` over each group. The two
+// group means are split along the span as `group_partials` splits its sums,
+// and `stats` are the forward pass's, from `group_fold`.
+extern "C" __global__ void group_bwd_partials(const half_t*__restrict__ x,
+    const half_t*__restrict__ g,const float*__restrict__ w,const float*__restrict__ stats,
+    float*__restrict__ out,long long pixels,int per_group,int splits){
+  __shared__ float red[THREADS];
+  long long n=blockIdx.y,s=blockIdx.x,span=pixels*per_group;
+  const half_t*xv=x+n*span;
+  const half_t*gv=g+n*span;
+  const float*wv=w+n*per_group;
+  float mean=stats[2*n],inv=stats[2*n+1];
+  long long begin=span*s/splits,end=span*(s+1)/splits;
+  float plain=0.f,projected=0.f;
+  for(long long i=begin+threadIdx.x;i<end;i+=THREADS){
+    float d=h2f(gv[i])*wv[i/pixels];
+    plain+=d;projected+=(h2f(xv[i])-mean)*inv*d;
+  }
+  float a=block_sum(plain,red),b=block_sum(projected,red);
+  if(threadIdx.x==0){out[n*splits+s]=a;out[((long long)gridDim.y+n)*splits+s]=b;}
+}
+extern "C" __global__ void group_bwd_apply(half_t*__restrict__ g,const half_t*__restrict__ x,
+    const float*__restrict__ w,const float*__restrict__ stats,const float*__restrict__ partials,
+    long long pixels,int per_group,int groups,int splits,float span){
+  __shared__ float means[2];
+  int c=blockIdx.y,n=c/per_group;
+  if(threadIdx.x==0){
+    float a=0.f,b=0.f;
+    for(int s=0;s<splits;s++){a+=partials[n*splits+s];b+=partials[(groups+n)*splits+s];}
+    means[0]=a/span;means[1]=b/span;
+  }
+  __syncthreads();
+  half_t*row=g+(long long)c*pixels;
+  const half_t*xr=x+(long long)c*pixels;
+  float mean=stats[2*n],inv=stats[2*n+1],scale=w[c],plain=means[0],projected=means[1];
+  long long base=(long long)blockIdx.x*blockDim.x*LANE+threadIdx.x;
+  for(int k=0;k<LANE;k++){
+    long long p=base+(long long)k*blockDim.x;
+    if(p>=pixels)continue;
+    float xhat=(h2f(xr[p])-mean)*inv;
+    row[p]=f2h(inv*(h2f(row[p])*scale-plain-xhat*projected));
+  }
+}
+
+// `dL/dx` of `layer_norm`, in place over `g`, one block per token. Every
+// value of the row is read into both sums before the first is written.
+extern "C" __global__ void layer_norm_bwd(half_t*g,const half_t*x,const float*w,int cols,float eps){
+  __shared__ float red[THREADS];
+  const half_t*src=x+(long long)blockIdx.x*cols;
+  half_t*grad=g+(long long)blockIdx.x*cols;
+  float total=0.f;
+  for(int i=threadIdx.x;i<cols;i+=THREADS)total+=h2f(src[i]);
+  float mean=block_sum(total,red)/(float)cols;
+  float square=0.f;
+  for(int i=threadIdx.x;i<cols;i+=THREADS){float d=h2f(src[i])-mean;square+=d*d;}
+  float inv=rsqrtf(block_sum(square,red)/(float)cols+eps);
+  float plain=0.f,projected=0.f;
+  for(int i=threadIdx.x;i<cols;i+=THREADS){
+    float d=h2f(grad[i])*w[i];
+    plain+=d;projected+=(h2f(src[i])-mean)*inv*d;
+  }
+  plain=block_sum(plain,red)/(float)cols;
+  projected=block_sum(projected,red)/(float)cols;
+  for(int i=threadIdx.x;i<cols;i+=THREADS){
+    float xhat=(h2f(src[i])-mean)*inv;
+    grad[i]=f2h(inv*(h2f(grad[i])*w[i]-plain-xhat*projected));
+  }
+}
+
+// The derivative of the tanh GELU `act_of` computes as kind 1.
+__device__ __forceinline__ float gelu_grad(float x){
+  float t=tanhf(0.7978846f*(x+0.044715f*x*x*x));
+  return 0.5f*(1.f+t)+0.5f*x*(1.f-t*t)*0.7978846f*(1.f+3.f*0.044715f*x*x);
+}
+// `dL/dx` of `gelu_gate` for `[tokens, 2 * inner]` of `x` and `[tokens,
+// inner]` of `g`, with the same optional bias.
+extern "C" __global__ void gelu_gate_bwd(half_t*__restrict__ out,const half_t*__restrict__ x,
+    const float*__restrict__ bias,const half_t*__restrict__ g,int inner){
+  const half_t*row=x+(long long)blockIdx.y*2*inner;
+  const half_t*grad=g+(long long)blockIdx.y*inner;
+  half_t*target=out+(long long)blockIdx.y*2*inner;
+  int base=blockIdx.x*blockDim.x*LANE+threadIdx.x;
+  for(int k=0;k<LANE;k++){
+    int c=base+k*blockDim.x;
+    if(c<inner){
+      float value=h2f(row[c]),gate=h2f(row[inner+c]),d=h2f(grad[c]);
+      if(bias){value+=bias[c];gate+=bias[inner+c];}
+      target[c]=f2h(d*act_of(gate,1));
+      target[inner+c]=f2h(d*value*gelu_grad(gate));
+    }
+  }
+}
+
+// `g *= silu'(pre)`.
+extern "C" __global__ void silu_bwd(half_t*__restrict__ g,const half_t*__restrict__ pre,
+    long long n){
+  long long base=(long long)blockIdx.x*blockDim.x*LANE+threadIdx.x;
+  for(int k=0;k<LANE;k++){
+    long long i=base+(long long)k*blockDim.x;
+    if(i>=n)continue;
+    float x=h2f(pre[i]),s=1.f/(1.f+expf(-x));
+    g[i]=f2h(h2f(g[i])*s*(1.f+x*(1.f-s)));
+  }
+}
+
+// `dL/dx` of `upsample`: each of the `n` values of the small map sums the
+// `factor * factor` copies made of it.
+extern "C" __global__ void upsample_bwd(half_t*out,const half_t*in,
+    long long n,int h,int w,int factor){
+  long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=n)return;
+  long long plane=(long long)h*w,c=i/plane,p=i%plane,y=p/w,x=p%w,wide=(long long)w*factor;
+  const half_t*source=in+(c*h*factor+y*factor)*wide+x*factor;
+  float sum=0.f;
+  for(int dy=0;dy<factor;dy++)
+    for(int dx=0;dx<factor;dx++)sum+=h2f(source[dy*wide+dx]);
+  out[i]=f2h(sum);
+}
 "#;
 
 /// NVRTC compilation costs a few hundred milliseconds and the source never
@@ -501,6 +656,14 @@ pub struct ImageGpu {
     gelu_gate: CudaFunction,
     upsample: CudaFunction,
     transpose: CudaFunction,
+    col2im: CudaFunction,
+    narrow: CudaFunction,
+    group_bwd_partials: CudaFunction,
+    group_bwd_apply: CudaFunction,
+    layer_norm_bwd: CudaFunction,
+    gelu_gate_bwd: CudaFunction,
+    silu_bwd: CudaFunction,
+    upsample_bwd: CudaFunction,
 }
 
 impl std::fmt::Debug for ImageGpu {
@@ -540,6 +703,14 @@ impl ImageGpu {
             gelu_gate: get("gelu_gate")?,
             upsample: get("upsample")?,
             transpose: get("transpose")?,
+            col2im: get("col2im")?,
+            narrow: get("narrow")?,
+            group_bwd_partials: get("group_bwd_partials")?,
+            group_bwd_apply: get("group_bwd_apply")?,
+            layer_norm_bwd: get("layer_norm_bwd")?,
+            gelu_gate_bwd: get("gelu_gate_bwd")?,
+            silu_bwd: get("silu_bwd")?,
+            upsample_bwd: get("upsample_bwd")?,
         }))
     }
 
@@ -1248,6 +1419,33 @@ impl ImageGpu {
         map: &mut Map,
         act: i32,
     ) -> Result<(), NetworkError> {
+        let (stats, per_group) = self.group_stats(norm, map)?;
+        unsafe {
+            let shape = lanes(map.pixels(), map.channels());
+            let (pixels, per_group) = (map.pixels() as i64, per_group as i32);
+            self.context
+                .stream
+                .launch_builder(&self.group_apply)
+                .arg(&mut map.tensor.data)
+                .arg(&stats)
+                .arg(&norm.weight)
+                .arg(&norm.bias)
+                .arg(&pixels)
+                .arg(&per_group)
+                .arg(&act)
+                .launch(shape)
+                .map_err(cuda_err("group norm kernel"))?;
+        }
+        Ok(())
+    }
+
+    /// Each group's mean and inverse deviation, interleaved, and the channels
+    /// per group.
+    fn group_stats(
+        &self,
+        norm: &DeviceGroupNorm,
+        map: &Map,
+    ) -> Result<(CudaSlice<f32>, usize), NetworkError> {
         let per_group = map.channels() / norm.groups;
         if per_group * norm.groups != map.channels() {
             return Err(NetworkError::InvalidTarget {
@@ -1297,22 +1495,8 @@ impl ImageGpu {
                 .arg(&norm.eps)
                 .launch(cfg(norm.groups))
                 .map_err(cuda_err("group fold kernel"))?;
-            let shape = lanes(map.pixels(), map.channels());
-            let (pixels, per_group) = (map.pixels() as i64, per_group as i32);
-            self.context
-                .stream
-                .launch_builder(&self.group_apply)
-                .arg(&mut map.tensor.data)
-                .arg(&stats)
-                .arg(&norm.weight)
-                .arg(&norm.bias)
-                .arg(&pixels)
-                .arg(&per_group)
-                .arg(&act)
-                .launch(shape)
-                .map_err(cuda_err("group norm kernel"))?;
         }
-        Ok(())
+        Ok((stats, per_group))
     }
 
     fn layer_norm(
@@ -1756,6 +1940,297 @@ impl ImageGpu {
 // ---------------------------------------------------------------------------
 // The UNet.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The backward operations, for adapters trained on a frozen UNet.
+// ---------------------------------------------------------------------------
+
+// The adapter training pass that calls these is the next step of roadmap G10b.
+#[allow(dead_code)]
+impl ImageGpu {
+    /// `dL/d(input)` of [`ImageGpu::conv`] for an input of `height` by
+    /// `width`: `weight^T . grad` lowered to columns, a chunk of output rows at
+    /// a time within `budget` FP16 elements, and each column added back where
+    /// `im2col` read it from.
+    fn conv_backward(
+        &self,
+        conv: &DeviceConv,
+        grad: &Map,
+        height: usize,
+        width: usize,
+        budget: usize,
+    ) -> Result<Map, NetworkError> {
+        if grad.channels() != conv.out_channels {
+            return Err(NetworkError::InvalidTarget {
+                expected: conv.out_channels,
+                actual: grad.channels(),
+            });
+        }
+        let (k, inputs, pixels) = (conv.kernel, conv.in_channels, grad.pixels());
+        // `columns[patch, span] = weight[out, patch]^T . grad[out, span]`.
+        let lower = |weight: &CudaView<'_, u8>,
+                     patch: usize,
+                     first: usize,
+                     span: usize,
+                     columns: &mut CudaSlice<f16>,
+                     pitch: usize| {
+            act_lhs_transposed::<f16, _>(
+                &self.context,
+                weight,
+                patch,
+                &grad.tensor.bytes().slice(first * 2..),
+                pixels,
+                true,
+                true,
+                columns,
+                pitch,
+                conv.out_channels,
+                patch,
+                span,
+                1.0,
+                0.0,
+            )
+        };
+        if k == 1 && conv.stride == 1 && conv.padding == 0 {
+            let mut output = self.uninit(inputs, pixels)?;
+            lower(
+                &conv.weight.bytes(),
+                inputs,
+                0,
+                pixels,
+                &mut output.data,
+                pixels,
+            )?;
+            return Ok(Map {
+                tensor: output,
+                height,
+                width,
+            });
+        }
+        let mut sums = self
+            .context
+            .stream
+            .alloc_zeros::<f32>(inputs * height * width)
+            .map_err(cuda_err("device allocation"))?;
+        let rows_of = |patch: usize| {
+            let group = if grad.width % 8 == 0 { 1 } else { 8 };
+            (budget / (patch * grad.width).max(1))
+                .max(group)
+                .next_multiple_of(group)
+                .min(grad.height)
+        };
+        // Row-wise weights are one `[out, in * k]` matrix per vertical tap, so
+        // each tap lowers and scatters on its own; `im2col` weights do all
+        // taps at once.
+        let (patch, taps): (usize, Vec<i32>) = match rowwise(k, conv.stride) {
+            true => (inputs * k, (0..k as i32).collect()),
+            false => (inputs * k * k, vec![-1]),
+        };
+        let stack = rows_of(patch);
+        let pitch = stack * grad.width;
+        let mut columns = self.uninit(patch, pitch)?;
+        let weights = conv.weight.bytes();
+        let tap_bytes = conv.out_channels * patch * 2;
+        for row in (0..grad.height).step_by(stack) {
+            let span = stack.min(grad.height - row) * grad.width;
+            for &tap in &taps {
+                let weight = match tap {
+                    -1 => weights.slice(..),
+                    _ => weights.slice(tap as usize * tap_bytes..(tap as usize + 1) * tap_bytes),
+                };
+                lower(
+                    &weight,
+                    patch,
+                    row * grad.width,
+                    span,
+                    &mut columns.data,
+                    pitch,
+                )?;
+                unsafe {
+                    self.context
+                        .stream
+                        .launch_builder(&self.col2im)
+                        .arg(&mut sums)
+                        .arg(&columns.data)
+                        .arg(&(height as i32))
+                        .arg(&(width as i32))
+                        .arg(&(k as i32))
+                        .arg(&(conv.stride as i32))
+                        .arg(&(conv.padding as i32))
+                        .arg(&(grad.width as i32))
+                        .arg(&(row as i32))
+                        .arg(&(span as i32))
+                        .arg(&(pitch as i64))
+                        .arg(&tap)
+                        .launch(plane(span, inputs))
+                        .map_err(cuda_err("col2im kernel"))?;
+                }
+            }
+        }
+        let mut output = self.uninit(inputs, height * width)?;
+        let len = output.len();
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.narrow)
+                .arg(&mut output.data)
+                .arg(&sums)
+                .arg(&(len as i64))
+                .launch(lanes(len, 1))
+                .map_err(cuda_err("narrowing kernel"))?;
+        }
+        Ok(Map {
+            tensor: output,
+            height,
+            width,
+        })
+    }
+
+    /// `dL/dx` of [`ImageGpu::group_norm`] with no activation, given its
+    /// input, in place over `grad`.
+    fn group_norm_backward(
+        &self,
+        norm: &DeviceGroupNorm,
+        input: &Map,
+        grad: &mut Map,
+    ) -> Result<(), NetworkError> {
+        let (stats, per_group) = self.group_stats(norm, input)?;
+        let span = per_group * input.pixels();
+        let splits = (span / (THREADS as usize * 16)).clamp(1, 128);
+        let mut partials = self
+            .context
+            .stream
+            .alloc_zeros::<f32>(2 * norm.groups * splits)
+            .map_err(cuda_err("device allocation"))?;
+        let (pixels, per_group, splits) = (input.pixels() as i64, per_group as i32, splits as i32);
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.group_bwd_partials)
+                .arg(&input.tensor.data)
+                .arg(&grad.tensor.data)
+                .arg(&norm.weight)
+                .arg(&stats)
+                .arg(&mut partials)
+                .arg(&pixels)
+                .arg(&per_group)
+                .arg(&splits)
+                .launch(LaunchConfig {
+                    grid_dim: (splits as u32, norm.groups as u32, 1),
+                    block_dim: (THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(cuda_err("group norm backward kernel"))?;
+            self.context
+                .stream
+                .launch_builder(&self.group_bwd_apply)
+                .arg(&mut grad.tensor.data)
+                .arg(&input.tensor.data)
+                .arg(&norm.weight)
+                .arg(&stats)
+                .arg(&partials)
+                .arg(&pixels)
+                .arg(&per_group)
+                .arg(&(norm.groups as i32))
+                .arg(&splits)
+                .arg(&(span as f32))
+                .launch(lanes(input.pixels(), input.channels()))
+                .map_err(cuda_err("group norm backward kernel"))?;
+        }
+        Ok(())
+    }
+
+    /// `dL/dx` of [`ImageGpu::layer_norm`], given its input, in place over
+    /// `grad`.
+    fn layer_norm_backward(
+        &self,
+        norm: &DeviceNorm,
+        tokens: &Tensor,
+        eps: f32,
+        grad: &mut Tensor,
+    ) -> Result<(), NetworkError> {
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.layer_norm_bwd)
+                .arg(&mut grad.data)
+                .arg(&tokens.data)
+                .arg(&norm.weight)
+                .arg(&(tokens.cols as i32))
+                .arg(&eps)
+                .launch(grid(tokens.rows))
+                .map_err(cuda_err("layer norm backward kernel"))?;
+        }
+        Ok(())
+    }
+
+    /// `dL/d(projected)` of [`ImageGpu::gelu_gate`].
+    fn gelu_gate_backward(
+        &self,
+        projected: &Tensor,
+        bias: Option<&CudaSlice<f32>>,
+        grad: &Tensor,
+    ) -> Result<Tensor, NetworkError> {
+        let inner = grad.cols;
+        let mut output = self.uninit(projected.rows, projected.cols)?;
+        let null = 0u64;
+        unsafe {
+            let mut launch = self.context.stream.launch_builder(&self.gelu_gate_bwd);
+            launch.arg(&mut output.data).arg(&projected.data);
+            match bias {
+                Some(bias) => launch.arg(bias),
+                None => launch.arg(&null),
+            };
+            launch
+                .arg(&grad.data)
+                .arg(&(inner as i32))
+                .launch(lanes(inner, projected.rows))
+                .map_err(cuda_err("gated GELU backward kernel"))?;
+        }
+        Ok(output)
+    }
+
+    /// `grad *= silu'(pre)`.
+    fn silu_backward(&self, grad: &mut Tensor, pre: &Tensor) -> Result<(), NetworkError> {
+        let len = grad.len();
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.silu_bwd)
+                .arg(&mut grad.data)
+                .arg(&pre.data)
+                .arg(&(len as i64))
+                .launch(lanes(len, 1))
+                .map_err(cuda_err("SiLU backward kernel"))?;
+        }
+        Ok(())
+    }
+
+    /// `dL/d(map)` of [`ImageGpu::upsample_nearest`].
+    fn upsample_backward(&self, grad: &Map, factor: usize) -> Result<Map, NetworkError> {
+        let (height, width) = (grad.height / factor, grad.width / factor);
+        let mut output = self.uninit(grad.channels(), height * width)?;
+        let len = output.len();
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.upsample_bwd)
+                .arg(&mut output.data)
+                .arg(&grad.tensor.data)
+                .arg(&(len as i64))
+                .arg(&(height as i32))
+                .arg(&(width as i32))
+                .arg(&(factor as i32))
+                .launch(cfg(len))
+                .map_err(cuda_err("upsample backward kernel"))?;
+        }
+        Ok(Map {
+            tensor: output,
+            height,
+            width,
+        })
+    }
+}
 
 struct DeviceResnet {
     norm1: DeviceGroupNorm,
@@ -2949,6 +3424,108 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    /// Each backward kernel against the host function `unet_lora` computes
+    /// the same gradient with.
+    #[test]
+    fn backward_kernels_match_the_host_or_skip_without_a_device() {
+        use crate::unet_lora as host;
+        let Some(gpu) = device() else { return };
+        // The forward test's convolutions, which cover the 1x1, `im2col` and
+        // row-wise paths, each in one chunk and in one row per chunk.
+        for (kernel, stride, padding, in_channels, out_channels) in [
+            (3, 1, 1, 3, 5),
+            (1, 1, 0, 4, 6),
+            (3, 2, 1, 2, 4),
+            (3, 1, 0, 3, 5),
+            (5, 1, 2, 2, 3),
+        ] {
+            let weight = Matrix::from_vec(
+                out_channels,
+                in_channels * kernel * kernel,
+                ramp(out_channels * in_channels * kernel * kernel, 0.3),
+            );
+            let conv = Conv2d::new(weight, None, in_channels, kernel, stride, padding)
+                .expect("a convolution");
+            let input = map(in_channels, 7, 9, 0.2);
+            let output = conv.forward(&input).expect("a host convolution");
+            let grad = map(out_channels, output.height, output.width, 0.7);
+            let expected = host::conv_backward(&conv, &grad, &input);
+            let device = upload_conv(&gpu, &conv).expect("an upload");
+            for budget in [COLUMN_BUDGET, 1] {
+                let actual = gpu
+                    .conv_backward(&device, &upload_map(&gpu, &grad), 7, 9, budget)
+                    .expect("a device convolution backward");
+                assert_close(
+                    &format!("{kernel}x{kernel}/{stride} backward, budget {budget}"),
+                    &download_map(&gpu, &actual).expect("a download").data,
+                    &expected.data,
+                    0.01,
+                );
+            }
+        }
+
+        let norm = GroupNorm::new(4, ramp(8, 0.9), ramp(8, 0.1), 1e-5).expect("a group norm");
+        let (input, grad) = (map(8, 6, 7, 0.4), map(8, 6, 7, 1.3));
+        let expected = host::group_norm_backward(&norm, &input, &grad);
+        let mut actual = upload_map(&gpu, &grad);
+        gpu.group_norm_backward(
+            &upload_group_norm(&gpu, &norm).expect("an upload"),
+            &upload_map(&gpu, &input),
+            &mut actual,
+        )
+        .expect("a group norm backward");
+        let actual = download_map(&gpu, &actual).expect("a download");
+        assert_close("group norm backward", &actual.data, &expected.data, 0.01);
+
+        let norm = Norm {
+            weight: ramp(24, 0.6),
+            bias: ramp(24, 0.2),
+        };
+        let tokens = Matrix::from_vec(5, 24, ramp(5 * 24, 0.5));
+        let grad = Matrix::from_vec(5, 24, ramp(5 * 24, 1.7));
+        let expected = host::norm_backward(&norm, &tokens, 1e-5, &grad);
+        let mut actual = gpu.upload_matrix(&grad).expect("an upload");
+        gpu.layer_norm_backward(
+            &upload_norm(&gpu, &norm).expect("an upload"),
+            &gpu.upload_matrix(&tokens).expect("an upload"),
+            1e-5,
+            &mut actual,
+        )
+        .expect("a layer norm backward");
+        let actual = gpu.download(&actual).expect("a download");
+        assert_close("layer norm backward", &actual.data, &expected.data, 0.01);
+
+        let projected = Matrix::from_vec(5, 2 * 12, ramp(5 * 24, 0.8));
+        let grad = Matrix::from_vec(5, 12, ramp(5 * 12, 2.1));
+        let expected = host::geglu_backward(&projected, &grad);
+        let actual = gpu
+            .gelu_gate_backward(
+                &gpu.upload_matrix(&projected).expect("an upload"),
+                None,
+                &gpu.upload_matrix(&grad).expect("an upload"),
+            )
+            .expect("a gated GELU backward");
+        let actual = gpu.download(&actual).expect("a download");
+        assert_close("GEGLU backward", &actual.data, &expected.data, 0.01);
+
+        let (pre, grad) = (map(3, 5, 6, 0.3), map(3, 5, 6, 1.9));
+        let expected = host::silu_backward(&grad, &pre);
+        let mut actual = upload_map(&gpu, &grad);
+        gpu.silu_backward(&mut actual.tensor, &upload_map(&gpu, &pre).tensor)
+            .expect("a SiLU backward");
+        let actual = download_map(&gpu, &actual).expect("a download");
+        assert_close("SiLU backward", &actual.data, &expected.data, 0.01);
+
+        let grad = map(3, 8, 10, 0.6);
+        let expected = host::upsample_backward(&grad);
+        let actual = gpu
+            .upsample_backward(&upload_map(&gpu, &grad), 2)
+            .expect("an upsample backward");
+        let actual = download_map(&gpu, &actual).expect("a download");
+        assert_eq!((actual.height, actual.width), (4, 5));
+        assert_close("upsample backward", &actual.data, &expected.data, 0.01);
     }
 
     #[test]
