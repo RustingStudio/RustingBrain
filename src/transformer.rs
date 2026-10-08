@@ -2541,7 +2541,37 @@ pub struct Decoder<'a> {
     device: Option<crate::gpu_model::DeviceKv>,
 }
 
-impl Decoder<'_> {
+impl<'a> Decoder<'a> {
+    /// An independent copy of the session, history and caches included. A
+    /// prefix every request shares, such as a system prompt or a few-shot
+    /// preamble, is prefilled once and each request continues a fork:
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Sampler, TransformerLm};
+    /// # let model = TransformerLm::load_bin("model.rbw")?;
+    /// # let mut sampler = Sampler::greedy();
+    /// let mut preamble = model.decoder();
+    /// preamble.feed(&[1, 2, 3, 4])?;
+    /// let mut request = preamble.fork()?;
+    /// request.feed(&[5, 6])?;
+    /// let id = request.next(&mut sampler)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// On a device the copy takes as much memory as the original's caches
+    /// and shares its packed weights.
+    pub fn fork(&self) -> Result<Decoder<'a>, NetworkError> {
+        Ok(Decoder {
+            model: self.model,
+            caches: self.caches.clone(),
+            history: self.history.clone(),
+            logits: self.logits.clone(),
+            pending: self.pending,
+            #[cfg(feature = "cuda")]
+            device: self.device.as_ref().map(|kv| kv.fork()).transpose()?,
+        })
+    }
+
     /// Appends `ids` to the session: a prompt, or the next turn of a
     /// conversation. Only these tokens are read, not the ones before them.
     pub fn feed(&mut self, ids: &[u32]) -> Result<(), NetworkError> {
@@ -3431,6 +3461,53 @@ mod tests {
         let model = tiny().build().unwrap();
         assert_batch_matches_single(&model, &model, 1e-5);
         assert!(model.batch_decoder(0).is_err());
+    }
+
+    /// Forks a session mid-generation, continues the original and the fork
+    /// differently, and checks each against a fresh session fed the same ids.
+    fn assert_forks_continue_independently(model: &TransformerLm, tolerance: f32) {
+        let mut sampler = Sampler::greedy();
+        let mut original = model.decoder();
+        original.feed(&[3, 8, 1, 5]).unwrap();
+        original.next(&mut sampler).unwrap();
+        let mut fork = original.fork().unwrap();
+        original.feed(&[2, 9]).unwrap();
+        fork.feed(&[7]).unwrap();
+        for session in [&mut original, &mut fork] {
+            session.next(&mut sampler).unwrap();
+            let mut fresh = model.decoder();
+            let history = session.history().to_vec();
+            fresh.feed(&history).unwrap();
+            for (a, b) in session
+                .logits()
+                .unwrap()
+                .iter()
+                .zip(fresh.logits().unwrap())
+            {
+                assert!((a - b).abs() <= tolerance, "{a} forked vs {b} fresh");
+            }
+        }
+        assert_ne!(original.history(), fork.history());
+    }
+
+    #[test]
+    fn a_forked_decoder_continues_independently() {
+        assert_forks_continue_independently(&tiny().build().unwrap(), 1e-5);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_forked_device_decoder_continues_independently_or_skips_without_device() {
+        match crate::cuda_training::cuda_doctor(0, 8192) {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("skipping: {err}");
+                return;
+            }
+        }
+        let mut model = tiny().build().unwrap();
+        model.to_cuda(0, 8192).unwrap();
+        assert_forks_continue_independently(&model, 1e-3);
     }
 
     #[test]
