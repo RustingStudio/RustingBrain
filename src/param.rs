@@ -924,6 +924,66 @@ impl Linear {
     }
 }
 
+/// Inverted dropout: while training each element is zeroed with probability
+/// `rate` and the rest are scaled by `1 / (1 - rate)`, so inference is the
+/// identity.
+#[derive(Clone, Copy, Debug)]
+pub struct Dropout {
+    rate: f32,
+}
+
+/// Which elements [`Dropout::forward`] kept: each one's factor, zero or
+/// `1 / (1 - rate)`. Empty when nothing was dropped.
+#[derive(Clone, Debug, Default)]
+pub struct DropoutMask(Vec<f32>);
+
+impl Dropout {
+    pub fn new(rate: f32) -> Result<Self, NetworkError> {
+        if !(0.0..1.0).contains(&rate) {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a dropout rate is in [0, 1), not {rate}"
+            )));
+        }
+        Ok(Self { rate })
+    }
+
+    pub fn rate(&self) -> f32 {
+        self.rate
+    }
+
+    pub fn forward(
+        &self,
+        input: &Matrix,
+        rng: &mut StdRng,
+        training: bool,
+    ) -> (Matrix, DropoutMask) {
+        if !training || self.rate == 0.0 {
+            return (input.clone(), DropoutMask::default());
+        }
+        let keep = 1.0 / (1.0 - self.rate);
+        let mask: Vec<f32> = (0..input.data.len())
+            .map(|_| match rng.r#gen::<f32>() < self.rate {
+                true => 0.0,
+                false => keep,
+            })
+            .collect();
+        let data = input.data.iter().zip(&mask).map(|(x, m)| x * m).collect();
+        (
+            Matrix::from_vec(input.rows, input.cols, data),
+            DropoutMask(mask),
+        )
+    }
+
+    /// `dL/d(input)`: the upstream gradient through the same mask.
+    pub fn backward(&self, mask: &DropoutMask, grad: &Matrix) -> Matrix {
+        if mask.0.is_empty() {
+            return grad.clone();
+        }
+        let data = grad.data.iter().zip(&mask.0).map(|(g, m)| g * m).collect();
+        Matrix::from_vec(grad.rows, grad.cols, data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +1003,24 @@ mod tests {
             }
             Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
         }
+    }
+
+    #[test]
+    fn dropout_keeps_the_mean_and_routes_the_gradient_through_its_mask() {
+        let mut rng = StdRng::seed_from_u64(0);
+        let dropout = Dropout::new(0.15).unwrap();
+        let ones = Matrix::from_vec(100, 1000, vec![1.0; 100_000]);
+        let (out, mask) = dropout.forward(&ones, &mut rng, true);
+        let mean = out.data.iter().sum::<f32>() / 1e5;
+        assert!((mean - 1.0).abs() < 1e-2, "mean {mean}");
+        let dropped = out.data.iter().filter(|v| **v == 0.0).count() as f32 / 1e5;
+        assert!((dropped - 0.15).abs() < 5e-3, "dropped {dropped}");
+        // The output is linear in the input with the mask as its slope.
+        assert_eq!(dropout.backward(&mask, &ones).data, out.data);
+        let (eval, mask) = dropout.forward(&ones, &mut rng, false);
+        assert_eq!(eval.data, ones.data);
+        assert_eq!(dropout.backward(&mask, &ones).data, ones.data);
+        assert!(Dropout::new(1.0).is_err() && Dropout::new(-0.1).is_err());
     }
 
     #[cfg(feature = "cuda")]
