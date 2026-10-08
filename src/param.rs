@@ -581,10 +581,16 @@ impl Param {
 
     /// Applies one optimizer update and clears the gradient.
     ///
-    /// `step` is the global Adam step count, already incremented; it is ignored
-    /// by SGD. `scale` divides the accumulated gradient, which lets a caller
-    /// accumulate over a batch and average once here.
+    /// `step` is the global Adam step count, already incremented: the first
+    /// update is step 1, not 0 (while [`Schedule::rate`] counts from 0). Step 0
+    /// panics, because Adam's bias correction `1 - beta^0` would divide by zero
+    /// and turn every parameter NaN. SGD does not read it. `scale` divides the
+    /// accumulated gradient, which lets a caller accumulate over a batch and
+    /// average once here.
+    ///
+    /// [`Schedule::rate`]: crate::optimizers::Schedule::rate
     pub fn step(&mut self, optimizer: &Optimizer, step: usize, scale: f32) {
+        assert!(step > 0, "optimizer steps count from 1");
         if self.frozen {
             return;
         }
@@ -1044,6 +1050,14 @@ mod tests {
         ));
         // The host path is untouched by a refused move.
         assert!(linear.to_cpu().is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "optimizer steps count from 1")]
+    fn step_zero_panics_instead_of_poisoning_the_parameters() {
+        let mut param = Param::new(Matrix::from_vec(1, 1, vec![1.0]));
+        param.grad.data[0] = 0.5;
+        param.step(&Optimizer::adam(1e-2), 0, 1.0);
     }
 
     #[test]

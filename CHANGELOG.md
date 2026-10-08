@@ -4,6 +4,7 @@
 
 ### Changed
 
+- `Param::step` (and so `apply_step` and `step_clipped`) panics on step 0 instead of turning every parameter NaN through Adam's bias correction; steps count from 1 (asked by RustingChop). An assert rather than an error, as the consumer allowed: the signatures stay the same.
 - A device decoder under mixed precision keeps its cache as BF16 keys and
   values, 512 bytes a position a layer on the default model instead of
   3072, and later turns read it in place through the flash kernel. 16

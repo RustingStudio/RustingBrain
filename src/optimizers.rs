@@ -227,7 +227,8 @@ pub fn grad_norm(params: &mut [&mut Param]) -> Result<f32, crate::network::Netwo
 /// Applies the optimizer to every parameter.
 ///
 /// `scale` divides the accumulated gradient, so a caller that ran several
-/// batches before stepping passes `1.0 / batches`.
+/// batches before stepping passes `1.0 / batches`. `step` counts from 1, as
+/// in [`Param::step`](crate::param::Param::step), which panics on 0.
 pub fn apply_step(params: &mut [&mut Param], optimizer: &Optimizer, step: usize, scale: f32) {
     if params.iter().any(|param| param.is_on_device()) {
         // One stream, one cuBLAS handle: the launches would serialize anyway,
