@@ -230,8 +230,8 @@ pub use dataset::{
     Standardizer,
 };
 pub use diffusion::{
-    Denoiser, SamplingConfig, Scheduler, Solver, noise, sample, sample_consistency, sample_from,
-    sample_unipc, sample_with_sigmas,
+    Denoiser, Inpaint, SamplingConfig, Scheduler, Solver, noise, sample, sample_consistency,
+    sample_from, sample_unipc, sample_with_sigmas,
 };
 pub use ema::Ema;
 pub use embedding::Embedding;
