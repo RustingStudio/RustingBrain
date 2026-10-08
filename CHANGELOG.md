@@ -74,6 +74,9 @@
 
 ### Added
 
+- `TransformerLm::generate_speculative_with` runs speculative decoding with
+  any `Sampler`, accepting draft proposals by rejection sampling so the
+  output is distributed as sampling the target model alone.
 - CLIP zero-shot classification and retrieval: `VitEncoder::embed` projects
   the image tower's class token, `clip::logit_scale` reads the learned
   temperature, and `clip::zero_shot` turns an image and captions into
