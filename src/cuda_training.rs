@@ -780,11 +780,38 @@ pub(crate) fn device_context(
         return Ok(entry.clone());
     }
     let ctx = CudaContext::new(device).map_err(cuda_err("CUDA driver/device initialization"))?;
+    keep_freed_memory(&ctx)?;
     let module = ctx
         .load_module(kernel_ptx()?.clone())
         .map_err(cuda_err("CUDA module loading"))?;
     contexts.insert(device, (ctx.clone(), module.clone()));
     Ok((ctx, module))
+}
+
+/// Stops the device's memory pool from handing freed memory back to the
+/// driver at every synchronization.
+///
+/// The pool's default release threshold is zero, so every sync returns the
+/// step's freed buffers to the driver and the next step's allocations map
+/// them back in. On the shape VAE that sync took 44 ms of a 129 ms step with
+/// the GPU idle. Memory freed by this process stays reserved
+/// for it until the context goes away, which is what a training loop wants.
+fn keep_freed_memory(ctx: &CudaContext) -> Result<(), NetworkError> {
+    use cudarc::driver::sys;
+    unsafe {
+        let mut pool = std::mem::MaybeUninit::uninit();
+        sys::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), ctx.cu_device())
+            .result()
+            .map_err(cuda_err("CUDA memory pool lookup"))?;
+        let mut keep = u64::MAX;
+        sys::cuMemPoolSetAttribute(
+            pool.assume_init(),
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            (&mut keep as *mut u64).cast(),
+        )
+        .result()
+        .map_err(cuda_err("CUDA memory pool setup"))
+    }
 }
 
 /// Every kernel handle resolved once. `CudaModule::load_function` is a driver

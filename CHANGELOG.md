@@ -4,6 +4,10 @@
 
 ### Changed
 
+- The device memory pool keeps the memory a training step frees instead of
+  returning it to the driver at every synchronization. The shape VAE's
+  training step runs 0.130 to 0.085 s (-35%); the language-model step is
+  unchanged.
 - The fused attention query-gradient kernel at head width 128 uses 34 KiB
   of shared memory instead of 52 KiB, so two blocks fit per SM: a training
   step with heads of 128 runs about 2.6% faster.

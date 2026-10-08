@@ -1482,3 +1482,20 @@ The query gradient reads 0.633 ms and the key/value gradient 0.806 ms in the
 same runs. The best variant saves 5 us a call, about 0.04 ms of a 77 ms step,
 under the run-to-run spread, so nothing was kept.
 
+## Device memory pool release threshold (A5 profile, 2026-10-08)
+
+`examples/profile_shape.rs 4 2048 4096 30` (mixed, packed) and
+`bench_train_step 4 1024 cuda`, old and new binaries alternated twice under
+the GPU lock, load 0.8-1.0.
+
+| Run | Before | After |
+|---|---|---|
+| Shape VAE step | 0.130-0.131 s | 0.085 s |
+| LM step, 4 x 1024 | 53461-53562 tok/s | 53451-53487 tok/s |
+
+Before, nsys showed a 44-47 ms GPU-idle `cudaStreamSynchronize` each shape
+step, after a burst of `cuMemFreeAsync`: the default pool released its memory
+at every sync (threshold 0). `keep_freed_memory` in `device_context` sets
+`CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` to `u64::MAX`. The LM step allocates
+little per step, so it does not move.
+
