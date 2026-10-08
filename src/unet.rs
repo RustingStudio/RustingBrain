@@ -20,9 +20,11 @@
 //! thousand. The level is turned back into that index here, and the latent is
 //! scaled the way the training distribution expects.
 //!
-//! NOTE: inference only, no CUDA, no image conditioning (ControlNet,
-//! inpainting). Those are more blocks of the same kind rather than a different
-//! model.
+//! An inpainting checkpoint reads the mask and the masked picture's latent as
+//! extra input channels; [`Unet::set_inpaint`] hands them over.
+//!
+//! NOTE: inference only, no ControlNet. That is more blocks of the same
+//! kind rather than a different model.
 
 use crate::clip::{Norm, norm};
 use crate::conv::{Conv2d, Dense, FeatureMap, GroupNorm, silu, upsample_nearest};
@@ -332,6 +334,8 @@ pub struct Unet {
     alphas: Vec<f32>,
     conditioning: Option<Conditioning>,
     unconditional: Option<Conditioning>,
+    /// What an inpainting checkpoint reads after the noisy latent.
+    inpaint: Option<FeatureMap>,
     /// The same weights on a CUDA device, when one was attached. The host copy
     /// stays where it is, which is what keeps the CPU path a fallback rather
     /// than a rewrite.
@@ -418,6 +422,7 @@ impl Unet {
             alphas: alphas_cumprod(0.00085, 0.012, 1000),
             conditioning: None,
             unconditional: None,
+            inpaint: None,
             #[cfg(feature = "cuda")]
             device: None,
             config,
@@ -453,8 +458,17 @@ impl Unet {
         self.unconditional = Some(conditioning);
     }
 
+    /// Hands an inpainting checkpoint, one whose `in_channels` exceed its
+    /// `out_channels`, the channels it reads after the noisy latent: the mask
+    /// (1.0 where to repaint) and then the latent of the picture with that
+    /// part blanked out, at the latent's size. `None` takes them away.
+    pub fn set_inpaint(&mut self, extra: Option<FeatureMap>) {
+        self.inpaint = extra;
+    }
+
     /// One pass: a noisy latent and a noise level in, the noise the model
-    /// believes is in there out.
+    /// believes is in there out. An inpainting checkpoint's input carries its
+    /// extra channels after the latent's, and only the latent's are scaled.
     pub fn forward(
         &self,
         latent: &FeatureMap,
@@ -465,7 +479,10 @@ impl Unet {
         // a Karras-style latent grows with the level.
         let mut scaled = latent.clone();
         let scale = (sigma * sigma + 1.0).sqrt().recip();
-        scaled.data.iter_mut().for_each(|value| *value *= scale);
+        let noisy = self.config.out_channels.min(latent.channels) * latent.height * latent.width;
+        scaled.data[..noisy]
+            .iter_mut()
+            .for_each(|value| *value *= scale);
 
         let step = self.timestep(sigma);
         let embedded = sinusoid(step, self.config.freq_dim);
@@ -596,7 +613,30 @@ impl Unet {
         sigma: f32,
         conditioning: &Conditioning,
     ) -> Result<Matrix, NetworkError> {
-        let latent = FeatureMap::from_tokens(latents, conditioning.height, conditioning.width)?;
+        let mut latent = FeatureMap::from_tokens(latents, conditioning.height, conditioning.width)?;
+        if self.config.in_channels > latent.channels {
+            let extra = self.inpaint.as_ref().ok_or_else(|| {
+                NetworkError::InvalidConfig(
+                    "an inpainting model needs the mask and the masked picture".into(),
+                )
+            })?;
+            if (extra.channels + latent.channels, extra.height, extra.width)
+                != (self.config.in_channels, latent.height, latent.width)
+            {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "the model reads {} channels and was handed {} latent and {} extra, at \
+                     {}x{} against {}x{}",
+                    self.config.in_channels,
+                    latent.channels,
+                    extra.channels,
+                    extra.height,
+                    extra.width,
+                    latent.height,
+                    latent.width
+                )));
+            }
+            latent = concatenate(&latent, extra);
+        }
         Ok(self.forward(&latent, sigma, conditioning)?.to_tokens())
     }
 }
@@ -622,7 +662,7 @@ impl Denoiser for Unet {
 }
 
 /// Two feature maps of the same size, stacked along their channels.
-fn concatenate(first: &FeatureMap, second: &FeatureMap) -> FeatureMap {
+pub(crate) fn concatenate(first: &FeatureMap, second: &FeatureMap) -> FeatureMap {
     let mut output = FeatureMap::new(first.channels + second.channels, first.height, first.width);
     let split = first.data.len();
     output.data[..split].copy_from_slice(&first.data);
@@ -1040,6 +1080,85 @@ pub(crate) mod tests {
         let model = Unet::load_at(&path, config.clone(), precision).expect("the model to load");
         std::fs::remove_file(path).ok();
         model
+    }
+
+    #[test]
+    fn an_inpainting_model_reads_the_mask_after_the_latent() {
+        let config = UnetConfig {
+            in_channels: 9,
+            ..tiny()
+        };
+        let mut model = load(
+            &config,
+            "rusting_brain_unet_inpaint.safetensors",
+            Precision::F32,
+        );
+        model.set_conditioning(conditioning(&config, 8, 1.0));
+        let noisy = FeatureMap::new(4, 8, 8).to_tokens();
+        assert!(model.denoise(&noisy, 1.0).is_err());
+        model.set_inpaint(Some(FeatureMap::new(4, 8, 8)));
+        assert!(model.denoise(&noisy, 1.0).is_err());
+
+        let mut predictions = Vec::new();
+        for repaint in [0.0, 1.0] {
+            let mut extra = FeatureMap::new(5, 8, 8);
+            extra.data[..64].fill(repaint);
+            model.set_inpaint(Some(extra));
+            predictions.push(model.denoise(&noisy, 1.0).unwrap());
+        }
+        assert_eq!(predictions[0].cols, 4);
+        assert_ne!(predictions[0].data, predictions[1].data);
+    }
+
+    /// Parity with diffusers for an inpainting checkpoint, against the files
+    /// `scripts/unet_inpaint_reference.py` writes: run it, then this test with
+    /// `RB_UNET_REF` set to its output directory. Worst error on 2026-10-08,
+    /// 5.5e-7 against a mean output of 0.075.
+    #[test]
+    #[ignore = "needs RB_UNET_REF from scripts/unet_inpaint_reference.py"]
+    fn an_inpainting_model_matches_diffusers() {
+        let dir = std::path::PathBuf::from(std::env::var("RB_UNET_REF").unwrap());
+        let config = UnetConfig::from_file(dir.join("unet/config.json")).unwrap();
+        let mut model =
+            Unet::load(dir.join("unet/diffusion_pytorch_model.safetensors"), config).unwrap();
+        let r: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("ref.json")).unwrap()).unwrap();
+        let v = |k: &str| -> Vec<f32> {
+            r[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let latent = FeatureMap::from_vec(4, 8, 8, v("latent")).unwrap();
+        let extra = FeatureMap::from_vec(5, 8, 8, v("extra")).unwrap();
+        let conditioning = Conditioning {
+            text: Matrix::from_vec(5, 16, v("text")),
+            pooled: vec![],
+            height: 8,
+            width: 8,
+            guidance: 0.0,
+        };
+        model.set_conditioning(conditioning);
+        assert!(
+            model
+                .denoise(&latent.to_tokens(), r["sigma"].as_f64().unwrap() as f32)
+                .is_err()
+        );
+        model.set_inpaint(Some(extra));
+        let out = model
+            .denoise(&latent.to_tokens(), r["sigma"].as_f64().unwrap() as f32)
+            .unwrap();
+        let out = FeatureMap::from_tokens(&out, 8, 8).unwrap();
+        let reference = v("out");
+        let worst = out
+            .data
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let mean = reference.iter().map(|x| x.abs()).sum::<f32>() / reference.len() as f32;
+        assert!(worst < 1e-3, "worst {worst} against a mean of {mean}");
     }
 
     #[test]

@@ -169,11 +169,13 @@ impl From<Unet> for ImageDenoiser {
 }
 
 impl ImageDenoiser {
-    /// How many channels it reads at each position it works over.
+    /// How many latent channels it denoises at each position it works over.
+    /// An inpainting UNet reads more than that, the mask and the masked
+    /// picture after them.
     pub fn in_channels(&self) -> usize {
         match self {
             Self::Transformer(denoiser) => denoiser.config().in_channels,
-            Self::Unet(denoiser) => denoiser.config().in_channels,
+            Self::Unet(denoiser) => denoiser.config().out_channels,
         }
     }
 
@@ -1186,6 +1188,114 @@ impl ImagePipeline {
         )?;
         self.decode(&latent, columns, rows)
     }
+
+    /// Repaints `image` where `keep` is 0.0 and keeps it where it is 1.0,
+    /// which is inpainting. `keep` is one channel at the image's size;
+    /// `strength` is as in [`ImagePipeline::generate_from_image`], and 1.0
+    /// repaints from pure noise.
+    ///
+    /// A checkpoint trained for inpainting (a UNet reading more channels than
+    /// it predicts) is handed the mask and the latent of the picture with the
+    /// repainted part blanked, the way diffusers does it. Any other model is
+    /// steered through [`Inpaint`], with the mask averaged over each latent
+    /// cell so its edge stays soft.
+    pub fn generate_inpaint(
+        &mut self,
+        prompt: &str,
+        image: &FeatureMap,
+        keep: &FeatureMap,
+        strength: f32,
+        seed: Option<u64>,
+        on_step: impl FnMut(usize, &Matrix) -> bool,
+    ) -> Result<FeatureMap, NetworkError> {
+        if (keep.channels, keep.height, keep.width) != (1, image.height, image.width) {
+            return Err(NetworkError::InvalidConfig(format!(
+                "the mask is {}x{}x{} and the picture {}x{}: it wants one channel at the \
+                 picture's size",
+                keep.channels, keep.height, keep.width, image.height, image.width
+            )));
+        }
+        let encoder = self.image_encoder.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig(
+                "this checkpoint's autoencoder holds no encoder, so it cannot inpaint".into(),
+            )
+        })?;
+        let encoded = encoder.encode(image)?;
+        let latent = self.pack(&encoded)?;
+        let trained = matches!(&self.denoiser, ImageDenoiser::Unet(unet)
+            if unet.config().in_channels > unet.config().out_channels);
+        // The mask on the latent's own grid: one value a packed row, which a
+        // UNet's latent position and a transformer's patch both are.
+        let conditioning = self.condition(prompt, image.width, image.height)?;
+        let (columns, rows) = (conditioning.width, conditioning.height);
+        let (step_y, step_x) = (keep.height / rows, keep.width / columns);
+        let cells = (0..rows * columns).map(|cell| {
+            let (y, x) = (cell / columns * step_y, cell % columns * step_x);
+            (0..step_y).flat_map(move |dy| (0..step_x).map(move |dx| (y + dy, x + dx)))
+        });
+        let unconditional = match self.config.guidance != 1.0 {
+            true => Some(self.condition("", image.width, image.height)?),
+            false => None,
+        };
+
+        let sampled = if trained {
+            // Binarized and sampled at each cell's corner, as diffusers
+            // resizes the mask; 1.0 marks what to repaint.
+            let mut extra = FeatureMap::new(1, rows, columns);
+            for (value, mut cell) in extra.data.iter_mut().zip(cells) {
+                let (y, x) = cell.next().expect("a cell holds a pixel");
+                *value = if keep.data[y * keep.width + x] < 0.5 {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
+            let mut blanked = image.clone();
+            let plane = image.height * image.width;
+            for (index, value) in blanked.data.iter_mut().enumerate() {
+                if keep.data[index % plane] < 0.5 {
+                    *value = 0.0;
+                }
+            }
+            let encoder = self.image_encoder.as_ref().expect("checked above");
+            let extra = crate::unet::concatenate(&extra, &encoder.encode(&blanked)?);
+            let ImageDenoiser::Unet(unet) = &mut self.denoiser else {
+                unreachable!("only a UNet reads the mask")
+            };
+            unet.set_inpaint(Some(extra));
+            let sampled = self.sample_latent_from(
+                conditioning,
+                unconditional,
+                &latent,
+                strength,
+                seed,
+                on_step,
+            );
+            if let ImageDenoiser::Unet(unet) = &mut self.denoiser {
+                unet.set_inpaint(None);
+            }
+            sampled
+        } else {
+            let pixels = (step_y * step_x) as f32;
+            let weights: Vec<f32> = cells
+                .map(|cell| {
+                    cell.map(|(y, x)| keep.data[y * keep.width + x])
+                        .sum::<f32>()
+                        / pixels
+                })
+                .collect();
+            self.sample_latent_inpaint(
+                conditioning,
+                unconditional,
+                &latent,
+                &weights,
+                strength,
+                seed,
+                on_step,
+            )
+        }?;
+        self.decode(&sampled, columns, rows)
+    }
 }
 
 /// The solver a published `scheduler_config.json` names, by the class it was
@@ -1799,6 +1909,56 @@ mod tests {
             .unwrap();
         assert_eq!((image.channels, image.height, image.width), (3, 8, 8));
         assert!(image.data.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn inpainting_runs_through_a_trained_unet_and_any_other_model() {
+        let clip = crate::clip::ClipTextConfig {
+            vocab_size: 320,
+            bos_token: 300,
+            eos_token: 301,
+            ..crate::clip::tests::tiny()
+        };
+        let picture = FeatureMap::from_vec(
+            3,
+            8,
+            8,
+            (0..192).map(|value| (value as f32 * 0.05).sin()).collect(),
+        )
+        .unwrap();
+        let mut keep = FeatureMap::new(1, 8, 8);
+        keep.data[32..].fill(1.0);
+        // A plain UNet, then one trained for inpainting with the mask and the
+        // masked picture's four channels after the latent.
+        for in_channels in [4, 9] {
+            let unet = UnetConfig {
+                cross_dim: 16,
+                in_channels,
+                ..crate::unet::tests::tiny()
+            };
+            let directory =
+                std::env::temp_dir().join(format!("rusting_brain_inpaint_{in_channels}"));
+            publish_unet(&directory, &unet, &clip, None);
+            let mut loaded = ImagePipeline::load(&directory).unwrap();
+            std::fs::remove_dir_all(&directory).ok();
+            loaded.config.steps = 2;
+
+            let image = loaded
+                .generate_inpaint("a lighthouse", &picture, &keep, 1.0, Some(4), |_, _| true)
+                .unwrap();
+            assert_eq!((image.channels, image.height, image.width), (3, 8, 8));
+            assert!(image.data.iter().all(|value| value.is_finite()));
+            let wrong = FeatureMap::new(1, 4, 4);
+            assert!(
+                loaded
+                    .generate_inpaint("a lighthouse", &picture, &wrong, 1.0, None, |_, _| true)
+                    .is_err()
+            );
+            // The trained model's mask goes with the run, so a plain run after
+            // it has none and says so.
+            let plain = loaded.generate("a lighthouse", 8, 8, Some(4), |_, _| true);
+            assert_eq!(plain.is_err(), in_channels == 9);
+        }
     }
 
     #[test]
