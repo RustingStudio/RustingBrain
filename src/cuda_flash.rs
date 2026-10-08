@@ -333,10 +333,11 @@ extern "C" __global__ __launch_bounds__(256) void image_attention_fwd(
 // time. `lse` is written in the same layout the three-kernel path used, so the
 // backward pass rebuilds the probabilities from it unchanged.
 template<int D> __device__ __forceinline__ void flash_fwd(
-    const unsigned short* __restrict__ qkv,
+    const unsigned short* __restrict__ q,
+    const unsigned short* __restrict__ kvp,
     unsigned short* __restrict__ out,
     float* __restrict__ lse,
-    int seq_len, int qkv_width, int query_width,
+    int q_len, int kv_len, int q_width, int kv_width, int query_width,
     int key_base, int value_base, int group,
     int lse_head_stride, float scale, int causal)
 {
@@ -348,7 +349,7 @@ template<int D> __device__ __forceinline__ void flash_fwd(
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
   const int kv = (h / group) * D;
-  const size_t seq_base = (size_t)b * seq_len;
+  const size_t seq_base = (size_t)b * q_len, kv_seq = (size_t)b * kv_len;
   const int q_row0 = qt*64 + warp*16;
   const int row_a = q_row0 + g, row_b = q_row0 + g + 8;
 
@@ -356,20 +357,20 @@ template<int D> __device__ __forceinline__ void flash_fwd(
   // path did, and rounded to BF16 exactly as that path's tensor cores did.
   unsigned qf[D/16][4];
   {
-    const size_t base = seq_base*(size_t)qkv_width + h*D;
+    const size_t base = seq_base*(size_t)q_width + h*D;
     #pragma unroll
     for (int kk=0; kk<D/16; ++kk) {
       int c = kk*16 + t*2;
       float a0=0.f,a1=0.f,a2=0.f,a3=0.f,a4=0.f,a5=0.f,a6=0.f,a7=0.f;
-      if (row_a < seq_len) {
-        size_t p = base + (size_t)row_a*qkv_width;
-        a0=bf16_load(qkv,p+c)*scale;   a1=bf16_load(qkv,p+c+1)*scale;
-        a4=bf16_load(qkv,p+c+8)*scale; a5=bf16_load(qkv,p+c+9)*scale;
+      if (row_a < q_len) {
+        size_t p = base + (size_t)row_a*q_width;
+        a0=bf16_load(q,p+c)*scale;   a1=bf16_load(q,p+c+1)*scale;
+        a4=bf16_load(q,p+c+8)*scale; a5=bf16_load(q,p+c+9)*scale;
       }
-      if (row_b < seq_len) {
-        size_t p = base + (size_t)row_b*qkv_width;
-        a2=bf16_load(qkv,p+c)*scale;   a3=bf16_load(qkv,p+c+1)*scale;
-        a6=bf16_load(qkv,p+c+8)*scale; a7=bf16_load(qkv,p+c+9)*scale;
+      if (row_b < q_len) {
+        size_t p = base + (size_t)row_b*q_width;
+        a2=bf16_load(q,p+c)*scale;   a3=bf16_load(q,p+c+1)*scale;
+        a6=bf16_load(q,p+c+8)*scale; a7=bf16_load(q,p+c+9)*scale;
       }
       qf[kk][0]=pack2(a0,a1); qf[kk][1]=pack2(a2,a3);
       qf[kk][2]=pack2(a4,a5); qf[kk][3]=pack2(a6,a7);
@@ -386,7 +387,7 @@ template<int D> __device__ __forceinline__ void flash_fwd(
 
   // Causal: query tile `qt` sees key tiles 0..qt and nothing beyond.
   // Bidirectional: every query tile sees every key tile.
-  const int last = causal ? qt : ((seq_len + 63) >> 6) - 1;
+  const int last = causal ? qt : ((kv_len + 63) >> 6) - 1;
   for (int kt=0; kt<=last; ++kt) {
     __syncthreads();
     // One element a thread, not two: the value tile is stored transposed, and
@@ -396,10 +397,10 @@ template<int D> __device__ __forceinline__ void flash_fwd(
       int r = (unsigned)i / D, c = (unsigned)i % D;
       int key = kt*64 + r;
       unsigned short kb = 0, vb = 0;
-      if (key < seq_len) {
-        size_t p = (seq_base + key)*(size_t)qkv_width;
-        kb = qkv[p + key_base + kv + c];
-        vb = qkv[p + value_base + kv + c];
+      if (key < kv_len) {
+        size_t p = (kv_seq + key)*(size_t)kv_width;
+        kb = kvp[p + key_base + kv + c];
+        vb = kvp[p + value_base + kv + c];
       }
       ks[r*DROW + c] = kb;
       vt[c*FA_ROW + r] = vb;
@@ -431,10 +432,10 @@ template<int D> __device__ __forceinline__ void flash_fwd(
       #pragma unroll
       for (int n=0;n<8;++n) {
         int key = kt*64 + n*8 + t*2;
-        if ((causal && key   > row_a) || key   >= seq_len) s[n][0]=NEG_INF;
-        if ((causal && key+1 > row_a) || key+1 >= seq_len) s[n][1]=NEG_INF;
-        if ((causal && key   > row_b) || key   >= seq_len) s[n][2]=NEG_INF;
-        if ((causal && key+1 > row_b) || key+1 >= seq_len) s[n][3]=NEG_INF;
+        if ((causal && key   > row_a) || key   >= kv_len) s[n][0]=NEG_INF;
+        if ((causal && key+1 > row_a) || key+1 >= kv_len) s[n][1]=NEG_INF;
+        if ((causal && key   > row_b) || key   >= kv_len) s[n][2]=NEG_INF;
+        if ((causal && key+1 > row_b) || key+1 >= kv_len) s[n][3]=NEG_INF;
       }
     }
 
@@ -497,19 +498,19 @@ template<int D> __device__ __forceinline__ void flash_fwd(
   #pragma unroll
   for (int n=0;n<D/8;++n) {
     int c = n*8 + t*2;
-    if (row_a < seq_len) {
+    if (row_a < q_len) {
       size_t p = obase + (size_t)row_a*query_width + c;
       *(unsigned*)(out+p) = pack2(acc[n][0]*inv_a,acc[n][1]*inv_a);
     }
-    if (row_b < seq_len) {
+    if (row_b < q_len) {
       size_t p = obase + (size_t)row_b*query_width + c;
       *(unsigned*)(out+p) = pack2(acc[n][2]*inv_b,acc[n][3]*inv_b);
     }
   }
   if (t == 0) {
     float* p = lse + (size_t)h*lse_head_stride + seq_base;
-    if (row_a < seq_len) p[row_a]=m_a+__logf(l_a);
-    if (row_b < seq_len) p[row_b]=m_b+__logf(l_b);
+    if (row_a < q_len) p[row_a]=m_a+__logf(l_a);
+    if (row_b < q_len) p[row_b]=m_b+__logf(l_b);
   }
 }
 // Row dot product of the attention output with its gradient, which is the
@@ -542,12 +543,13 @@ template<int D> __device__ __forceinline__ void flash_delta(
 // shared memory: keys twice, once each way round, because the score matmul
 // wants them key-major and the query matmul wants them dimension-major.
 template<int D> __device__ __forceinline__ void flash_dq(
-    const unsigned short* __restrict__ qkv,
+    const unsigned short* __restrict__ q,
+    const unsigned short* __restrict__ kvp,
     const unsigned short* __restrict__ grad_out,
     const float* __restrict__ lse,
     const float* __restrict__ delta,
-    unsigned short* __restrict__ grad_qkv,
-    int seq_len, int qkv_width, int query_width,
+    unsigned short* __restrict__ grad_q,
+    int q_len, int kv_len, int q_width, int kv_width, int query_width,
     int key_base, int value_base, int group,
     int lse_head_stride, float scale, int causal)
 {
@@ -559,31 +561,31 @@ template<int D> __device__ __forceinline__ void flash_dq(
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
   const int kv = (h / group) * D;
-  const size_t seq_base = (size_t)b * seq_len;
+  const size_t seq_base = (size_t)b * q_len, kv_seq = (size_t)b * kv_len;
   const int q_row0 = qt*64 + warp*16;
   const int row_a = q_row0 + g, row_b = q_row0 + g + 8;
 
   unsigned qf[D/16][4], df[D/16][4];
   float lse_a=0.f, lse_b=0.f, del_a=0.f, del_b=0.f;
   {
-    const size_t qbase = seq_base*(size_t)qkv_width + h*D;
+    const size_t qbase = seq_base*(size_t)q_width + h*D;
     const size_t gbase = seq_base*(size_t)query_width + h*D;
     #pragma unroll
     for (int kk=0; kk<D/16; ++kk) {
       int c = kk*16 + t*2;
       float q0=0.f,q1=0.f,q2=0.f,q3=0.f,q4=0.f,q5=0.f,q6=0.f,q7=0.f;
       df[kk][0]=0; df[kk][1]=0; df[kk][2]=0; df[kk][3]=0;
-      if (row_a < seq_len) {
-        size_t p = qbase + (size_t)row_a*qkv_width;
-        q0=bf16_load(qkv,p+c)*scale;   q1=bf16_load(qkv,p+c+1)*scale;
-        q4=bf16_load(qkv,p+c+8)*scale; q5=bf16_load(qkv,p+c+9)*scale;
+      if (row_a < q_len) {
+        size_t p = qbase + (size_t)row_a*q_width;
+        q0=bf16_load(q,p+c)*scale;   q1=bf16_load(q,p+c+1)*scale;
+        q4=bf16_load(q,p+c+8)*scale; q5=bf16_load(q,p+c+9)*scale;
         size_t e = gbase + (size_t)row_a*query_width;
         df[kk][0]=bf16_pair(grad_out,e+c); df[kk][2]=bf16_pair(grad_out,e+c+8);
       }
-      if (row_b < seq_len) {
-        size_t p = qbase + (size_t)row_b*qkv_width;
-        q2=bf16_load(qkv,p+c)*scale;   q3=bf16_load(qkv,p+c+1)*scale;
-        q6=bf16_load(qkv,p+c+8)*scale; q7=bf16_load(qkv,p+c+9)*scale;
+      if (row_b < q_len) {
+        size_t p = qbase + (size_t)row_b*q_width;
+        q2=bf16_load(q,p+c)*scale;   q3=bf16_load(q,p+c+1)*scale;
+        q6=bf16_load(q,p+c+8)*scale; q7=bf16_load(q,p+c+9)*scale;
         size_t e = gbase + (size_t)row_b*query_width;
         df[kk][1]=bf16_pair(grad_out,e+c); df[kk][3]=bf16_pair(grad_out,e+c+8);
       }
@@ -592,8 +594,8 @@ template<int D> __device__ __forceinline__ void flash_dq(
     }
     const float* row = lse + (size_t)h*lse_head_stride + seq_base;
     const float* dd  = delta + (size_t)h*lse_head_stride + seq_base;
-    if (row_a < seq_len) { lse_a=row[row_a]; del_a=dd[row_a]; }
-    if (row_b < seq_len) { lse_b=row[row_b]; del_b=dd[row_b]; }
+    if (row_a < q_len) { lse_a=row[row_a]; del_a=dd[row_a]; }
+    if (row_b < q_len) { lse_b=row[row_b]; del_b=dd[row_b]; }
   }
 
   float acc[D/8][4];
@@ -602,17 +604,17 @@ template<int D> __device__ __forceinline__ void flash_dq(
     #pragma unroll
     for (int i=0;i<4;++i) acc[n][i]=0.f;
 
-  const int last = causal ? qt : ((seq_len + 63) >> 6) - 1;
+  const int last = causal ? qt : ((kv_len + 63) >> 6) - 1;
   for (int ktile=0; ktile<=last; ++ktile) {
     __syncthreads();
     for (int i = threadIdx.x*2; i < 64*D; i += 256) {
       int r = (unsigned)i / D, c = (unsigned)i % D;
       int key = ktile*64 + r;
       unsigned kw = 0, vw = 0;
-      if (key < seq_len) {
-        size_t p = (seq_base + key)*(size_t)qkv_width;
-        kw = bf16_pair(qkv,p + key_base + kv + c);
-        vw = bf16_pair(qkv,p + value_base + kv + c);
+      if (key < kv_len) {
+        size_t p = (kv_seq + key)*(size_t)kv_width;
+        kw = bf16_pair(kvp,p + key_base + kv + c);
+        vw = bf16_pair(kvp,p + value_base + kv + c);
       }
       *(unsigned*)(ks + r*DROW + c) = kw;
       *(unsigned*)(vs + r*DROW + c) = vw;
@@ -642,10 +644,10 @@ template<int D> __device__ __forceinline__ void flash_dq(
       #pragma unroll
       for (int n=0;n<8;++n) {
         int key = ktile*64 + n*8 + t*2;
-        if ((causal && key   > row_a) || key   >= seq_len) s[n][0]=NEG_INF;
-        if ((causal && key+1 > row_a) || key+1 >= seq_len) s[n][1]=NEG_INF;
-        if ((causal && key   > row_b) || key   >= seq_len) s[n][2]=NEG_INF;
-        if ((causal && key+1 > row_b) || key+1 >= seq_len) s[n][3]=NEG_INF;
+        if ((causal && key   > row_a) || key   >= kv_len) s[n][0]=NEG_INF;
+        if ((causal && key+1 > row_a) || key+1 >= kv_len) s[n][1]=NEG_INF;
+        if ((causal && key   > row_b) || key   >= kv_len) s[n][2]=NEG_INF;
+        if ((causal && key+1 > row_b) || key+1 >= kv_len) s[n][3]=NEG_INF;
       }
     }
 
@@ -677,17 +679,17 @@ template<int D> __device__ __forceinline__ void flash_dq(
     }
   }
 
-  const size_t obase = seq_base*(size_t)qkv_width + h*D;
+  const size_t obase = seq_base*(size_t)q_width + h*D;
   #pragma unroll
   for (int n=0;n<D/8;++n) {
     int c = n*8 + t*2;
-    if (row_a < seq_len) {
-      size_t p = obase + (size_t)row_a*qkv_width;
-      *(unsigned*)(grad_qkv+p+c) = pack2(acc[n][0]*scale,acc[n][1]*scale);
+    if (row_a < q_len) {
+      size_t p = obase + (size_t)row_a*q_width;
+      *(unsigned*)(grad_q+p+c) = pack2(acc[n][0]*scale,acc[n][1]*scale);
     }
-    if (row_b < seq_len) {
-      size_t p = obase + (size_t)row_b*qkv_width;
-      *(unsigned*)(grad_qkv+p+c) = pack2(acc[n][2]*scale,acc[n][3]*scale);
+    if (row_b < q_len) {
+      size_t p = obase + (size_t)row_b*q_width;
+      *(unsigned*)(grad_q+p+c) = pack2(acc[n][2]*scale,acc[n][3]*scale);
     }
   }
 }
@@ -698,12 +700,13 @@ template<int D> __device__ __forceinline__ void flash_dq(
 // the query head is what keeps grouped-query attention exact without atomics:
 // every query head that shares a key head is summed inside one block.
 template<int D> __device__ __forceinline__ void flash_dkv(
-    const unsigned short* __restrict__ qkv,
+    const unsigned short* __restrict__ q,
+    const unsigned short* __restrict__ kvp,
     const unsigned short* __restrict__ grad_out,
     const float* __restrict__ lse,
     const float* __restrict__ delta,
-    unsigned short* __restrict__ grad_qkv,
-    int seq_len, int qkv_width, int query_width,
+    unsigned short* __restrict__ grad_kv,
+    int q_len, int kv_len, int q_width, int kv_width, int query_width,
     int key_base, int value_base, int group,
     int lse_head_stride, float scale, int causal)
 {
@@ -718,34 +721,34 @@ template<int D> __device__ __forceinline__ void flash_dkv(
   const int jt = blockIdx.x, kvh = blockIdx.y, b = blockIdx.z;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
-  const size_t seq_base = (size_t)b * seq_len;
+  const size_t seq_base = (size_t)b * q_len, kv_seq = (size_t)b * kv_len;
   const int k_row0 = jt*64 + warp*16;
   const int key_a = k_row0 + g, key_b = k_row0 + g + 8;
-  const int tiles = (seq_len + 63) >> 6;
+  const int tiles = (q_len + 63) >> 6;
 
   // Keys and values stay in registers for the whole block, as the operand of
   // every matmul below.
   unsigned kf[D/16][4], vf[D/16][4];
   {
-    const size_t base = seq_base*(size_t)qkv_width + kvh*D;
+    const size_t base = kv_seq*(size_t)kv_width + kvh*D;
     #pragma unroll
     for (int kk=0; kk<D/16; ++kk) {
       int c = kk*16 + t*2;
       kf[kk][0]=0; kf[kk][1]=0; kf[kk][2]=0; kf[kk][3]=0;
       vf[kk][0]=0; vf[kk][1]=0; vf[kk][2]=0; vf[kk][3]=0;
-      if (key_a < seq_len) {
-        size_t p = base + (size_t)key_a*qkv_width;
-        kf[kk][0]=bf16_pair(qkv,p+key_base+c);
-        kf[kk][2]=bf16_pair(qkv,p+key_base+c+8);
-        vf[kk][0]=bf16_pair(qkv,p+value_base+c);
-        vf[kk][2]=bf16_pair(qkv,p+value_base+c+8);
+      if (key_a < kv_len) {
+        size_t p = base + (size_t)key_a*kv_width;
+        kf[kk][0]=bf16_pair(kvp,p+key_base+c);
+        kf[kk][2]=bf16_pair(kvp,p+key_base+c+8);
+        vf[kk][0]=bf16_pair(kvp,p+value_base+c);
+        vf[kk][2]=bf16_pair(kvp,p+value_base+c+8);
       }
-      if (key_b < seq_len) {
-        size_t p = base + (size_t)key_b*qkv_width;
-        kf[kk][1]=bf16_pair(qkv,p+key_base+c);
-        kf[kk][3]=bf16_pair(qkv,p+key_base+c+8);
-        vf[kk][1]=bf16_pair(qkv,p+value_base+c);
-        vf[kk][3]=bf16_pair(qkv,p+value_base+c+8);
+      if (key_b < kv_len) {
+        size_t p = base + (size_t)key_b*kv_width;
+        kf[kk][1]=bf16_pair(kvp,p+key_base+c);
+        kf[kk][3]=bf16_pair(kvp,p+key_base+c+8);
+        vf[kk][1]=bf16_pair(kvp,p+value_base+c);
+        vf[kk][3]=bf16_pair(kvp,p+value_base+c+8);
       }
     }
   }
@@ -761,11 +764,11 @@ template<int D> __device__ __forceinline__ void flash_dkv(
       __syncthreads();
       for (int i = threadIdx.x*2; i < 64*D; i += 256) {
         int r = (unsigned)i / D, c = (unsigned)i % D;
-        int q = it*64 + r;
+        int qi = it*64 + r;
         unsigned qw = 0, gw = 0;
-        if (q < seq_len) {
-          qw = bf16_pair(qkv,(seq_base+q)*(size_t)qkv_width + hq*D + c);
-          gw = bf16_pair(grad_out,(seq_base+q)*(size_t)query_width + hq*D + c);
+        if (qi < q_len) {
+          qw = bf16_pair(q,(seq_base+qi)*(size_t)q_width + hq*D + c);
+          gw = bf16_pair(grad_out,(seq_base+qi)*(size_t)query_width + hq*D + c);
         }
         // The queries are stored unscaled, so the scores carry the scale
         // instead: one multiply per score rather than one per element here.
@@ -773,10 +776,10 @@ template<int D> __device__ __forceinline__ void flash_dkv(
         *(unsigned*)(gs + r*DROW + c) = gw;
       }
       if (threadIdx.x < 64) {
-        int q = it*64 + threadIdx.x;
-        bool ok = q < seq_len;
-        lse_s[threadIdx.x] = ok ? lse[(size_t)hq*lse_head_stride + seq_base + q] : 0.f;
-        del_s[threadIdx.x] = ok ? delta[(size_t)hq*lse_head_stride + seq_base + q] : 0.f;
+        int qi = it*64 + threadIdx.x;
+        bool ok = qi < q_len;
+        lse_s[threadIdx.x] = ok ? lse[(size_t)hq*lse_head_stride + seq_base + qi] : 0.f;
+        del_s[threadIdx.x] = ok ? delta[(size_t)hq*lse_head_stride + seq_base + qi] : 0.f;
       }
       __syncthreads();
 
@@ -814,10 +817,10 @@ template<int D> __device__ __forceinline__ void flash_dkv(
           int q0 = it*64 + col, q1 = q0 + 1;
           float l0 = lse_s[col], l1 = lse_s[col+1];
           float d0 = del_s[col], d1 = del_s[col+1];
-          float p0 = ((!causal || q0 >= key_a) && q0 < seq_len) ? __expf(st[n][0]*scale-l0) : 0.f;
-          float p1 = ((!causal || q1 >= key_a) && q1 < seq_len) ? __expf(st[n][1]*scale-l1) : 0.f;
-          float p2 = ((!causal || q0 >= key_b) && q0 < seq_len) ? __expf(st[n][2]*scale-l0) : 0.f;
-          float p3 = ((!causal || q1 >= key_b) && q1 < seq_len) ? __expf(st[n][3]*scale-l1) : 0.f;
+          float p0 = ((!causal || q0 >= key_a) && q0 < q_len) ? __expf(st[n][0]*scale-l0) : 0.f;
+          float p1 = ((!causal || q1 >= key_a) && q1 < q_len) ? __expf(st[n][1]*scale-l1) : 0.f;
+          float p2 = ((!causal || q0 >= key_b) && q0 < q_len) ? __expf(st[n][2]*scale-l0) : 0.f;
+          float p3 = ((!causal || q1 >= key_b) && q1 < q_len) ? __expf(st[n][3]*scale-l1) : 0.f;
           st[n][0]=p0; st[n][1]=p1; st[n][2]=p2; st[n][3]=p3;
           dpt[n][0]=p0*(dpt[n][0]-d0); dpt[n][1]=p1*(dpt[n][1]-d1);
           dpt[n][2]=p2*(dpt[n][2]-d0); dpt[n][3]=p3*(dpt[n][3]-d1);
@@ -851,48 +854,57 @@ template<int D> __device__ __forceinline__ void flash_dkv(
     }
   }
 
-  const size_t base = seq_base*(size_t)qkv_width + kvh*D;
+  const size_t base = kv_seq*(size_t)kv_width + kvh*D;
   #pragma unroll
   for (int n=0;n<D/8;++n) {
     int c = n*8 + t*2;
-    if (key_a < seq_len) {
-      size_t p = base + (size_t)key_a*qkv_width;
-      *(unsigned*)(grad_qkv+p+key_base+c) = pack2(dk[n][0]*scale,dk[n][1]*scale);
-      *(unsigned*)(grad_qkv+p+value_base+c) = pack2(dv[n][0],dv[n][1]);
+    if (key_a < kv_len) {
+      size_t p = base + (size_t)key_a*kv_width;
+      *(unsigned*)(grad_kv+p+key_base+c) = pack2(dk[n][0]*scale,dk[n][1]*scale);
+      *(unsigned*)(grad_kv+p+value_base+c) = pack2(dv[n][0],dv[n][1]);
     }
-    if (key_b < seq_len) {
-      size_t p = base + (size_t)key_b*qkv_width;
-      *(unsigned*)(grad_qkv+p+key_base+c) = pack2(dk[n][2]*scale,dk[n][3]*scale);
-      *(unsigned*)(grad_qkv+p+value_base+c) = pack2(dv[n][2],dv[n][3]);
+    if (key_b < kv_len) {
+      size_t p = base + (size_t)key_b*kv_width;
+      *(unsigned*)(grad_kv+p+key_base+c) = pack2(dk[n][2]*scale,dk[n][3]*scale);
+      *(unsigned*)(grad_kv+p+value_base+c) = pack2(dv[n][2],dv[n][3]);
     }
   }
 }
 
 // One entry point per kernel and head width, named `<kernel>_<width>`.
+// The key/value gradient at width 64 needs at most 170 registers to fit three
+// blocks on an SM: separate query and key buffers took it from 168 to 173,
+// two blocks, and 25% slower, so the bound holds it there.
+// Queries come from `q` and keys and values from `kv`, `q_len` and `kv_len`
+// per sequence: self-attention passes one fused buffer as both, with equal
+// lengths, and cross-attention passes two.
 #define FLASH_ARGS \
-    int seq_len, int qkv_width, int query_width, int key_base, int value_base, \
-    int group, int lse_head_stride, float scale, int causal
+    int q_len, int kv_len, int q_width, int kv_width, int query_width, \
+    int key_base, int value_base, int group, int lse_head_stride, float scale, int causal
 #define FLASH_PASS \
-    seq_len, qkv_width, query_width, key_base, value_base, group, lse_head_stride, scale, causal
+    q_len, kv_len, q_width, kv_width, query_width, key_base, value_base, group, \
+    lse_head_stride, scale, causal
 #define FLASH_WIDTH(W) \
 extern "C" __global__ __launch_bounds__(128) void flash_attention_fwd_##W( \
-    const unsigned short* __restrict__ qkv, unsigned short* __restrict__ out, \
-    float* __restrict__ lse, FLASH_ARGS) \
-{ flash_fwd<W>(qkv, out, lse, FLASH_PASS); } \
+    const unsigned short* __restrict__ q, const unsigned short* __restrict__ kv, \
+    unsigned short* __restrict__ out, float* __restrict__ lse, FLASH_ARGS) \
+{ flash_fwd<W>(q, kv, out, lse, FLASH_PASS); } \
 extern "C" __global__ void flash_attention_delta_##W( \
     const unsigned short* __restrict__ out, const unsigned short* __restrict__ grad_out, \
     float* __restrict__ delta, int rows, int heads, int query_width, int delta_head_stride) \
 { flash_delta<W>(out, grad_out, delta, rows, heads, query_width, delta_head_stride); } \
 extern "C" __global__ __launch_bounds__(128) void flash_attention_dq_##W( \
-    const unsigned short* __restrict__ qkv, const unsigned short* __restrict__ grad_out, \
+    const unsigned short* __restrict__ q, const unsigned short* __restrict__ kv, \
+    const unsigned short* __restrict__ grad_out, \
     const float* __restrict__ lse, const float* __restrict__ delta, \
-    unsigned short* __restrict__ grad_qkv, FLASH_ARGS) \
-{ flash_dq<W>(qkv, grad_out, lse, delta, grad_qkv, FLASH_PASS); } \
-extern "C" __global__ __launch_bounds__(128) void flash_attention_dkv_##W( \
-    const unsigned short* __restrict__ qkv, const unsigned short* __restrict__ grad_out, \
+    unsigned short* __restrict__ grad_q, FLASH_ARGS) \
+{ flash_dq<W>(q, kv, grad_out, lse, delta, grad_q, FLASH_PASS); } \
+extern "C" __global__ __launch_bounds__(128, (W) == 64 ? 3 : 1) void flash_attention_dkv_##W( \
+    const unsigned short* __restrict__ q, const unsigned short* __restrict__ kv, \
+    const unsigned short* __restrict__ grad_out, \
     const float* __restrict__ lse, const float* __restrict__ delta, \
-    unsigned short* __restrict__ grad_qkv, FLASH_ARGS) \
-{ flash_dkv<W>(qkv, grad_out, lse, delta, grad_qkv, FLASH_PASS); }
+    unsigned short* __restrict__ grad_kv, FLASH_ARGS) \
+{ flash_dkv<W>(q, kv, grad_out, lse, delta, grad_kv, FLASH_PASS); }
 
 FLASH_WIDTH(64)
 FLASH_WIDTH(128)
