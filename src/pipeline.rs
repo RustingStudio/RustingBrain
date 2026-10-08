@@ -567,9 +567,10 @@ impl ImagePipeline {
         Self::load_with_loras(directory, precision, &[])
     }
 
-    /// The same, with LoRA files merged into the denoiser at the strength
-    /// paired with each; see [`crate::safetensors::ShardedSafeTensors::add_lora`].
-    /// What a file adapts in the text encoders is left out.
+    /// The same, with LoRA files merged into the denoiser and the CLIP text
+    /// encoders at the strength paired with each; see
+    /// [`crate::safetensors::ShardedSafeTensors::add_lora`]. A file must adapt
+    /// the denoiser.
     pub fn load_with_loras(
         directory: impl AsRef<std::path::Path>,
         precision: Precision,
@@ -663,8 +664,17 @@ impl ImagePipeline {
         };
 
         let tower = |name: &str| -> Result<ClipTextEncoder, NetworkError> {
-            ClipTextEncoder::load_at(
-                weights(&part(name))?,
+            let mut file = crate::safetensors::ShardedSafeTensors::open(weights(&part(name))?)?;
+            // kohya numbers XL's two towers and leaves 1.x's unnumbered.
+            let prefixes: &[&str] = match name {
+                "text_encoder" => &[name, "lora_te", "lora_te1"],
+                _ => &[name, "lora_te2"],
+            };
+            for (path, scale) in loras {
+                file.add_lora(path, prefixes, *scale)?;
+            }
+            ClipTextEncoder::read_at(
+                &mut file,
                 "",
                 crate::clip::ClipTextConfig::from_file(part(&format!("{name}/config.json")))?,
                 precision,
@@ -1985,7 +1995,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lora_file_changes_the_denoiser_it_is_loaded_into() {
+    fn a_lora_file_changes_the_models_it_is_loaded_into() {
         let unet = UnetConfig {
             cross_dim: 16,
             ..crate::unet::tests::tiny()
@@ -1998,33 +2008,48 @@ mod tests {
         };
         let directory = std::env::temp_dir().join("rusting_brain_pipeline_lora");
         publish_unet(&directory, &unet, &clip, None);
-        let file = |name: &str, stem: &str| {
+        // Rank-one adapters on `conv_in` and on the text encoder's first
+        // feed-forward layer.
+        let file = |name: &str, adapters: &[(&str, usize, usize)]| {
             let path = directory.join(name);
-            let tensors = [
-                (
-                    format!("{stem}.lora_down.weight"),
-                    vec![1, 36],
-                    vec![0.1; 36],
-                ),
-                (format!("{stem}.lora_up.weight"), vec![8, 1], vec![0.5; 8]),
-            ]
-            .into_iter()
-            .map(|(name, shape, values)| (name, (shape, values)))
-            .collect();
+            let tensors = adapters
+                .iter()
+                .flat_map(|(stem, inputs, outputs)| {
+                    [
+                        (
+                            format!("{stem}.lora_down.weight"),
+                            vec![1, *inputs],
+                            vec![0.1; *inputs],
+                        ),
+                        (
+                            format!("{stem}.lora_up.weight"),
+                            vec![*outputs, 1],
+                            vec![0.5; *outputs],
+                        ),
+                    ]
+                })
+                .map(|(name, shape, values)| (name, (shape, values)))
+                .collect();
             crate::safetensors::write_checkpoint(&path, &tensors);
             path
         };
-        let conv_in = file("conv_in.safetensors", "lora_unet_conv_in");
-        let text = file("text.safetensors", "lora_te_text_model_fc1");
+        let conv_in = ("lora_unet_conv_in", 36, 8);
+        let fc1 = ("lora_te_text_model_encoder_layers_0_mlp_fc1", 16, 32);
+        let unet_only = file("unet.safetensors", &[conv_in]);
+        let both = file("both.safetensors", &[conv_in, fc1]);
+        let text_only = file("text.safetensors", &[fc1]);
         let run = |loras: &[(std::path::PathBuf, f32)]| {
             let mut loaded = ImagePipeline::load_with_loras(&directory, Precision::F32, loras)?;
             loaded.config.steps = 2;
             loaded.generate("a lighthouse", 8, 8, Some(4), |_, _| true)
         };
         let plain = run(&[]).unwrap();
-        assert_eq!(run(&[(conv_in.clone(), 0.0)]).unwrap().data, plain.data);
-        assert_ne!(run(&[(conv_in, 1.0)]).unwrap().data, plain.data);
-        assert!(run(&[(text, 1.0)]).is_err());
+        assert_eq!(run(&[(both.clone(), 0.0)]).unwrap().data, plain.data);
+        let steered = run(&[(unet_only, 1.0)]).unwrap();
+        assert_ne!(steered.data, plain.data);
+        // The text encoder's half changes the prompt, and so the picture.
+        assert_ne!(run(&[(both, 1.0)]).unwrap().data, steered.data);
+        assert!(run(&[(text_only, 1.0)]).is_err());
         std::fs::remove_dir_all(&directory).ok();
     }
 
