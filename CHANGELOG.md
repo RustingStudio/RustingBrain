@@ -67,6 +67,11 @@
 
 ### Added
 
+- CLIP zero-shot classification and retrieval: `VitEncoder::embed` projects
+  the image tower's class token, `clip::logit_scale` reads the learned
+  temperature, and `clip::zero_shot` turns an image and captions into
+  probabilities. Matches `transformers`' `CLIPModel` within 2.2e-7.
+
 - `TransformerLm::set_8bit_optimizer_state` holds the device Adam moments at
   one byte each (block-wise, bitsandbytes' dynamic map). The default model
   trains in 1723 MiB instead of 2037 at the same speed, and its loss over
@@ -195,6 +200,11 @@
   public; `bellman_targets` is unchanged.
 
 ### Fixed
+
+- `ClipTextConfig::from_file` read the legacy `bos 0, eos 2` of older CLIP
+  configurations (OpenAI CLIP, Stable Diffusion 1.x, FLUX.1's CLIP-L) as
+  real tokens, so prompts started with `!` and pooled at the wrong row. It
+  now uses the vocabulary's last two ids, as `transformers` does.
 
 - Stable Diffusion XL, 2.x and 3 prompts are padded with the pad token the
   tokenizer names (`!` for SDXL's second tower) instead of the end token. The

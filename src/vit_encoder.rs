@@ -66,6 +66,10 @@ pub struct VitEncoder {
     pub(crate) pre_norm: Norm,
     pub(crate) layers: Vec<Layer>,
     pub(crate) post_norm: Norm,
+    /// `visual_projection`, which maps the class token into the space the
+    /// text tower's pooled vector is projected to. Only full CLIP checkpoints
+    /// carry it.
+    projection: Option<Dense>,
     channels: usize,
     patch_size: usize,
     /// The same weights on a CUDA device, when one was attached.
@@ -171,6 +175,11 @@ impl VitEncoder {
 
         Ok(Self {
             post_norm: norm(file, &format!("{base}.post_layernorm"))?,
+            projection: file
+                .matrix(&format!("{prefix}visual_projection.weight"))
+                .ok()
+                .map(|weight| Dense::new(weight, None))
+                .transpose()?,
             config,
             patch,
             class_token,
@@ -309,6 +318,20 @@ impl VitEncoder {
                 .collect());
         }
         images.iter().map(|image| self.encode(image)).collect()
+    }
+
+    /// The image as one vector: the class token through the final norm, then
+    /// through `visual_projection` when the checkpoint has one.
+    ///
+    /// With a full CLIP checkpoint this is the vector the text tower's
+    /// [`pool`](crate::clip::ClipTextEncoder::pool) is compared with, by
+    /// [`crate::clip::zero_shot`] or by cosine similarity for retrieval.
+    pub fn embed(&self, image: &FeatureMap) -> Result<Vec<f32>, NetworkError> {
+        let tokens = self.encode(image)?;
+        match &self.projection {
+            Some(projection) => projection.apply(tokens.row(0)),
+            None => Ok(tokens.row(0).to_vec()),
+        }
     }
 
     /// The image cut into patches, `[patches, channels * patch * patch]`, one
@@ -517,6 +540,7 @@ pub(crate) mod tests {
                 identity_layers,
             );
         }
+        add("visual_projection.weight".into(), vec![4, D_MODEL], false);
         crate::safetensors::write_checkpoint(path, &tensors);
     }
 
@@ -559,6 +583,30 @@ pub(crate) mod tests {
         let tokens = tower.encode(&ramp(tower.image_size())).unwrap();
         assert_eq!((tokens.rows, tokens.cols), (GRID * GRID + 1, D_MODEL));
         assert!(tokens.data.iter().all(|value| value.is_finite()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_embedding_is_the_projected_class_token() {
+        let path = scratch("embed");
+        checkpoint(&path, false);
+        let tower = VitEncoder::load(&path, "", tiny(), Precision::F32).unwrap();
+        let image = ramp(tower.image_size());
+        let class = tower.encode(&image).unwrap().row(0).to_vec();
+        let projection = tower.projection.as_ref().unwrap();
+
+        let embedding = tower.embed(&image).unwrap();
+        assert_eq!(embedding.len(), 4);
+        for (unit, got) in embedding.iter().enumerate() {
+            let want: f32 = projection
+                .weight
+                .row(unit)
+                .iter()
+                .zip(&class)
+                .map(|(a, b)| a * b)
+                .sum();
+            assert!((got - want).abs() < 1e-5, "{got} against {want}");
+        }
         std::fs::remove_file(&path).ok();
     }
 

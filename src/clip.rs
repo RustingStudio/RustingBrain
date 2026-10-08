@@ -10,9 +10,11 @@
 //! The pooled vector is the hidden state at the end-of-text token, not the last
 //! position: a prompt is padded, and the padding has read the whole prompt too.
 //!
-//! NOTE: inference only, `f32` or one byte per weight, no image tower. The
-//! image tower is a different model that happens to share a name, and nothing
-//! in a text-to-image pipeline asks for it.
+//! The image tower is [`crate::vit_encoder::VitEncoder`].
+//! [`zero_shot`] compares the two towers' vectors, with [`logit_scale`] read
+//! from the same checkpoint.
+//!
+//! NOTE: inference only, `f32` or one byte per weight.
 
 use crate::conv::Dense;
 use crate::matrix::Matrix;
@@ -110,7 +112,21 @@ impl ClipTextConfig {
                 .map(|value| value as usize),
             bos_token: token("bos_token_id", default.bos_token),
             eos_token: token("eos_token_id", default.eos_token),
-        })
+        }
+        .legacy_special_tokens())
+    }
+
+    /// Older configurations (OpenAI's CLIP, Stable Diffusion 1.x, FLUX.1's
+    /// CLIP-L) say `bos 0, eos 2`, which are ordinary tokens. Transformers
+    /// treats `eos_token_id == 2` as that legacy case and pools at the highest
+    /// id, which in CLIP's vocabulary is the end token, the last entry; the
+    /// start token sits just before it.
+    fn legacy_special_tokens(mut self) -> Self {
+        if self.eos_token == 2 && self.vocab_size >= 2 {
+            self.bos_token = self.vocab_size as u32 - 2;
+            self.eos_token = self.vocab_size as u32 - 1;
+        }
+        self
     }
 
     /// Dimensions per attention head.
@@ -442,6 +458,52 @@ pub(crate) fn add(target: &mut Matrix, source: &Matrix) {
         .for_each(|(target, source)| *target += source);
 }
 
+/// The temperature a full CLIP checkpoint learned, `exp(logit_scale)`, which
+/// is the multiplier [`zero_shot`] takes. About 100 for the published models.
+pub fn logit_scale(file: &mut ShardedSafeTensors, prefix: &str) -> Result<f32, NetworkError> {
+    let (values, _) = file.tensor(&format!("{prefix}logit_scale"))?;
+    match values[..] {
+        [value] => Ok(value.exp()),
+        _ => Err(NetworkError::InvalidTarget {
+            expected: 1,
+            actual: values.len(),
+        }),
+    }
+}
+
+/// Zero-shot classification: how likely each caption is to describe the
+/// image, as CLIP's `logits_per_image` through a softmax.
+///
+/// `image` is [`VitEncoder::embed`](crate::vit_encoder::VitEncoder::embed) and
+/// each of `captions` is [`ClipTextEncoder::pool`], both from the same
+/// checkpoint; `scale` is [`logit_scale`]. For retrieval, rank by the same
+/// cosine similarities without the softmax.
+pub fn zero_shot(image: &[f32], captions: &[Vec<f32>], scale: f32) -> Vec<f32> {
+    let unit = |vector: &[f32]| {
+        let length = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        vector
+            .iter()
+            .map(|value| value / length)
+            .collect::<Vec<_>>()
+    };
+    let image = unit(image);
+    let logits: Vec<f32> = captions
+        .iter()
+        .map(|caption| {
+            scale
+                * unit(caption)
+                    .iter()
+                    .zip(&image)
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+        })
+        .collect();
+    let top = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let weights: Vec<f32> = logits.iter().map(|logit| (logit - top).exp()).collect();
+    let total: f32 = weights.iter().sum();
+    weights.iter().map(|weight| weight / total).collect()
+}
+
 pub(crate) fn norm(file: &mut ShardedSafeTensors, name: &str) -> Result<Norm, NetworkError> {
     Ok(Norm {
         weight: file.tensor(&format!("{name}.weight"))?.0,
@@ -629,6 +691,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn zero_shot_is_a_softmax_over_scaled_cosines() {
+        let image = [3.0, 0.0];
+        // Lengths differ on purpose: only the direction may count.
+        let captions = [vec![2.0, 0.0], vec![0.0, 5.0], vec![-0.5, 0.0]];
+
+        let probabilities = zero_shot(&image, &captions, 1.0);
+        let total: f32 = [1.0f32, 0.0, -1.0].iter().map(|x| x.exp()).sum();
+        for (got, logit) in probabilities.iter().zip([1.0f32, 0.0, -1.0]) {
+            assert!((got - logit.exp() / total).abs() < 1e-6, "{got}");
+        }
+        assert!(zero_shot(&image, &captions, 100.0)[0] > 0.999);
+    }
+
+    #[test]
     fn a_projection_widens_the_pooled_vector() {
         let mut config = tiny();
         config.projection_dim = Some(6);
@@ -674,7 +750,7 @@ pub(crate) mod tests {
             r#"{"hidden_size": 1280, "num_hidden_layers": 32, "num_attention_heads": 20,
                 "intermediate_size": 5120, "max_position_embeddings": 77, "vocab_size": 49408,
                 "layer_norm_eps": 1e-5, "hidden_act": "gelu", "projection_dim": 1280,
-                "eos_token_id": 2}"#,
+                "bos_token_id": 0, "eos_token_id": 2}"#,
         )
         .unwrap();
         let config = ClipTextConfig::from_file(&path).unwrap();
@@ -684,7 +760,8 @@ pub(crate) mod tests {
         assert_eq!(config.layers, 32);
         assert_eq!(config.head_dim(), 64);
         assert_eq!(config.projection_dim, Some(1280));
-        assert_eq!(config.eos_token, 2);
+        // The legacy `bos 0, eos 2` means the vocabulary's last two entries.
+        assert_eq!((config.bos_token, config.eos_token), (49406, 49407));
         assert!(!config.quick_gelu);
     }
 
