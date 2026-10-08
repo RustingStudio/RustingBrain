@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Device decode attention runs one block per key-value head, scoring every
+  query head of its group against each cached key and value it loads,
+  instead of one block per query head. On the default model (8 heads over
+  2 key-value heads) 16 sequences after a 2000-token prompt decode 5016 to
+  6906 tokens/s, and one int8 sequence after 4000 tokens 1205 to 1430.
 - A decoder's device KV cache grows with the session, doubling up to
   `max_seq_len`, instead of taking `max_seq_len` positions per sequence when
   it is made. Forks copy only what the session holds room for.
