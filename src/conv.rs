@@ -2231,6 +2231,642 @@ pub struct DeviceBatchNormCache {
     training: bool,
 }
 
+/// A depthwise convolution without bias, as ultralytics' `DWConv` and C2PSA's
+/// positional encoding use before a batch norm: each channel convolved with
+/// its own `kernel x kernel` filter, padded by `kernel / 2`.
+#[derive(Clone, Debug)]
+pub struct DepthwiseConv2d {
+    /// `[1, channels * kernel * kernel]`, PyTorch's `[C, 1, k, k]` flattened.
+    pub weight: Param,
+    kernel: usize,
+    stride: usize,
+}
+
+/// What [`DepthwiseConv2d::backward`] needs: the input.
+#[derive(Clone, Debug)]
+pub struct DepthwiseCache {
+    input: ImageBatch,
+}
+
+impl DepthwiseConv2d {
+    pub fn new(channels: usize, kernel: usize, stride: usize, rng: &mut StdRng) -> Self {
+        let fan_in = kernel * kernel;
+        Self {
+            weight: Param::he_uniform(1, channels * fan_in, fan_in, rng),
+            kernel,
+            stride,
+        }
+    }
+
+    pub fn channels(&self) -> usize {
+        self.weight.value.cols / (self.kernel * self.kernel)
+    }
+
+    pub fn output_size(&self, height: usize, width: usize) -> (usize, usize) {
+        let size = |n: usize| (n + 2 * (self.kernel / 2) - self.kernel) / self.stride + 1;
+        (size(height), size(width))
+    }
+
+    /// Every `(output index, input index, weight index)` the convolution
+    /// multiplies, in a fixed order.
+    fn taps(&self, input: &ImageBatch) -> impl Iterator<Item = (usize, usize, usize)> + use<> {
+        let (h, w, c) = (input.height, input.width, input.channels());
+        let (oh, ow) = self.output_size(h, w);
+        let (k, s, pad) = (self.kernel, self.stride, self.kernel / 2);
+        let batch = input.batch;
+        (0..batch * oh * ow).flat_map(move |row| {
+            let (ox, oy, b) = (row % ow, row / ow % oh, row / ow / oh);
+            (0..k * k).flat_map(move |t| {
+                let (sy, sx) = (
+                    (oy * s + t / k).wrapping_sub(pad),
+                    (ox * s + t % k).wrapping_sub(pad),
+                );
+                let inside = sy < h && sx < w;
+                (0..c).filter(move |_| inside).map(move |ch| {
+                    (
+                        row * c + ch,
+                        ((b * h + sy) * w + sx) * c + ch,
+                        ch * k * k + t,
+                    )
+                })
+            })
+        })
+    }
+
+    pub fn forward(
+        &self,
+        input: &ImageBatch,
+    ) -> Result<(ImageBatch, DepthwiseCache), NetworkError> {
+        if input.channels() != self.channels() {
+            return Err(NetworkError::InvalidTarget {
+                expected: self.channels(),
+                actual: input.channels(),
+            });
+        }
+        let (oh, ow) = self.output_size(input.height, input.width);
+        let mut output = ImageBatch::new(input.batch, oh, ow, input.channels());
+        let weight = &self.weight.value.data;
+        for (o, i, t) in self.taps(input) {
+            output.tokens.data[o] += input.tokens.data[i] * weight[t];
+        }
+        Ok((
+            output,
+            DepthwiseCache {
+                input: input.clone(),
+            },
+        ))
+    }
+
+    /// Adds to the weight's gradient and returns the input's.
+    pub fn backward(&mut self, cache: &DepthwiseCache, grad: &ImageBatch) -> ImageBatch {
+        let mut input_grad = cache.input.like(cache.input.channels());
+        let weight = self.weight.value.data.clone();
+        for (o, i, t) in self.taps(&cache.input) {
+            input_grad.tokens.data[i] += grad.tokens.data[o] * weight[t];
+            self.weight.grad.data[t] += grad.tokens.data[o] * cache.input.tokens.data[i];
+        }
+        input_grad
+    }
+
+    pub fn params_mut(&mut self) -> Vec<&mut Param> {
+        vec![&mut self.weight]
+    }
+
+    pub fn to_cuda_on(&mut self, device: &crate::param::CudaDevice) -> Result<(), NetworkError> {
+        self.weight.to_cuda_on(device)
+    }
+
+    pub fn to_cpu(&mut self) -> Result<(), NetworkError> {
+        self.weight.to_cpu()
+    }
+
+    /// [`DepthwiseConv2d::forward`] on the device. The cache is the input,
+    /// which the caller passes back to [`DepthwiseConv2d::backward_device`].
+    #[cfg(feature = "cuda")]
+    pub fn forward_device(
+        &self,
+        input: &DeviceImageBatch,
+    ) -> Result<DeviceImageBatch, NetworkError> {
+        let Some(weight) = self.weight.device.as_ref() else {
+            return Err(NetworkError::InvalidConfig(
+                "forward_device needs the weight on a device".into(),
+            ));
+        };
+        if input.channels != self.channels() {
+            return Err(NetworkError::InvalidTarget {
+                expected: self.channels(),
+                actual: input.channels,
+            });
+        }
+        let (oh, ow) = self.output_size(input.height, input.width);
+        let context = &input.context;
+        let total = input.batch * oh * ow * input.channels;
+        let mut out = context.zeros(total)?;
+        let dims = self.dims(input);
+        unsafe {
+            let mut launch = context.stream.launch_builder(&context.image.dw_fwd);
+            launch.arg(&mut out).arg(&input.data).arg(weight.value());
+            dims.iter().for_each(|d| {
+                launch.arg(d);
+            });
+            launch
+                .launch(crate::cuda_training::cfg(total))
+                .map_err(crate::cuda_training::cuda_err("depthwise kernel"))?;
+        }
+        Ok(DeviceImageBatch {
+            height: oh,
+            width: ow,
+            ..input.with_data(out)
+        })
+    }
+
+    /// [`DepthwiseConv2d::backward`] on the device, given the forward input.
+    #[cfg(feature = "cuda")]
+    pub fn backward_device(
+        &mut self,
+        input: &DeviceImageBatch,
+        grad: &DeviceImageBatch,
+    ) -> Result<DeviceImageBatch, NetworkError> {
+        let dims = self.dims(input);
+        let taps = self.weight.value.cols;
+        let Some(weight) = self.weight.device.as_mut() else {
+            return Err(NetworkError::InvalidConfig(
+                "backward_device needs the weight on a device".into(),
+            ));
+        };
+        let context = input.context.clone();
+        let err = crate::cuda_training::cuda_err;
+        let total = input.data.len();
+        let mut input_grad = context.zeros(total)?;
+        let mut weight_grad = context.zeros(taps)?;
+        unsafe {
+            let mut launch = context.stream.launch_builder(&context.image.dw_bwd_input);
+            launch
+                .arg(&mut input_grad)
+                .arg(&grad.data)
+                .arg(weight.value());
+            dims.iter().for_each(|d| {
+                launch.arg(d);
+            });
+            launch
+                .launch(crate::cuda_training::cfg(total))
+                .map_err(err("depthwise input gradient kernel"))?;
+            let mut launch = context.stream.launch_builder(&context.image.dw_bwd_weight);
+            launch
+                .arg(&mut weight_grad)
+                .arg(&grad.data)
+                .arg(&input.data);
+            dims.iter().for_each(|d| {
+                launch.arg(d);
+            });
+            launch
+                .launch(group_blocks(taps))
+                .map_err(err("depthwise weight gradient kernel"))?;
+        }
+        let one = context.filled(1, 1.0)?;
+        weight.accumulate_grad_device(&one, &weight_grad, 1)?;
+        Ok(input.with_data(input_grad))
+    }
+
+    /// `[batch, height, width, channels, kernel, stride, out_height, out_width]`.
+    #[cfg(feature = "cuda")]
+    fn dims(&self, input: &DeviceImageBatch) -> [i32; 8] {
+        let (oh, ow) = self.output_size(input.height, input.width);
+        [
+            input.batch,
+            input.height,
+            input.width,
+            input.channels,
+            self.kernel,
+            self.stride,
+            oh,
+            ow,
+        ]
+        .map(|v| v as i32)
+    }
+}
+
+/// The head layout of a `qkv` map for [`pixel_attention`]: each head's
+/// channels are its `key_dim` queries, `key_dim` keys and `head_dim` values,
+/// in that order, as ultralytics' `Attention` views them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelAttentionShape {
+    pub heads: usize,
+    pub key_dim: usize,
+    pub head_dim: usize,
+}
+
+impl PixelAttentionShape {
+    /// The shape of ultralytics' `Attention(dim, num_heads, attn_ratio=0.5)`.
+    pub fn yolo(dim: usize, heads: usize) -> Self {
+        let head_dim = dim / heads;
+        Self {
+            heads,
+            key_dim: head_dim / 2,
+            head_dim,
+        }
+    }
+
+    fn per_head(&self) -> usize {
+        2 * self.key_dim + self.head_dim
+    }
+
+    /// Channels of the attended output and of the values, `heads * head_dim`.
+    pub fn dim(&self) -> usize {
+        self.heads * self.head_dim
+    }
+
+    fn scale(&self) -> f32 {
+        (self.key_dim as f32).powf(-0.5)
+    }
+
+    fn check(&self, channels: usize) -> Result<(), NetworkError> {
+        match channels == self.heads * self.per_head() {
+            true => Ok(()),
+            false => Err(NetworkError::InvalidTarget {
+                expected: self.heads * self.per_head(),
+                actual: channels,
+            }),
+        }
+    }
+}
+
+/// What [`pixel_attention_backward`] needs from the forward pass.
+#[derive(Clone, Debug)]
+pub struct PixelAttentionCache {
+    qkv: ImageBatch,
+    shape: PixelAttentionShape,
+    /// Per sample and head, `[pixels, pixels]`.
+    probabilities: Vec<Matrix>,
+}
+
+/// One head's `width` channels from `offset` within it, `[pixels, width]`.
+fn head_part(map: &ImageBatch, sample: usize, start: usize, width: usize) -> Matrix {
+    let (pixels, channels) = (map.pixels(), map.channels());
+    let mut part = Matrix::new(pixels, width);
+    for p in 0..pixels {
+        let row = &map.tokens.data[(sample * pixels + p) * channels..][start..start + width];
+        part.data[p * width..(p + 1) * width].copy_from_slice(row);
+    }
+    part
+}
+
+fn add_head_part(map: &mut ImageBatch, sample: usize, start: usize, part: &Matrix) {
+    let (pixels, channels, width) = (map.pixels(), map.channels(), part.cols);
+    for p in 0..pixels {
+        map.tokens.data[(sample * pixels + p) * channels..][start..start + width]
+            .iter_mut()
+            .zip(part.row(p))
+            .for_each(|(slot, v)| *slot += v);
+    }
+}
+
+/// ultralytics' `Attention` between its `qkv` and `pe`/`proj` convolutions:
+/// every pixel attends over all pixels of its sample, per head. Returns the
+/// attended map and the values (the input to the positional encoding), both
+/// `shape.dim()` channels with head `h` at `h * head_dim`.
+pub fn pixel_attention(
+    qkv: &ImageBatch,
+    shape: PixelAttentionShape,
+) -> Result<(ImageBatch, ImageBatch, PixelAttentionCache), NetworkError> {
+    shape.check(qkv.channels())?;
+    let (pixels, kd, hd) = (qkv.pixels(), shape.key_dim, shape.head_dim);
+    let mut attended = qkv.like(shape.dim());
+    let mut values = qkv.like(shape.dim());
+    let mut probabilities = Vec::new();
+    for b in 0..qkv.batch {
+        for h in 0..shape.heads {
+            let start = h * shape.per_head();
+            let q = head_part(qkv, b, start, kd);
+            let k = head_part(qkv, b, start + kd, kd);
+            let v = head_part(qkv, b, start + 2 * kd, hd);
+            let mut p = Matrix::new(pixels, pixels);
+            q.dot_rhs_transposed(&k, &mut p);
+            for row in p.data.chunks_exact_mut(pixels) {
+                let max = row.iter().fold(f32::MIN, |m, &s| m.max(s * shape.scale()));
+                let mut sum = 0.0;
+                row.iter_mut().for_each(|s| {
+                    *s = (*s * shape.scale() - max).exp();
+                    sum += *s;
+                });
+                row.iter_mut().for_each(|s| *s /= sum);
+            }
+            let mut out = Matrix::new(pixels, hd);
+            p.dot(&v, &mut out);
+            add_head_part(&mut attended, b, h * hd, &out);
+            add_head_part(&mut values, b, h * hd, &v);
+            probabilities.push(p);
+        }
+    }
+    Ok((
+        attended,
+        values,
+        PixelAttentionCache {
+            qkv: qkv.clone(),
+            shape,
+            probabilities,
+        },
+    ))
+}
+
+/// The `qkv` gradient from the attended map's and the values' gradients.
+pub fn pixel_attention_backward(
+    cache: &PixelAttentionCache,
+    grad_attended: &ImageBatch,
+    grad_values: &ImageBatch,
+) -> ImageBatch {
+    let (qkv, shape) = (&cache.qkv, cache.shape);
+    let (pixels, kd, hd) = (qkv.pixels(), shape.key_dim, shape.head_dim);
+    let mut grad = qkv.like(qkv.channels());
+    for b in 0..qkv.batch {
+        for h in 0..shape.heads {
+            let start = h * shape.per_head();
+            let p = &cache.probabilities[b * shape.heads + h];
+            let q = head_part(qkv, b, start, kd);
+            let k = head_part(qkv, b, start + kd, kd);
+            let v = head_part(qkv, b, start + 2 * kd, hd);
+            let d_out = head_part(grad_attended, b, h * hd, hd);
+            let mut d_v = head_part(grad_values, b, h * hd, hd);
+            let mut through = Matrix::new(pixels, hd);
+            p.dot_self_transposed(&d_out, &mut through);
+            d_v.data
+                .iter_mut()
+                .zip(&through.data)
+                .for_each(|(a, b)| *a += b);
+            let mut d_s = Matrix::new(pixels, pixels);
+            d_out.dot_rhs_transposed(&v, &mut d_s);
+            for (ds, pr) in d_s
+                .data
+                .chunks_exact_mut(pixels)
+                .zip(p.data.chunks_exact(pixels))
+            {
+                let along: f32 = ds.iter().zip(pr).map(|(d, p)| d * p).sum();
+                ds.iter_mut()
+                    .zip(pr)
+                    .for_each(|(d, p)| *d = p * (*d - along) * shape.scale());
+            }
+            let (mut d_q, mut d_k) = (Matrix::new(pixels, kd), Matrix::new(pixels, kd));
+            d_s.dot(&k, &mut d_q);
+            d_s.dot_self_transposed(&q, &mut d_k);
+            add_head_part(&mut grad, b, start, &d_q);
+            add_head_part(&mut grad, b, start + kd, &d_k);
+            add_head_part(&mut grad, b, start + 2 * kd, &d_v);
+        }
+    }
+    grad
+}
+
+/// What [`pixel_attention_backward_device`] needs from the forward pass.
+#[cfg(feature = "cuda")]
+pub struct DevicePixelAttentionCache {
+    qkv: DeviceImageBatch,
+    shape: PixelAttentionShape,
+    /// `[batch, heads, pixels, pixels]`.
+    probabilities: cudarc::driver::CudaSlice<f32>,
+}
+
+/// [`pixel_attention`] on the device, through cuBLAS batched over the heads.
+// NOTE: the cache holds every head's `pixels x pixels` probabilities,
+// 4 x 400 x 400 floats a sample at the P5 map of a 1280 input (2.6 MB);
+// a flash kernel replaces it if larger maps ever attend.
+#[cfg(feature = "cuda")]
+pub fn pixel_attention_device(
+    qkv: &DeviceImageBatch,
+    shape: PixelAttentionShape,
+) -> Result<
+    (
+        DeviceImageBatch,
+        DeviceImageBatch,
+        DevicePixelAttentionCache,
+    ),
+    NetworkError,
+> {
+    use crate::gpu_transformer::{gemm_plain_batched, gemm_rhs_transposed_batched};
+    shape.check(qkv.channels)?;
+    let context = &qkv.context;
+    let (n, kd, hd, s, cq, dim) = (
+        qkv.pixels(),
+        shape.key_dim,
+        shape.head_dim,
+        shape.per_head(),
+        qkv.channels,
+        shape.dim(),
+    );
+    let (rows, span) = (qkv.batch * n, shape.heads * n * n);
+    let mut probabilities = context.zeros(qkv.batch * span)?;
+    let mut lse = context.zeros(qkv.batch * shape.heads * n)?;
+    let mut attended = context.zeros(rows * dim)?;
+    let mut values = context.zeros(rows * dim)?;
+    for b in 0..qkv.batch {
+        let base = b * n * cq;
+        gemm_rhs_transposed_batched(
+            context,
+            &qkv.data.slice(base..),
+            cq,
+            &qkv.data.slice(base + kd..),
+            cq,
+            &mut probabilities.slice_mut(b * span..),
+            n,
+            n,
+            n,
+            kd,
+            shape.scale(),
+            0.0,
+            shape.heads,
+            s,
+            s,
+            n * n,
+        )?;
+    }
+    let gpu = crate::gpu_model::Gpu { context };
+    gpu.attention_softmax(
+        &mut probabilities,
+        &mut lse,
+        qkv.batch * shape.heads * n,
+        n,
+        false,
+        n,
+        0,
+    )?;
+    for b in 0..qkv.batch {
+        gemm_plain_batched(
+            context,
+            &probabilities.slice(b * span..),
+            n,
+            &qkv.data.slice(b * n * cq + 2 * kd..),
+            cq,
+            &mut attended.slice_mut(b * n * dim..),
+            dim,
+            n,
+            hd,
+            n,
+            1.0,
+            0.0,
+            shape.heads,
+            n * n,
+            s,
+            hd,
+        )?;
+    }
+    for h in 0..shape.heads {
+        copy_channels(
+            context,
+            &mut values,
+            dim,
+            h * hd,
+            &qkv.data,
+            cq,
+            h * s + 2 * kd,
+            hd,
+            rows,
+        )?;
+    }
+    Ok((
+        DeviceImageBatch {
+            channels: dim,
+            ..qkv.with_data(attended)
+        },
+        DeviceImageBatch {
+            channels: dim,
+            ..qkv.with_data(values)
+        },
+        DevicePixelAttentionCache {
+            qkv: qkv.with_data(qkv.data.clone()),
+            shape,
+            probabilities,
+        },
+    ))
+}
+
+/// [`pixel_attention_backward`] on the device.
+#[cfg(feature = "cuda")]
+pub fn pixel_attention_backward_device(
+    cache: &DevicePixelAttentionCache,
+    grad_attended: &DeviceImageBatch,
+    grad_values: &DeviceImageBatch,
+) -> Result<DeviceImageBatch, NetworkError> {
+    use crate::gpu_transformer::{
+        gemm_lhs_transposed_batched, gemm_plain_batched, gemm_rhs_transposed_batched,
+    };
+    let (qkv, shape) = (&cache.qkv, cache.shape);
+    let context = &qkv.context;
+    let (n, kd, hd, s, cq, dim) = (
+        qkv.pixels(),
+        shape.key_dim,
+        shape.head_dim,
+        shape.per_head(),
+        qkv.channels,
+        shape.dim(),
+    );
+    let (rows, span) = (qkv.batch * n, shape.heads * n * n);
+    let mut grad = context.zeros(rows * cq)?;
+    for h in 0..shape.heads {
+        copy_channels(
+            context,
+            &mut grad,
+            cq,
+            h * s + 2 * kd,
+            &grad_values.data,
+            dim,
+            h * hd,
+            hd,
+            rows,
+        )?;
+    }
+    let mut d_s = context.zeros(qkv.batch * span)?;
+    for b in 0..qkv.batch {
+        let base = b * n * cq;
+        let d_out = grad_attended.data.slice(b * n * dim..);
+        // dV += P^T dO
+        gemm_lhs_transposed_batched(
+            context,
+            &cache.probabilities.slice(b * span..),
+            n,
+            &d_out,
+            dim,
+            &mut grad.slice_mut(base + 2 * kd..),
+            cq,
+            n,
+            n,
+            hd,
+            1.0,
+            1.0,
+            shape.heads,
+            n * n,
+            hd,
+            s,
+        )?;
+        // dP = dO V^T
+        gemm_rhs_transposed_batched(
+            context,
+            &d_out,
+            dim,
+            &qkv.data.slice(base + 2 * kd..),
+            cq,
+            &mut d_s.slice_mut(b * span..),
+            n,
+            n,
+            n,
+            hd,
+            1.0,
+            0.0,
+            shape.heads,
+            hd,
+            s,
+            n * n,
+        )?;
+    }
+    let gpu = crate::gpu_model::Gpu { context };
+    gpu.softmax_backward(
+        &mut d_s,
+        &cache.probabilities,
+        qkv.batch * shape.heads * n,
+        n,
+        false,
+    )?;
+    for b in 0..qkv.batch {
+        let base = b * n * cq;
+        // dQ = scale dS K, dK = scale dS^T Q
+        gemm_plain_batched(
+            context,
+            &d_s.slice(b * span..),
+            n,
+            &qkv.data.slice(base + kd..),
+            cq,
+            &mut grad.slice_mut(base..),
+            cq,
+            n,
+            kd,
+            n,
+            shape.scale(),
+            0.0,
+            shape.heads,
+            n * n,
+            s,
+            s,
+        )?;
+        gemm_lhs_transposed_batched(
+            context,
+            &d_s.slice(b * span..),
+            n,
+            &qkv.data.slice(base..),
+            cq,
+            &mut grad.slice_mut(base + kd..),
+            cq,
+            n,
+            n,
+            kd,
+            shape.scale(),
+            0.0,
+            shape.heads,
+            n * n,
+            s,
+            s,
+        )?;
+    }
+    Ok(qkv.with_data(grad))
+}
+
 /// Nearest-neighbour upsampling by `factor` along both axes.
 pub fn upsample_nearest_batch(input: &ImageBatch, factor: usize) -> ImageBatch {
     let mut output = ImageBatch::new(
@@ -3740,5 +4376,162 @@ mod tests {
             &max_pool_same_backward(&cache, &weights).tokens.data,
             "max pool grad",
         );
+    }
+    #[test]
+    fn depthwise_convolution_matches_finite_differences() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        for stride in [1, 2] {
+            let mut conv = DepthwiseConv2d::new(4, 3, stride, &mut rng);
+            let input = noise(2, 7, 6, 4, 1);
+            let (output, cache) = conv.forward(&input).unwrap();
+            assert_eq!((output.height, output.width), conv.output_size(7, 6));
+            // Channel 1's centre pixel against a direct sum.
+            let w = &conv.weight.value.data[9..18];
+            let (y, x) = (1, 2 / stride);
+            let direct: f32 = (0..9)
+                .map(|t| input.pixel(1, y * stride + t / 3 - 1, x * stride + t % 3 - 1)[1] * w[t])
+                .sum();
+            assert!((output.pixel(1, y, x)[1] - direct).abs() < 1e-5);
+            let weights = noise(2, output.height, output.width, 4, 6);
+            let grad = conv.backward(&cache, &weights);
+            let through = |input: &ImageBatch| conv.forward(input).unwrap().0.tokens;
+            let gap = pooled_gap(through, &input, &weights.tokens.data, &grad.tokens.data);
+            assert!(gap < 1e-3, "stride {stride}: input {gap}");
+            let as_batch =
+                |data: Vec<f32>| ImageBatch::from_tokens(1, 1, 36, Matrix::from_vec(36, 1, data));
+            let through = |params: &ImageBatch| {
+                let mut moved = conv.clone();
+                moved.weight.value.data.copy_from_slice(&params.tokens.data);
+                moved.forward(&input).unwrap().0.tokens
+            };
+            let gap = pooled_gap(
+                through,
+                &as_batch(conv.weight.value.data.clone()),
+                &weights.tokens.data,
+                &conv.weight.grad.data,
+            );
+            assert!(gap < 1e-3, "stride {stride}: weight {gap}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_depthwise_convolution_matches_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        for stride in [1, 2] {
+            let mut host = DepthwiseConv2d::new(6, 3, stride, &mut rng);
+            let mut resident = host.clone();
+            resident.to_cuda_on(&device).unwrap();
+            let input = noise(3, 13, 10, 6, 1);
+            let (expected, cache) = host.forward(&input).unwrap();
+            let weights = noise(3, expected.height, expected.width, 6, 2);
+            let expected_grad = host.backward(&cache, &weights);
+            let on_card = device.upload(&input).unwrap();
+            let output = resident.forward_device(&on_card).unwrap();
+            let grad = resident
+                .backward_device(&on_card, &device.upload(&weights).unwrap())
+                .unwrap();
+            let close = |a: &[f32], b: &[f32], what: &str| {
+                assert_eq!(a.len(), b.len(), "{what}");
+                for (index, (a, b)) in a.iter().zip(b).enumerate() {
+                    assert!(
+                        (a - b).abs() < 1e-4 + 1e-4 * b.abs(),
+                        "{what}[{index}]: {a} against {b}"
+                    );
+                }
+            };
+            close(
+                &output.download().unwrap().tokens.data,
+                &expected.tokens.data,
+                "output",
+            );
+            close(
+                &grad.download().unwrap().tokens.data,
+                &expected_grad.tokens.data,
+                "input grad",
+            );
+            resident.to_cpu().unwrap();
+            close(
+                &resident.weight.grad.data,
+                &host.weight.grad.data,
+                "weight grad",
+            );
+        }
+    }
+
+    #[test]
+    fn pixel_attention_matches_ultralytics() {
+        let fixture = std::path::Path::new("/home/vasylt/cs2/fixtures/k13a_attention.json");
+        let Ok(text) = std::fs::read_to_string(fixture) else {
+            eprintln!("skipped: no {}", fixture.display());
+            return;
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let size = |key: &str| json[key].as_u64().unwrap() as usize;
+        let map = |key: &str| {
+            let data: Vec<f32> = serde_json::from_value(json[key].clone()).unwrap();
+            let rows = size("batch") * size("height") * size("width");
+            let tokens = Matrix::from_vec(rows, data.len() / rows, data);
+            ImageBatch::from_tokens(size("batch"), size("height"), size("width"), tokens)
+        };
+        let shape = PixelAttentionShape::yolo(size("dim"), size("heads"));
+        let (attended, values, cache) = pixel_attention(&map("qkv"), shape).unwrap();
+        let grad = pixel_attention_backward(&cache, &map("grad_attended"), &map("grad_values"));
+        for (got, key) in [
+            (attended, "attended"),
+            (values, "values"),
+            (grad, "grad_qkv"),
+        ] {
+            let gap = got
+                .tokens
+                .data
+                .iter()
+                .zip(&map(key).tokens.data)
+                .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(gap < 1e-5, "{key}: {gap}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_pixel_attention_matches_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let shape = PixelAttentionShape::yolo(16, 2);
+        let qkv = noise(3, 5, 4, 32, 1);
+        let (attended, values, cache) = pixel_attention(&qkv, shape).unwrap();
+        let (grad_attended, grad_values) = (noise(3, 5, 4, 16, 2), noise(3, 5, 4, 16, 3));
+        let grad = pixel_attention_backward(&cache, &grad_attended, &grad_values);
+        let (on_attended, on_values, on_cache) =
+            pixel_attention_device(&device.upload(&qkv).unwrap(), shape).unwrap();
+        let on_grad = pixel_attention_backward_device(
+            &on_cache,
+            &device.upload(&grad_attended).unwrap(),
+            &device.upload(&grad_values).unwrap(),
+        )
+        .unwrap();
+        for (got, expected, what) in [
+            (on_attended, attended, "attended"),
+            (on_values, values, "values"),
+            (on_grad, grad, "qkv grad"),
+        ] {
+            let got = got.download().unwrap();
+            for (index, (a, b)) in got
+                .tokens
+                .data
+                .iter()
+                .zip(&expected.tokens.data)
+                .enumerate()
+            {
+                assert!(
+                    (a - b).abs() < 1e-4 + 1e-4 * b.abs(),
+                    "{what}[{index}]: {a} against {b}"
+                );
+            }
+        }
     }
 }

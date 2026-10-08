@@ -253,6 +253,30 @@ extern "C" __global__ void maxpool_same_bwd(float*dx,const float*g,const int*arg
       long long o=((long long)(b*H+oy)*W+ox)*C+c;if(arg[o]==ky*k+kx)s+=g[o];}}
   dx[i]=s;
 }
+// Depthwise convolution, padded by k/2. The input gradient gathers like
+// col2im; the weight gradient is one block per (channel, tap).
+extern "C" __global__ void dw_fwd(float*y,const float*x,const float*w,int B,int H,int W,int C,int k,int s,int OH,int OW){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=B*OH*OW*C)return;
+  int c=i%C,r=i/C,ox=r%OW,q=r/OW,oy=q%OH,b=q/OH,pad=k/2;float a=0.f;
+  for(int t=0;t<k*k;t++){int sy=oy*s+t/k-pad,sx=ox*s+t%k-pad;
+    if(sy>=0&&sy<H&&sx>=0&&sx<W)a+=x[((long long)(b*H+sy)*W+sx)*C+c]*w[c*k*k+t];}
+  y[i]=a;
+}
+extern "C" __global__ void dw_bwd_input(float*dx,const float*g,const float*w,int B,int H,int W,int C,int k,int s,int OH,int OW){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=B*H*W*C)return;
+  int c=i%C,r=i/C,px=r%W,q=r/W,py=q%H,b=q/H,pad=k/2;float a=0.f;
+  for(int t=0;t<k*k;t++){int sy=py+pad-t/k,sx=px+pad-t%k;
+    if(sy<0||sx<0||sy%s||sx%s)continue;int oy=sy/s,ox=sx/s;if(oy>=OH||ox>=OW)continue;
+    a+=g[((long long)(b*OH+oy)*OW+ox)*C+c]*w[c*k*k+t];}
+  dx[i]=a;
+}
+extern "C" __global__ void dw_bwd_weight(float*dw,const float*g,const float*x,int B,int H,int W,int C,int k,int s,int OH,int OW){
+  int c=blockIdx.x/(k*k),t=blockIdx.x%(k*k),pad=k/2,n=B*OH*OW;float a=0.f;
+  for(int r=threadIdx.x;r<n;r+=blockDim.x){int ox=r%OW,q=r/OW,oy=q%OH,b=q/OH;
+    int sy=oy*s+t/k-pad,sx=ox*s+t%k-pad;
+    if(sy>=0&&sy<H&&sx>=0&&sx<W)a+=g[(long long)r*C+c]*x[((long long)(b*H+sy)*W+sx)*C+c];}
+  a=img_block_sum(a);if(threadIdx.x==0)dw[blockIdx.x]=a;
+}
 extern "C" __global__ void add_f32(float*out,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]+b[i];}
 extern "C" __global__ void mul_f32(float*out,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]*b[i];}
 extern "C" __global__ void silu_f32(float*y,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];y[i]=v/(1.f+expf(-v));}}
