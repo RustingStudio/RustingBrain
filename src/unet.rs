@@ -1433,6 +1433,69 @@ pub(crate) mod tests {
         assert!(worst < 1e-3, "worst {worst} against a mean of {mean}");
     }
 
+    /// Needs `RB_LORA_REF` from `scripts/unet_lora_reference.py`.
+    #[test]
+    #[ignore]
+    fn a_lora_file_merges_as_peft_does() {
+        let dir = std::path::PathBuf::from(std::env::var("RB_LORA_REF").unwrap());
+        let r: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("ref.json")).unwrap()).unwrap();
+        let v = |k: &str| -> Vec<f32> {
+            r[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let scale = r["scale"].as_f64().unwrap() as f32;
+        let config = UnetConfig::from_file(dir.join("unet/config.json")).unwrap();
+        let open =
+            || ShardedSafeTensors::open(dir.join("unet/diffusion_pytorch_model.safetensors"));
+        for (lora, prefixes) in [
+            ("diffusers_lora.safetensors", ["unet", ""]),
+            ("kohya_lora.safetensors", ["lora_unet", ""]),
+        ] {
+            let mut file = open().unwrap();
+            // Twelve of each attention projection and resnet, six of the rest.
+            assert_eq!(file.add_lora(dir.join(lora), &prefixes, scale).unwrap(), 72);
+            let mut model = Unet::read_at(&mut file, config.clone(), Precision::F32).unwrap();
+            model.set_conditioning(Conditioning {
+                text: Matrix::from_vec(5, 16, v("text")),
+                pooled: vec![],
+                height: 8,
+                width: 8,
+                guidance: 0.0,
+            });
+            let latent = FeatureMap::from_vec(4, 8, 8, v("latent")).unwrap();
+            let out = model
+                .denoise(&latent.to_tokens(), r["sigma"].as_f64().unwrap() as f32)
+                .unwrap();
+            let out = FeatureMap::from_tokens(&out, 8, 8).unwrap();
+            let reference = v("out");
+            let worst = out
+                .data
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let mean = reference.iter().map(|x| x.abs()).sum::<f32>() / reference.len() as f32;
+            assert!(
+                worst < 1e-3,
+                "{lora}: worst {worst} against a mean of {mean}"
+            );
+        }
+        // The kohya file's text encoder adapter is an error once it is asked for.
+        let mut file = open().unwrap();
+        assert!(
+            file.add_lora(
+                dir.join("kohya_lora.safetensors"),
+                &["lora_te", "lora_unet"],
+                1.0
+            )
+            .is_err()
+        );
+    }
+
     /// Needs `RB_CONTROLNET_REF` from `scripts/controlnet_reference.py`.
     #[test]
     #[ignore]

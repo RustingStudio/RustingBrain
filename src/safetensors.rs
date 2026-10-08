@@ -392,6 +392,8 @@ pub struct ShardedSafeTensors {
     /// Tensor name to shard file name.
     map: BTreeMap<String, String>,
     shards: BTreeMap<String, SafeTensors>,
+    /// What [`ShardedSafeTensors::add_lora`] adds to a weight as it is read.
+    deltas: BTreeMap<String, Vec<f32>>,
 }
 
 impl ShardedSafeTensors {
@@ -422,6 +424,7 @@ impl ShardedSafeTensors {
                 directory,
                 map,
                 shards: BTreeMap::from([(name, shard)]),
+                deltas: BTreeMap::new(),
             });
         }
 
@@ -454,12 +457,152 @@ impl ShardedSafeTensors {
             directory,
             map,
             shards: BTreeMap::new(),
+            deltas: BTreeMap::new(),
         })
     }
 
     /// Every tensor name across every shard, sorted.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(String::as_str)
+    }
+
+    /// Merges a LoRA file into the weights it adapts, as they are read from
+    /// now on, and says how many weights it changes.
+    ///
+    /// Both published spellings are read: PEFT and diffusers' `lora_A` and
+    /// `lora_B`, and kohya's `lora_down`, `lora_up` and `alpha`, which name the
+    /// weight with underscores for dots. Each adapted weight gains
+    /// `scale * alpha / rank * up @ down`, with `alpha` the rank where the file
+    /// has none.
+    ///
+    /// One file often adapts several parts of a model, each under its own
+    /// prefix (`unet.`, `text_encoder.`, `lora_unet_`, `lora_te_`, ...). An
+    /// adapter under a prefix not in `prefixes` belongs to another part and
+    /// is skipped; `""` in `prefixes` takes names with none. An adapter for
+    /// this part that names no weight here, or a kind of adapter other than
+    /// LoRA, is an error, because merging only some of it is a different model.
+    pub fn add_lora(
+        &mut self,
+        path: impl AsRef<Path>,
+        prefixes: &[&str],
+        scale: f32,
+    ) -> Result<usize, NetworkError> {
+        const PARTS: [&str; 12] = [
+            "text_encoder_2",
+            "text_encoder_3",
+            "text_encoder",
+            "lora_transformer",
+            "transformer",
+            "lora_unet",
+            "unet",
+            "lora_te1",
+            "lora_te2",
+            "lora_te3",
+            "lora_te",
+            "base_model_model",
+        ];
+        let flat = |name: &str| name.replace('.', "_");
+        let weights: BTreeMap<String, String> = self
+            .map
+            .keys()
+            .filter_map(|name| name.strip_suffix(".weight"))
+            .map(|stem| (flat(stem), stem.to_string()))
+            .collect();
+        let mut file = SafeTensors::open(path)?;
+        let names: Vec<String> = file.names().map(str::to_string).collect();
+        let mut changed = 0;
+        for name in &names {
+            let (stem, up_name) = match name.strip_suffix(".lora_A.weight") {
+                Some(stem) => (stem, format!("{stem}.lora_B.weight")),
+                None => match name.strip_suffix(".lora_down.weight") {
+                    Some(stem) => (stem, format!("{stem}.lora_up.weight")),
+                    None if name.ends_with(".lora_B.weight")
+                        || name.ends_with(".lora_up.weight")
+                        || name.ends_with(".alpha") =>
+                    {
+                        continue;
+                    }
+                    None => {
+                        return Err(NetworkError::InvalidDataset(format!(
+                            "{name} is not part of a LoRA pair; other adapter kinds are not read"
+                        )));
+                    }
+                },
+            };
+            // Peel off prefixes until what is left names a weight here, or a
+            // prefix says it belongs elsewhere.
+            let mut rest = flat(stem);
+            let mut part = "";
+            let target = loop {
+                if let Some(target) = weights.get(&rest)
+                    && prefixes.contains(&part)
+                {
+                    break Some(target);
+                }
+                let Some(prefix) = PARTS
+                    .iter()
+                    .find(|prefix| rest.starts_with(&format!("{prefix}_")))
+                else {
+                    break None;
+                };
+                rest = rest[prefix.len() + 1..].to_string();
+                if *prefix != "base_model_model" {
+                    part = prefix;
+                }
+            };
+            let Some(target) = target else {
+                if prefixes.contains(&part) {
+                    return Err(NetworkError::InvalidDataset(format!(
+                        "the LoRA adapts {stem}, which this checkpoint does not hold"
+                    )));
+                }
+                continue;
+            };
+
+            let (down, down_shape) = file.tensor(name)?;
+            let (up, up_shape) = file.tensor(&up_name)?;
+            let rank = down_shape[0];
+            let alpha = match file.tensor(&format!("{stem}.alpha")) {
+                Ok((alpha, _)) => alpha[0],
+                Err(_) => rank as f32,
+            };
+            let inputs = down.len() / rank.max(1);
+            let outputs = up_shape[0];
+            let base = self.map.get(&format!("{target}.weight")).cloned();
+            let base_len = base
+                .and_then(|file| self.size_of(&file, &format!("{target}.weight")))
+                .unwrap_or(0);
+            if up.len() != outputs * rank || outputs * inputs != base_len {
+                return Err(NetworkError::InvalidDataset(format!(
+                    "the LoRA for {target} is {up_shape:?} by {down_shape:?}, which does not \
+                     make its {base_len} weights"
+                )));
+            }
+            let up = Matrix::from_vec(outputs, rank, up);
+            let down = Matrix::from_vec(rank, inputs, down);
+            let mut product = Matrix::new(outputs, inputs);
+            up.dot(&down, &mut product);
+            let factor = scale * alpha / rank as f32;
+            let delta = self
+                .deltas
+                .entry(format!("{target}.weight"))
+                .or_insert_with(|| vec![0.0; base_len]);
+            for (delta, value) in delta.iter_mut().zip(&product.data) {
+                *delta += factor * value;
+            }
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    /// How many values a tensor holds, from its shard's header.
+    fn size_of(&mut self, file: &str, name: &str) -> Option<usize> {
+        if !self.shards.contains_key(file) {
+            let shard = SafeTensors::open(self.directory.join(file)).ok()?;
+            self.shards.insert(file.to_string(), shard);
+        }
+        let info = self.shards.get(file)?.info(name)?;
+        Some(info.shape.iter().product())
     }
 
     /// Reads one tensor as `f32`, opening its shard if this is the first
@@ -476,29 +619,30 @@ impl ShardedSafeTensors {
             let shard = SafeTensors::open(self.directory.join(&file))?;
             self.shards.insert(file.clone(), shard);
         }
-        self.shards
+        let (mut values, shape) = self
+            .shards
             .get_mut(&file)
             .expect("the shard was just opened")
-            .tensor(name)
+            .tensor(name)?;
+        if let Some(delta) = self.deltas.get(name) {
+            values
+                .iter_mut()
+                .zip(delta)
+                .for_each(|(value, delta)| *value += delta);
+        }
+        Ok((values, shape))
     }
 
     /// Reads one tensor as a [`Matrix`].
     pub fn matrix(&mut self, name: &str) -> Result<Matrix, NetworkError> {
-        let file = self
-            .map
-            .get(name)
-            .ok_or_else(|| {
-                NetworkError::InvalidDataset(format!("no tensor named {name} in the index"))
-            })?
-            .clone();
-        if !self.shards.contains_key(&file) {
-            let shard = SafeTensors::open(self.directory.join(&file))?;
-            self.shards.insert(file.clone(), shard);
+        let (values, shape) = self.tensor(name)?;
+        match shape.as_slice() {
+            [cols] => Ok(Matrix::from_vec(1, *cols, values)),
+            [rows, cols] => Ok(Matrix::from_vec(*rows, *cols, values)),
+            _ => Err(NetworkError::InvalidDataset(format!(
+                "{name} has shape {shape:?}, which is not a matrix"
+            ))),
         }
-        self.shards
-            .get_mut(&file)
-            .expect("the shard was just opened")
-            .matrix(name)
     }
 }
 
@@ -650,6 +794,89 @@ pub(crate) fn write_checkpoint(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn a_lora_adds_up_times_down_to_the_weight_it_names() {
+        let dir = std::env::temp_dir().join("rusting_brain_lora_merge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, tensors: &[(&str, Vec<usize>, Vec<f32>)]| {
+            let path = dir.join(name);
+            let tensors = tensors
+                .iter()
+                .map(|(name, shape, values)| (name.to_string(), (shape.clone(), values.clone())))
+                .collect();
+            write_checkpoint(&path, &tensors);
+            path
+        };
+        let base = file(
+            "base.safetensors",
+            &[
+                ("mid.to_q.weight", vec![2, 3], vec![1.0; 6]),
+                ("mid.to_q.bias", vec![2], vec![0.0; 2]),
+            ],
+        );
+        // Rank one: up [2, 1] times down [1, 3], at alpha 2 over rank 1.
+        let pair = |stem: &str, down: &str, up: &str| {
+            vec![
+                (
+                    format!("{stem}.{down}.weight"),
+                    vec![1, 3],
+                    vec![1.0, 2.0, 3.0],
+                ),
+                (format!("{stem}.{up}.weight"), vec![2, 1], vec![1.0, -1.0]),
+                (format!("{stem}.alpha"), vec![1], vec![2.0]),
+            ]
+        };
+        let lora = |name: &str, tensors: Vec<(String, Vec<usize>, Vec<f32>)>| {
+            let tensors: Vec<_> = tensors
+                .iter()
+                .map(|(name, shape, values)| (name.as_str(), shape.clone(), values.clone()))
+                .collect();
+            file(name, &tensors)
+        };
+        let kohya = lora(
+            "kohya.safetensors",
+            [
+                pair("lora_unet_mid_to_q", "lora_down", "lora_up"),
+                pair("lora_te_text_model_fc1", "lora_down", "lora_up"),
+            ]
+            .concat(),
+        );
+        let peft = lora(
+            "peft.safetensors",
+            pair("unet.mid.to_q", "lora_A", "lora_B"),
+        );
+        let stray = lora(
+            "stray.safetensors",
+            pair("unet.mid.to_v", "lora_A", "lora_B"),
+        );
+        let other = lora(
+            "other.safetensors",
+            vec![("unet.mid.to_q.hada_w1_a".into(), vec![1], vec![0.0])],
+        );
+
+        for path in [&kohya, &peft] {
+            let mut weights = ShardedSafeTensors::open(&base).unwrap();
+            let prefixes = ["unet", "lora_unet", ""];
+            assert_eq!(weights.add_lora(path, &prefixes, 0.5).unwrap(), 1);
+            // 1 + 0.5 * 2 * up[row] * down[col].
+            let (values, shape) = weights.tensor("mid.to_q.weight").unwrap();
+            assert_eq!(shape, vec![2, 3]);
+            assert_eq!(values, vec![2.0, 3.0, 4.0, 0.0, -1.0, -2.0]);
+            assert_eq!(weights.matrix("mid.to_q.weight").unwrap().data, values);
+            assert_eq!(weights.tensor("mid.to_q.bias").unwrap().0, vec![0.0; 2]);
+        }
+        let mut weights = ShardedSafeTensors::open(&base).unwrap();
+        assert!(weights.add_lora(&stray, &["unet"], 1.0).is_err());
+        assert!(weights.add_lora(&other, &["unet"], 1.0).is_err());
+        assert!(
+            weights
+                .add_lora(&kohya, &["lora_te", "lora_unet"], 1.0)
+                .is_err()
+        );
+        assert_eq!(weights.add_lora(&stray, &["transformer"], 1.0).unwrap(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Writes a file in the format, which is also the shortest description of
     /// it: a length, a JSON header, and the bytes.
