@@ -121,6 +121,52 @@ extern "C" __global__ void col2im_train(float*grad,const float*columns,
   }
   grad[idx]=s;
 }
+// Group norm and SiLU over a device-resident `[batch * pixels, channels]`
+// image batch, for `conv::TrainableGroupNorm` and `conv::silu_device`. One
+// block per (sample, group) for the reductions, which sum in two passes like
+// the host layer does.
+__device__ float img_block_sum(float v){
+  __shared__ float s[32];int l=threadIdx.x&31,w=threadIdx.x>>5;
+  for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o);
+  __syncthreads();if(l==0)s[w]=v;__syncthreads();
+  v=threadIdx.x<(blockDim.x>>5)?s[threadIdx.x]:0.f;
+  if(w==0)for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o);
+  if(threadIdx.x==0)s[0]=v;__syncthreads();float r=s[0];__syncthreads();return r;
+}
+extern "C" __global__ void gn_stats(float*mean,float*inv,const float*x,int pixels,int C,int cg,float eps){
+  int bg=blockIdx.x,G=C/cg,k=bg%G;long long b=bg/G;int n=pixels*cg;
+  const float*xs=x+b*pixels*C+k*cg;
+  float s=0.f;for(int i=threadIdx.x;i<n;i+=blockDim.x)s+=xs[(long long)(i/cg)*C+i%cg];
+  float m=img_block_sum(s)/(float)n;
+  float v=0.f;for(int i=threadIdx.x;i<n;i+=blockDim.x){float d=xs[(long long)(i/cg)*C+i%cg]-m;v+=d*d;}
+  v=img_block_sum(v)/(float)n;
+  if(threadIdx.x==0){mean[bg]=m;inv[bg]=1.f/sqrtf(v+eps);}
+}
+extern "C" __global__ void gn_apply(float*y,float*xhat,const float*x,const float*mean,const float*inv,
+    const float*gamma,const float*beta,int total,int pixels,int C,int cg){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C,bg=(i/C/pixels)*(C/cg)+c/cg;
+  float h=(x[i]-mean[bg])*inv[bg];xhat[i]=h;y[i]=h*gamma[c]+beta[c];
+}
+extern "C" __global__ void gn_bwd_stats(float*m1,float*m2,const float*g,const float*xhat,const float*gamma,
+    int pixels,int C,int cg){
+  int bg=blockIdx.x,G=C/cg,k=bg%G;long long b=bg/G;int n=pixels*cg;
+  long long base=b*pixels*C+k*cg;
+  float a=0.f,z=0.f;
+  for(int i=threadIdx.x;i<n;i+=blockDim.x){long long at=base+(long long)(i/cg)*C+i%cg;
+    float d=g[at]*gamma[k*cg+i%cg];a+=d;z+=d*xhat[at];}
+  a=img_block_sum(a);z=img_block_sum(z);
+  if(threadIdx.x==0){m1[bg]=a/(float)n;m2[bg]=z/(float)n;}
+}
+extern "C" __global__ void gn_bwd_apply(float*dx,const float*g,const float*xhat,const float*inv,
+    const float*m1,const float*m2,const float*gamma,int total,int pixels,int C,int cg){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C,bg=(i/C/pixels)*(C/cg)+c/cg;
+  dx[i]=inv[bg]*(g[i]*gamma[c]-m1[bg]-xhat[i]*m2[bg]);
+}
+extern "C" __global__ void mul_f32(float*out,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]*b[i];}
+extern "C" __global__ void silu_f32(float*y,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];y[i]=v/(1.f+expf(-v));}}
+extern "C" __global__ void silu_bwd_f32(float*dx,const float*g,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i],s=1.f/(1.f+expf(-v));dx[i]=g[i]*s*(1.f+v*(1.f-s));}}
 extern "C" __global__ void scatter_rows_neg(float*grad,const float*upstream,const unsigned int*rows_of,int rows,int width){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*width){int r=i/width,c=i%width;atomicAdd(&grad[rows_of[r]*width+c],-upstream[i]);}}
 
 // The transformer path's fused kernels. Everything a decoder layer does

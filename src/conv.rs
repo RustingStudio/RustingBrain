@@ -47,6 +47,8 @@
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::param::{Linear, Param};
+#[cfg(feature = "cuda")]
+use cudarc::driver::PushKernelArg;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
 
@@ -497,6 +499,15 @@ impl DeviceImageBatch {
 
     pub fn pixels(&self) -> usize {
         self.height * self.width
+    }
+
+    /// Another buffer of this shape.
+    fn with_data(&self, data: cudarc::driver::CudaSlice<f32>) -> Self {
+        Self {
+            data,
+            context: self.context.clone(),
+            ..*self
+        }
     }
 }
 
@@ -1264,6 +1275,212 @@ impl TrainableGroupNorm {
     pub fn params_mut(&mut self) -> Vec<&mut Param> {
         vec![&mut self.gamma, &mut self.beta]
     }
+
+    /// Moves `gamma` and `beta` onto a device for
+    /// [`TrainableGroupNorm::forward_device`].
+    pub fn to_cuda_on(&mut self, device: &crate::param::CudaDevice) -> Result<(), NetworkError> {
+        self.gamma.to_cuda_on(device)?;
+        self.beta.to_cuda_on(device)
+    }
+
+    pub fn to_cpu(&mut self) -> Result<(), NetworkError> {
+        self.gamma.to_cpu()?;
+        self.beta.to_cpu()
+    }
+
+    /// [`TrainableGroupNorm::forward`] for a batch already on the device.
+    #[cfg(feature = "cuda")]
+    pub fn forward_device(
+        &self,
+        input: &DeviceImageBatch,
+    ) -> Result<(DeviceImageBatch, DeviceGroupNormCache), NetworkError> {
+        let channels = self.gamma.value.cols;
+        if input.channels != channels {
+            return Err(NetworkError::InvalidTarget {
+                expected: channels,
+                actual: input.channels,
+            });
+        }
+        let (gamma, beta) = match (&self.gamma.device, &self.beta.device) {
+            (Some(gamma), Some(beta)) => (gamma.value(), beta.value()),
+            _ => {
+                return Err(NetworkError::InvalidConfig(
+                    "forward_device needs gamma and beta on a device".into(),
+                ));
+            }
+        };
+        let context = &input.context;
+        let err = crate::cuda_training::cuda_err;
+        let total = input.data.len();
+        let blocks = input.batch * self.groups;
+        let (mut mean, mut inv_std) = (context.zeros(blocks)?, context.zeros(blocks)?);
+        let (mut output, mut normalized) = (context.zeros(total)?, context.zeros(total)?);
+        let [n, pixels, channels, per_group] =
+            [total, input.pixels(), channels, channels / self.groups].map(|v| v as i32);
+        unsafe {
+            context
+                .stream
+                .launch_builder(&context.image.gn_stats)
+                .arg(&mut mean)
+                .arg(&mut inv_std)
+                .arg(&input.data)
+                .arg(&pixels)
+                .arg(&channels)
+                .arg(&per_group)
+                .arg(&self.eps)
+                .launch(group_blocks(blocks))
+                .map_err(err("group norm statistics kernel"))?;
+            context
+                .stream
+                .launch_builder(&context.image.gn_apply)
+                .arg(&mut output)
+                .arg(&mut normalized)
+                .arg(&input.data)
+                .arg(&mean)
+                .arg(&inv_std)
+                .arg(gamma)
+                .arg(beta)
+                .arg(&n)
+                .arg(&pixels)
+                .arg(&channels)
+                .arg(&per_group)
+                .launch(crate::cuda_training::cfg(total))
+                .map_err(err("group norm kernel"))?;
+        }
+        Ok((
+            input.with_data(output),
+            DeviceGroupNormCache {
+                normalized,
+                inv_std,
+            },
+        ))
+    }
+
+    /// [`TrainableGroupNorm::backward`] on the device: adds to `gamma` and
+    /// `beta`'s device gradients and returns the input's.
+    #[cfg(feature = "cuda")]
+    pub fn backward_device(
+        &mut self,
+        cache: &DeviceGroupNormCache,
+        grad: &DeviceImageBatch,
+    ) -> Result<DeviceImageBatch, NetworkError> {
+        let context = grad.context.clone();
+        let err = crate::cuda_training::cuda_err;
+        let (total, rows) = (grad.data.len(), grad.batch * grad.pixels());
+        let blocks = grad.batch * self.groups;
+        let channels = self.gamma.value.cols;
+        let (Some(gamma), Some(beta)) = (self.gamma.device.as_mut(), self.beta.device.as_mut())
+        else {
+            return Err(NetworkError::InvalidConfig(
+                "backward_device needs gamma and beta on a device".into(),
+            ));
+        };
+        let ones = context.filled(rows, 1.0)?;
+        let mut product = context.zeros(total)?;
+        let (mut first, mut second) = (context.zeros(blocks)?, context.zeros(blocks)?);
+        let mut input_grad = context.zeros(total)?;
+        let [n, pixels, channels, per_group] =
+            [total, grad.pixels(), channels, channels / self.groups].map(|v| v as i32);
+        unsafe {
+            context
+                .stream
+                .launch_builder(&context.image.mul)
+                .arg(&mut product)
+                .arg(&grad.data)
+                .arg(&cache.normalized)
+                .arg(&n)
+                .launch(crate::cuda_training::cfg(total))
+                .map_err(err("multiply kernel"))?;
+            context
+                .stream
+                .launch_builder(&context.image.gn_bwd_stats)
+                .arg(&mut first)
+                .arg(&mut second)
+                .arg(&grad.data)
+                .arg(&cache.normalized)
+                .arg(gamma.value())
+                .arg(&pixels)
+                .arg(&channels)
+                .arg(&per_group)
+                .launch(group_blocks(blocks))
+                .map_err(err("group norm backward statistics kernel"))?;
+            context
+                .stream
+                .launch_builder(&context.image.gn_bwd_apply)
+                .arg(&mut input_grad)
+                .arg(&grad.data)
+                .arg(&cache.normalized)
+                .arg(&cache.inv_std)
+                .arg(&first)
+                .arg(&second)
+                .arg(gamma.value())
+                .arg(&n)
+                .arg(&pixels)
+                .arg(&channels)
+                .arg(&per_group)
+                .launch(crate::cuda_training::cfg(total))
+                .map_err(err("group norm backward kernel"))?;
+        }
+        gamma.accumulate_grad_device(&ones, &product, rows)?;
+        beta.accumulate_grad_device(&ones, &grad.data, rows)?;
+        Ok(grad.with_data(input_grad))
+    }
+}
+
+/// What [`TrainableGroupNorm::backward_device`] needs from the forward pass.
+#[cfg(feature = "cuda")]
+pub struct DeviceGroupNormCache {
+    normalized: cudarc::driver::CudaSlice<f32>,
+    inv_std: cudarc::driver::CudaSlice<f32>,
+}
+
+/// One block per sample and group, for the group norm reductions.
+#[cfg(feature = "cuda")]
+fn group_blocks(blocks: usize) -> cudarc::driver::LaunchConfig {
+    cudarc::driver::LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// SiLU over a device-resident batch. Keep the input: it is what
+/// [`silu_backward_device`] differentiates at.
+#[cfg(feature = "cuda")]
+pub fn silu_device(input: &DeviceImageBatch) -> Result<DeviceImageBatch, NetworkError> {
+    silu_launch(input, None)
+}
+
+/// `grad * silu'(input)`, on the device.
+#[cfg(feature = "cuda")]
+pub fn silu_backward_device(
+    input: &DeviceImageBatch,
+    grad: &DeviceImageBatch,
+) -> Result<DeviceImageBatch, NetworkError> {
+    silu_launch(input, Some(grad))
+}
+
+#[cfg(feature = "cuda")]
+fn silu_launch(
+    input: &DeviceImageBatch,
+    grad: Option<&DeviceImageBatch>,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let context = &input.context;
+    let total = input.data.len();
+    let mut output = context.zeros(total)?;
+    let n = total as i32;
+    let mut launch = match grad {
+        None => context.stream.launch_builder(&context.image.silu),
+        Some(_) => context.stream.launch_builder(&context.image.silu_bwd),
+    };
+    launch.arg(&mut output);
+    if let Some(grad) = grad {
+        launch.arg(&grad.data);
+    }
+    launch.arg(&input.data).arg(&n);
+    unsafe { launch.launch(crate::cuda_training::cfg(total)) }
+        .map_err(crate::cuda_training::cuda_err("SiLU kernel"))?;
+    Ok(input.with_data(output))
 }
 
 /// SiLU over a whole map, the activation every one of these decoders uses.
@@ -1991,6 +2208,86 @@ mod tests {
             );
             close(&device_side.bias.grad.data, &host_side.bias.grad.data, what);
         }
+    }
+
+    /// Group norm then SiLU on the device, forward and back, against the host
+    /// layer and the host SiLU, with nothing crossing the bus in between.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_group_norm_and_silu_match_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let input = noise(2, 16, 17, 12, 1);
+        let grad = noise(2, 16, 17, 12, 2);
+        let mut host = TrainableGroupNorm::new(4, 12, 1e-5).unwrap();
+        host.gamma.value.data = noise(1, 1, 12, 1, 3)
+            .tokens
+            .data
+            .iter()
+            .map(|v| v + 1.2)
+            .collect();
+        host.beta.value.data = noise(1, 1, 12, 1, 4).tokens.data;
+        let mut resident = host.clone();
+        resident.to_cuda_on(&device).unwrap();
+
+        let (normed, cache) = host.forward(&input).unwrap();
+        let mut activated = normed.clone();
+        let mut back = grad.clone();
+        for ((value, grad), pre) in activated
+            .tokens
+            .data
+            .iter_mut()
+            .zip(&mut back.tokens.data)
+            .zip(&normed.tokens.data)
+        {
+            *value = crate::ffn::silu(*pre);
+            *grad *= crate::ffn::silu_derivative(*pre);
+        }
+        let expected_grad = host.backward(&cache, &back);
+
+        let context = device.context();
+        let (on_card, on_card_grad) = (
+            device.upload(&input).unwrap(),
+            device.upload(&grad).unwrap(),
+        );
+        let before = context.transfers();
+        let (normed, cache) = resident.forward_device(&on_card).unwrap();
+        let output = silu_device(&normed).unwrap();
+        let back = silu_backward_device(&normed, &on_card_grad).unwrap();
+        let input_grad = resident.backward_device(&cache, &back).unwrap();
+        assert_eq!(
+            context.transfers(),
+            before,
+            "nothing crosses inside the chain"
+        );
+
+        let close = |a: &[f32], b: &[f32], what: &str| {
+            assert_eq!(a.len(), b.len(), "{what}");
+            for (index, (a, b)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-4 + 1e-4 * b.abs(),
+                    "{what}[{index}]: {a} against {b}"
+                );
+            }
+        };
+        close(
+            &output.download().unwrap().tokens.data,
+            &activated.tokens.data,
+            "output",
+        );
+        close(
+            &input_grad.download().unwrap().tokens.data,
+            &expected_grad.tokens.data,
+            "input grad",
+        );
+        resident.to_cpu().unwrap();
+        close(
+            &resident.gamma.grad.data,
+            &host.gamma.grad.data,
+            "gamma grad",
+        );
+        close(&resident.beta.grad.data, &host.beta.grad.data, "beta grad");
     }
 
     /// The host path is unchanged by a device being present, which is what
