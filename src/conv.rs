@@ -1103,6 +1103,145 @@ pub fn pixel_unshuffle(map: &FeatureMap, factor: usize) -> Result<FeatureMap, Ne
     Ok(output)
 }
 
+/// `n` evenly spaced points from -1 to 1; the middle for one.
+fn unit_coordinates(n: usize) -> Vec<f32> {
+    match n {
+        1 => vec![0.0],
+        _ => (0..n)
+            .map(|i| -1.0 + 2.0 * i as f32 / (n - 1) as f32)
+            .collect(),
+    }
+}
+
+/// What [`spatial_softmax_backward`] needs from the forward pass.
+pub struct SpatialSoftmaxCache {
+    /// The softmax over pixels of each sample's channels, laid out like the
+    /// input.
+    probabilities: ImageBatch,
+    /// The forward output.
+    expected: Matrix,
+}
+
+/// Each channel's softmax over its pixels, reduced to the expected `x` and
+/// `y` with both axes running from -1 to 1: `[batch, 2 * channels]`, every
+/// channel's `x` first, then every channel's `y`. A keypoint layer with no
+/// parameters.
+pub fn spatial_softmax(input: &ImageBatch) -> (Matrix, SpatialSoftmaxCache) {
+    let (channels, pixels, width) = (input.channels(), input.pixels(), input.width);
+    let (xs, ys) = (
+        unit_coordinates(input.width),
+        unit_coordinates(input.height),
+    );
+    let mut probabilities = input.like(channels);
+    let mut expected = Matrix::new(input.batch, 2 * channels);
+    probabilities
+        .tokens
+        .data
+        .par_chunks_mut(pixels * channels)
+        .zip(input.tokens.data.par_chunks(pixels * channels))
+        .zip(expected.data.par_chunks_mut(2 * channels))
+        .for_each(|((probability, logits), expected)| {
+            for channel in 0..channels {
+                let logit = |pixel: usize| logits[pixel * channels + channel];
+                let max = (0..pixels).map(logit).fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for pixel in 0..pixels {
+                    let value = (logit(pixel) - max).exp();
+                    probability[pixel * channels + channel] = value;
+                    sum += value;
+                }
+                let (mut x, mut y) = (0.0, 0.0);
+                for pixel in 0..pixels {
+                    let slot = &mut probability[pixel * channels + channel];
+                    *slot /= sum;
+                    x += *slot * xs[pixel % width];
+                    y += *slot * ys[pixel / width];
+                }
+                (expected[channel], expected[channels + channel]) = (x, y);
+            }
+        });
+    let cache = SpatialSoftmaxCache {
+        probabilities,
+        expected: expected.clone(),
+    };
+    (expected, cache)
+}
+
+/// `dL/d(input)` of [`spatial_softmax`], given `dL/d(output)`.
+pub fn spatial_softmax_backward(cache: &SpatialSoftmaxCache, grad: &Matrix) -> ImageBatch {
+    let probabilities = &cache.probabilities;
+    let (channels, pixels, width) = (
+        probabilities.channels(),
+        probabilities.pixels(),
+        probabilities.width,
+    );
+    let (xs, ys) = (
+        unit_coordinates(probabilities.width),
+        unit_coordinates(probabilities.height),
+    );
+    let mut out = probabilities.like(channels);
+    out.tokens
+        .data
+        .par_chunks_mut(pixels * channels)
+        .zip(probabilities.tokens.data.par_chunks(pixels * channels))
+        .zip(
+            grad.data
+                .par_chunks(2 * channels)
+                .zip(cache.expected.data.par_chunks(2 * channels)),
+        )
+        .for_each(|((out, probability), (grad, expected))| {
+            for pixel in 0..pixels {
+                for channel in 0..channels {
+                    // The softmax Jacobian: `q_i (dL/dq_i - sum_j q_j dL/dq_j)`,
+                    // where `dL/dq_i` is the coordinate times the upstream.
+                    let (gx, gy) = (grad[channel], grad[channels + channel]);
+                    let along = gx * (xs[pixel % width] - expected[channel])
+                        + gy * (ys[pixel / width] - expected[channels + channel]);
+                    let slot = pixel * channels + channel;
+                    out[slot] = probability[slot] * along;
+                }
+            }
+        });
+    out
+}
+
+/// The mean of each channel over its pixels: `[batch, channels]`.
+pub fn global_avg_pool(input: &ImageBatch) -> Matrix {
+    let (channels, pixels) = (input.channels(), input.pixels());
+    let mut out = Matrix::new(input.batch, channels);
+    out.data
+        .par_chunks_mut(channels)
+        .zip(input.tokens.data.par_chunks(pixels * channels))
+        .for_each(|(out, sample)| {
+            for pixel in sample.chunks_exact(channels) {
+                out.iter_mut()
+                    .zip(pixel)
+                    .for_each(|(sum, value)| *sum += value);
+            }
+            out.iter_mut().for_each(|sum| *sum /= pixels as f32);
+        });
+    out
+}
+
+/// `dL/d(input)` of [`global_avg_pool`] over a `height` by `width` input.
+pub fn global_avg_pool_backward(grad: &Matrix, height: usize, width: usize) -> ImageBatch {
+    let (channels, pixels) = (grad.cols, height * width);
+    let mut out = ImageBatch::new(grad.rows, height, width, channels);
+    out.tokens
+        .data
+        .par_chunks_mut(pixels * channels)
+        .zip(grad.data.par_chunks(channels))
+        .for_each(|(out, grad)| {
+            for pixel in out.chunks_exact_mut(channels) {
+                pixel
+                    .iter_mut()
+                    .zip(grad)
+                    .for_each(|(slot, value)| *slot = value / pixels as f32);
+            }
+        });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,6 +1310,65 @@ mod tests {
         Ok(curve)
     }
 
+    /// `sum(f(input) * weights)`'s gradient by central differences, against
+    /// `analytic`, relative to the largest analytic value.
+    fn pooled_gap(
+        f: impl Fn(&ImageBatch) -> Matrix,
+        input: &ImageBatch,
+        weights: &[f32],
+        analytic: &[f32],
+    ) -> f32 {
+        let loss = |input: &ImageBatch| -> f32 {
+            f(input).data.iter().zip(weights).map(|(a, b)| a * b).sum()
+        };
+        let scale = analytic.iter().fold(0f32, |m, g| m.max(g.abs()));
+        let mut moved = input.clone();
+        let mut worst = 0f32;
+        for (index, analytic) in analytic.iter().enumerate() {
+            let h = 1e-2;
+            moved.tokens.data[index] += h;
+            let up = loss(&moved);
+            moved.tokens.data[index] -= 2.0 * h;
+            let down = loss(&moved);
+            moved.tokens.data[index] += h;
+            worst = worst.max(((up - down) / (2.0 * h) - analytic).abs() / scale);
+        }
+        worst
+    }
+
+    #[test]
+    fn spatial_softmax_matches_finite_differences_and_finds_a_peak() {
+        let mut input = noise(2, 3, 4, 5, 3);
+        input.tokens.data.iter_mut().for_each(|v| *v *= 3.0);
+        let weights = noise(1, 1, 20, 1, 4).tokens.data;
+        let (_, cache) = spatial_softmax(&input);
+        let grad = spatial_softmax_backward(&cache, &Matrix::from_vec(2, 10, weights.clone()));
+        let gap = pooled_gap(
+            |x| spatial_softmax(x).0,
+            &input,
+            &weights,
+            &grad.tokens.data,
+        );
+        assert!(gap < 1e-2, "{gap}");
+
+        // A spike at sample 0, row 0, column 3, channel 2 is the top right.
+        let mut spike = ImageBatch::new(2, 3, 4, 5);
+        spike.tokens.data[3 * 5 + 2] = 50.0;
+        let (expected, _) = spatial_softmax(&spike);
+        assert!((expected.data[2] - 1.0).abs() < 1e-4);
+        assert!((expected.data[5 + 2] + 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn global_avg_pool_matches_finite_differences() {
+        let input = noise(2, 3, 4, 5, 5);
+        let weights = noise(1, 1, 10, 1, 6).tokens.data;
+        let grad = global_avg_pool_backward(&Matrix::from_vec(2, 5, weights.clone()), 3, 4);
+        let gap = pooled_gap(global_avg_pool, &input, &weights, &grad.tokens.data);
+        assert!(gap < 1e-2, "{gap}");
+        assert!((global_avg_pool(&ImageBatch::new(1, 2, 2, 3)).data[0]).abs() < 1e-9);
+    }
+
     #[test]
     fn a_convolution_without_bias_adds_and_trains_none() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(12);
@@ -1189,7 +1387,10 @@ mod tests {
         let (_, grad) = mse(&without, &target);
         biased.backward(&with_cache, &grad).unwrap();
         plain.backward(&cache, &grad).unwrap();
-        assert_eq!(plain.weight.weight.grad.data, biased.weight.weight.grad.data);
+        assert_eq!(
+            plain.weight.weight.grad.data,
+            biased.weight.weight.grad.data
+        );
         assert!(plain.bias.grad.data.iter().all(|g| *g == 0.0));
         assert!(plain.bias.value.data.iter().all(|b| *b == 0.0));
     }
