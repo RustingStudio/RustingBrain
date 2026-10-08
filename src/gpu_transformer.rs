@@ -51,6 +51,10 @@ pub(crate) struct ImageTrainKernels {
     pub(crate) mul: CudaFunction,
     pub(crate) silu: CudaFunction,
     pub(crate) silu_bwd: CudaFunction,
+    pub(crate) ssm_fwd: CudaFunction,
+    pub(crate) ssm_bwd: CudaFunction,
+    pub(crate) gap_fwd: CudaFunction,
+    pub(crate) gap_bwd: CudaFunction,
 }
 
 /// One device, its stream, cuBLAS handle and the kernels the transformer uses.
@@ -190,6 +194,10 @@ impl GpuContext {
                 mul: get("mul_f32")?,
                 silu: get("silu_f32")?,
                 silu_bwd: get("silu_bwd_f32")?,
+                ssm_fwd: get("ssm_fwd")?,
+                ssm_bwd: get("ssm_bwd")?,
+                gap_fwd: get("gap_fwd")?,
+                gap_bwd: get("gap_bwd")?,
             },
             transfers: std::sync::atomic::AtomicUsize::new(0),
             model: crate::gpu_model::ModelKernels::load(&module)?,
