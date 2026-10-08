@@ -499,8 +499,10 @@ impl ConvGeometry {
 pub struct TrainableConv2d {
     /// `[out_channels, in_channels * kernel * kernel]`.
     pub weight: Linear,
-    /// `[1, out_channels]`.
+    /// `[1, out_channels]`. Zero and unused after
+    /// [`TrainableConv2d::without_bias`].
     pub bias: Param,
+    has_bias: bool,
     in_channels: usize,
     kernel: usize,
     stride: usize,
@@ -578,6 +580,7 @@ impl TrainableConv2d {
                 lora: None,
             },
             bias: Param::zeros(1, out_channels),
+            has_bias: true,
             in_channels,
             kernel,
             stride,
@@ -598,6 +601,19 @@ impl TrainableConv2d {
         let mut conv = Self::new(in_channels, out_channels, kernel, 1, rng)?;
         conv.weight.weight = Param::zeros(out_channels, in_channels * kernel * kernel);
         Ok(conv)
+    }
+
+    /// Drops the bias: the forward pass adds none, the backward pass gathers
+    /// none, and [`TrainableConv2d::params_mut`] leaves it out. For a
+    /// convolution before a norm, whose mean subtraction would cancel it.
+    pub fn without_bias(mut self) -> Self {
+        self.has_bias = false;
+        self.bias = Param::zeros(1, self.bias.value.cols);
+        self
+    }
+
+    pub fn has_bias(&self) -> bool {
+        self.has_bias
     }
 
     pub fn out_channels(&self) -> usize {
@@ -814,6 +830,9 @@ impl TrainableConv2d {
     }
 
     fn add_bias(&self, tokens: &mut Matrix) {
+        if !self.has_bias {
+            return;
+        }
         let bias = &self.bias.value.data;
         tokens.data.par_chunks_mut(tokens.cols).for_each(|row| {
             for (value, bias) in row.iter_mut().zip(bias) {
@@ -827,7 +846,7 @@ impl TrainableConv2d {
     /// Always on the host: it is one pass over a buffer that is already here,
     /// and the bias is one value per output channel rather than one per weight.
     fn accumulate_bias_grad(&mut self, grad_output: &Matrix) {
-        if self.bias.is_frozen() {
+        if self.bias.is_frozen() || !self.has_bias {
             return;
         }
         for row in 0..grad_output.rows {
@@ -839,7 +858,9 @@ impl TrainableConv2d {
 
     pub fn params_mut(&mut self) -> Vec<&mut Param> {
         let mut params = self.weight.params_mut();
-        params.push(&mut self.bias);
+        if self.has_bias {
+            params.push(&mut self.bias);
+        }
         params
     }
 
@@ -1148,6 +1169,29 @@ mod tests {
             }
         }
         Ok(curve)
+    }
+
+    #[test]
+    fn a_convolution_without_bias_adds_and_trains_none() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12);
+        let mut biased = TrainableConv2d::new(3, 4, 3, 2, &mut rng).unwrap();
+        biased.bias.value.data.fill(1.0);
+        let mut plain = biased.clone().without_bias();
+        assert!(!plain.has_bias());
+        assert_eq!(plain.params_mut().len() + 1, biased.params_mut().len());
+
+        let (input, target) = (noise(2, 5, 6, 3, 1), noise(2, 3, 3, 4, 2));
+        let (with, with_cache) = biased.forward(&input).unwrap();
+        let (without, cache) = plain.forward(&input).unwrap();
+        for (with, without) in with.tokens.data.iter().zip(&without.tokens.data) {
+            assert!((with - without - 1.0).abs() < 1e-6);
+        }
+        let (_, grad) = mse(&without, &target);
+        biased.backward(&with_cache, &grad).unwrap();
+        plain.backward(&cache, &grad).unwrap();
+        assert_eq!(plain.weight.weight.grad.data, biased.weight.weight.grad.data);
+        assert!(plain.bias.grad.data.iter().all(|g| *g == 0.0));
+        assert!(plain.bias.value.data.iter().all(|b| *b == 0.0));
     }
 
     #[test]
