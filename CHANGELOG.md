@@ -97,6 +97,9 @@
   Inpainting UNets (nine input channels) load and read the mask and the
   masked picture as diffusers feeds them, matching diffusers within 6e-7;
   other models are steered through `Inpaint`.
+- `ControlNet` loads diffusers ControlNets for UNet models, and
+  `Unet::set_controls` lets one or more of them steer the layout from an edge,
+  depth or pose picture; matches diffusers within 9e-7.
 - `TransformerLm::log_probabilities` gives each token's log-probability
   after the ones before it, for scoring and ranking texts.
 - `TransformerLm::generate_beam` runs beam search, with an optional end

@@ -1819,16 +1819,17 @@ impl DeviceUnet {
     /// already on the device, so the caller is left on the CPU path intact.
     pub fn upload(gpu: &Arc<ImageGpu>, model: &Unet) -> Result<Self, NetworkError> {
         Ok(Self {
-            conv_in: upload_conv(gpu, &model.conv_in)?,
+            conv_in: upload_conv(gpu, &model.encoder.conv_in)?,
             down: model
+                .encoder
                 .down
                 .iter()
                 .map(|block| upload_block(gpu, block))
                 .collect::<Result<_, _>>()?,
             middle: (
-                upload_resnet(gpu, &model.middle.0)?,
-                upload_transformer(gpu, &model.middle.1)?,
-                upload_resnet(gpu, &model.middle.2)?,
+                upload_resnet(gpu, &model.encoder.middle.0)?,
+                upload_transformer(gpu, &model.encoder.middle.1)?,
+                upload_resnet(gpu, &model.encoder.middle.2)?,
             ),
             up: model
                 .up

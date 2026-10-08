@@ -21,10 +21,11 @@
 //! scaled the way the training distribution expects.
 //!
 //! An inpainting checkpoint reads the mask and the masked picture's latent as
-//! extra input channels; [`Unet::set_inpaint`] hands them over.
+//! extra input channels; [`Unet::set_inpaint`] hands them over. A
+//! [`ControlNet`] is a second copy of the way down that reads another picture
+//! and corrects every rung; [`Unet::set_controls`] attaches them.
 //!
-//! NOTE: inference only, no ControlNet. That is more blocks of the same
-//! kind rather than a different model.
+//! NOTE: inference only.
 
 use crate::clip::{Norm, norm};
 use crate::conv::{Conv2d, Dense, FeatureMap, GroupNorm, silu, upsample_nearest};
@@ -314,9 +315,10 @@ pub(crate) struct Block {
     pub(crate) resampler: Option<Conv2d>,
 }
 
-/// A UNet denoiser.
-pub struct Unet {
-    config: UnetConfig,
+/// The half of a UNet that climbs down: the input convolution, the noise
+/// level's embedding, the down blocks and the middle. A ControlNet is a
+/// trained copy of it.
+pub(crate) struct Encoder {
     pub(crate) conv_in: Conv2d,
     time_in: Dense,
     time_out: Dense,
@@ -326,6 +328,239 @@ pub struct Unet {
     add_out: Option<Dense>,
     pub(crate) down: Vec<Block>,
     pub(crate) middle: (Resnet, Transformer, Resnet),
+}
+
+impl Encoder {
+    fn read(
+        file: &mut ShardedSafeTensors,
+        config: &UnetConfig,
+        precision: Precision,
+    ) -> Result<Self, NetworkError> {
+        let down = (0..config.block_channels.len())
+            .map(|level| {
+                read_block(
+                    file,
+                    &format!("down_blocks.{level}"),
+                    config,
+                    level,
+                    precision,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let deepest = config.heads.len() - 1;
+        Ok(Self {
+            conv_in: read_conv(file, "conv_in", 1, 1)?,
+            time_in: dense(file, "time_embedding.linear_1", precision)?,
+            time_out: dense(file, "time_embedding.linear_2", precision)?,
+            add_in: dense(file, "add_embedding.linear_1", precision).ok(),
+            add_out: dense(file, "add_embedding.linear_2", precision).ok(),
+            middle: (
+                read_resnet(file, "mid_block.resnets.0", config, precision)?,
+                read_transformer(file, "mid_block.attentions.0", config, deepest, precision)?,
+                read_resnet(file, "mid_block.resnets.1", config, precision)?,
+            ),
+            down,
+        })
+    }
+
+    /// The vector a step index, and for XL the pooled prompt and the size,
+    /// become.
+    fn time(
+        &self,
+        config: &UnetConfig,
+        step: f32,
+        latent: &FeatureMap,
+        pooled: &[f32],
+    ) -> Result<Vec<f32>, NetworkError> {
+        let embedded = sinusoid(step, config.freq_dim);
+        let hidden = self.time_in.apply(&embedded)?;
+        let activated: Vec<f32> = hidden
+            .iter()
+            .map(|value| crate::ffn::silu(*value))
+            .collect();
+        let mut time = self.time_out.apply(&activated)?;
+
+        // Stable Diffusion XL adds the pooled prompt and the crop it is meant
+        // to be producing to the same vector.
+        if let (Some(input), Some(output)) = (&self.add_in, &self.add_out) {
+            let mut added = pooled.to_vec();
+            let upscale = 8;
+            let (height, width) = (
+                (latent.height * upscale) as f32,
+                (latent.width * upscale) as f32,
+            );
+            for value in [height, width, 0.0, 0.0, height, width] {
+                added.extend(sinusoid(value, config.addition_time_dim));
+            }
+            let hidden = input.apply(&added)?;
+            let activated: Vec<f32> = hidden
+                .iter()
+                .map(|value| crate::ffn::silu(*value))
+                .collect();
+            for (time, added) in time.iter_mut().zip(output.apply(&activated)?) {
+                *time += added;
+            }
+        }
+        Ok(time)
+    }
+
+    /// The down blocks and the middle, from what `conv_in` produced. Every
+    /// rung keeps what it produced for the matching rung on the way up.
+    fn run(
+        &self,
+        eps: f32,
+        mut sample: FeatureMap,
+        time: &[f32],
+        text: &Matrix,
+    ) -> Result<(FeatureMap, Vec<FeatureMap>), NetworkError> {
+        let mut skips = vec![sample.clone()];
+        for block in &self.down {
+            for (index, resnet) in block.resnets.iter().enumerate() {
+                sample = resnet.forward(&sample, time)?;
+                if let Some(transformer) = block.attentions.get(index) {
+                    sample = transformer.forward(&sample, text, eps)?;
+                }
+                skips.push(sample.clone());
+            }
+            if let Some(resampler) = &block.resampler {
+                sample = resampler.forward(&sample)?;
+                skips.push(sample.clone());
+            }
+        }
+        sample = self.middle.0.forward(&sample, time)?;
+        sample = self.middle.1.forward(&sample, text, eps)?;
+        sample = self.middle.2.forward(&sample, time)?;
+        Ok((sample, skips))
+    }
+}
+
+/// A ControlNet: a trained copy of a UNet's way down that reads a second
+/// picture (edges, depth, a pose) and hands the UNet one correction for every
+/// rung, which is how the picture steers the layout.
+pub struct ControlNet {
+    config: UnetConfig,
+    encoder: Encoder,
+    /// The small convolution stack that brings the picture down to the
+    /// latent's size, from `controlnet_cond_embedding`.
+    hint: Vec<Conv2d>,
+    /// The one-by-one convolutions every rung's correction leaves through,
+    /// which start at zero in training.
+    zero: Vec<Conv2d>,
+    zero_middle: Conv2d,
+}
+
+impl ControlNet {
+    /// Reads a ControlNet out of a diffusers checkpoint; its `config.json`
+    /// reads with [`UnetConfig::from_file`].
+    pub fn load(
+        path: impl AsRef<std::path::Path>,
+        config: UnetConfig,
+        precision: Precision,
+    ) -> Result<Self, NetworkError> {
+        let file = &mut ShardedSafeTensors::open(path)?;
+        let base = "controlnet_cond_embedding";
+        let mut hint = vec![read_conv(file, &format!("{base}.conv_in"), 1, 1)?];
+        // The stack alternates a convolution that keeps the size with one
+        // that halves it.
+        while let Ok(conv) = read_conv(
+            file,
+            &format!("{base}.blocks.{}", hint.len() - 1),
+            1 + (hint.len() - 1) % 2,
+            1,
+        ) {
+            hint.push(conv);
+        }
+        hint.push(read_conv(file, &format!("{base}.conv_out"), 1, 1)?);
+        let mut zero = Vec::new();
+        while let Ok(conv) = read_conv(
+            file,
+            &format!("controlnet_down_blocks.{}", zero.len()),
+            1,
+            0,
+        ) {
+            zero.push(conv);
+        }
+        Ok(Self {
+            encoder: Encoder::read(file, &config, precision)?,
+            zero_middle: read_conv(file, "controlnet_mid_block", 1, 0)?,
+            config,
+            hint,
+            zero,
+        })
+    }
+
+    /// The corrections for every skip and for the middle, scaled.
+    fn residuals(
+        &self,
+        latent: &FeatureMap,
+        step: f32,
+        control: &Control,
+        conditioning: &Conditioning,
+    ) -> Result<(Vec<FeatureMap>, FeatureMap), NetworkError> {
+        let time = self
+            .encoder
+            .time(&self.config, step, latent, &conditioning.pooled)?;
+        let mut hint = control.image.clone();
+        for (index, conv) in self.hint.iter().enumerate() {
+            hint = conv.forward(&hint)?;
+            if index + 1 < self.hint.len() {
+                silu(&mut hint);
+            }
+        }
+        let mut sample = self.encoder.conv_in.forward(latent)?;
+        if (hint.channels, hint.height, hint.width)
+            != (sample.channels, sample.height, sample.width)
+        {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a ControlNet picture of {}x{} does not match a {}x{} latent; it is the size of \
+                 the image being made",
+                control.image.height, control.image.width, latent.height, latent.width
+            )));
+        }
+        add_maps(&mut sample, &hint)?;
+        let (middle, skips) =
+            self.encoder
+                .run(self.config.eps, sample, &time, &conditioning.text)?;
+        if skips.len() != self.zero.len() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "the ControlNet has {} rungs and {} corrections for them",
+                skips.len(),
+                self.zero.len()
+            )));
+        }
+        let scale = |map: FeatureMap| {
+            let mut map = map;
+            map.data
+                .iter_mut()
+                .for_each(|value| *value *= control.scale);
+            map
+        };
+        let skips = skips
+            .iter()
+            .zip(&self.zero)
+            .map(|(skip, conv)| conv.forward(skip).map(scale))
+            .collect::<Result<_, _>>()?;
+        Ok((skips, scale(self.zero_middle.forward(&middle)?)))
+    }
+}
+
+/// A ControlNet with the picture it is to follow and how hard. Through an
+/// [`crate::ImagePipeline`], hand it to the UNet in `pipeline.denoiser` and
+/// generate as usual.
+#[derive(Clone)]
+pub struct Control {
+    pub net: std::sync::Arc<ControlNet>,
+    /// RGB in `[0, 1]`, at the size of the image being made: eight times the
+    /// latent's.
+    pub image: FeatureMap,
+    /// Diffusers' `controlnet_conditioning_scale`; 1.0 is what it was trained at.
+    pub scale: f32,
+}
+
+/// A UNet denoiser.
+pub struct Unet {
+    config: UnetConfig,
+    pub(crate) encoder: Encoder,
     pub(crate) up: Vec<Block>,
     pub(crate) norm_out: GroupNorm,
     pub(crate) conv_out: Conv2d,
@@ -336,6 +571,7 @@ pub struct Unet {
     unconditional: Option<Conditioning>,
     /// What an inpainting checkpoint reads after the noisy latent.
     inpaint: Option<FeatureMap>,
+    controls: Vec<Control>,
     /// The same weights on a CUDA device, when one was attached. The host copy
     /// stays where it is, which is what keeps the CPU path a fallback rather
     /// than a rewrite.
@@ -351,7 +587,7 @@ impl Unet {
 
     /// The width of the pooled prompt vector this model takes, if it takes one.
     pub fn pooled_dim(&self) -> Option<usize> {
-        self.add_in.as_ref().and(self.config.pooled_dim)
+        self.encoder.add_in.as_ref().and(self.config.pooled_dim)
     }
 
     /// Reads a UNet out of a checkpoint.
@@ -380,17 +616,6 @@ impl Unet {
         config: UnetConfig,
         precision: Precision,
     ) -> Result<Self, NetworkError> {
-        let down = (0..config.block_channels.len())
-            .map(|level| {
-                read_block(
-                    file,
-                    &format!("down_blocks.{level}"),
-                    &config,
-                    level,
-                    precision,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         // Climbing up reverses the ladder, so the head counts reverse with it.
         let up = (0..config.block_channels.len())
             .map(|level| {
@@ -404,29 +629,19 @@ impl Unet {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let deepest = config.heads.len() - 1;
 
         Ok(Self {
-            conv_in: read_conv(file, "conv_in", 1, 1)?,
-            time_in: dense(file, "time_embedding.linear_1", precision)?,
-            time_out: dense(file, "time_embedding.linear_2", precision)?,
-            add_in: dense(file, "add_embedding.linear_1", precision).ok(),
-            add_out: dense(file, "add_embedding.linear_2", precision).ok(),
-            middle: (
-                read_resnet(file, "mid_block.resnets.0", &config, precision)?,
-                read_transformer(file, "mid_block.attentions.0", &config, deepest, precision)?,
-                read_resnet(file, "mid_block.resnets.1", &config, precision)?,
-            ),
+            encoder: Encoder::read(file, &config, precision)?,
             norm_out: read_group_norm(file, "conv_norm_out", config.norm_groups, config.eps)?,
             conv_out: read_conv(file, "conv_out", 1, 1)?,
             alphas: alphas_cumprod(0.00085, 0.012, 1000),
             conditioning: None,
             unconditional: None,
             inpaint: None,
+            controls: Vec::new(),
             #[cfg(feature = "cuda")]
             device: None,
             config,
-            down,
             up,
         })
     }
@@ -466,6 +681,12 @@ impl Unet {
         self.inpaint = extra;
     }
 
+    /// Hands the model the ControlNets to follow, whose corrections add up.
+    /// An empty list takes them away.
+    pub fn set_controls(&mut self, controls: Vec<Control>) {
+        self.controls = controls;
+    }
+
     /// One pass: a noisy latent and a noise level in, the noise the model
     /// believes is in there out. An inpainting checkpoint's input carries its
     /// extra channels after the latent's, and only the latent's are scaled.
@@ -485,65 +706,44 @@ impl Unet {
             .for_each(|value| *value *= scale);
 
         let step = self.timestep(sigma);
-        let embedded = sinusoid(step, self.config.freq_dim);
-        let hidden = self.time_in.apply(&embedded)?;
-        let activated: Vec<f32> = hidden
-            .iter()
-            .map(|value| crate::ffn::silu(*value))
-            .collect();
-        let mut time = self.time_out.apply(&activated)?;
+        let time = self
+            .encoder
+            .time(&self.config, step, latent, &conditioning.pooled)?;
 
-        // Stable Diffusion XL adds the pooled prompt and the crop it is meant
-        // to be producing to the same vector.
-        if let (Some(input), Some(output)) = (&self.add_in, &self.add_out) {
-            let mut added = conditioning.pooled.clone();
-            let upscale = 8;
-            let (height, width) = (
-                (latent.height * upscale) as f32,
-                (latent.width * upscale) as f32,
-            );
-            for value in [height, width, 0.0, 0.0, height, width] {
-                added.extend(sinusoid(value, self.config.addition_time_dim));
-            }
-            let hidden = input.apply(&added)?;
-            let activated: Vec<f32> = hidden
-                .iter()
-                .map(|value| crate::ffn::silu(*value))
-                .collect();
-            for (time, added) in time.iter_mut().zip(output.apply(&activated)?) {
-                *time += added;
-            }
-        }
-
+        // NOTE: a ControlNet runs on the CPU, so a model with one falls
+        // back there whole; give the device a ControlNet when that is slow.
         #[cfg(feature = "cuda")]
-        if let Some(device) = &self.device {
+        if let Some(device) = &self.device
+            && self.controls.is_empty()
+        {
             return device.forward(&scaled, &time, &conditioning.text);
         }
 
-        let mut sample = self.conv_in.forward(&scaled)?;
-        // Every rung on the way down keeps what it produced for the matching
-        // rung on the way up.
-        let mut skips = vec![sample.clone()];
-        for block in &self.down {
-            for (index, resnet) in block.resnets.iter().enumerate() {
-                sample = resnet.forward(&sample, &time)?;
-                if let Some(transformer) = block.attentions.get(index) {
-                    sample = transformer.forward(&sample, &conditioning.text, self.config.eps)?;
+        let sample = self.encoder.conv_in.forward(&scaled)?;
+        let (mut sample, mut skips) =
+            self.encoder
+                .run(self.config.eps, sample, &time, &conditioning.text)?;
+        if !self.controls.is_empty() {
+            let noisy = FeatureMap {
+                channels: self.config.out_channels.min(latent.channels),
+                height: latent.height,
+                width: latent.width,
+                data: scaled.data[..noisy].to_vec(),
+            };
+            for control in &self.controls {
+                let (corrections, middle) =
+                    control.net.residuals(&noisy, step, control, conditioning)?;
+                if corrections.len() != skips.len() {
+                    return Err(NetworkError::InvalidConfig(
+                        "the ControlNet does not have the UNet's rungs".into(),
+                    ));
                 }
-                skips.push(sample.clone());
-            }
-            if let Some(resampler) = &block.resampler {
-                sample = resampler.forward(&sample)?;
-                skips.push(sample.clone());
+                for (skip, correction) in skips.iter_mut().zip(&corrections) {
+                    add_maps(skip, correction)?;
+                }
+                add_maps(&mut sample, &middle)?;
             }
         }
-
-        sample = self.middle.0.forward(&sample, &time)?;
-        sample = self
-            .middle
-            .1
-            .forward(&sample, &conditioning.text, self.config.eps)?;
-        sample = self.middle.2.forward(&sample, &time)?;
 
         for block in &self.up {
             for (index, resnet) in block.resnets.iter().enumerate() {
@@ -668,6 +868,24 @@ pub(crate) fn concatenate(first: &FeatureMap, second: &FeatureMap) -> FeatureMap
     output.data[..split].copy_from_slice(&first.data);
     output.data[split..].copy_from_slice(&second.data);
     output
+}
+
+fn add_maps(target: &mut FeatureMap, source: &FeatureMap) -> Result<(), NetworkError> {
+    if target.data.len() != source.data.len() {
+        return Err(NetworkError::InvalidConfig(format!(
+            "a ControlNet correction of {}x{}x{} does not fit a {}x{}x{} rung",
+            source.channels,
+            source.height,
+            source.width,
+            target.channels,
+            target.height,
+            target.width
+        )));
+    }
+    for (target, source) in target.data.iter_mut().zip(&source.data) {
+        *target += source;
+    }
+    Ok(())
 }
 
 fn add(target: &mut Matrix, source: &Matrix) {
@@ -981,6 +1199,10 @@ pub(crate) mod tests {
 
     /// Writes a checkpoint shaped the way diffusers writes one.
     pub(crate) fn checkpoint(config: &UnetConfig, path: &std::path::Path) {
+        crate::safetensors::write_checkpoint(path, &unet_writer(config).tensors);
+    }
+
+    fn unet_writer(config: &UnetConfig) -> Writer {
         let mut writer = Writer {
             tensors: BTreeMap::new(),
         };
@@ -1049,7 +1271,57 @@ pub(crate) mod tests {
 
         writer.norm("conv_norm_out", config.block_channels[0]);
         writer.conv("conv_out", config.out_channels, config.block_channels[0], 3);
-        crate::safetensors::write_checkpoint(path, &writer.tensors);
+        writer
+    }
+
+    #[test]
+    fn a_controlnet_steers_the_unet_only_as_hard_as_its_scale() {
+        let config = tiny();
+        let mut model = load(
+            &config,
+            "rusting_brain_controlnet_unet.safetensors",
+            Precision::F32,
+        );
+        // The UNet's own weights with a ControlNet's extras on top, which
+        // the loader reads the way down out of and ignores the way up of.
+        let mut writer = unet_writer(&config);
+        let base = "controlnet_cond_embedding";
+        writer.conv(&format!("{base}.conv_in"), 4, 3, 3);
+        for index in 0..6 {
+            writer.conv(&format!("{base}.blocks.{index}"), 4, 4, 3);
+        }
+        writer.conv(&format!("{base}.conv_out"), 8, 4, 3);
+        for (index, width) in [8, 8, 8, 8, 16, 16].into_iter().enumerate() {
+            writer.conv(&format!("controlnet_down_blocks.{index}"), width, width, 1);
+        }
+        writer.conv("controlnet_mid_block", 16, 16, 1);
+        let path = std::env::temp_dir().join("rusting_brain_controlnet.safetensors");
+        crate::safetensors::write_checkpoint(&path, &writer.tensors);
+        let net =
+            std::sync::Arc::new(ControlNet::load(&path, config.clone(), Precision::F32).unwrap());
+        std::fs::remove_file(&path).ok();
+
+        let mut picture = FeatureMap::new(3, 64, 64);
+        for (index, value) in picture.data.iter_mut().enumerate() {
+            *value = (index as f32 * 0.37).sin().abs();
+        }
+        let conditioning = conditioning(&config, 8, 1.0);
+        let run = |model: &mut Unet, scale: f32, image: &FeatureMap| {
+            model.set_controls(vec![Control {
+                net: net.clone(),
+                image: image.clone(),
+                scale,
+            }]);
+            model.forward(&latent(&config, 8), 1.0, &conditioning)
+        };
+        let plain = model
+            .forward(&latent(&config, 8), 1.0, &conditioning)
+            .unwrap();
+        assert_eq!(run(&mut model, 0.0, &picture).unwrap().data, plain.data);
+        let steered = run(&mut model, 1.0, &picture).unwrap();
+        assert!(steered.data.iter().all(|value| value.is_finite()));
+        assert_ne!(steered.data, plain.data);
+        assert!(run(&mut model, 1.0, &FeatureMap::new(3, 32, 32)).is_err());
     }
 
     fn conditioning(config: &UnetConfig, size: usize, seed: f32) -> Conditioning {
@@ -1149,6 +1421,63 @@ pub(crate) mod tests {
         let out = model
             .denoise(&latent.to_tokens(), r["sigma"].as_f64().unwrap() as f32)
             .unwrap();
+        let out = FeatureMap::from_tokens(&out, 8, 8).unwrap();
+        let reference = v("out");
+        let worst = out
+            .data
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let mean = reference.iter().map(|x| x.abs()).sum::<f32>() / reference.len() as f32;
+        assert!(worst < 1e-3, "worst {worst} against a mean of {mean}");
+    }
+
+    /// Needs `RB_CONTROLNET_REF` from `scripts/controlnet_reference.py`.
+    #[test]
+    #[ignore]
+    fn a_controlnet_matches_diffusers() {
+        let dir = std::path::PathBuf::from(std::env::var("RB_CONTROLNET_REF").unwrap());
+        let read = |name: &str| {
+            let config = UnetConfig::from_file(dir.join(name).join("config.json")).unwrap();
+            (
+                config,
+                dir.join(name).join("diffusion_pytorch_model.safetensors"),
+            )
+        };
+        let (config, path) = read("unet");
+        let mut model = Unet::load(path, config).unwrap();
+        let (config, path) = read("controlnet");
+        let net = std::sync::Arc::new(ControlNet::load(path, config, Precision::F32).unwrap());
+        let r: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("ref.json")).unwrap()).unwrap();
+        let v = |k: &str| -> Vec<f32> {
+            r[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let latent = FeatureMap::from_vec(4, 8, 8, v("latent")).unwrap();
+        let sigma = r["sigma"].as_f64().unwrap() as f32;
+        model.set_conditioning(Conditioning {
+            text: Matrix::from_vec(5, 16, v("text")),
+            pooled: vec![],
+            height: 8,
+            width: 8,
+            guidance: 0.0,
+        });
+        let control = |image: FeatureMap| Control {
+            net: net.clone(),
+            image,
+            scale: r["scale"].as_f64().unwrap() as f32,
+        };
+        model.set_controls(vec![control(FeatureMap::new(3, 32, 32))]);
+        assert!(model.denoise(&latent.to_tokens(), sigma).is_err());
+        model.set_controls(vec![control(
+            FeatureMap::from_vec(3, 64, 64, v("image")).unwrap(),
+        )]);
+        let out = model.denoise(&latent.to_tokens(), sigma).unwrap();
         let out = FeatureMap::from_tokens(&out, 8, 8).unwrap();
         let reference = v("out");
         let worst = out
