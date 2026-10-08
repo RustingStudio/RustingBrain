@@ -438,15 +438,15 @@ impl Encoder {
 /// picture (edges, depth, a pose) and hands the UNet one correction for every
 /// rung, which is how the picture steers the layout.
 pub struct ControlNet {
-    config: UnetConfig,
-    encoder: Encoder,
+    pub(crate) config: UnetConfig,
+    pub(crate) encoder: Encoder,
     /// The small convolution stack that brings the picture down to the
     /// latent's size, from `controlnet_cond_embedding`.
-    hint: Vec<Conv2d>,
+    pub(crate) hint: Vec<Conv2d>,
     /// The one-by-one convolutions every rung's correction leaves through,
     /// which start at zero in training.
-    zero: Vec<Conv2d>,
-    zero_middle: Conv2d,
+    pub(crate) zero: Vec<Conv2d>,
+    pub(crate) zero_middle: Conv2d,
 }
 
 impl ControlNet {
@@ -577,6 +577,10 @@ pub struct Unet {
     /// than a rewrite.
     #[cfg(feature = "cuda")]
     device: Option<crate::cuda_image::DeviceUnet>,
+    /// The controls on the same device, in the same order, once every one
+    /// fitted there.
+    #[cfg(feature = "cuda")]
+    device_controls: Vec<crate::cuda_image::DeviceControlNet>,
 }
 
 impl Unet {
@@ -641,6 +645,8 @@ impl Unet {
             controls: Vec::new(),
             #[cfg(feature = "cuda")]
             device: None,
+            #[cfg(feature = "cuda")]
+            device_controls: Vec::new(),
             config,
             up,
         })
@@ -683,8 +689,28 @@ impl Unet {
 
     /// Hands the model the ControlNets to follow, whose corrections add up.
     /// An empty list takes them away.
+    ///
+    /// On a device, each is uploaded there; one that does not fit leaves them
+    /// all on the CPU, and the UNet with them.
     pub fn set_controls(&mut self, controls: Vec<Control>) {
         self.controls = controls;
+        #[cfg(feature = "cuda")]
+        self.upload_controls();
+    }
+
+    // NOTE: each call uploads its ControlNets again; share them between
+    // controls with the same net if switching pictures gets slow.
+    #[cfg(feature = "cuda")]
+    fn upload_controls(&mut self) {
+        self.device_controls.clear();
+        if let Some(device) = &self.device {
+            self.device_controls = self
+                .controls
+                .iter()
+                .map(|control| crate::cuda_image::DeviceControlNet::upload(device.gpu(), control))
+                .collect::<Result<_, _>>()
+                .unwrap_or_default();
+        }
     }
 
     /// One pass: a noisy latent and a noise level in, the noise the model
@@ -710,13 +736,31 @@ impl Unet {
             .encoder
             .time(&self.config, step, latent, &conditioning.pooled)?;
 
-        // NOTE: a ControlNet runs on the CPU, so a model with one falls
-        // back there whole; give the device a ControlNet when that is slow.
+        let noisy = FeatureMap {
+            channels: self.config.out_channels.min(latent.channels),
+            height: latent.height,
+            width: latent.width,
+            data: scaled.data[..noisy].to_vec(),
+        };
         #[cfg(feature = "cuda")]
         if let Some(device) = &self.device
-            && self.controls.is_empty()
+            && self.device_controls.len() == self.controls.len()
         {
-            return device.forward(&scaled, &time, &conditioning.text);
+            let controls = self
+                .controls
+                .iter()
+                .zip(&self.device_controls)
+                .map(|(control, net)| {
+                    let time = control.net.encoder.time(
+                        &control.net.config,
+                        step,
+                        latent,
+                        &conditioning.pooled,
+                    )?;
+                    Ok((net, time, &control.image))
+                })
+                .collect::<Result<Vec<_>, NetworkError>>()?;
+            return device.forward(&scaled, &time, &conditioning.text, &noisy, &controls);
         }
 
         let sample = self.encoder.conv_in.forward(&scaled)?;
@@ -724,12 +768,6 @@ impl Unet {
             self.encoder
                 .run(self.config.eps, sample, &time, &conditioning.text)?;
         if !self.controls.is_empty() {
-            let noisy = FeatureMap {
-                channels: self.config.out_channels.min(latent.channels),
-                height: latent.height,
-                width: latent.width,
-                data: scaled.data[..noisy].to_vec(),
-            };
             for control in &self.controls {
                 let (corrections, middle) =
                     control.net.residuals(&noisy, step, control, conditioning)?;
@@ -778,6 +816,7 @@ impl Unet {
         gpu: std::sync::Arc<crate::cuda_image::ImageGpu>,
     ) -> Result<(), NetworkError> {
         self.device = Some(crate::cuda_image::DeviceUnet::upload(&gpu, self)?);
+        self.upload_controls();
         Ok(())
     }
 
@@ -1274,17 +1313,11 @@ pub(crate) mod tests {
         writer
     }
 
-    #[test]
-    fn a_controlnet_steers_the_unet_only_as_hard_as_its_scale() {
-        let config = tiny();
-        let mut model = load(
-            &config,
-            "rusting_brain_controlnet_unet.safetensors",
-            Precision::F32,
-        );
-        // The UNet's own weights with a ControlNet's extras on top, which
-        // the loader reads the way down out of and ignores the way up of.
-        let mut writer = unet_writer(&config);
+    /// A ControlNet for [`tiny`]: the UNet's own weights with a ControlNet's
+    /// extras on top, which the loader reads the way down out of and ignores
+    /// the way up of.
+    pub(crate) fn controlnet(config: &UnetConfig) -> std::sync::Arc<ControlNet> {
+        let mut writer = unet_writer(config);
         let base = "controlnet_cond_embedding";
         writer.conv(&format!("{base}.conv_in"), 4, 3, 3);
         for index in 0..6 {
@@ -1300,6 +1333,18 @@ pub(crate) mod tests {
         let net =
             std::sync::Arc::new(ControlNet::load(&path, config.clone(), Precision::F32).unwrap());
         std::fs::remove_file(&path).ok();
+        net
+    }
+
+    #[test]
+    fn a_controlnet_steers_the_unet_only_as_hard_as_its_scale() {
+        let config = tiny();
+        let mut model = load(
+            &config,
+            "rusting_brain_controlnet_unet.safetensors",
+            Precision::F32,
+        );
+        let net = controlnet(&config);
 
         let mut picture = FeatureMap::new(3, 64, 64);
         for (index, value) in picture.data.iter_mut().enumerate() {
