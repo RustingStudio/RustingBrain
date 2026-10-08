@@ -55,6 +55,16 @@ pub(crate) struct ImageTrainKernels {
     pub(crate) ssm_bwd: CudaFunction,
     pub(crate) gap_fwd: CudaFunction,
     pub(crate) gap_bwd: CudaFunction,
+    pub(crate) bn_center_sq: CudaFunction,
+    pub(crate) bn_finish: CudaFunction,
+    pub(crate) bn_apply: CudaFunction,
+    pub(crate) bn_bwd_apply: CudaFunction,
+    pub(crate) upsample: CudaFunction,
+    pub(crate) upsample_bwd: CudaFunction,
+    pub(crate) copy_channels: CudaFunction,
+    pub(crate) maxpool: CudaFunction,
+    pub(crate) maxpool_bwd: CudaFunction,
+    pub(crate) add: CudaFunction,
 }
 
 /// One device, its stream, cuBLAS handle and the kernels the transformer uses.
@@ -198,6 +208,16 @@ impl GpuContext {
                 ssm_bwd: get("ssm_bwd")?,
                 gap_fwd: get("gap_fwd")?,
                 gap_bwd: get("gap_bwd")?,
+                bn_center_sq: get("bn_center_sq")?,
+                bn_finish: get("bn_finish")?,
+                bn_apply: get("bn_apply")?,
+                bn_bwd_apply: get("bn_bwd_apply")?,
+                upsample: get("upsample_nearest")?,
+                upsample_bwd: get("upsample_nearest_bwd")?,
+                copy_channels: get("copy_channels")?,
+                maxpool: get("maxpool_same")?,
+                maxpool_bwd: get("maxpool_same_bwd")?,
+                add: get("add_f32")?,
             },
             transfers: std::sync::atomic::AtomicUsize::new(0),
             model: crate::gpu_model::ModelKernels::load(&module)?,
@@ -816,6 +836,12 @@ impl DeviceParam {
     pub(crate) fn value(&self) -> &CudaSlice<f32> {
         debug_assert!(!self.is_quantized(), "a quantized weight has no FP32 value");
         &self.value
+    }
+
+    /// The weight, for a kernel that updates it in place, such as a batch
+    /// norm's running statistics.
+    pub(crate) fn value_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.value
     }
 
     /// `-dL/dw`, see the module documentation. A caller accumulating into this
