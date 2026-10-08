@@ -1454,6 +1454,7 @@ pub(crate) mod tests {
         for (lora, prefixes) in [
             ("diffusers_lora.safetensors", ["unet", ""]),
             ("kohya_lora.safetensors", ["lora_unet", ""]),
+            ("kohya_sdxl_lora.safetensors", ["lora_unet", ""]),
         ] {
             let mut file = open().unwrap();
             // Twelve of each attention projection and resnet, six of the rest.
