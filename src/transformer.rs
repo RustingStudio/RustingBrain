@@ -943,6 +943,86 @@ impl TransformerLm {
         Ok(generated)
     }
 
+    /// Beam search: keeps the `beams` most probable continuations of
+    /// `prompt` at each step and returns the best one found.
+    ///
+    /// A continuation that samples `end` stops there, `end` included, and
+    /// gives up its beam, so the search narrows as continuations finish. The
+    /// best is the one with the highest mean log-probability per token, so a
+    /// short finished continuation does not win only for summing fewer
+    /// terms. With `beams` at 1 this is greedy decoding.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::TransformerLm;
+    /// # let model = TransformerLm::load_bin("model.rbw")?;
+    /// # let end_of_text = 0;
+    /// let continuation = model.generate_beam(&[1, 2, 3], 64, 4, Some(end_of_text))?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn generate_beam(
+        &self,
+        prompt: &[u32],
+        max_new_tokens: usize,
+        beams: usize,
+        end: Option<u32>,
+    ) -> Result<Vec<u32>, NetworkError> {
+        if prompt.is_empty() || beams == 0 {
+            return Err(NetworkError::InvalidConfig(
+                "beam search needs a prompt token and at least one beam".into(),
+            ));
+        }
+        let mut root = self.decoder();
+        root.feed(prompt)?;
+        // Each live beam: its session, its continuation, and the summed
+        // log-probability of that continuation.
+        let mut live = vec![(root, Vec::new(), 0.0f32)];
+        let mut finished: Vec<(Vec<u32>, f32)> = Vec::new();
+        for _ in 0..max_new_tokens {
+            let mut candidates = Vec::new();
+            for (parent, (decoder, _, score)) in live.iter_mut().enumerate() {
+                let logits = decoder.logits()?;
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let log_sum = max + logits.iter().map(|l| (l - max).exp()).sum::<f32>().ln();
+                candidates.extend(
+                    logits
+                        .iter()
+                        .enumerate()
+                        .map(|(id, l)| (parent, id as u32, *score + l - log_sum)),
+                );
+            }
+            candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
+            let mut next = Vec::with_capacity(beams);
+            for &(parent, id, score) in candidates.iter().take(beams) {
+                let mut continuation = live[parent].1.clone();
+                continuation.push(id);
+                if Some(id) == end {
+                    finished.push((continuation, score));
+                    continue;
+                }
+                // NOTE: a fork copies the whole cache every step; reuse
+                // the parent for its last child if beam search gets hot.
+                let mut decoder = live[parent].0.fork()?;
+                decoder.push(id)?;
+                next.push((decoder, continuation, score));
+            }
+            live = next;
+            if live.is_empty() {
+                break;
+            }
+        }
+        finished.extend(
+            live.into_iter()
+                .map(|(_, continuation, score)| (continuation, score)),
+        );
+        let mean =
+            |(continuation, score): &(Vec<u32>, f32)| score / continuation.len().max(1) as f32;
+        Ok(finished
+            .into_iter()
+            .max_by(|a, b| mean(a).total_cmp(&mean(b)))
+            .map(|(continuation, _)| continuation)
+            .unwrap_or_default())
+    }
+
     /// [`generate`](TransformerLm::generate) with a greedy sampler, drafted
     /// by a smaller model `draft` that shares this model's vocabulary.
     ///
@@ -3461,6 +3541,41 @@ mod tests {
         let model = tiny().build().unwrap();
         assert_batch_matches_single(&model, &model, 1e-5);
         assert!(model.batch_decoder(0).is_err());
+    }
+
+    #[test]
+    fn beam_search_finds_the_most_probable_continuation() {
+        let model = tiny().build().unwrap();
+        let prompt = [3, 8, 1];
+        let greedy = model.generate(&prompt, 5, &mut Sampler::greedy()).unwrap();
+        assert_eq!(model.generate_beam(&prompt, 5, 1, None).unwrap(), greedy);
+        assert_eq!(
+            model.generate_beam(&prompt, 5, 1, Some(greedy[1])).unwrap(),
+            greedy[..2]
+        );
+
+        // With a beam per vocabulary id, two steps search every pair.
+        let log_probabilities = |history: &[u32]| {
+            let mut decoder = model.decoder();
+            decoder.feed(history).unwrap();
+            let logits = decoder.logits().unwrap().to_vec();
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_sum = max + logits.iter().map(|l| (l - max).exp()).sum::<f32>().ln();
+            logits.into_iter().map(|l| l - log_sum).collect::<Vec<_>>()
+        };
+        let first = log_probabilities(&prompt);
+        let mut best = (f32::NEG_INFINITY, vec![]);
+        for a in 0..24u32 {
+            let second = log_probabilities(&[3, 8, 1, a]);
+            for b in 0..24u32 {
+                let score = first[a as usize] + second[b as usize];
+                if score > best.0 {
+                    best = (score, vec![a, b]);
+                }
+            }
+        }
+        assert_eq!(model.generate_beam(&prompt, 2, 24, None).unwrap(), best.1);
+        assert!(model.generate_beam(&prompt, 2, 0, None).is_err());
     }
 
     /// Forks a session mid-generation, continues the original and the fork
