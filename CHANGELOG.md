@@ -96,6 +96,7 @@
 
 ### Added
 
+- `conv::spatial_softmax` and `conv::global_avg_pool` over an `ImageBatch`, each with its backward (`spatial_softmax_backward`, `global_avg_pool_backward`) (asked by RustingChop and RustingCS2).
 - `TrainableConv2d::without_bias()`: a convolution that adds, gathers and trains no bias, for one before a norm (asked by RustingChop). A builder rather than `bias: Option<Param>`, so the public `bias` field keeps its type.
 - `losses::bce_with_logits`, `losses::soft_cross_entropy` and `losses::huber` take logits (or raw predictions) and optional per-sample weights, reduce as `sum(w * loss) / batch`, and return the gradient with the loss (asked by RustingChop and RustingCS2).
 - `ffn::silu_derivative` is public, for hand-written backward passes through SiLU (asked by RustingChop and RustingCS2).
