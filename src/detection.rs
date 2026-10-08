@@ -310,6 +310,489 @@ pub fn mosaic(tiles: [&DetectionImage; 4], size: usize, centre: [usize; 2]) -> D
     out
 }
 
+/// Centre, width and height to corners.
+pub fn xywh_to_xyxy([x, y, w, h]: [f32; 4]) -> [f32; 4] {
+    [x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0]
+}
+
+/// Corners to centre, width and height.
+pub fn xyxy_to_xywh([x1, y1, x2, y2]: [f32; 4]) -> [f32; 4] {
+    [(x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1]
+}
+
+/// Which overlap [`box_iou`] measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overlap {
+    Iou,
+    Giou,
+    Ciou,
+}
+
+/// The overlap of `pred` with `target`, both `[x1, y1, x2, y2]`, as
+/// ultralytics' `bbox_iou(xywh=False)` computes it, with its gradient with
+/// respect to `pred`. CIoU's aspect-ratio weight is held constant in the
+/// gradient, as it is there.
+pub fn box_iou(pred: [f32; 4], target: [f32; 4], kind: Overlap) -> (f32, [f32; 4]) {
+    const EPS: f32 = 1e-7;
+    let [x1, y1, x2, y2] = pred;
+    let [u1, v1, u2, v2] = target;
+    let (w1, h1, w2, h2) = (x2 - x1, y2 - y1 + EPS, u2 - u1, v2 - v1 + EPS);
+    let (iw, ih) = (x2.min(u2) - x1.max(u1), y2.min(v2) - y1.max(v1));
+    let inter = iw.max(0.0) * ih.max(0.0);
+    let union = w1 * h1 + w2 * h2 - inter + EPS;
+    let iou = inter / union;
+    let (cw, ch) = (x2.max(u2) - x1.min(u1), y2.max(v2) - y1.min(v1));
+    // Gradients of the value with respect to each intermediate.
+    let mut d_union = -inter / (union * union);
+    let (mut d_cw, mut d_ch, mut d_w1, mut d_h1) = (0.0, 0.0, 0.0, 0.0);
+    let mut grad = [0.0; 4];
+    let value = match kind {
+        Overlap::Iou => iou,
+        Overlap::Giou => {
+            let area = cw * ch + EPS;
+            d_union += 1.0 / area;
+            let d_area = -union / (area * area);
+            (d_cw, d_ch) = (d_area * ch, d_area * cw);
+            iou - (area - union) / area
+        }
+        Overlap::Ciou => {
+            let c2 = cw * cw + ch * ch + EPS;
+            let (dx, dy) = (u1 + u2 - x1 - x2, v1 + v2 - y1 - y2);
+            let rho2 = (dx * dx + dy * dy) / 4.0;
+            let k = 4.0 / (std::f32::consts::PI * std::f32::consts::PI);
+            let angle = (w2 / h2).atan() - (w1 / h1).atan();
+            let v = k * angle * angle;
+            let alpha = v / (1.0 - iou + v + EPS);
+            let d_c2 = rho2 / (c2 * c2);
+            (d_cw, d_ch) = (d_c2 * 2.0 * cw, d_c2 * 2.0 * ch);
+            // rho2 falls as the centres meet: d rho2 / d x1 = -dx / 2.
+            let d_rho2 = -1.0 / c2;
+            grad[0] -= d_rho2 * dx / 2.0;
+            grad[2] -= d_rho2 * dx / 2.0;
+            grad[1] -= d_rho2 * dy / 2.0;
+            grad[3] -= d_rho2 * dy / 2.0;
+            let d_atan = alpha * k * 2.0 * angle;
+            let norm = w1 * w1 + h1 * h1;
+            d_w1 += d_atan * h1 / norm;
+            d_h1 -= d_atan * w1 / norm;
+            iou - (rho2 / c2 + v * alpha)
+        }
+    };
+    let d_inter = 1.0 / union - d_union;
+    d_w1 += d_union * h1;
+    d_h1 += d_union * w1;
+    if iw >= 0.0 && ih >= 0.0 {
+        let (d_iw, d_ih) = (d_inter * ih.max(0.0), d_inter * iw.max(0.0));
+        if x2 < u2 {
+            grad[2] += d_iw;
+        }
+        if x1 > u1 {
+            grad[0] -= d_iw;
+        }
+        if y2 < v2 {
+            grad[3] += d_ih;
+        }
+        if y1 > v1 {
+            grad[1] -= d_ih;
+        }
+    }
+    if x2 > u2 {
+        grad[2] += d_cw;
+    }
+    if x1 < u1 {
+        grad[0] -= d_cw;
+    }
+    if y2 > v2 {
+        grad[3] += d_ch;
+    }
+    if y1 < v1 {
+        grad[1] -= d_ch;
+    }
+    grad[2] += d_w1;
+    grad[0] -= d_w1;
+    grad[3] += d_h1;
+    grad[1] -= d_h1;
+    (value, grad)
+}
+
+/// ultralytics' distribution focal loss for one side of a box: the cross
+/// entropy of `logits` (one per bin) against the two bins either side of
+/// `target`, each weighted by how close the target is to it. Returns the loss
+/// and its gradient with respect to the logits.
+pub fn distribution_focal_loss(logits: &[f32], target: f32) -> (f32, Vec<f32>) {
+    let target = target.clamp(0.0, logits.len() as f32 - 1.01);
+    let left = target as usize;
+    let (left_weight, right_weight) = (left as f32 + 1.0 - target, target - left as f32);
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
+    let log_p = |i: usize| logits[i] - max - sum.ln();
+    let loss = -(log_p(left) * left_weight + log_p(left + 1) * right_weight);
+    let mut grad: Vec<f32> = logits.iter().map(|&l| (l - max).exp() / sum).collect();
+    grad[left] -= left_weight;
+    grad[left + 1] -= right_weight;
+    (loss, grad)
+}
+
+/// The centre of every grid cell of each `(height, width)` feature map in
+/// pixels, row by row, with the stride of its map: ultralytics'
+/// `make_anchors` multiplied out by the stride.
+pub fn make_anchors(maps: &[(usize, usize)], strides: &[f32]) -> (Vec<[f32; 2]>, Vec<f32>) {
+    let mut points = Vec::new();
+    let mut point_strides = Vec::new();
+    for (&(height, width), &stride) in maps.iter().zip(strides) {
+        for y in 0..height {
+            for x in 0..width {
+                points.push([(x as f32 + 0.5) * stride, (y as f32 + 0.5) * stride]);
+                point_strides.push(stride);
+            }
+        }
+    }
+    (points, point_strides)
+}
+
+/// The box `[left, top, right, bottom]` distances from `point` describe.
+pub fn ltrb_to_box([px, py]: [f32; 2], [l, t, r, b]: [f32; 4]) -> [f32; 4] {
+    [px - l, py - t, px + r, py + b]
+}
+
+/// The distances from `point` to the sides of `xyxy`, clamped to
+/// `0..max - 0.01` as the distribution focal loss's target.
+pub fn box_to_ltrb([px, py]: [f32; 2], [x1, y1, x2, y2]: [f32; 4], max: f32) -> [f32; 4] {
+    [px - x1, py - y1, x2 - px, y2 - py].map(|d| d.clamp(0.0, max - 0.01))
+}
+
+/// ultralytics' task-aligned assigner, which picks the anchors each labelled
+/// box trains and the soft class targets they train towards.
+#[derive(Clone, Debug)]
+pub struct TaskAlignedAssigner {
+    /// Candidates per labelled box.
+    pub topk: usize,
+    /// Exponent of the class score in the alignment metric.
+    pub alpha: f32,
+    /// Exponent of the CIoU in the alignment metric.
+    pub beta: f32,
+    /// Labelled boxes narrower or shorter than this take anchors as if they
+    /// were this wide or tall.
+    pub min_side: f32,
+}
+
+/// What [`TaskAlignedAssigner::assign`] gives each anchor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Assignment {
+    pub foreground: Vec<bool>,
+    /// The labelled box each anchor trains towards; 0 for background.
+    pub gt_index: Vec<usize>,
+    pub boxes: Vec<[f32; 4]>,
+    /// Soft class targets, anchors by classes, zero for background.
+    pub scores: Vec<f32>,
+}
+
+impl TaskAlignedAssigner {
+    /// YOLOv8 and YOLO11's settings for the given strides.
+    pub fn yolo(strides: &[f32]) -> Self {
+        Self {
+            topk: 10,
+            alpha: 0.5,
+            beta: 6.0,
+            min_side: strides[strides.len().min(2) - 1],
+        }
+    }
+
+    /// Assigns one image's anchors. `scores` are the predicted class
+    /// probabilities, anchors by `num_classes`; `pred_boxes`, `points` and
+    /// `gt_boxes` are in pixels.
+    pub fn assign(
+        &self,
+        scores: &[f32],
+        num_classes: usize,
+        pred_boxes: &[[f32; 4]],
+        points: &[[f32; 2]],
+        gt_classes: &[usize],
+        gt_boxes: &[[f32; 4]],
+    ) -> Assignment {
+        const EPS: f32 = 1e-9;
+        let anchors = points.len();
+        let mut assignment = Assignment {
+            foreground: vec![false; anchors],
+            gt_index: vec![0; anchors],
+            boxes: vec![[0.0; 4]; anchors],
+            scores: vec![0.0; anchors * num_classes],
+        };
+        if gt_boxes.is_empty() {
+            return assignment;
+        }
+        let gts = gt_boxes.len();
+        let mut overlaps = vec![0.0f32; gts * anchors];
+        let mut metric = vec![0.0f32; gts * anchors];
+        let mut positive = vec![false; gts * anchors];
+        for (g, (&gt, &class)) in gt_boxes.iter().zip(gt_classes).enumerate() {
+            let [cx, cy, w, h] = xyxy_to_xywh(gt);
+            let [x1, y1, x2, y2] =
+                xywh_to_xyxy([cx, cy, w.max(self.min_side), h.max(self.min_side)]);
+            let inside: Vec<bool> = points
+                .iter()
+                .map(|&[px, py]| px - x1 > EPS && py - y1 > EPS && x2 - px > EPS && y2 - py > EPS)
+                .collect();
+            let row = g * anchors..(g + 1) * anchors;
+            for a in (0..anchors).filter(|&a| inside[a]) {
+                let overlap = box_iou(gt, pred_boxes[a], Overlap::Ciou).0.max(0.0);
+                overlaps[row.start + a] = overlap;
+                metric[row.start + a] =
+                    scores[a * num_classes + class].powf(self.alpha) * overlap.powf(self.beta);
+            }
+            // The top candidates by metric, ties to the lower anchor, kept
+            // only where the anchor lies inside the box.
+            let mut order: Vec<usize> = (0..anchors).collect();
+            order.sort_by(|&a, &b| metric[row.start + b].total_cmp(&metric[row.start + a]));
+            for &a in order.iter().take(self.topk).filter(|&&a| inside[a]) {
+                positive[row.start + a] = true;
+            }
+        }
+        for a in 0..anchors {
+            let claims = (0..gts).filter(|&g| positive[g * anchors + a]).count();
+            if claims > 1 {
+                // The labelled box it overlaps most wins it.
+                let best = (0..gts).fold(0, |best, g| {
+                    match overlaps[g * anchors + a] > overlaps[best * anchors + a] {
+                        true => g,
+                        false => best,
+                    }
+                });
+                (0..gts).for_each(|g| positive[g * anchors + a] = g == best);
+            }
+            if let Some(g) = (0..gts).find(|&g| positive[g * anchors + a]) {
+                assignment.foreground[a] = true;
+                assignment.gt_index[a] = g;
+            }
+        }
+        // Scale each box's metrics so its best anchor scores its best CIoU.
+        let mut norm = vec![0.0f32; anchors];
+        for g in 0..gts {
+            let row = g * anchors..(g + 1) * anchors;
+            let kept = |values: &[f32]| {
+                values[row.clone()]
+                    .iter()
+                    .zip(&positive[row.clone()])
+                    .map(|(&v, &p)| if p { v } else { 0.0 })
+                    .fold(0.0f32, f32::max)
+            };
+            let (best_metric, best_overlap) = (kept(&metric), kept(&overlaps));
+            for a in (0..anchors).filter(|&a| positive[row.start + a]) {
+                norm[a] = norm[a].max(metric[row.start + a] * best_overlap / (best_metric + EPS));
+            }
+        }
+        for a in (0..anchors).filter(|&a| assignment.foreground[a]) {
+            let g = assignment.gt_index[a];
+            assignment.boxes[a] = gt_boxes[g];
+            assignment.scores[a * num_classes + gt_classes[g]] = norm[a];
+        }
+        // ultralytics hands background anchors the first box too.
+        for a in (0..anchors).filter(|&a| !assignment.foreground[a]) {
+            assignment.boxes[a] = gt_boxes[0];
+        }
+        assignment
+    }
+}
+
+/// One kept detection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Detection {
+    pub xyxy: [f32; 4],
+    pub score: f32,
+    pub class: usize,
+}
+
+/// ultralytics' `non_max_suppression` for one image with one label per box:
+/// each `xywh` box takes its best class of `num_classes` scores if that is
+/// over `conf`, then from the highest score down a box is dropped when it
+/// overlaps a kept box of its class by more than `iou`. At most `max_det`,
+/// highest score first.
+pub fn non_max_suppression(
+    xywh: &[[f32; 4]],
+    scores: &[f32],
+    num_classes: usize,
+    conf: f32,
+    iou: f32,
+    max_det: usize,
+) -> Vec<Detection> {
+    let mut candidates: Vec<Detection> = xywh
+        .iter()
+        .zip(scores.chunks_exact(num_classes))
+        .filter_map(|(&b, row)| {
+            let class =
+                (0..num_classes).fold(0, |best, c| if row[c] > row[best] { c } else { best });
+            (row[class] > conf).then(|| Detection {
+                xyxy: xywh_to_xyxy(b),
+                score: row[class],
+                class,
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    // Classes are kept apart by moving each one's boxes 7680 pixels along
+    // both axes, as ultralytics does; the rounding that adds is kept too.
+    let shifted = |d: &Detection| d.xyxy.map(|v| v + d.class as f32 * 7680.0);
+    let area = |[x1, y1, x2, y2]: [f32; 4]| (x2 - x1) * (y2 - y1);
+    let mut kept: Vec<Detection> = Vec::new();
+    for candidate in candidates {
+        let b = shifted(&candidate);
+        let overlaps = kept.iter().any(|k| {
+            let a = shifted(k);
+            let inter = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0)
+                * (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+            inter / (area(a) + area(b) - inter) > iou
+        });
+        if !overlaps {
+            kept.push(candidate);
+            if kept.len() == max_det {
+                break;
+            }
+        }
+    }
+    kept
+}
+
+/// Which detections are true positives at each of the ten IoU thresholds
+/// 0.5, 0.55, ..., 0.95, matched as ultralytics' validator matches them.
+fn match_detections(detections: &[Detection], labels: &[(usize, [f32; 4])]) -> Vec<[bool; 10]> {
+    let mut correct = vec![[false; 10]; detections.len()];
+    // IoU with the class mismatches zeroed, labels by detections.
+    let area = |[x1, y1, x2, y2]: [f32; 4]| (x2 - x1) * (y2 - y1);
+    let iou: Vec<Vec<f32>> = labels
+        .iter()
+        .map(|&(class, a)| {
+            detections
+                .iter()
+                .map(|d| {
+                    let b = d.xyxy;
+                    let inter = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0)
+                        * (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+                    let iou = inter / (area(a) + area(b) - inter + 1e-7);
+                    if d.class == class { iou } else { 0.0 }
+                })
+                .collect()
+        })
+        .collect();
+    for (t, threshold) in iou_thresholds().into_iter().enumerate() {
+        let mut matches: Vec<(usize, usize, f32)> = (0..labels.len())
+            .flat_map(|l| (0..detections.len()).map(move |d| (l, d)))
+            .filter(|&(l, d)| iou[l][d] >= threshold)
+            .map(|(l, d)| (l, d, iou[l][d]))
+            .collect();
+        matches.sort_by(|a, b| b.2.total_cmp(&a.2));
+        // Each detection's best match, in detection order; then each label's
+        // first, in that order, which is the lowest detection index.
+        let mut by_detection: Vec<(usize, usize, f32)> = Vec::new();
+        for m in matches {
+            if !by_detection.iter().any(|k| k.1 == m.1) {
+                by_detection.push(m);
+            }
+        }
+        by_detection.sort_by_key(|m| m.1);
+        let mut seen_labels = Vec::new();
+        for (l, d, _) in by_detection {
+            if !seen_labels.contains(&l) {
+                seen_labels.push(l);
+                correct[d][t] = true;
+            }
+        }
+    }
+    correct
+}
+
+/// `torch.linspace(0.5, 0.95, 10)` in single precision.
+fn iou_thresholds() -> [f32; 10] {
+    let step = (0.95f32 - 0.5) / 9.0;
+    std::array::from_fn(|i| match i < 5 {
+        true => 0.5 + i as f32 * step,
+        false => 0.95 - (9 - i) as f32 * step,
+    })
+}
+
+/// COCO's 101-point interpolated average precision of one precision-recall
+/// curve, as ultralytics' `compute_ap`.
+fn average_precision(recall: &[f64], precision: &[f64]) -> f64 {
+    let mut mrec = vec![0.0];
+    mrec.extend_from_slice(recall);
+    mrec.extend([recall.last().copied().unwrap_or(1.0), 1.0]);
+    let mut mpre = vec![1.0];
+    mpre.extend_from_slice(precision);
+    mpre.extend([0.0, 0.0]);
+    for i in (0..mpre.len() - 1).rev() {
+        mpre[i] = mpre[i].max(mpre[i + 1]);
+    }
+    // numpy's interp: the last point at or below x, joined to the next.
+    let interp = |x: f64| {
+        let j = mrec.partition_point(|&r| r <= x).saturating_sub(1);
+        match j + 1 >= mrec.len() || x == mrec[mrec.len() - 1] {
+            true => mpre[mrec.len() - 1],
+            false => mpre[j] + (mpre[j + 1] - mpre[j]) / (mrec[j + 1] - mrec[j]) * (x - mrec[j]),
+        }
+    };
+    let xs: Vec<f64> = (0..=100)
+        .map(|i| if i == 100 { 1.0 } else { i as f64 * 0.01 })
+        .collect();
+    let ys: Vec<f64> = xs.iter().map(|&x| interp(x)).collect();
+    (0..100)
+        .map(|i| (xs[i + 1] - xs[i]) * (ys[i] + ys[i + 1]) / 2.0)
+        .sum()
+}
+
+/// One image's detections and its labelled `(class, xyxy)` boxes.
+pub type LabelledDetections = (Vec<Detection>, Vec<(usize, [f32; 4])>);
+
+/// mAP50 and mAP50-95 as ultralytics' validator reports them, over images
+/// given as their detections and their labelled `(class, xyxy)` boxes.
+/// Classes without a label are left out of the mean; with no labels at all
+/// both are zero.
+pub fn mean_average_precision(images: &[LabelledDetections]) -> [f32; 2] {
+    let mut rows: Vec<(f32, usize, [bool; 10])> = Vec::new();
+    let mut label_classes: Vec<usize> = Vec::new();
+    for (detections, labels) in images {
+        let correct = match labels.is_empty() {
+            true => vec![[false; 10]; detections.len()],
+            false => match_detections(detections, labels),
+        };
+        rows.extend(
+            detections
+                .iter()
+                .zip(correct)
+                .map(|(d, c)| (d.score, d.class, c)),
+        );
+        label_classes.extend(labels.iter().map(|l| l.0));
+    }
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut classes = label_classes.clone();
+    classes.sort_unstable();
+    classes.dedup();
+    if classes.is_empty() {
+        return [0.0, 0.0];
+    }
+    let mut sums = [0.0f64; 2];
+    for &class in &classes {
+        let labelled = label_classes.iter().filter(|&&c| c == class).count() as f64;
+        let hits: Vec<&[bool; 10]> = rows.iter().filter(|r| r.1 == class).map(|r| &r.2).collect();
+        if hits.is_empty() {
+            continue;
+        }
+        for t in 0..10 {
+            let (mut tp, mut recall, mut precision) = (0.0, Vec::new(), Vec::new());
+            for (i, hit) in hits.iter().enumerate() {
+                tp += hit[t] as u8 as f64;
+                recall.push(tp / (labelled + 1e-16));
+                precision.push(tp / (i + 1) as f64);
+            }
+            let ap = average_precision(&recall, &precision);
+            sums[1] += ap;
+            if t == 0 {
+                sums[0] += ap;
+            }
+        }
+    }
+    let n = classes.len() as f64;
+    [(sums[0] / n) as f32, (sums[1] / (10.0 * n)) as f32]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +1013,175 @@ mod tests {
                 "{got:?} against {e:?}"
             );
         }
+    }
+
+    fn load_ops() -> Option<serde_json::Value> {
+        let fixture = Path::new("/home/vasylt/cs2/fixtures/k13b_ops.json");
+        let Ok(text) = std::fs::read_to_string(fixture) else {
+            eprintln!("skipped: no {}", fixture.display());
+            return None;
+        };
+        Some(serde_json::from_str(&text).unwrap())
+    }
+
+    fn get<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> T {
+        serde_json::from_value(value.clone()).unwrap()
+    }
+
+    #[test]
+    fn overlap_gradients_match_finite_differences() {
+        let pairs = [
+            ([10.0, 12.0, 50.0, 70.0], [20.0, 5.0, 60.0, 55.0]),
+            ([0.0, 0.0, 30.0, 10.0], [40.0, 20.0, 70.0, 90.0]),
+            ([15.0, 15.0, 35.0, 45.0], [10.0, 10.0, 40.0, 50.0]),
+        ];
+        // CIoU's gradient holds its aspect weight constant, so only the
+        // ultralytics fixture checks it.
+        for kind in [Overlap::Iou, Overlap::Giou] {
+            for (pred, target) in pairs {
+                let (_, grad) = box_iou(pred, target, kind);
+                for i in 0..4 {
+                    let (mut up, mut down) = (pred, pred);
+                    up[i] += 0.01;
+                    down[i] -= 0.01;
+                    let numeric =
+                        (box_iou(up, target, kind).0 - box_iou(down, target, kind).0) / 0.02;
+                    assert!(
+                        (numeric - grad[i]).abs() < 2e-4,
+                        "{kind:?} side {i}: {numeric} vs {}",
+                        grad[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Against ultralytics 8.4.174, exported by
+    /// `/home/vasylt/cs2/fixtures/export_k13b_ops.py`.
+    #[test]
+    fn detection_ops_match_ultralytics() {
+        let Some(data) = load_ops() else { return };
+
+        let (preds, targets): (Vec<[f32; 4]>, Vec<[f32; 4]>) =
+            (get(&data["iou"]["pred"]), get(&data["iou"]["target"]));
+        let mut worst = [0.0f32; 2];
+        for (kind, key) in [
+            (Overlap::Iou, "iou"),
+            (Overlap::Giou, "giou"),
+            (Overlap::Ciou, "ciou"),
+        ] {
+            let values: Vec<f32> = get(&data["iou"][key]["value"]);
+            let grads: Vec<[f32; 4]> = get(&data["iou"][key]["grad"]);
+            for i in 0..preds.len() {
+                let (value, grad) = box_iou(preds[i], targets[i], kind);
+                worst[0] = worst[0].max((value - values[i]).abs());
+                for j in 0..4 {
+                    worst[1] = worst[1].max((grad[j] - grads[i][j]).abs());
+                }
+            }
+        }
+        assert!(
+            worst[0] < 1e-5 && worst[1] < 1e-5,
+            "overlap worst value {} grad {}",
+            worst[0],
+            worst[1]
+        );
+
+        let logits: Vec<Vec<f32>> = get(&data["dfl"]["logits"]);
+        let targets: Vec<[f32; 4]> = get(&data["dfl"]["target"]);
+        let losses: Vec<f32> = get(&data["dfl"]["loss"]);
+        let grads: Vec<Vec<f32>> = get(&data["dfl"]["grad"]);
+        for (b, sides) in targets.iter().enumerate() {
+            let mut loss = 0.0;
+            for (s, &target) in sides.iter().enumerate() {
+                let (l, grad) = distribution_focal_loss(&logits[b * 4 + s], target);
+                loss += l / 4.0;
+                for (g, e) in grad.iter().zip(&grads[b * 4 + s]) {
+                    assert!((g / 4.0 - e).abs() < 1e-6, "dfl grad {g} vs {e}");
+                }
+            }
+            assert!(
+                (loss - losses[b]).abs() < 1e-5,
+                "dfl loss {loss} vs {}",
+                losses[b]
+            );
+        }
+
+        let a = &data["assign"];
+        let points: Vec<[f32; 2]> = get(&a["points"]);
+        let (maps, strides) = ([(8, 8), (4, 4), (2, 2)], [8.0, 16.0, 32.0]);
+        assert_eq!(make_anchors(&maps, &strides).0, points);
+        let scores: Vec<Vec<f32>> = get(&a["pred_scores"]);
+        let assignment = TaskAlignedAssigner::yolo(&strides).assign(
+            &scores.concat(),
+            2,
+            &get::<Vec<[f32; 4]>>(&a["pred_boxes"]),
+            &points,
+            &get::<Vec<usize>>(&a["gt_cls"]),
+            &get::<Vec<[f32; 4]>>(&a["gt"]),
+        );
+        assert_eq!(assignment.foreground, get::<Vec<bool>>(&a["fg"]));
+        assert_eq!(assignment.gt_index, get::<Vec<usize>>(&a["gt_idx"]));
+        assert_eq!(assignment.boxes, get::<Vec<[f32; 4]>>(&a["target_boxes"]));
+        let expected: Vec<Vec<f32>> = get(&a["target_scores"]);
+        for (got, e) in assignment.scores.iter().zip(expected.concat()) {
+            assert!((got - e).abs() < 1e-5, "assigned score {got} vs {e}");
+        }
+
+        let scores: Vec<Vec<f32>> = get(&data["nms"]["scores"]);
+        let kept = non_max_suppression(
+            &get::<Vec<[f32; 4]>>(&data["nms"]["xywh"]),
+            &scores.concat(),
+            2,
+            0.001,
+            0.7,
+            300,
+        );
+        let expected: Vec<[f32; 6]> = get(&data["nms"]["kept"]);
+        assert_eq!(kept.len(), expected.len());
+        for (d, e) in kept.iter().zip(&expected) {
+            assert_eq!(
+                (d.xyxy, d.score, d.class),
+                ([e[0], e[1], e[2], e[3]], e[4], e[5] as usize)
+            );
+        }
+
+        let images: Vec<_> = data["map"]["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|image| {
+                let dets: Vec<[f32; 4]> = get(&image["dets"]);
+                let (classes, confs): (Vec<usize>, Vec<f32>) =
+                    (get(&image["det_cls"]), get(&image["det_conf"]));
+                let detections: Vec<Detection> = (0..dets.len())
+                    .map(|i| Detection {
+                        xyxy: dets[i],
+                        score: confs[i],
+                        class: classes[i],
+                    })
+                    .collect();
+                let labels: Vec<[f32; 4]> = get(&image["labels"]);
+                let labels: Vec<(usize, [f32; 4])> = get::<Vec<usize>>(&image["label_cls"])
+                    .into_iter()
+                    .zip(labels)
+                    .collect();
+                assert_eq!(
+                    match_detections(&detections, &labels),
+                    get::<Vec<[bool; 10]>>(&image["correct"])
+                );
+                (detections, labels)
+            })
+            .collect();
+        let [map50, map50_95] = mean_average_precision(&images);
+        let expected = [
+            data["map"]["map50"].as_f64().unwrap(),
+            data["map"]["map50_95"].as_f64().unwrap(),
+        ];
+        assert!(
+            (map50 as f64 - expected[0]).abs() < 1e-6
+                && (map50_95 as f64 - expected[1]).abs() < 1e-6,
+            "mAP {map50} {map50_95} vs {expected:?}"
+        );
     }
 }
