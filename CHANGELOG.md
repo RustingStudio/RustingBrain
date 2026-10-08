@@ -74,6 +74,8 @@
 
 ### Added
 
+- `Decoder::fork` copies a session, so a shared prefix is prefilled once
+  and each request continues its own fork.
 - `Decoder::logits` and `Decoder::push`, and the same on `BatchDecoder`:
   read the next-token logits and append an id of the caller's choosing, for
   constrained decoding, logit biases and log-probabilities.

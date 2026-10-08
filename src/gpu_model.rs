@@ -3519,8 +3519,8 @@ pub(crate) struct DeviceKv {
     packs: PackMemo,
     /// The LM head narrowed to BF16 under mixed precision, or int8 in int8
     /// mode, made on first use. The FP32 head was a fifth of a decode step's
-    /// kernel time.
-    head: Option<Act>,
+    /// kernel time. Shared with forks.
+    head: Option<Arc<Act>>,
     /// Set from [`TransformerLm::set_int8_decode`] when the decoder is made:
     /// every projection and the head run as int8 weights.
     int8: bool,
@@ -3567,6 +3567,21 @@ impl DeviceKv {
     /// Forgets every position from `positions` on.
     pub(crate) fn truncate(&mut self, positions: usize) {
         self.length = self.length.min(positions);
+    }
+
+    /// A copy of the cached rows that shares the weight packs and the head.
+    pub(crate) fn fork(&self) -> Result<Self, NetworkError> {
+        let copy = |slice: &CudaSlice<f32>| slice.try_clone().map_err(cuda_err("KV cache copy"));
+        Ok(Self {
+            layers: self.layers.iter().map(copy).collect::<Result<_, _>>()?,
+            length: self.length,
+            sequences: self.sequences,
+            slots: self.slots.try_clone().map_err(cuda_err("KV cache copy"))?,
+            padded: self.padded,
+            packs: self.packs.clone(),
+            head: self.head.clone(),
+            int8: self.int8,
+        })
     }
 }
 
@@ -3683,11 +3698,11 @@ pub(crate) fn decode(
     }
     if kv.head.is_none() {
         let head = head_of(model)?.value().slice(..);
-        kv.head = Some(if kv.int8 {
+        kv.head = Some(Arc::new(if kv.int8 {
             gpu.quantized(&head, vocab, d_model)?
         } else {
             gpu.narrowed(&head, vocab * d_model, true)?
-        });
+        }));
     }
     let head = kv.head.as_ref().expect("made above");
     let last = final_output
