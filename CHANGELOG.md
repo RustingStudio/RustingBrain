@@ -4,6 +4,11 @@
 
 ### Changed
 
+- A device decoder under mixed precision keeps its cache as BF16 keys and
+  values, 512 bytes a position a layer on the default model instead of
+  3072, and later turns read it in place through the flash kernel. 16
+  sequences after a 2000-token prompt decode 7040 to 7360 tokens/s, and
+  over 8 steps 2.89 to 2.30 ms a step; one sequence is unchanged.
 - A device decoder's first prompt runs the fused flash attention kernel
   under mixed precision at head widths 64 and 128, instead of a full score
   matrix a head: 16 prompts of 2000 tokens prefill in 149 ms instead of
