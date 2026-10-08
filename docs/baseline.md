@@ -1686,3 +1686,22 @@ The flash path converts the whole cached history to BF16 each layer, which
 a short turn does not earn back, so later turns take it from 128 rows. The
 training kernel's extra mask test costs nothing: `bench_train_step 4 1024
 cuda` 54321-54404 tokens/s, load 17.
+
+## BF16 key-value cache for device decode (C21, 2026-10-08)
+
+Under mixed precision the device decode cache keeps only keys and values,
+in BF16: 512 bytes a position a layer on the default model, against 3072
+for FP32 `[query, key, value]` rows. `bench_decode`, `6e47a70` against the
+change, three interleaved rounds, first (cold) round of the old build
+dropped, load 5.4 to 6.5:
+
+| run | FP32 rows | BF16 keys and values |
+|---|---|---|
+| `2000 128 cuda 1`, ms/step | 0.70-0.71 | 0.71 (one round 0.96) |
+| `2000 128 cuda 16`, tokens/s | 7029-7041 | 7315-7365 |
+| `2000 8 cuda 16`, ms/step | 2.88-2.89 | 2.30-2.31 |
+| then an 8-id turn, ms | 9.9-10.0 | 9.1-9.2 |
+
+Multi-row turns read the cache in place through the flash kernel instead of
+a BF16 copy of the whole history, which is where the small-turn and short
+decode gains come from.

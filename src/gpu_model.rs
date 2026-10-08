@@ -56,6 +56,7 @@ pub(crate) struct ModelKernels {
     decode_attention: CudaFunction,
     mask_padding: CudaFunction,
     decode_attention_merge: CudaFunction,
+    store_rows: CudaFunction,
     quantize_q8: CudaFunction,
     dequantize_q8: CudaFunction,
     dequantize_q4: CudaFunction,
@@ -106,6 +107,7 @@ impl ModelKernels {
             decode_attention: get("decode_attention")?,
             mask_padding: get("mask_padding")?,
             decode_attention_merge: get("decode_attention_merge")?,
+            store_rows: get("store_rows")?,
             quantize_q8: get("quantize_rows_q8")?,
             dequantize_q8: get("dequantize_q8")?,
             dequantize_q4: get("dequantize_q4")?,
@@ -3494,19 +3496,23 @@ fn head_chunk_rows(rows: usize, vocab: usize, logit_bytes: usize) -> usize {
 /// The device half of a [`Decoder`](crate::transformer::Decoder): every
 /// layer's projected rows for the positions decoded so far.
 ///
-/// NOTE: a layer keeps whole `[query, key, value]` rows, so the projection
-/// GEMM writes straight into the cache and attention reads keys and values in
-/// place. The query third is dead weight once its row is decoded, a third to a
-/// half more memory than keys and values alone; split the buffer if the cache
-/// ever has to hold long contexts for many sequences.
+/// Under mixed precision, when every layer's attention fits the fused decode
+/// and flash kernels, a layer keeps `[key, value]` rows in BF16 (`narrow`),
+/// and each call projects its queries into scratch. Otherwise it keeps whole
+/// FP32 `[query, key, value]` rows, so the projection GEMM writes straight
+/// into the cache and the cuBLAS path reads it in place.
 ///
 /// With several sequences the rows interleave position-major, row
 /// `position * sequences + sequence`, so one decode step's new rows are
 /// contiguous and the projection still writes them in place.
 pub(crate) struct DeviceKv {
+    /// A narrow cache's rows are BF16 pairs in `f32` slots.
     layers: Vec<CudaSlice<f32>>,
-    /// Each layer's row width, `(heads + 2 * kv_heads) * head_dim`.
+    /// Each layer's row width in `f32` slots: `(heads + 2 * kv_heads) *
+    /// head_dim`, or `kv_heads * head_dim` (keys and values in BF16) when
+    /// `narrow`.
     widths: Vec<usize>,
+    narrow: bool,
     length: usize,
     /// Positions the buffers hold room for; they grow on demand, doubling,
     /// up to `max_seq_len`.
@@ -3544,12 +3550,24 @@ impl DeviceKv {
         sequences: usize,
     ) -> Result<Self, NetworkError> {
         let gpu = Gpu { context };
+        let narrow = context.mixed_precision
+            && context.flash.is_some()
+            && model.blocks.iter().all(|block| {
+                let attention = &block.attention;
+                crate::cuda_flash::eligible(true, attention.head_dim())
+                    && attention.num_heads() / attention.num_kv_heads() <= DECODE_GROUP
+            });
         let widths: Vec<usize> = model
             .blocks
             .iter()
             .map(|block| {
                 let attention = &block.attention;
-                (attention.num_heads() + 2 * attention.num_kv_heads()) * attention.head_dim()
+                let kv_width = attention.num_kv_heads() * attention.head_dim();
+                if narrow {
+                    kv_width
+                } else {
+                    attention.num_heads() * attention.head_dim() + 2 * kv_width
+                }
             })
             .collect();
         Ok(Self {
@@ -3558,6 +3576,7 @@ impl DeviceKv {
                 .map(|_| gpu.uninit(0))
                 .collect::<Result<_, _>>()?,
             widths,
+            narrow,
             length: 0,
             capacity: 0,
             sequences,
@@ -3619,6 +3638,7 @@ impl DeviceKv {
         Ok(Self {
             layers: self.layers.iter().map(copy).collect::<Result<_, _>>()?,
             widths: self.widths.clone(),
+            narrow: self.narrow,
             length: self.length,
             capacity: self.capacity,
             sequences: self.sequences,
@@ -3725,8 +3745,8 @@ pub(crate) fn decode(
     let blocks = (|| {
         for (block, cache) in model.blocks.iter().zip(&mut kv.layers) {
             hidden = decode_block(
-                &gpu, block, hidden, cache, kv.length, sequences, rows, &valid, &kv.slots, padding,
-                &kv.lead,
+                &gpu, block, hidden, cache, kv.narrow, kv.length, sequences, rows, &valid,
+                &kv.slots, padding, &kv.lead,
             )?;
         }
         let final_weight = gpu.decode_norm(&model.final_norm.weight.value.data)?;
@@ -3796,6 +3816,7 @@ fn decode_block(
     block: &TransformerBlock,
     input: CudaSlice<f32>,
     cache: &mut CudaSlice<f32>,
+    narrow_cache: bool,
     offset: usize,
     sequences: usize,
     rows: usize,
@@ -3817,10 +3838,21 @@ fn decode_block(
     let value_base = query_width + kv_width;
     let queries = rows / sequences;
     let history = offset + queries;
-    let start = offset * sequences * qkv_width;
     // One sequence's consecutive positions are `sequences` rows apart.
     let row_stride = sequences * qkv_width;
     let narrow = gpu.context.mixed_precision;
+    // A narrow cache keeps BF16 `[key, value]` rows, so the new rows are
+    // projected into scratch and their keys and values stored after RoPE.
+    let mut scratch = if narrow_cache {
+        Some(gpu.uninit(rows * qkv_width)?)
+    } else {
+        None
+    };
+    let start = if narrow_cache {
+        0
+    } else {
+        offset * sequences * qkv_width
+    };
 
     let attention_weight = gpu.decode_norm(&block.attention_norm.weight.value.data)?;
     let (normed, _, residual) = gpu.rmsnorm(
@@ -3846,7 +3878,7 @@ fn decode_block(
         d_model,
         &normed.all(),
         narrow,
-        &mut cache.slice_mut(start..),
+        &mut scratch.as_mut().unwrap_or(cache).slice_mut(start..),
         rows,
         0.0,
     )?;
@@ -3861,7 +3893,7 @@ fn decode_block(
             gpu.context
                 .stream
                 .launch_builder(&gpu.context.model.rope)
-                .arg(&mut cache.slice_mut(start..))
+                .arg(&mut scratch.as_mut().unwrap_or(cache).slice_mut(start..))
                 .arg(&tables.cos.slice(offset * half..))
                 .arg(&tables.sin.slice(offset * half..))
                 .arg(&(rows as i32))
@@ -3878,21 +3910,42 @@ fn decode_block(
         }
     }
 
+    if let Some(scratch) = &scratch {
+        let cols = 2 * kv_width;
+        unsafe {
+            gpu.context
+                .stream
+                .launch_builder(&gpu.context.model.store_rows)
+                .arg(scratch)
+                .arg(&mut cache.slice_mut(offset * sequences * kv_width..))
+                .arg(&(rows as i32))
+                .arg(&(cols as i32))
+                .arg(&(qkv_width as i32))
+                .arg(&(key_base as i32))
+                .arg(&(cols as i32))
+                .arg(&1i32)
+                .launch(cfg(rows * cols))
+                .map_err(cuda_err("KV store kernel"))?;
+        }
+    }
+
     // A single new row per sequence, the common decode step, runs one fused
     // kernel per layer. Several rows (a prompt, a speculative check) take the
     // three-kernel path below.
     const THREADS: usize = 256;
+    const FUSED_ROWS: usize = 16;
     let group = heads / kv_heads;
     // Only the fused path writes `merged` narrow; the cuBLAS path below
     // accumulates into FP32.
-    let fused = queries == 1 && head_dim <= THREADS && group <= DECODE_GROUP;
+    let fused = queries <= FUSED_ROWS && head_dim <= THREADS && group <= DECODE_GROUP;
     // Several new rows under mixed precision take the training flash kernel
-    // instead of a `[queries, history]` score matrix a head. It reads a BF16
-    // copy of the whole history, which a later turn of fewer than about 128
-    // rows does not earn back.
+    // instead of a `[queries, history]` score matrix a head. Over an FP32
+    // cache it reads a BF16 copy of the whole history, which a later turn of
+    // fewer than about 128 rows does not earn back.
     let flash = gpu.context.flash.as_ref().filter(|_| {
-        queries > 1
-            && (offset == 0 || queries >= 128)
+        !fused
+            && queries > 1
+            && (narrow_cache || offset == 0 || queries >= 128)
             && crate::cuda_flash::eligible(narrow, head_dim)
     });
     let mut merged = gpu.act(rows * query_width, (fused || flash.is_some()) && narrow)?;
@@ -3901,8 +3954,17 @@ fn decode_block(
         // `sequences` rows apart, which the kernel takes as rows `sequences`
         // times as wide. Padding rows get zeros, so no later kernel reads
         // garbage from them.
-        let cached = history * sequences * qkv_width;
-        let qkv = gpu.narrowed(&cache.slice(..cached), cached, true)?;
+        // Over a narrow cache the queries are the new rows in scratch and
+        // keys and values are read in place; otherwise both come from a BF16
+        // copy of the whole history.
+        let (qkv, first_query, key_width, key_base, value_base) = if let Some(scratch) = &scratch {
+            let qkv = gpu.narrowed(&scratch.slice(..), rows * qkv_width, true)?;
+            (qkv, 0, 2 * kv_width, 0, kv_width)
+        } else {
+            let cached = history * sequences * qkv_width;
+            let qkv = gpu.narrowed(&cache.slice(..cached), cached, true)?;
+            (qkv, offset * sequences, qkv_width, key_base, value_base)
+        };
         let mut log_sum_exp = gpu.uninit(heads * queries)?;
         let forward = &flash.width(head_dim).forward;
         if lead.iter().any(|&pad| pad > offset) {
@@ -3915,8 +3977,18 @@ fn decode_block(
             // Padding among the new rows, which only a first prompt has.
             let skipped = pad.saturating_sub(offset);
             let length = queries - skipped;
-            let query_row = (offset + skipped) * sequences + seq;
+            let query_row = first_query + skipped * sequences + seq;
             let key_row = pad * sequences + seq;
+            // A narrow cache row is `kv_width` slots of BF16 pairs. The
+            // kernel takes a bare pointer, so the copy's bytes go in as an
+            // empty view of the same address.
+            let keys = if narrow_cache {
+                cache.slice(key_row * kv_width..)
+            } else {
+                let bytes = qkv.bytes.slice(key_row * qkv_width * 2..);
+                // SAFETY: a zero-length view reads nothing.
+                unsafe { bytes.transmute(0) }.expect("an empty view fits")
+            };
             // One more than the key position of the first query, which the
             // kernel takes as a causal mask shifted that far.
             let causal = offset + skipped - pad + 1;
@@ -3925,7 +3997,7 @@ fn decode_block(
                     .stream
                     .launch_builder(forward)
                     .arg(&qkv.bytes.slice(query_row * qkv_width * 2..))
-                    .arg(&qkv.bytes.slice(key_row * qkv_width * 2..))
+                    .arg(&keys)
                     .arg(
                         &mut merged
                             .bytes
@@ -3935,7 +4007,7 @@ fn decode_block(
                     .arg(&(length as i32))
                     .arg(&((history - pad) as i32))
                     .arg(&(row_stride as i32))
-                    .arg(&(row_stride as i32))
+                    .arg(&((sequences * key_width) as i32))
                     .arg(&((sequences * query_width) as i32))
                     .arg(&(key_base as i32))
                     .arg(&(value_base as i32))
@@ -3957,26 +4029,32 @@ fn decode_block(
         }
     } else if fused {
         let chunks = history.div_ceil(DECODE_CHUNK);
-        let mut partial = gpu.uninit(heads * sequences * chunks * (head_dim + 2))?;
+        let mut partial = gpu.uninit(heads * rows * chunks * (head_dim + 2))?;
+        let (queries_in, kv_row, key_base, value_base) = match &scratch {
+            Some(scratch) => (scratch.slice(..), 2 * kv_width, 0, kv_width),
+            None => (cache.slice(start..), qkv_width, key_base, value_base),
+        };
         unsafe {
             gpu.context
                 .stream
                 .launch_builder(&gpu.context.model.decode_attention)
+                .arg(&queries_in)
                 .arg(&*cache)
                 .arg(&mut partial)
                 .arg(slots)
                 .arg(&(history as i32))
+                .arg(&(queries as i32))
                 .arg(&(sequences as i32))
                 .arg(&(qkv_width as i32))
+                .arg(&(kv_row as i32))
                 .arg(&(head_dim as i32))
                 .arg(&(group as i32))
                 .arg(&(key_base as i32))
                 .arg(&(value_base as i32))
-                .arg(&(start as i64))
                 .arg(&scale)
-                .arg(&(query_width as i32))
+                .arg(&i32::from(narrow_cache))
                 .launch(cudarc::driver::LaunchConfig {
-                    grid_dim: (kv_heads as u32, sequences as u32, chunks as u32),
+                    grid_dim: (kv_heads as u32, rows as u32, chunks as u32),
                     block_dim: (THREADS as u32, 1, 1),
                     shared_mem_bytes: 0,
                 })
@@ -3991,13 +4069,19 @@ fn decode_block(
                 .arg(&(query_width as i32))
                 .arg(&i32::from(fused && narrow))
                 .launch(cudarc::driver::LaunchConfig {
-                    grid_dim: (heads as u32, sequences as u32, 1),
+                    grid_dim: (heads as u32, rows as u32, 1),
                     block_dim: (head_dim.next_multiple_of(32) as u32, 1, 1),
                     shared_mem_bytes: 0,
                 })
                 .map_err(cuda_err("decode attention merge kernel"))?;
         }
     } else {
+        if narrow_cache {
+            // `RUSTING_BRAIN_NO_FLASH` set after the cache was made.
+            return Err(unsupported(
+                "a BF16 key-value cache without flash attention",
+            ));
+        }
         // Scores are `[heads, sequences, queries, history]`.
         let block_scores = queries * history;
         let mut scores = gpu.uninit(heads * sequences * block_scores)?;

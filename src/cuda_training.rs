@@ -259,38 +259,42 @@ extern "C" __global__ void attention_softmax_lse(float*s,float*lse,int rows,int 
     for(int j=vis+lane;j<seq_len;j+=WARP)row[j]=0.f;
   }
 }
-// One decode step's attention for a single new row per sequence, split the
+// Decode attention for a few new rows per sequence, split the
 // flash-decoding way so a batch-1 step still fills the card. Block
-// (kv head, sequence, chunk) scores DECODE_CHUNK positions of the history for
+// (kv head, row, chunk) scores DECODE_CHUNK positions of the history for
 // every query head sharing that kv head, so each key and value is loaded once
-// for the whole group. It reads the [query, key, value] rows of the device
-// cache in place and writes, per query head, its running max, its exp-sum and
-// its unnormalised weighted sum of values; `decode_attention_merge` rescales
-// and adds the chunks. Position p of sequence `seq` is cache row
-// p*sequences+seq, and `slots` at the same index is zero where that position
-// is padding, which no query attends to. Launch with DECODE_THREADS threads
-// and `group` at most DECODE_GROUP.
+// for the whole group. Row r of the `queries * sequences` new rows is
+// sequence r % sequences at the r / sequences-th new position, and sees the
+// history up to and including itself. Queries are FP32 rows `q_width` apart;
+// keys and values are read in place from the device cache, rows `kv_width`
+// apart and BF16 when `narrow`, position p of sequence `seq` at row
+// p*sequences+seq. `slots` at the same index is zero where that position is
+// padding, which no query attends to. It writes, per query head, its running
+// max, its exp-sum and its unnormalised weighted sum of values;
+// `decode_attention_merge` rescales and adds the chunks. Launch with
+// DECODE_THREADS threads and `group` at most DECODE_GROUP.
 #define DECODE_CHUNK 64
 #define DECODE_GROUP 8
 #define DECODE_THREADS 256
-extern "C" __global__ void decode_attention(const float*qkv,float*partial,const int*slots,int history,int sequences,int qkv_width,int head_dim,int group,int key_base,int value_base,long start,float scale,int query_width){
+extern "C" __global__ void decode_attention(const float*q,const void*kv,float*partial,const int*slots,int history,int queries,int sequences,int q_width,int kv_width,int head_dim,int group,int key_base,int value_base,float scale,int narrow){
   __shared__ float s[DECODE_GROUP][DECODE_CHUNK];
   __shared__ float red[DECODE_GROUP][2];
   __shared__ float part[DECODE_GROUP*DECODE_THREADS];
-  int kvh=blockIdx.x,seq=blockIdx.y,chunk=blockIdx.z,chunks=gridDim.z,heads=gridDim.x*group;
-  int first=chunk*DECODE_CHUNK,count=min(DECODE_CHUNK,history-first);
+  int kvh=blockIdx.x,row=blockIdx.y,chunk=blockIdx.z,chunks=gridDim.z,heads=gridDim.x*group;
+  int seq=row%sequences,seen=history-queries+row/sequences+1;
+  int first=chunk*DECODE_CHUNK,count=min(DECODE_CHUNK,seen-first);
   int lane=threadIdx.x%WARP,warp=threadIdx.x/WARP;
-  long row_stride=(long)sequences*qkv_width;
-  const float*q=qkv+start+(long)seq*qkv_width+kvh*group*head_dim;
-  const float*k=qkv+(long)seq*qkv_width+key_base+kvh*head_dim+first*row_stride;
-  const float*v=qkv+(long)seq*qkv_width+value_base+kvh*head_dim+first*row_stride;
+  long row_stride=(long)sequences*kv_width;
+  q+=(long)row*q_width+kvh*group*head_dim;
+  long k=(long)seq*kv_width+key_base+kvh*head_dim+first*row_stride;
+  long v=(long)seq*kv_width+value_base+kvh*head_dim+first*row_stride;
   // A few threads per position, so every key load is in flight at once.
   {int per=DECODE_THREADS/DECODE_CHUNK,p=threadIdx.x/per,sub=threadIdx.x%per;float d[DECODE_GROUP];
     #pragma unroll
     for(int g=0;g<DECODE_GROUP;g++)d[g]=0.f;
-    if(p<count){const float*kp=k+p*row_stride;
+    if(p<count){long kp=k+p*row_stride;
       #pragma unroll 4
-      for(int i=sub;i<head_dim;i+=per){float key=kp[i];
+      for(int i=sub;i<head_dim;i+=per){float key=load_act(kv,kp+i,narrow);
         #pragma unroll
         for(int g=0;g<DECODE_GROUP;g++)if(g<group)d[g]+=q[g*head_dim+i]*key;}}
     bool live=p<count&&slots[(long)(first+p)*sequences+seq];
@@ -313,14 +317,14 @@ extern "C" __global__ void decode_attention(const float*qkv,float*partial,const 
   for(int g=0;g<DECODE_GROUP;g++)acc[g]=0.f;
   if(slice<slices){
     #pragma unroll 8
-    for(int p=slice;p<count;p+=slices){float value=v[p*row_stride+t];
+    for(int p=slice;p<count;p+=slices){float value=load_act(kv,v+p*row_stride+t,narrow);
       #pragma unroll
       for(int g=0;g<DECODE_GROUP;g++)if(g<group)acc[g]+=s[g][p]*value;}}
   #pragma unroll
   for(int g=0;g<DECODE_GROUP;g++)if(g<group)part[g*DECODE_THREADS+threadIdx.x]=acc[g];
   __syncthreads();
   for(int g=0;g<group;g++){
-    float*out=partial+((long)(seq*heads+kvh*group+g)*chunks+chunk)*(head_dim+2);
+    float*out=partial+((long)(row*heads+kvh*group+g)*chunks+chunk)*(head_dim+2);
     if(threadIdx.x<head_dim){
       float total=0.f;for(int i=0;i<slices;i++)total+=part[g*DECODE_THREADS+i*head_dim+threadIdx.x];
       out[2+threadIdx.x]=total;
@@ -328,7 +332,14 @@ extern "C" __global__ void decode_attention(const float*qkv,float*partial,const 
     if(threadIdx.x==0){out[0]=red[g][0];out[1]=red[g][1];}
   }
 }
-// Block (head, sequence), one thread per output element.
+// `dst` row r, `cols` wide and `dst_width` apart, takes `src` row r from
+// column `src_off`, rows `src_width` apart, narrowed when `narrow`.
+extern "C" __global__ void store_rows(const float*src,void*dst,int rows,int cols,int src_width,int src_off,int dst_width,int narrow){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*cols)return;
+  int r=i/cols,c=i%cols;
+  store_act(dst,(size_t)r*dst_width+c,src[(size_t)r*src_width+src_off+c],narrow);
+}
+// Block (head, row), one thread per output element.
 extern "C" __global__ void decode_attention_merge(const float*partial,void*out,int chunks,int head_dim,int query_width,int narrow){
   int head=blockIdx.x,seq=blockIdx.y,t=threadIdx.x;
   if(t>=head_dim)return;
