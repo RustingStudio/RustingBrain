@@ -172,6 +172,81 @@ impl TensorInfo {
     }
 }
 
+/// Pairs of a diffusers UNet name and the original (LDM) UNet name for the
+/// same module, both with underscores for dots, laid out from the blocks the
+/// checkpoint holds.
+fn ldm_blocks(names: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let has = |prefix: String| names.keys().any(|name| name.starts_with(&prefix));
+    let mut pairs: Vec<(String, String)> = [
+        ("conv_in", "input_blocks_0_0"),
+        ("time_embedding_linear_1", "time_embed_0"),
+        ("time_embedding_linear_2", "time_embed_2"),
+        ("add_embedding_linear_1", "label_emb_0_0"),
+        ("add_embedding_linear_2", "label_emb_0_2"),
+        ("conv_norm_out", "out_0"),
+        ("conv_out", "out_2"),
+        ("mid_block_attentions_0", "middle_block_1"),
+    ]
+    .map(|(diffusers, ldm)| (diffusers.to_string(), ldm.to_string()))
+    .into();
+    let mut resnet = |diffusers: String, ldm: String| {
+        for (inner, original) in [
+            ("norm1", "in_layers_0"),
+            ("conv1", "in_layers_2"),
+            ("time_emb_proj", "emb_layers_1"),
+            ("norm2", "out_layers_0"),
+            ("conv2", "out_layers_3"),
+            ("conv_shortcut", "skip_connection"),
+        ] {
+            pairs.push((format!("{diffusers}_{inner}"), format!("{ldm}_{original}")));
+        }
+    };
+    resnet("mid_block_resnets_0".into(), "middle_block_0".into());
+    resnet("mid_block_resnets_1".into(), "middle_block_2".into());
+    let mut blocks = Vec::new();
+    for side in ["down", "up"] {
+        let mut index = if side == "down" { 1 } else { 0 };
+        for block in (0..).take_while(|block| has(format!("{side}_blocks.{block}."))) {
+            let at = format!("{side}_blocks_{block}");
+            let original = if side == "down" { "input" } else { "output" };
+            let layers = (0..)
+                .take_while(|layer| has(format!("{side}_blocks.{block}.resnets.{layer}.")))
+                .count();
+            for layer in 0..layers {
+                resnet(
+                    format!("{at}_resnets_{layer}"),
+                    format!("{original}_blocks_{index}_0"),
+                );
+                let attention = has(format!("{side}_blocks.{block}.attentions.{layer}."));
+                if attention {
+                    blocks.push((
+                        format!("{at}_attentions_{layer}"),
+                        format!("{original}_blocks_{index}_1"),
+                    ));
+                }
+                // An up block resamples after its last layer, in the same
+                // original block; a down block resamples in a block of its own.
+                if side == "up" && layer + 1 == layers {
+                    blocks.push((
+                        format!("{at}_upsamplers_0_conv"),
+                        format!("{original}_blocks_{index}_{}_conv", 1 + attention as usize),
+                    ));
+                }
+                index += 1;
+            }
+            if side == "down" && has(format!("down_blocks.{block}.downsamplers.0.")) {
+                blocks.push((
+                    format!("{at}_downsamplers_0_conv"),
+                    format!("input_blocks_{index}_0_op"),
+                ));
+                index += 1;
+            }
+        }
+    }
+    pairs.extend(blocks);
+    pairs
+}
+
 /// An open `.safetensors` file, read tensor by tensor.
 ///
 /// ```no_run
@@ -506,12 +581,26 @@ impl ShardedSafeTensors {
             "base_model_model",
         ];
         let flat = |name: &str| name.replace('.', "_");
-        let weights: BTreeMap<String, String> = self
+        let mut weights: BTreeMap<String, String> = self
             .map
             .keys()
             .filter_map(|name| name.strip_suffix(".weight"))
             .map(|stem| (flat(stem), stem.to_string()))
             .collect();
+        // kohya trains SDXL on the original UNet, so its files name blocks as
+        // `input_blocks_4_1` rather than `down_blocks_1_attentions_0`.
+        let blocks = ldm_blocks(&self.map);
+        let aliases: Vec<(String, String)> = weights
+            .iter()
+            .filter_map(|(name, stem)| {
+                blocks.iter().find_map(|(diffusers, ldm)| {
+                    let rest = name.strip_prefix(diffusers.as_str())?;
+                    (rest.is_empty() || rest.starts_with('_'))
+                        .then(|| (format!("{ldm}{rest}"), stem.clone()))
+                })
+            })
+            .collect();
+        weights.extend(aliases);
         let mut file = SafeTensors::open(path)?;
         let names: Vec<String> = file.names().map(str::to_string).collect();
         let mut changed = 0;
