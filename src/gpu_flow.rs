@@ -25,9 +25,10 @@
 //!
 //! # Precision
 //!
-//! NOTE: FP32 throughout, following [`crate::gpu_cross`]. The self-
-//! attention here reuses that module with the queries and the keys pointing at
-//! the same activations, which costs one extra copy of them and one extra
+//! Attention precision follows [`crate::gpu_cross`]: BF16 through the fused
+//! kernels under mixed precision with heads 64 or 128 wide, FP32 otherwise.
+//! The rest of the block is FP32. The self-attention here reuses that module
+//! with the queries and the keys pointing at the same activations, which costs one extra copy of them and one extra
 //! projection GEMM against a fused QKV. Fuse it when a profile says the block
 //! is projection-bound rather than attention-bound.
 

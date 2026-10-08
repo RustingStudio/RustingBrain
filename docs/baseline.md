@@ -1529,3 +1529,22 @@ seed 7.
 Both runs memorize the small corpus (42 passes), so the held-out loss rises
 for both; the 8-bit run stays within 1% of it.
 
+## Fused BF16 cross-attention (A5, 2026-10-08)
+
+`examples/profile_shape.rs 4 2048 4096 30` (mixed, packed) and
+`bench_train_step 4 1024 cuda`, old and new binaries alternated under the GPU
+lock, load 2.3-4.0 (8 on the 15-minute average).
+
+| Run | Before | After |
+|---|---|---|
+| Shape VAE step | 0.084-0.087 s | 0.062-0.065 s |
+| LM step, 4 x 1024 | 54308-54654 tok/s | 54126-54511 tok/s |
+
+The first build of the separate-buffer flash kernels cost the LM step 1-2%
+(old 53126-54155, new 52480-53103 tok/s over five pairs). nsys put it all in
+`flash_attention_dkv_64`: 651 to 811 us a call. Its registers went 168 to
+173, which at 128 threads is two blocks per SM instead of three.
+`__launch_bounds__(128, 3)` at width 64 holds it at 168 with an 8-byte spill:
+690 us, while `flash_attention_dq_64` went 485 to 460 us, so the backward pair
+is even and the step is back within run-to-run spread.
+

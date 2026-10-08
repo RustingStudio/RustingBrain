@@ -24,13 +24,13 @@
 //!
 //! # Precision
 //!
-//! NOTE: FP32 throughout. The fused BF16 path in [`crate::cuda_flash`] is
-//! written around one sequence attending to itself, and the score matrix here
-//! is small enough not to need it: 512 queries over 1024 image tokens at ten
-//! heads and batch 4 is 84 MB, against the 21% of GPU time the flash kernel
-//! was written to recover at `seq_len` 1024 in *every* block. Widen this to a
-//! fused cross kernel when a profile says the score round trip costs more than
-//! the rest of the block.
+//! Under mixed precision, with a head width the fused kernels in
+//! [`crate::cuda_flash`] take, every activation and weight here is BF16 and
+//! attention is those kernels with the keys and values read from a second
+//! buffer. Otherwise everything is FP32 and attention is three kernels around
+//! a score matrix: one batched GEMM per head, the softmax, one more GEMM per
+//! head. A profile of the shape VAE at batch 4 put the three-kernel path,
+//! softmax and per-head GEMMs together, at about 40% of the step.
 
 // Stage D of `2Dto3DPlan.md` is what calls this; until that block exists the
 // only caller is the parity test below, and a `cargo build` would otherwise
@@ -39,7 +39,7 @@
 
 use crate::attention::MultiHeadAttention;
 use crate::cuda_training::cuda_err;
-use crate::gpu_model::{Act, Gpu};
+use crate::gpu_model::{Act, FlashShape, Gpu};
 use crate::gpu_transformer::{
     gemm_lhs_transposed_batched, gemm_plain_batched, gemm_rhs_transposed_batched,
 };
@@ -106,52 +106,68 @@ pub(crate) fn forward(
     let plan = Plan::new(attention, shape)?;
     let (q_rows, kv_rows) = (shape.q_rows(), shape.kv_rows());
 
-    // Everything here stays FP32, so the packed weights and the activations
-    // are wide `Act`s and the batched GEMMs can read them directly.
-    let queries_in = gpu.narrowed(queries_in, q_rows * plan.d_model, false)?;
-    let kv_in = gpu.narrowed(kv_in, kv_rows * plan.d_kv, false)?;
+    // The fused kernels read and write BF16 only, and the batched GEMMs of
+    // the fallback read FP32 only, so one choice sets every buffer's width.
+    let fused = gpu
+        .context
+        .flash
+        .as_ref()
+        .filter(|_| crate::cuda_flash::eligible(gpu.context.mixed_precision, plan.head_dim));
+    let narrow = fused.is_some();
+    let queries_in = gpu.narrowed(queries_in, q_rows * plan.d_model, narrow)?;
+    let kv_in = gpu.narrowed(kv_in, kv_rows * plan.d_kv, narrow)?;
 
-    let query_weight = gpu.pack(&[&attention.query], false)?;
-    let kv_weights = gpu.pack(&[&attention.key, &attention.value], false)?;
-    let output_weight = gpu.pack(&[&attention.output], false)?;
+    let query_weight = gpu.pack(&[&attention.query], narrow)?;
+    let kv_weights = gpu.pack(&[&attention.key, &attention.value], narrow)?;
+    let output_weight = gpu.pack(&[&attention.output], narrow)?;
 
-    let mut queries = gpu.act(q_rows * plan.query_width, false)?;
+    let mut queries = gpu.act(q_rows * plan.query_width, narrow)?;
     gpu.linear_packed_act(
         &query_weight.all(),
         plan.query_width,
         plan.d_model,
         &queries_in.all(),
-        false,
+        narrow,
         &mut queries,
         q_rows,
     )?;
 
     // Key and value share `kv_in` and differ only in nothing at all, so one
     // GEMM at twice the width produces both.
-    let mut kv = gpu.act(kv_rows * plan.kv_stride, false)?;
+    let mut kv = gpu.act(kv_rows * plan.kv_stride, narrow)?;
     gpu.linear_packed_act(
         &kv_weights.all(),
         plan.kv_stride,
         plan.d_kv,
         &kv_in.all(),
-        false,
+        narrow,
         &mut kv,
         kv_rows,
     )?;
 
-    let mut probabilities = gpu.uninit(plan.heads * shape.sequences * plan.block_size)?;
-    plan.scores(gpu, &queries, &kv, &mut probabilities, shape, plan.scale)?;
     let mut log_sum_exp = gpu.uninit(plan.heads * q_rows)?;
-    gpu.softmax_lse(
-        &mut probabilities,
-        &mut log_sum_exp,
-        plan.heads * shape.sequences * shape.q_len,
-        shape.kv_len,
-        false,
-    )?;
+    let mut merged = gpu.act(q_rows * plan.query_width, narrow)?;
+    if let Some(flash) = fused {
+        gpu.flash_attention(
+            flash,
+            &queries,
+            &kv,
+            &mut merged,
+            &mut log_sum_exp,
+            plan.flash_shape(shape),
+            plan.scale,
+        )?;
+    } else {
+        let mut probabilities = gpu.uninit(plan.heads * shape.sequences * plan.block_size)?;
+        plan.scores(gpu, &queries, &kv, &mut probabilities, shape, plan.scale)?;
+        gpu.softmax_lse(
+            &mut probabilities,
+            &mut log_sum_exp,
+            plan.heads * shape.sequences * shape.q_len,
+            shape.kv_len,
+            false,
+        )?;
 
-    let mut merged = gpu.act(q_rows * plan.query_width, false)?;
-    {
         let kv_view = kv.wide();
         let mut wide_merged = merged.wide_mut();
         for head in 0..plan.heads {
@@ -186,7 +202,7 @@ pub(crate) fn forward(
         plan.d_model,
         plan.query_width,
         &merged.all(),
-        false,
+        narrow,
         &mut output,
         q_rows,
         0.0,
@@ -224,15 +240,17 @@ pub(crate) fn backward(
     let plan = Plan::new(attention, shape)?;
     let (q_rows, kv_rows) = (shape.q_rows(), shape.kv_rows());
 
-    let grad_output = gpu.narrowed(&grad_output.slice(..), q_rows * plan.d_model, false)?;
-    let mut grad_merged = gpu.act(q_rows * plan.query_width, false)?;
+    // The forward pass chose the path, and left its choice in every buffer.
+    let narrow = cache.queries.is_narrow();
+    let grad_output = gpu.narrowed(&grad_output.slice(..), q_rows * plan.d_model, narrow)?;
+    let mut grad_merged = gpu.act(q_rows * plan.query_width, narrow)?;
     gpu.linear_packed_backward_input(
         &cache.output_weight.all(),
         plan.d_model,
         plan.query_width,
         &grad_output.all(),
-        false,
-        false,
+        narrow,
+        narrow,
         grad_merged.destination(),
         q_rows,
         0.0,
@@ -241,146 +259,170 @@ pub(crate) fn backward(
         &mut attention.output,
         &grad_output.all(),
         &cache.merged.all(),
-        false,
+        narrow,
         q_rows,
     )?;
 
-    // The forward pass kept only the log-sum-exp, so the probabilities are
-    // rebuilt here and live for this backward pass alone.
-    let mut probabilities = gpu.uninit(plan.heads * shape.sequences * plan.block_size)?;
-    plan.scores(
-        gpu,
-        &cache.queries,
-        &cache.kv,
-        &mut probabilities,
-        shape,
-        plan.scale,
-    )?;
-    gpu.probs_from_lse(
-        &mut probabilities,
-        &cache.log_sum_exp,
-        plan.heads * shape.sequences * shape.q_len,
-        shape.kv_len,
-        false,
-    )?;
-
-    let mut grad_scores = gpu.uninit(plan.heads * shape.sequences * plan.block_size)?;
-    let mut grad_queries = gpu.act(q_rows * plan.query_width, false)?;
-    let mut grad_kv = gpu.act(kv_rows * plan.kv_stride, false)?;
-    {
-        // Every query head writes its own slice of `grad_queries` and of
-        // `grad_scores`, but the query heads of a group all accumulate into
-        // one key and value head, so that buffer starts at zero.
-        let mut wide_grad_kv = grad_kv.wide_mut();
-        gpu.context
-            .stream
-            .memset_zeros(&mut wide_grad_kv)
-            .map_err(cuda_err("gradient clear"))?;
-
-        let kv_view = cache.kv.wide();
-        let queries_view = cache.queries.wide();
-        let grad_merged_view = grad_merged.wide();
-        let mut wide_grad_queries = grad_queries.wide_mut();
-
-        for head in 0..plan.heads {
-            let kv_base = plan.kv_base(head);
-            let upstream = grad_merged_view.slice(head * plan.head_dim..);
-            let value = kv_view.slice(plan.value_base + kv_base..);
-            let mut scores = grad_scores.slice_mut(head * shape.sequences * plan.block_size..);
-            gemm_rhs_transposed_batched(
-                gpu.context,
-                &upstream,
-                plan.query_width,
-                &value,
-                plan.kv_stride,
-                &mut scores,
-                shape.kv_len,
-                shape.q_len,
-                shape.kv_len,
-                plan.head_dim,
-                1.0,
-                0.0,
-                shape.sequences,
-                shape.q_len * plan.query_width,
-                shape.kv_len * plan.kv_stride,
-                plan.block_size,
-            )?;
-
-            let head_probabilities =
-                probabilities.slice(head * shape.sequences * plan.block_size..);
-            let mut grad_value = wide_grad_kv.slice_mut(plan.value_base + kv_base..);
-            gemm_lhs_transposed_batched(
-                gpu.context,
-                &head_probabilities,
-                shape.kv_len,
-                &upstream,
-                plan.query_width,
-                &mut grad_value,
-                plan.kv_stride,
-                shape.q_len,
-                shape.kv_len,
-                plan.head_dim,
-                1.0,
-                1.0,
-                shape.sequences,
-                plan.block_size,
-                shape.q_len * plan.query_width,
-                shape.kv_len * plan.kv_stride,
-            )?;
-        }
-
-        gpu.softmax_backward(
-            &mut grad_scores,
-            &probabilities,
+    let mut grad_queries = gpu.act(q_rows * plan.query_width, narrow)?;
+    let mut grad_kv = gpu.act(kv_rows * plan.kv_stride, narrow)?;
+    if narrow {
+        let flash = gpu
+            .context
+            .flash
+            .as_ref()
+            .expect("the forward pass ran fused");
+        let mut delta = gpu.uninit(plan.heads * q_rows)?;
+        // Every column of both gradients is written, not accumulated: the
+        // query tiles write the queries', the key tiles the keys' and values'.
+        gpu.flash_attention_backward(
+            flash,
+            &cache.queries,
+            &cache.kv,
+            &cache.merged,
+            &grad_merged,
+            &cache.log_sum_exp,
+            &mut delta,
+            &grad_queries,
+            &grad_kv,
+            plan.flash_shape(shape),
+            plan.scale,
+        )?;
+    } else {
+        // The forward pass kept only the log-sum-exp, so the probabilities are
+        // rebuilt here and live for this backward pass alone.
+        let mut probabilities = gpu.uninit(plan.heads * shape.sequences * plan.block_size)?;
+        plan.scores(
+            gpu,
+            &cache.queries,
+            &cache.kv,
+            &mut probabilities,
+            shape,
+            plan.scale,
+        )?;
+        gpu.probs_from_lse(
+            &mut probabilities,
+            &cache.log_sum_exp,
             plan.heads * shape.sequences * shape.q_len,
             shape.kv_len,
             false,
         )?;
 
-        for head in 0..plan.heads {
-            let kv_base = plan.kv_base(head);
-            let scores = grad_scores.slice(head * shape.sequences * plan.block_size..);
-            let key = kv_view.slice(plan.key_base + kv_base..);
-            let mut grad_query = wide_grad_queries.slice_mut(head * plan.head_dim..);
-            gemm_plain_batched(
-                gpu.context,
-                &scores,
+        let mut grad_scores = gpu.uninit(plan.heads * shape.sequences * plan.block_size)?;
+        {
+            // Every query head writes its own slice of `grad_queries` and of
+            // `grad_scores`, but the query heads of a group all accumulate into
+            // one key and value head, so that buffer starts at zero.
+            let mut wide_grad_kv = grad_kv.wide_mut();
+            gpu.context
+                .stream
+                .memset_zeros(&mut wide_grad_kv)
+                .map_err(cuda_err("gradient clear"))?;
+
+            let kv_view = cache.kv.wide();
+            let queries_view = cache.queries.wide();
+            let grad_merged_view = grad_merged.wide();
+            let mut wide_grad_queries = grad_queries.wide_mut();
+
+            for head in 0..plan.heads {
+                let kv_base = plan.kv_base(head);
+                let upstream = grad_merged_view.slice(head * plan.head_dim..);
+                let value = kv_view.slice(plan.value_base + kv_base..);
+                let mut scores = grad_scores.slice_mut(head * shape.sequences * plan.block_size..);
+                gemm_rhs_transposed_batched(
+                    gpu.context,
+                    &upstream,
+                    plan.query_width,
+                    &value,
+                    plan.kv_stride,
+                    &mut scores,
+                    shape.kv_len,
+                    shape.q_len,
+                    shape.kv_len,
+                    plan.head_dim,
+                    1.0,
+                    0.0,
+                    shape.sequences,
+                    shape.q_len * plan.query_width,
+                    shape.kv_len * plan.kv_stride,
+                    plan.block_size,
+                )?;
+
+                let head_probabilities =
+                    probabilities.slice(head * shape.sequences * plan.block_size..);
+                let mut grad_value = wide_grad_kv.slice_mut(plan.value_base + kv_base..);
+                gemm_lhs_transposed_batched(
+                    gpu.context,
+                    &head_probabilities,
+                    shape.kv_len,
+                    &upstream,
+                    plan.query_width,
+                    &mut grad_value,
+                    plan.kv_stride,
+                    shape.q_len,
+                    shape.kv_len,
+                    plan.head_dim,
+                    1.0,
+                    1.0,
+                    shape.sequences,
+                    plan.block_size,
+                    shape.q_len * plan.query_width,
+                    shape.kv_len * plan.kv_stride,
+                )?;
+            }
+
+            gpu.softmax_backward(
+                &mut grad_scores,
+                &probabilities,
+                plan.heads * shape.sequences * shape.q_len,
                 shape.kv_len,
-                &key,
-                plan.kv_stride,
-                &mut grad_query,
-                plan.query_width,
-                shape.q_len,
-                plan.head_dim,
-                shape.kv_len,
-                plan.scale,
-                0.0,
-                shape.sequences,
-                plan.block_size,
-                shape.kv_len * plan.kv_stride,
-                shape.q_len * plan.query_width,
+                false,
             )?;
 
-            let query = queries_view.slice(head * plan.head_dim..);
-            let mut grad_key = wide_grad_kv.slice_mut(plan.key_base + kv_base..);
-            gemm_lhs_transposed_batched(
-                gpu.context,
-                &scores,
-                shape.kv_len,
-                &query,
-                plan.query_width,
-                &mut grad_key,
-                plan.kv_stride,
-                shape.q_len,
-                shape.kv_len,
-                plan.head_dim,
-                plan.scale,
-                1.0,
-                shape.sequences,
-                plan.block_size,
-                shape.q_len * plan.query_width,
-                shape.kv_len * plan.kv_stride,
-            )?;
+            for head in 0..plan.heads {
+                let kv_base = plan.kv_base(head);
+                let scores = grad_scores.slice(head * shape.sequences * plan.block_size..);
+                let key = kv_view.slice(plan.key_base + kv_base..);
+                let mut grad_query = wide_grad_queries.slice_mut(head * plan.head_dim..);
+                gemm_plain_batched(
+                    gpu.context,
+                    &scores,
+                    shape.kv_len,
+                    &key,
+                    plan.kv_stride,
+                    &mut grad_query,
+                    plan.query_width,
+                    shape.q_len,
+                    plan.head_dim,
+                    shape.kv_len,
+                    plan.scale,
+                    0.0,
+                    shape.sequences,
+                    plan.block_size,
+                    shape.kv_len * plan.kv_stride,
+                    shape.q_len * plan.query_width,
+                )?;
+
+                let query = queries_view.slice(head * plan.head_dim..);
+                let mut grad_key = wide_grad_kv.slice_mut(plan.key_base + kv_base..);
+                gemm_lhs_transposed_batched(
+                    gpu.context,
+                    &scores,
+                    shape.kv_len,
+                    &query,
+                    plan.query_width,
+                    &mut grad_key,
+                    plan.kv_stride,
+                    shape.q_len,
+                    shape.kv_len,
+                    plan.head_dim,
+                    plan.scale,
+                    1.0,
+                    shape.sequences,
+                    plan.block_size,
+                    shape.q_len * plan.query_width,
+                    shape.kv_len * plan.kv_stride,
+                )?;
+            }
         }
     }
 
@@ -390,7 +432,7 @@ pub(crate) fn backward(
         plan.query_width,
         plan.d_model,
         &grad_queries.all(),
-        false,
+        narrow,
         false,
         &mut grad_queries_in,
         q_rows,
@@ -400,7 +442,7 @@ pub(crate) fn backward(
         &mut [&mut attention.query],
         &grad_queries.all(),
         &cache.queries_in.all(),
-        false,
+        narrow,
         q_rows,
     )?;
 
@@ -410,7 +452,7 @@ pub(crate) fn backward(
         plan.kv_stride,
         plan.d_kv,
         &grad_kv.all(),
-        false,
+        narrow,
         false,
         &mut grad_kv_in,
         kv_rows,
@@ -420,7 +462,7 @@ pub(crate) fn backward(
         &mut [&mut attention.key, &mut attention.value],
         &grad_kv.all(),
         &cache.kv_in.all(),
-        false,
+        narrow,
         kv_rows,
     )?;
 
@@ -480,6 +522,25 @@ impl Plan {
     /// fused `kv` row. Grouped-query heads share one.
     fn kv_base(&self, head: usize) -> usize {
         (head / self.group) * self.head_dim
+    }
+
+    /// Where the fused kernels find the queries in their own buffer and the
+    /// keys and values in the packed one.
+    fn flash_shape(&self, shape: CrossShape) -> FlashShape {
+        FlashShape {
+            rows: shape.q_rows(),
+            seq_len: shape.q_len,
+            kv_len: shape.kv_len,
+            sequences: shape.sequences,
+            heads: self.heads,
+            group: self.group,
+            qkv_width: self.query_width,
+            kv_width: self.kv_stride,
+            query_width: self.query_width,
+            key_base: self.key_base,
+            value_base: self.value_base,
+            causal: false,
+        }
     }
 
     /// `out = alpha * Q Kᵀ`, one batched GEMM per query head.
@@ -562,6 +623,8 @@ mod tests {
 
     fn assert_close(label: &str, device: &[f32], host: &[f32], tolerance: f32) {
         assert_eq!(device.len(), host.len(), "{label}: length");
+        let largest = host.iter().fold(1f32, |m, v| m.max(v.abs()));
+        let tolerance = tolerance * largest;
         for (index, (a, b)) in device.iter().zip(host).enumerate() {
             assert!(
                 (a - b).abs() <= tolerance,
@@ -580,10 +643,38 @@ mod tests {
         let Some(context) = cuda_or_skip() else {
             return;
         };
-        let gpu = Gpu { context: &context };
+        parity(&context, (8, 6, 4, 2, 4), (3, 5, 2), 1e-4);
+    }
 
-        let (d_model, d_kv, heads, kv_heads, head_dim) = (8, 6, 4, 2, 4);
-        let (q_len, kv_len, sequences) = (3, 5, 2);
+    /// The fused path, which only a mixed-precision context with a 64- or
+    /// 128-wide head takes. Both lengths are past one 64-row tile and neither
+    /// is a multiple of it, so every kernel crosses a tile edge and masks a
+    /// ragged tail, on the query side and the key side separately. BF16
+    /// operands put the worst error at 0.47% of the largest value; a forward
+    /// kernel that stops one key tile short is off by 0.93%.
+    #[test]
+    fn fused_cross_attention_matches_the_host_or_skips_without_device() {
+        if cuda_or_skip().is_none() {
+            return;
+        }
+        let context = GpuContext::with_precision(0, true).unwrap();
+        // More key tiles than query tiles, then fewer, so no loop bound
+        // can take the wrong length and still cover the same tiles.
+        for lengths in [(70, 150, 2), (150, 70, 2)] {
+            parity(&context, (48, 40, 4, 2, 64), lengths, 6e-3);
+        }
+    }
+
+    /// Runs one layer both ways and holds every output and gradient to
+    /// `tolerance` times the largest host value, or to `tolerance` when that
+    /// is below one.
+    fn parity(
+        context: &Arc<GpuContext>,
+        (d_model, d_kv, heads, kv_heads, head_dim): (usize, usize, usize, usize, usize),
+        (q_len, kv_len, sequences): (usize, usize, usize),
+        tolerance: f32,
+    ) {
+        let gpu = Gpu { context };
         let shape = CrossShape {
             q_len,
             kv_len,
@@ -608,7 +699,7 @@ mod tests {
             host.backward_cross(&host_cache, &grad_output).unwrap();
 
         for param in device.params_mut() {
-            param.move_to_cuda(&context).unwrap();
+            param.move_to_cuda(context).unwrap();
         }
         let device_queries_in = gpu.upload(&queries_in.data).unwrap();
         let device_kv_in = gpu.upload(&kv_in.data).unwrap();
@@ -626,7 +717,7 @@ mod tests {
             "cross forward",
             &gpu.download(&output).unwrap(),
             &host_output.data,
-            1e-4,
+            tolerance,
         );
 
         let (grad_queries, grad_kv) = backward(&gpu, &mut device, &cache, &device_grad_output)
@@ -635,13 +726,13 @@ mod tests {
             "cross grad_queries_in",
             &gpu.download(&grad_queries).unwrap(),
             &host_grad_queries.data,
-            1e-4,
+            tolerance,
         );
         assert_close(
             "cross grad_kv_in",
             &gpu.download(&grad_kv).unwrap(),
             &host_grad_kv.data,
-            1e-4,
+            tolerance,
         );
 
         // The weight gradients live on the device until they are asked for.
@@ -658,7 +749,7 @@ mod tests {
                 &format!("cross grad_{name}"),
                 &device.weight.grad.data,
                 &host.weight.grad.data,
-                1e-4,
+                tolerance,
             );
         }
     }

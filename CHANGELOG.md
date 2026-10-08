@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Device cross-attention (the shape VAE and the flow transformer) runs in
+  BF16 through the fused flash kernels under mixed precision with heads 64 or
+  128 wide, instead of FP32 around a score matrix. The shape VAE's training
+  step runs 0.084-0.087 to 0.062-0.065 s (-25%).
 - The device memory pool keeps the memory a training step frees instead of
   returning it to the driver at every synchronization. The shape VAE's
   training step runs 0.130 to 0.085 s (-35%); the language-model step is

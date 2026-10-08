@@ -140,15 +140,23 @@ impl ModelKernels {
 }
 
 /// Everything [`Gpu::flash_attention`] needs to locate one block's queries,
-/// keys and values inside the fused projection output.
+/// keys and values. Self-attention reads all three from one fused projection
+/// output; cross-attention reads the keys and values from a second buffer
+/// with its own width and length.
 #[derive(Clone, Copy)]
 pub(crate) struct FlashShape {
+    /// Query rows over all sequences, which is also the log-sum-exp stride.
     pub(crate) rows: usize,
+    /// Queries per sequence.
     pub(crate) seq_len: usize,
+    /// Keys per sequence.
+    pub(crate) kv_len: usize,
     pub(crate) sequences: usize,
     pub(crate) heads: usize,
     pub(crate) group: usize,
     pub(crate) qkv_width: usize,
+    /// Row stride of the key and value buffer.
+    pub(crate) kv_width: usize,
     pub(crate) query_width: usize,
     pub(crate) key_base: usize,
     pub(crate) value_base: usize,
@@ -936,12 +944,13 @@ impl Gpu<'_> {
         &self,
         flash: &crate::cuda_flash::FlashKernels,
         qkv: &Act,
+        kv: &Act,
         merged: &mut Act,
         log_sum_exp: &mut CudaSlice<f32>,
         shape: FlashShape,
         scale: f32,
     ) -> Result<(), NetworkError> {
-        debug_assert!(qkv.is_narrow() && merged.is_narrow());
+        debug_assert!(qkv.is_narrow() && kv.is_narrow() && merged.is_narrow());
         let config = cudarc::driver::LaunchConfig {
             grid_dim: (
                 shape.seq_len.div_ceil(crate::cuda_flash::TILE) as u32,
@@ -957,10 +966,13 @@ impl Gpu<'_> {
                 .stream
                 .launch_builder(&flash.forward)
                 .arg(&qkv.all())
+                .arg(&kv.all())
                 .arg(merged.destination())
                 .arg(log_sum_exp)
                 .arg(&(shape.seq_len as i32))
+                .arg(&(shape.kv_len as i32))
                 .arg(&(shape.qkv_width as i32))
+                .arg(&(shape.kv_width as i32))
                 .arg(&(shape.query_width as i32))
                 .arg(&(shape.key_base as i32))
                 .arg(&(shape.value_base as i32))
@@ -988,15 +1000,16 @@ impl Gpu<'_> {
         &self,
         flash: &crate::cuda_flash::FlashKernels,
         qkv: &Act,
+        kv: &Act,
         merged: &Act,
         grad_merged: &Act,
         log_sum_exp: &CudaSlice<f32>,
         delta: &mut CudaSlice<f32>,
-        grad_qkv: &mut Act,
+        grad_qkv: &Act,
+        grad_kv: &Act,
         shape: FlashShape,
         scale: f32,
     ) -> Result<(), NetworkError> {
-        let tiles = shape.seq_len.div_ceil(crate::cuda_flash::TILE) as u32;
         let head_dim = shape.head_dim();
         let flash = flash.width(head_dim);
         let warps = shape.heads * shape.rows;
@@ -1017,14 +1030,19 @@ impl Gpu<'_> {
 
         let delta = &*delta;
         let grad_merged_view = grad_merged.all();
-        // Both kernels write disjoint columns of `grad_qkv`, so they take it
-        // as a shared view rather than one after the other.
-        debug_assert!(qkv.is_narrow() && grad_qkv.is_narrow() && grad_merged.is_narrow());
+        // In self-attention both kernels write disjoint columns of one
+        // gradient buffer, so they take it as a shared view.
+        debug_assert!(qkv.is_narrow() && kv.is_narrow() && grad_merged.is_narrow());
+        debug_assert!(grad_qkv.is_narrow() && grad_kv.is_narrow());
         let qkv = qkv.all();
-        let grad_qkv = grad_qkv.all();
-        let launch = |function, grid_y, shared_mem_bytes| {
+        let kv = kv.all();
+        let launch = |function, tiles: usize, grid_y, grad: &Act, shared_mem_bytes| {
             let config = cudarc::driver::LaunchConfig {
-                grid_dim: (tiles, grid_y, shape.sequences as u32),
+                grid_dim: (
+                    tiles.div_ceil(crate::cuda_flash::TILE) as u32,
+                    grid_y,
+                    shape.sequences as u32,
+                ),
                 block_dim: (crate::cuda_flash::THREADS, 1, 1),
                 shared_mem_bytes,
             };
@@ -1033,12 +1051,15 @@ impl Gpu<'_> {
                     .stream
                     .launch_builder(function)
                     .arg(&qkv)
+                    .arg(&kv)
                     .arg(&grad_merged_view)
                     .arg(log_sum_exp)
                     .arg(&*delta)
-                    .arg(&grad_qkv)
+                    .arg(&grad.all())
                     .arg(&(shape.seq_len as i32))
+                    .arg(&(shape.kv_len as i32))
                     .arg(&(shape.qkv_width as i32))
+                    .arg(&(shape.kv_width as i32))
                     .arg(&(shape.query_width as i32))
                     .arg(&(shape.key_base as i32))
                     .arg(&(shape.value_base as i32))
@@ -1052,12 +1073,16 @@ impl Gpu<'_> {
         };
         launch(
             &flash.grad_query,
+            shape.seq_len,
             shape.heads as u32,
+            grad_qkv,
             crate::cuda_flash::dq_shared_bytes(head_dim),
         )?;
         launch(
             &flash.grad_key_value,
+            shape.kv_len,
             (shape.heads / shape.group) as u32,
+            grad_kv,
             crate::cuda_flash::dkv_shared_bytes(head_dim),
         )?;
         Ok(())
@@ -2583,10 +2608,12 @@ fn forward_block(
     let shape = FlashShape {
         rows,
         seq_len,
+        kv_len: seq_len,
         sequences,
         heads,
         group,
         qkv_width,
+        kv_width: qkv_width,
         query_width,
         key_base,
         value_base,
@@ -2597,7 +2624,7 @@ fn forward_block(
     // GEMM the fallback path ends with produces FP32.
     let mut merged = gpu.act(rows * query_width, narrow && fused.is_some())?;
     if let Some(flash) = fused {
-        gpu.flash_attention(flash, &qkv, &mut merged, &mut log_sum_exp, shape, scale)?;
+        gpu.flash_attention(flash, &qkv, &qkv, &mut merged, &mut log_sum_exp, shape, scale)?;
     } else {
         let mut wide_merged = merged.wide_mut();
         let qkv = qkv.wide();
@@ -4190,10 +4217,12 @@ fn backward_attention(
         let shape = FlashShape {
             rows,
             seq_len,
+            kv_len: seq_len,
             sequences,
             heads,
             group,
             qkv_width,
+            kv_width: qkv_width,
             query_width,
             key_base,
             value_base,
@@ -4206,11 +4235,13 @@ fn backward_attention(
         gpu.flash_attention_backward(
             flash,
             &cache.qkv,
+            &cache.qkv,
             &cache.merged,
             &grad_merged,
             &cache.log_sum_exp,
             &mut delta,
-            &mut grad_qkv,
+            &grad_qkv,
+            &grad_qkv,
             shape,
             scale,
         )?;

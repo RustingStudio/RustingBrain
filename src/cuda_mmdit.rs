@@ -663,17 +663,19 @@ impl DeviceDit {
         let shape = FlashShape {
             rows,
             seq_len: rows,
+            kv_len: rows,
             sequences: 1,
             heads,
             group: 1,
             qkv_width,
+            kv_width: qkv_width,
             query_width: width,
             key_base: width,
             value_base: 2 * width,
             causal: false,
         };
         let scale = ((width / heads) as f32).sqrt().recip();
-        gpu.flash_attention(flash, &qkv, &mut merged, &mut log_sum_exp, shape, scale)?;
+        gpu.flash_attention(flash, &qkv, &qkv, &mut merged, &mut log_sum_exp, shape, scale)?;
         Ok(merged)
     }
 }
