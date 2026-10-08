@@ -967,6 +967,37 @@ impl TransformerLm {
         max_new_tokens: usize,
         lookahead: usize,
     ) -> Result<Vec<u32>, NetworkError> {
+        let mut greedy = crate::sampling::Sampler::greedy();
+        self.generate_speculative_with(draft, prompt, max_new_tokens, lookahead, &mut greedy)
+    }
+
+    /// [`generate_speculative`](TransformerLm::generate_speculative) with any
+    /// sampler: the continuation is distributed as `generate` with `sampler`
+    /// would draw it from this model, whatever the draft proposes.
+    ///
+    /// Both models are sampled with the same settings. A proposal `x` that the
+    /// draft gave probability `q(x)` is kept with probability
+    /// `min(1, p(x) / q(x))` under this model's `p`; the first one refused is
+    /// replaced by a draw from what is left of `p` once `q` is taken out,
+    /// `max(0, p - q)`, which is exactly the mass the acceptance test
+    /// under-counts. A greedy sampler reduces this to the greedy scheme.
+    ///
+    /// ```no_run
+    /// # use rusting_brain::{Sampler, TransformerLm};
+    /// # let model = TransformerLm::load_bin("model.rbw")?;
+    /// # let draft = TransformerLm::load_bin("draft.rbw")?;
+    /// let mut sampler = Sampler::temperature(0.8, Some(7)).top_k(40);
+    /// let continuation = model.generate_speculative_with(&draft, &[1, 2, 3], 128, 4, &mut sampler)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn generate_speculative_with(
+        &self,
+        draft: &TransformerLm,
+        prompt: &[u32],
+        max_new_tokens: usize,
+        lookahead: usize,
+        sampler: &mut crate::sampling::Sampler,
+    ) -> Result<Vec<u32>, NetworkError> {
         if prompt.is_empty() {
             return Err(NetworkError::InvalidConfig(
                 "generation needs at least one prompt token".into(),
@@ -979,7 +1010,6 @@ impl TransformerLm {
                 self.embedding.vocab_size()
             )));
         }
-        let mut greedy = crate::sampling::Sampler::greedy();
         let mut target = self.decoder();
         let mut proposer = draft.decoder();
         target.rewrite(0, prompt)?;
@@ -992,19 +1022,31 @@ impl TransformerLm {
             let proposals = lookahead
                 .min(max_new_tokens - generated.len() - 1)
                 .min(capacity.saturating_sub(base));
-            let proposal = (0..proposals)
-                .map(|_| proposer.next(&mut greedy))
-                .collect::<Result<Vec<_>, _>>()?;
+            let (proposal, drafted): (Vec<u32>, Vec<Vec<f32>>) = (0..proposals)
+                .map(|_| proposer.propose(sampler))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .unzip();
             let logits = target.score(&proposal)?;
-            let choices: Vec<u32> = (0..logits.rows)
-                .map(|row| greedy.pick(logits.row(row), &[]))
-                .collect();
-            let accepted = proposal
-                .iter()
-                .zip(&choices)
-                .take_while(|(proposed, chosen)| proposed == chosen)
-                .count();
-            let own = choices[accepted];
+            let mut accepted = 0;
+            let own = loop {
+                let p =
+                    sampler.probabilities(logits.row(accepted), &target.history[..base + accepted]);
+                if accepted == proposals {
+                    break sampler.draw(&p);
+                }
+                let (x, q) = (proposal[accepted] as usize, &drafted[accepted]);
+                if sampler.uniform() * q[x] < p[x] {
+                    accepted += 1;
+                    continue;
+                }
+                let rest: Vec<f32> = p.iter().zip(q).map(|(p, q)| (p - q).max(0.0)).collect();
+                // All of `p` under `q` leaves nothing; only rounding gets here.
+                break match rest.iter().sum::<f32>() > 0.0 {
+                    true => sampler.draw(&rest),
+                    false => sampler.draw(&p),
+                };
+            };
             generated.extend_from_slice(&proposal[..accepted]);
             generated.push(own);
             target.rewrite(base + accepted, &[own])?;
@@ -2525,6 +2567,22 @@ impl Decoder<'_> {
         Ok(next)
     }
 
+    /// [`next`](Decoder::next), also returning the distribution it drew from.
+    fn propose(
+        &mut self,
+        sampler: &mut crate::sampling::Sampler,
+    ) -> Result<(u32, Vec<f32>), NetworkError> {
+        self.catch_up()?;
+        let logits = self.logits.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig("decoding needs a prompt fed in first".into())
+        })?;
+        let q = sampler.probabilities(logits.row(logits.rows - 1), &self.history);
+        let next = sampler.draw(&q);
+        self.history.push(next);
+        self.pending = Some(next);
+        Ok((next, q))
+    }
+
     /// Every id the session has seen, prompts and generated tokens alike.
     pub fn history(&self) -> &[u32] {
         &self.history
@@ -3318,6 +3376,65 @@ mod tests {
         assert_eq!(
             target.generate_speculative(draft, &prompt, 5, 0).unwrap(),
             expected[..5]
+        );
+    }
+
+    /// The next-token distribution `sampler` gives `model` after `history`.
+    fn next_distribution(model: &TransformerLm, sampler: &Sampler, history: &[u32]) -> Vec<f32> {
+        let mut decoder = model.decoder();
+        decoder.feed(history).unwrap();
+        let logits = decoder.logits.unwrap();
+        sampler.probabilities(logits.row(logits.rows - 1), history)
+    }
+
+    #[test]
+    fn sampled_speculative_decoding_draws_from_the_target() {
+        let target = tiny().build().unwrap();
+        let draft = tiny().n_layers(1).moe_layers([]).seed(99).build().unwrap();
+        let mut sampler = Sampler::temperature(0.02, Some(5)).top_k(12);
+        let prompt = [3u32, 1, 4];
+        let vocab = 24;
+
+        // The first two ids' marginals under plain sampling from the target.
+        let first = next_distribution(&target, &sampler, &prompt);
+        let mut second = vec![0.0; vocab];
+        for (id, &weight) in first.iter().enumerate().filter(|(_, w)| **w > 0.0) {
+            let after = next_distribution(&target, &sampler, &[3, 1, 4, id as u32]);
+            for (total, p) in second.iter_mut().zip(after) {
+                *total += weight * p;
+            }
+        }
+        let distance = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(a, b)| (a - b).abs()).sum::<f32>() / 2.0
+        };
+        // A draft this far from the target is what makes the check bite:
+        // keeping every proposal would sample the draft instead.
+        let drafted = next_distribution(&draft, &sampler, &prompt);
+        assert!(
+            distance(&first, &drafted) > 0.3,
+            "{}",
+            distance(&first, &drafted)
+        );
+
+        let trials = 4000;
+        let (mut seen_first, mut seen_second) = (vec![0.0; vocab], vec![0.0; vocab]);
+        for _ in 0..trials {
+            let got = target
+                .generate_speculative_with(&draft, &prompt, 3, 2, &mut sampler)
+                .unwrap();
+            assert_eq!(got.len(), 3);
+            seen_first[got[0] as usize] += 1.0 / trials as f32;
+            seen_second[got[1] as usize] += 1.0 / trials as f32;
+        }
+        assert!(
+            distance(&seen_first, &first) < 0.05,
+            "{}",
+            distance(&seen_first, &first)
+        );
+        assert!(
+            distance(&seen_second, &second) < 0.05,
+            "{}",
+            distance(&seen_second, &second)
         );
     }
 

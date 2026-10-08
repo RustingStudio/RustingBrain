@@ -88,6 +88,58 @@ impl Sampler {
     ///
     /// If `logits` is empty: there is no token to return.
     pub fn pick(&mut self, logits: &[f32], history: &[u32]) -> u32 {
+        let (ranked, weights) = self.kept(logits, history);
+        if weights.len() == 1 {
+            return ranked[0].0 as u32;
+        }
+        let total: f32 = weights.iter().sum();
+        let mut threshold = self.rng.gen_range(0.0..total);
+        for (&(id, _), &weight) in ranked.iter().zip(&weights) {
+            threshold -= weight;
+            if threshold <= 0.0 {
+                return id as u32;
+            }
+        }
+        ranked[0].0 as u32
+    }
+
+    /// The distribution [`pick`](Sampler::pick) draws from, over the whole
+    /// vocabulary: zero outside what the truncations keep, and all of it on
+    /// the argmax for a greedy sampler.
+    pub(crate) fn probabilities(&self, logits: &[f32], history: &[u32]) -> Vec<f32> {
+        let (ranked, weights) = self.kept(logits, history);
+        let total: f32 = weights.iter().sum();
+        let mut probabilities = vec![0.0; logits.len()];
+        for (&(id, _), &weight) in ranked.iter().zip(&weights) {
+            probabilities[id] = weight / total;
+        }
+        probabilities
+    }
+
+    /// An id drawn in proportion to `weights`, which need not sum to one.
+    pub(crate) fn draw(&mut self, weights: &[f32]) -> u32 {
+        let total: f32 = weights.iter().sum();
+        let mut threshold = self.rng.gen_range(0.0..total);
+        for (id, &weight) in weights.iter().enumerate() {
+            threshold -= weight;
+            if weight > 0.0 && threshold <= 0.0 {
+                return id as u32;
+            }
+        }
+        weights
+            .iter()
+            .rposition(|&weight| weight > 0.0)
+            .unwrap_or(0) as u32
+    }
+
+    /// A uniform draw from `[0, 1)`.
+    pub(crate) fn uniform(&mut self) -> f32 {
+        self.rng.gen_range(0.0..1.0)
+    }
+
+    /// The candidates in descending order and their unnormalised weights.
+    /// A single candidate means there is nothing to draw.
+    fn kept(&self, logits: &[f32], history: &[u32]) -> (Vec<(usize, f32)>, Vec<f32>) {
         assert!(!logits.is_empty(), "cannot sample from an empty vocabulary");
 
         let mut scores: Vec<f32> = logits.to_vec();
@@ -118,7 +170,7 @@ impl Sampler {
                     best = index;
                 }
             }
-            return ranked[best].0 as u32;
+            return (vec![ranked[best]], vec![1.0]);
         }
 
         // Sorting a 32000-token vocabulary costs more than some models spend
@@ -159,17 +211,10 @@ impl Sampler {
         // NaN as well as zero: a diverged model gives `gen_range` an empty or
         // undefined range, which panics.
         if total <= 0.0 || !total.is_finite() {
-            return ranked[0].0 as u32;
+            return (vec![ranked[0]], vec![1.0]);
         }
-
-        let mut threshold = self.rng.gen_range(0.0..total);
-        for (&(id, _), &weight) in ranked.iter().zip(&weights) {
-            threshold -= weight;
-            if threshold <= 0.0 {
-                return id as u32;
-            }
-        }
-        ranked[0].0 as u32
+        ranked.truncate(weights.len());
+        (ranked, weights)
     }
 }
 
