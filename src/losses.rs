@@ -6,6 +6,7 @@
 //! reintroduce the catastrophic cancellation the pairing exists to avoid.
 
 use crate::activations::Activation;
+use crate::matrix::Matrix;
 use serde::{Deserialize, Serialize};
 
 const EPSILON: f32 = 1e-7;
@@ -311,5 +312,196 @@ mod divergence_tests {
         let (value, grad) = clamped_l1(&[0.05, -0.02], &[0.01, 0.03], 0.1);
         assert!((value - (0.04 + 0.05) / 2.0).abs() < 1e-6);
         assert_eq!(grad, vec![0.5, -0.5]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Losses on logits with per-sample weights, for behaviour cloning and
+// advantage-weighted regression. Each reduces as `sum_i(w_i * loss_i) / batch`
+// (Keras' `sum_over_batch_size`), so weights of one give the plain mean, and
+// returns the loss with its gradient with respect to the input.
+// ---------------------------------------------------------------------------
+
+fn sample_weight(weights: Option<&[f32]>, sample: usize) -> f32 {
+    weights.map_or(1.0, |weights| weights[sample])
+}
+
+fn check_weights(weights: Option<&[f32]>, batch: usize) {
+    if let Some(weights) = weights {
+        assert_eq!(weights.len(), batch, "one weight a sample");
+    }
+}
+
+/// Sigmoid binary cross-entropy on `logits`, `[batch, keys]`, averaged over
+/// the keys of each sample. Targets are smoothed to `y (1 - s) + s / 2`.
+/// Stable for any logit: the loss is `max(z, 0) - z t + ln(1 + e^-|z|)`.
+///
+/// ```
+/// use rusting_brain::{losses::bce_with_logits, matrix::Matrix};
+/// let (loss, _) = bce_with_logits(&Matrix::new(1, 2), &Matrix::from_vec(1, 2, vec![1.0; 2]), 0.0, None);
+/// assert!((loss - std::f32::consts::LN_2).abs() < 1e-6);
+/// ```
+pub fn bce_with_logits(
+    logits: &Matrix,
+    targets: &Matrix,
+    smoothing: f32,
+    weights: Option<&[f32]>,
+) -> (f32, Matrix) {
+    assert_eq!((logits.rows, logits.cols), (targets.rows, targets.cols));
+    let (batch, keys) = (logits.rows, logits.cols);
+    check_weights(weights, batch);
+    let mut grad = Matrix::new(batch, keys);
+    let mut total = 0f64;
+    for sample in 0..batch {
+        let weight = sample_weight(weights, sample);
+        let (z, y) = (logits.row(sample), targets.row(sample));
+        for (key, slot) in grad.row_mut(sample).iter_mut().enumerate() {
+            let (z, t) = (z[key], y[key] * (1.0 - smoothing) + 0.5 * smoothing);
+            let loss = z.max(0.0) - z * t + (-z.abs()).exp().ln_1p();
+            total += (weight * loss / keys as f32) as f64;
+            *slot = weight * (1.0 / (1.0 + (-z).exp()) - t) / (keys * batch) as f32;
+        }
+    }
+    ((total / batch.max(1) as f64) as f32, grad)
+}
+
+/// Cross-entropy of `softmax(logits)` against soft `targets`, each row a
+/// distribution over the classes.
+pub fn soft_cross_entropy(
+    logits: &Matrix,
+    targets: &Matrix,
+    weights: Option<&[f32]>,
+) -> (f32, Matrix) {
+    assert_eq!((logits.rows, logits.cols), (targets.rows, targets.cols));
+    let batch = logits.rows;
+    check_weights(weights, batch);
+    let mut grad = Matrix::new(batch, logits.cols);
+    let mut total = 0f64;
+    for sample in 0..batch {
+        let weight = sample_weight(weights, sample);
+        let (z, t) = (logits.row(sample), targets.row(sample));
+        let max = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let log_sum = max + z.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
+        let mass: f32 = t.iter().sum();
+        for (class, slot) in grad.row_mut(sample).iter_mut().enumerate() {
+            let log_p = z[class] - log_sum;
+            total -= (weight * t[class] * log_p) as f64;
+            *slot = weight * (log_p.exp() * mass - t[class]) / batch as f32;
+        }
+    }
+    ((total / batch.max(1) as f64) as f32, grad)
+}
+
+/// Huber loss with threshold `delta`: quadratic within it, linear outside.
+pub fn huber(
+    prediction: &[f32],
+    target: &[f32],
+    delta: f32,
+    weights: Option<&[f32]>,
+) -> (f32, Vec<f32>) {
+    assert_eq!(prediction.len(), target.len());
+    let batch = prediction.len();
+    check_weights(weights, batch);
+    let mut total = 0f64;
+    let grad = (0..batch)
+        .map(|sample| {
+            let weight = sample_weight(weights, sample);
+            let error = prediction[sample] - target[sample];
+            let loss = match error.abs() <= delta {
+                true => 0.5 * error * error,
+                false => delta * (error.abs() - 0.5 * delta),
+            };
+            total += (weight * loss) as f64;
+            weight * error.clamp(-delta, delta) / batch as f32
+        })
+        .collect();
+    ((total / batch.max(1) as f64) as f32, grad)
+}
+
+#[cfg(test)]
+mod logit_tests {
+    use super::*;
+
+    /// The largest gap between `grad` and central differences of `loss`,
+    /// relative to the largest gradient.
+    fn gap(loss: impl Fn(&[f32]) -> f32, input: &[f32], grad: &[f32]) -> f32 {
+        let mut input = input.to_vec();
+        let scale = grad.iter().fold(0f32, |m, g| m.max(g.abs()));
+        let mut worst = 0f32;
+        for index in 0..input.len() {
+            let (original, h) = (input[index], 1e-2);
+            input[index] = original + h;
+            let high = loss(&input);
+            input[index] = original - h;
+            let low = loss(&input);
+            input[index] = original;
+            worst = worst.max(((high - low) / (2.0 * h) - grad[index]).abs() / scale);
+        }
+        worst
+    }
+
+    fn values(count: usize, seed: u32, spread: f32) -> Vec<f32> {
+        (0..count)
+            .map(|i| {
+                ((((i as u32).wrapping_mul(2_654_435_761) ^ seed) % 1000) as f32 / 500.0 - 1.0)
+                    * spread
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bce_with_logits_matches_finite_differences_and_stays_finite() {
+        let z = values(12, 1, 4.0);
+        let y = Matrix::from_vec(2, 6, vec![1., 0., 0., 1., 1., 0., 0., 0., 1., 1., 0., 1.]);
+        for weights in [None, Some(&[0.5f32, 2.0][..])] {
+            let loss = |z: &[f32]| {
+                bce_with_logits(&Matrix::from_vec(2, 6, z.to_vec()), &y, 0.1, weights).0
+            };
+            let (_, grad) = bce_with_logits(&Matrix::from_vec(2, 6, z.clone()), &y, 0.1, weights);
+            assert!(gap(loss, &z, &grad.data) < 1e-2);
+        }
+        let extreme = Matrix::from_vec(1, 2, vec![100.0, -100.0]);
+        let (loss, grad) =
+            bce_with_logits(&extreme, &Matrix::from_vec(1, 2, vec![0.0, 1.0]), 0.0, None);
+        assert!((loss - 100.0).abs() < 1e-3, "{loss}");
+        assert_eq!(grad.data, vec![0.5, -0.5]);
+    }
+
+    #[test]
+    fn soft_cross_entropy_matches_finite_differences_and_stays_finite() {
+        let z = values(30, 2, 3.0);
+        let mut t = vec![0f32; 30];
+        (t[3], t[4], t[5], t[15], t[16]) = (0.1, 0.8, 0.1, 0.9, 0.1);
+        let t = Matrix::from_vec(2, 15, t);
+        for weights in [None, Some(&[1.5f32, 0.3][..])] {
+            let loss =
+                |z: &[f32]| soft_cross_entropy(&Matrix::from_vec(2, 15, z.to_vec()), &t, weights).0;
+            let (_, grad) = soft_cross_entropy(&Matrix::from_vec(2, 15, z.clone()), &t, weights);
+            assert!(gap(loss, &z, &grad.data) < 1e-2);
+        }
+        let (uniform, _) = soft_cross_entropy(
+            &Matrix::new(1, 15),
+            &Matrix::from_vec(1, 15, t.row(0).to_vec()),
+            None,
+        );
+        assert!((uniform - 15f32.ln()).abs() < 1e-5);
+        let extreme = Matrix::from_vec(1, 2, vec![100.0, -100.0]);
+        let (loss, grad) =
+            soft_cross_entropy(&extreme, &Matrix::from_vec(1, 2, vec![0.0, 1.0]), None);
+        assert!((loss - 200.0).abs() < 1e-3 && grad.data.iter().all(|g| g.is_finite()));
+    }
+
+    #[test]
+    fn huber_matches_finite_differences_and_its_two_pieces() {
+        let p = values(8, 3, 3.0);
+        let t = values(8, 4, 1.0);
+        for weights in [None, Some(&values(8, 5, 1.0)[..])] {
+            let (_, grad) = huber(&p, &t, 1.0, weights);
+            assert!(gap(|p| huber(p, &t, 1.0, weights).0, &p, &grad) < 1e-2);
+        }
+        assert_eq!(
+            huber(&[3.0, 0.5], &[0.0, 0.0], 1.0, None).0,
+            (2.5 + 0.125) / 2.0
+        );
     }
 }
