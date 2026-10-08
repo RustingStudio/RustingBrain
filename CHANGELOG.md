@@ -102,7 +102,8 @@
   depth or pose picture; matches diffusers within 9e-7.
 - `ImagePipeline::load_with_loras` and `ShardedSafeTensors::add_lora` merge
   published LoRA files (PEFT/diffusers and kohya spellings, including
-  kohya's SDXL files that use the original UNet's block names) into a UNet
+  kohya's SDXL and FLUX files that use the original models' module names,
+  whose fused FLUX projections are split onto diffusers' parts) into a UNet
   or DiT, and into the CLIP text encoders, as they load; matches PEFT's
   `fuse_lora` within 1.1e-6.
 - `TransformerLm::log_probabilities` gives each token's log-probability

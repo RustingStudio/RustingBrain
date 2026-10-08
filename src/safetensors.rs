@@ -172,6 +172,88 @@ impl TensorInfo {
     }
 }
 
+/// Module names as the original code of a model wrote them, each with the
+/// diffusers names of the weights it is, in output order; all with
+/// underscores for dots.
+fn original_names(names: &BTreeMap<String, String>) -> Vec<(String, Vec<String>)> {
+    let has = |prefix: String| names.keys().any(|name| name.starts_with(&prefix));
+    let mut pairs: Vec<(String, Vec<String>)> = ldm_blocks(names)
+        .into_iter()
+        .map(|(diffusers, original)| (original, vec![diffusers]))
+        .collect();
+    // FLUX's reference DiT.
+    let mut alias = |original: String, diffusers: &[String]| {
+        pairs.push((original, diffusers.to_vec()));
+    };
+    for (original, diffusers) in [
+        ("time_in", "time_text_embed_timestep_embedder"),
+        ("vector_in", "time_text_embed_text_embedder"),
+        ("guidance_in", "time_text_embed_guidance_embedder"),
+    ] {
+        alias(
+            format!("{original}_in_layer"),
+            &[format!("{diffusers}_linear_1")],
+        );
+        alias(
+            format!("{original}_out_layer"),
+            &[format!("{diffusers}_linear_2")],
+        );
+    }
+    alias("img_in".into(), &["x_embedder".into()]);
+    alias("txt_in".into(), &["context_embedder".into()]);
+    alias("final_layer_linear".into(), &["proj_out".into()]);
+    for block in
+        (0..).take_while(|block| has(format!("transformer_blocks.{block}.attn.add_q_proj.")))
+    {
+        let (from, to) = (
+            format!("double_blocks_{block}"),
+            format!("transformer_blocks_{block}"),
+        );
+        for (original, diffusers) in [
+            ("img_attn_qkv", &["attn_to_q", "attn_to_k", "attn_to_v"][..]),
+            (
+                "txt_attn_qkv",
+                &["attn_add_q_proj", "attn_add_k_proj", "attn_add_v_proj"],
+            ),
+            ("img_attn_proj", &["attn_to_out_0"]),
+            ("txt_attn_proj", &["attn_to_add_out"]),
+            ("img_mlp_0", &["ff_net_0_proj"]),
+            ("img_mlp_2", &["ff_net_2"]),
+            ("txt_mlp_0", &["ff_context_net_0_proj"]),
+            ("txt_mlp_2", &["ff_context_net_2"]),
+            ("img_mod_lin", &["norm1_linear"]),
+            ("txt_mod_lin", &["norm1_context_linear"]),
+        ] {
+            let diffusers: Vec<String> = diffusers
+                .iter()
+                .map(|part| format!("{to}_{part}"))
+                .collect();
+            alias(format!("{from}_{original}"), &diffusers);
+        }
+    }
+    for block in (0..).take_while(|block| has(format!("single_transformer_blocks.{block}."))) {
+        let (from, to) = (
+            format!("single_blocks_{block}"),
+            format!("single_transformer_blocks_{block}"),
+        );
+        for (original, diffusers) in [
+            (
+                "linear1",
+                &["attn_to_q", "attn_to_k", "attn_to_v", "proj_mlp"][..],
+            ),
+            ("linear2", &["proj_out"]),
+            ("modulation_lin", &["norm_linear"]),
+        ] {
+            let diffusers: Vec<String> = diffusers
+                .iter()
+                .map(|part| format!("{to}_{part}"))
+                .collect();
+            alias(format!("{from}_{original}"), &diffusers);
+        }
+    }
+    pairs
+}
+
 /// Pairs of a diffusers UNet name and the original (LDM) UNet name for the
 /// same module, both with underscores for dots, laid out from the blocks the
 /// checkpoint holds.
@@ -581,25 +663,34 @@ impl ShardedSafeTensors {
             "base_model_model",
         ];
         let flat = |name: &str| name.replace('.', "_");
-        let mut weights: BTreeMap<String, String> = self
+        let mut weights: BTreeMap<String, Vec<String>> = self
             .map
             .keys()
             .filter_map(|name| name.strip_suffix(".weight"))
-            .map(|stem| (flat(stem), stem.to_string()))
+            .map(|stem| (flat(stem), vec![stem.to_string()]))
             .collect();
-        // kohya trains SDXL on the original UNet, so its files name blocks as
-        // `input_blocks_4_1` rather than `down_blocks_1_attentions_0`.
-        let blocks = ldm_blocks(&self.map);
-        let aliases: Vec<(String, String)> = weights
-            .iter()
-            .filter_map(|(name, stem)| {
-                blocks.iter().find_map(|(diffusers, ldm)| {
-                    let rest = name.strip_prefix(diffusers.as_str())?;
-                    (rest.is_empty() || rest.starts_with('_'))
-                        .then(|| (format!("{ldm}{rest}"), stem.clone()))
-                })
-            })
-            .collect();
+        // Files name modules as the model's original code did where that
+        // differs from diffusers: kohya trains SDXL on the original UNet
+        // (`input_blocks_4_1`), and FLUX on the reference DiT, whose fused
+        // projections diffusers writes as several.
+        let mut aliases = Vec::new();
+        for (original, diffusers) in original_names(&self.map) {
+            for (name, _) in weights.range(diffusers[0].clone()..) {
+                let Some(rest) = name.strip_prefix(diffusers[0].as_str()) else {
+                    break;
+                };
+                if !rest.is_empty() && !rest.starts_with('_') {
+                    continue;
+                }
+                let targets: Option<Vec<String>> = diffusers
+                    .iter()
+                    .map(|part| Some(weights.get(&format!("{part}{rest}"))?[0].clone()))
+                    .collect();
+                if let Some(targets) = targets {
+                    aliases.push((format!("{original}{rest}"), targets));
+                }
+            }
+        }
         weights.extend(aliases);
         let mut file = SafeTensors::open(path)?;
         let names: Vec<String> = file.names().map(str::to_string).collect();
@@ -661,19 +752,28 @@ impl ShardedSafeTensors {
             };
             let inputs = down.len().checked_div(rank).unwrap_or(0);
             let outputs = up_shape.first().copied().unwrap_or(0);
-            let base = self.map.get(&format!("{target}.weight")).cloned();
-            let base_len = base
-                .and_then(|file| self.size_of(&file, &format!("{target}.weight")))
-                .unwrap_or(0);
+            // One adapter can feed several weights, which take its outputs
+            // in turn.
+            let mut sizes = Vec::new();
+            for stem in target {
+                let name = format!("{stem}.weight");
+                let file = self.map.get(&name).cloned();
+                sizes.push(
+                    file.and_then(|file| self.size_of(&file, &name))
+                        .unwrap_or(0),
+                );
+            }
+            let base_len: usize = sizes.iter().sum();
             // The shapes come from the file, so every product is checked: a
             // wrapped one would size the multiply below past its buffers.
             if rank == 0
                 || down.len() != rank * inputs
                 || Some(up.len()) != outputs.checked_mul(rank)
                 || Some(base_len) != outputs.checked_mul(inputs)
+                || sizes.iter().any(|size| size % inputs != 0)
             {
                 return Err(NetworkError::InvalidDataset(format!(
-                    "the LoRA for {target} is {up_shape:?} by {down_shape:?}, which does not \
+                    "the LoRA for {target:?} is {up_shape:?} by {down_shape:?}, which does not \
                      make its {base_len} weights"
                 )));
             }
@@ -682,12 +782,15 @@ impl ShardedSafeTensors {
             let mut product = Matrix::new(outputs, inputs);
             up.dot(&down, &mut product);
             let factor = scale * alpha / rank as f32;
-            let delta = self
-                .deltas
-                .entry(format!("{target}.weight"))
-                .or_insert_with(|| vec![0.0; base_len]);
-            for (delta, value) in delta.iter_mut().zip(&product.data) {
-                *delta += factor * value;
+            let mut values = product.data.iter();
+            for (stem, size) in target.iter().zip(sizes) {
+                let delta = self
+                    .deltas
+                    .entry(format!("{stem}.weight"))
+                    .or_insert_with(|| vec![0.0; size]);
+                for (delta, value) in delta.iter_mut().zip(values.by_ref().take(size)) {
+                    *delta += factor * value;
+                }
             }
             changed += 1;
         }

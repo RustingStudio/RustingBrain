@@ -793,8 +793,10 @@ impl ImagePipeline {
 
         let denoiser_file = |name: &str| {
             let mut file = crate::safetensors::ShardedSafeTensors::open(weights(&part(name))?)?;
+            // kohya calls every denoiser, FLUX's DiT too, `lora_unet`.
+            let prefixes = [name, &format!("lora_{name}"), "lora_unet", ""];
             for (path, scale) in loras {
-                if file.add_lora(path, &[name, &format!("lora_{name}"), ""], *scale)? == 0 {
+                if file.add_lora(path, &prefixes, *scale)? == 0 {
                     return Err(NetworkError::InvalidDataset(format!(
                         "{} adapts nothing in the {name}",
                         path.display()
