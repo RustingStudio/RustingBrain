@@ -232,7 +232,15 @@ pub fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
-pub(crate) fn silu_derivative(x: f32) -> f32 {
+/// `d silu(x) / dx`, from the pre-activation `x`.
+///
+/// ```
+/// use rusting_brain::ffn::{silu, silu_derivative};
+/// let (x, h) = (0.7f32, 1e-3f32);
+/// let numeric = (silu(x + h) - silu(x - h)) / (2.0 * h);
+/// assert!((silu_derivative(x) - numeric).abs() < 1e-3);
+/// ```
+pub fn silu_derivative(x: f32) -> f32 {
     let s = sigmoid(x);
     s * (1.0 + x * (1.0 - s))
 }
@@ -349,5 +357,14 @@ mod tests {
         // Both are asymptotically the identity for large positive inputs.
         assert!((silu(10.0) - 10.0).abs() < 1e-3);
         assert!((gelu(10.0) - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn silu_derivative_matches_finite_differences() {
+        for x in [-8.0f32, -3.0, -1.5, -0.5, 0.0, 0.25, 1.0, 2.5, 5.0, 9.0] {
+            let h = 1e-3;
+            let numeric = (silu(x + h) - silu(x - h)) / (2.0 * h);
+            assert!((silu_derivative(x) - numeric).abs() < 1e-3, "at {x}");
+        }
     }
 }
