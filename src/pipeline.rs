@@ -816,7 +816,7 @@ impl ImagePipeline {
 
     /// Moves everything that has a device path onto CUDA device `device`.
     ///
-    /// That is the denoiser, the VAE decoder, every CLIP tower and a gated
+    /// That is the denoiser, both halves of the VAE, every CLIP tower and a gated
     /// T5 encoder. The UNet runs on the FP16 image kernels; a transformer
     /// denoiser and T5 run on the BF16 ones, because T5 1.1's activations pass
     /// FP16's range. The original ungated T5 stays on the host.
@@ -831,6 +831,9 @@ impl ImagePipeline {
             unet.attach_device(gpu.clone())?;
         }
         self.decoder.attach_device(gpu.clone())?;
+        if let Some(encoder) = &mut self.image_encoder {
+            encoder.attach_device(gpu.clone())?;
+        }
         for tower in self.encoder.towers() {
             tower.attach_device(gpu.clone())?;
         }

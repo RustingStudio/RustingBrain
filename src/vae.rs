@@ -515,11 +515,11 @@ fn stitch_tiles(
 
 /// One rung of the encoder's ladder: several residual blocks, then a halving.
 #[derive(Clone, Debug)]
-struct DownBlock {
-    resnets: Vec<ResnetBlock>,
+pub(crate) struct DownBlock {
+    pub(crate) resnets: Vec<ResnetBlock>,
     /// The stride-two convolution that ends the rung. Absent on the last one,
     /// which is already at the latent's resolution.
-    downsampler: Option<Conv2d>,
+    pub(crate) downsampler: Option<Conv2d>,
 }
 
 /// The encoder half of a latent diffusion model's autoencoder.
@@ -533,16 +533,19 @@ struct DownBlock {
 #[derive(Clone, Debug)]
 pub struct VaeEncoder {
     config: VaeConfig,
-    conv_in: Conv2d,
-    down_blocks: Vec<DownBlock>,
-    mid_first: ResnetBlock,
-    mid_attention: AttentionBlock,
-    mid_last: ResnetBlock,
-    norm_out: GroupNorm,
-    conv_out: Conv2d,
+    pub(crate) conv_in: Conv2d,
+    pub(crate) down_blocks: Vec<DownBlock>,
+    pub(crate) mid_first: ResnetBlock,
+    pub(crate) mid_attention: AttentionBlock,
+    pub(crate) mid_last: ResnetBlock,
+    pub(crate) norm_out: GroupNorm,
+    pub(crate) conv_out: Conv2d,
     /// The one-by-one convolution some checkpoints put between the encoder and
     /// the latent. It lives beside `encoder.` rather than inside it.
-    quant: Option<Conv2d>,
+    pub(crate) quant: Option<Conv2d>,
+    /// The same weights on a CUDA device, when one was attached.
+    #[cfg(feature = "cuda")]
+    device: Option<std::sync::Arc<crate::cuda_image::DeviceVaeEncoder>>,
 }
 
 impl VaeEncoder {
@@ -652,7 +655,23 @@ impl VaeEncoder {
             norm_out,
             conv_out,
             quant,
+            #[cfg(feature = "cuda")]
+            device: None,
         })
+    }
+
+    /// Uploads the encoder to a CUDA device and encodes there from now on.
+    ///
+    /// Fails closed, leaving the encoder on the CPU if the upload does not fit.
+    #[cfg(feature = "cuda")]
+    pub fn attach_device(
+        &mut self,
+        gpu: std::sync::Arc<crate::cuda_image::ImageGpu>,
+    ) -> Result<(), NetworkError> {
+        self.device = Some(std::sync::Arc::new(
+            crate::cuda_image::DeviceVaeEncoder::upload(&gpu, self)?,
+        ));
+        Ok(())
     }
 
     /// Encodes an image whose values sit in roughly `[-1, 1]` into the latent
@@ -667,6 +686,30 @@ impl VaeEncoder {
                 expected: self.config.out_channels,
                 actual: image.channels,
             });
+        }
+
+        let moments = self.moments(image)?;
+
+        // The second half of the channels is the log-variance, which only
+        // sampling from the distribution would need.
+        let channels = self.config.latent_channels;
+        let pixels = moments.pixels();
+        let mut latent = FeatureMap::from_vec(
+            channels,
+            moments.height,
+            moments.width,
+            moments.data[..channels * pixels].to_vec(),
+        )?;
+        for value in &mut latent.data {
+            *value = (*value - self.config.shift_factor) * self.config.scaling_factor;
+        }
+        Ok(latent)
+    }
+
+    fn moments(&self, image: &FeatureMap) -> Result<FeatureMap, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            return device.moments(image);
         }
 
         let mut hidden = self.conv_in.forward(image)?;
@@ -689,21 +732,7 @@ impl VaeEncoder {
         if let Some(quant) = &self.quant {
             moments = quant.forward(&moments)?;
         }
-
-        // The second half of the channels is the log-variance, which only
-        // sampling from the distribution would need.
-        let channels = self.config.latent_channels;
-        let pixels = moments.pixels();
-        let mut latent = FeatureMap::from_vec(
-            channels,
-            moments.height,
-            moments.width,
-            moments.data[..channels * pixels].to_vec(),
-        )?;
-        for value in &mut latent.data {
-            *value = (*value - self.config.shift_factor) * self.config.scaling_factor;
-        }
-        Ok(latent)
+        Ok(moments)
     }
 }
 

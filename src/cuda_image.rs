@@ -54,7 +54,7 @@ use crate::gpu_transformer::{GpuContext, act_plain, act_rhs_transposed};
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::unet::{Projection, Unet};
-use crate::vae::VaeDecoder;
+use crate::vae::{VaeDecoder, VaeEncoder};
 use crate::vit_encoder::VitEncoder;
 use cudarc::cublas::{result as cublas, sys as cublas_sys, sys::cublasOperation_t};
 use cudarc::driver::{
@@ -744,6 +744,10 @@ struct DeviceConv {
     kernel: usize,
     stride: usize,
     padding: usize,
+    /// Extra zeros past the right and bottom edges only, which is how the VAE
+    /// encoder's halving convolution pads. im2col already reads zeros past
+    /// the edge, so this only changes how many output pixels there are.
+    pad_end: usize,
 }
 
 struct DeviceDense {
@@ -793,6 +797,7 @@ fn upload_conv(gpu: &ImageGpu, conv: &Conv2d) -> Result<DeviceConv, NetworkError
         kernel: conv.kernel,
         stride: conv.stride,
         padding: conv.padding,
+        pad_end: 0,
     })
 }
 
@@ -915,7 +920,9 @@ impl ImageGpu {
                 input.channels()
             )));
         }
-        let size = |length: usize| match (length + 2 * conv.padding).checked_sub(conv.kernel) {
+        let size = |length: usize| match (length + 2 * conv.padding + conv.pad_end)
+            .checked_sub(conv.kernel)
+        {
             Some(span) => span / conv.stride + 1,
             None => 0,
         };
@@ -2087,13 +2094,7 @@ impl DeviceVae {
             },
             conv_in: upload_conv(gpu, &decoder.conv_in)?,
             mid_first: upload_vae_resnet(gpu, &decoder.mid_first)?,
-            mid_attention: DeviceVaeAttention {
-                norm: upload_group_norm(gpu, &decoder.mid_attention.norm)?,
-                query: upload_dense(gpu, &decoder.mid_attention.query)?,
-                key: upload_dense(gpu, &decoder.mid_attention.key)?,
-                value: upload_dense(gpu, &decoder.mid_attention.value)?,
-                output: upload_dense(gpu, &decoder.mid_attention.output)?,
-            },
+            mid_attention: upload_vae_attention(gpu, &decoder.mid_attention)?,
             mid_last: upload_vae_resnet(gpu, &decoder.mid_last)?,
             up_blocks: decoder
                 .up_blocks
@@ -2135,13 +2136,13 @@ impl DeviceVae {
             hidden = gpu.conv(post_quant, &hidden)?;
         }
         hidden = gpu.conv(&self.conv_in, &hidden)?;
-        hidden = self.resnet(&self.mid_first, hidden)?;
-        hidden = self.attention(&hidden)?;
-        hidden = self.resnet(&self.mid_last, hidden)?;
+        hidden = vae_resnet(gpu, &self.mid_first, hidden)?;
+        hidden = vae_attention(gpu, &self.mid_attention, &hidden)?;
+        hidden = vae_resnet(gpu, &self.mid_last, hidden)?;
 
         for block in &self.up_blocks {
             for resnet in &block.resnets {
-                hidden = self.resnet(resnet, hidden)?;
+                hidden = vae_resnet(gpu, resnet, hidden)?;
             }
             if let Some(upsampler) = &block.upsampler {
                 let large = gpu.upsample_nearest(&hidden, 2)?;
@@ -2166,53 +2167,159 @@ impl DeviceVae {
         }
         Ok(image)
     }
+}
 
-    /// Takes the input by value so the normalization can run in place.
-    ///
-    /// At the decoder's last rung one feature map is half a gigabyte, and the
-    /// naive order — clone, normalize the clone, convolve, then build the skip
-    /// — holds three of them at once. Building the skip first instead lets the
-    /// input be normalized where it lies and freed as soon as the first
-    /// convolution has read it.
-    fn resnet(&self, resnet: &DeviceVaeResnet, input: Map) -> Result<Map, NetworkError> {
+/// A VAE encoder, resident on the device. The same blocks as [`DeviceVae`],
+/// run the other way.
+pub struct DeviceVaeEncoder {
+    gpu: Arc<ImageGpu>,
+    conv_in: DeviceConv,
+    down_blocks: Vec<(Vec<DeviceVaeResnet>, Option<DeviceConv>)>,
+    mid_first: DeviceVaeResnet,
+    mid_attention: DeviceVaeAttention,
+    mid_last: DeviceVaeResnet,
+    norm_out: DeviceGroupNorm,
+    conv_out: DeviceConv,
+    quant: Option<DeviceConv>,
+}
+
+impl std::fmt::Debug for DeviceVaeEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceVaeEncoder").finish_non_exhaustive()
+    }
+}
+
+impl DeviceVaeEncoder {
+    pub fn upload(gpu: &Arc<ImageGpu>, encoder: &VaeEncoder) -> Result<Self, NetworkError> {
+        Ok(Self {
+            conv_in: upload_conv(gpu, &encoder.conv_in)?,
+            down_blocks: encoder
+                .down_blocks
+                .iter()
+                .map(|block| {
+                    let resnets = block
+                        .resnets
+                        .iter()
+                        .map(|resnet| upload_vae_resnet(gpu, resnet))
+                        .collect::<Result<_, NetworkError>>()?;
+                    let downsampler = match &block.downsampler {
+                        Some(conv) => Some(DeviceConv {
+                            pad_end: 1,
+                            ..upload_conv(gpu, conv)?
+                        }),
+                        None => None,
+                    };
+                    Ok((resnets, downsampler))
+                })
+                .collect::<Result<_, NetworkError>>()?,
+            mid_first: upload_vae_resnet(gpu, &encoder.mid_first)?,
+            mid_attention: upload_vae_attention(gpu, &encoder.mid_attention)?,
+            mid_last: upload_vae_resnet(gpu, &encoder.mid_last)?,
+            norm_out: upload_group_norm(gpu, &encoder.norm_out)?,
+            conv_out: upload_conv(gpu, &encoder.conv_out)?,
+            quant: match &encoder.quant {
+                Some(conv) => Some(upload_conv(gpu, conv)?),
+                None => None,
+            },
+            gpu: gpu.clone(),
+        })
+    }
+
+    /// The moments, mean and log-variance, before the host picks the mean
+    /// and applies the scale and shift.
+    pub fn moments(&self, image: &FeatureMap) -> Result<FeatureMap, NetworkError> {
         let gpu = &self.gpu;
-        let (skip, mut hidden) = match &resnet.shortcut {
-            Some(shortcut) => (gpu.conv(shortcut, &input)?, input),
-            // Without one the input is the skip, so the normalization is what
-            // needs the copy.
-            None => {
-                let copy = clone_map(gpu, &input)?;
-                (input, copy)
-            }
+        let mut hidden = Map {
+            tensor: gpu.upload(image.channels, image.pixels(), &image.data)?,
+            height: image.height,
+            width: image.width,
         };
-        gpu.group_norm(&resnet.norm1, &mut hidden, 0)?;
-        let mut next = gpu.conv(&resnet.conv1, &hidden)?;
-        drop(hidden);
-        gpu.group_norm(&resnet.norm2, &mut next, 0)?;
-        let mut output = skip;
-        gpu.conv_add(&resnet.conv2, &next, &mut output)?;
-        Ok(output)
+        hidden = gpu.conv(&self.conv_in, &hidden)?;
+        for (resnets, downsampler) in &self.down_blocks {
+            for resnet in resnets {
+                hidden = vae_resnet(gpu, resnet, hidden)?;
+            }
+            if let Some(downsampler) = downsampler {
+                hidden = gpu.conv(downsampler, &hidden)?;
+            }
+        }
+        hidden = vae_resnet(gpu, &self.mid_first, hidden)?;
+        hidden = vae_attention(gpu, &self.mid_attention, &hidden)?;
+        hidden = vae_resnet(gpu, &self.mid_last, hidden)?;
+        gpu.group_norm(&self.norm_out, &mut hidden, 0)?;
+        hidden = gpu.conv(&self.conv_out, &hidden)?;
+        if let Some(quant) = &self.quant {
+            hidden = gpu.conv(quant, &hidden)?;
+        }
+        let moments = download_map(gpu, &hidden)?;
+        if moments.data.iter().any(|value| !value.is_finite()) {
+            return Err(NetworkError::Cuda(
+                "VAE encode overflowed FP16 on the device; encode this image on the host".into(),
+            ));
+        }
+        Ok(moments)
     }
+}
 
-    /// One head over the full channel width, which is what the decoder's own
-    /// attention is.
-    fn attention(&self, input: &Map) -> Result<Map, NetworkError> {
-        let gpu = &self.gpu;
-        let attention = &self.mid_attention;
-        let mut normed = clone_map(gpu, input)?;
-        gpu.group_norm(&attention.norm, &mut normed, -1)?;
-        let tokens = gpu.to_tokens(&normed)?;
+/// Takes the input by value so the normalization can run in place.
+///
+/// At the decoder's last rung one feature map is half a gigabyte, and the
+/// naive order — clone, normalize the clone, convolve, then build the skip
+/// — holds three of them at once. Building the skip first instead lets the
+/// input be normalized where it lies and freed as soon as the first
+/// convolution has read it.
+fn vae_resnet(gpu: &ImageGpu, resnet: &DeviceVaeResnet, input: Map) -> Result<Map, NetworkError> {
+    let (skip, mut hidden) = match &resnet.shortcut {
+        Some(shortcut) => (gpu.conv(shortcut, &input)?, input),
+        // Without one the input is the skip, so the normalization is what
+        // needs the copy.
+        None => {
+            let copy = clone_map(gpu, &input)?;
+            (input, copy)
+        }
+    };
+    gpu.group_norm(&resnet.norm1, &mut hidden, 0)?;
+    let mut next = gpu.conv(&resnet.conv1, &hidden)?;
+    drop(hidden);
+    gpu.group_norm(&resnet.norm2, &mut next, 0)?;
+    let mut output = skip;
+    gpu.conv_add(&resnet.conv2, &next, &mut output)?;
+    Ok(output)
+}
 
-        let queries = gpu.dense(&attention.query, &tokens)?;
-        let keys = gpu.dense(&attention.key, &tokens)?;
-        let values = gpu.dense(&attention.value, &tokens)?;
-        let attended = gpu.attention(queries.view(), keys.view(), values.view(), 1, false)?;
-        let projected = gpu.dense(&attention.output, &attended)?;
+/// One head over the full channel width, which is what the decoder's own
+/// attention is.
+fn vae_attention(
+    gpu: &ImageGpu,
+    attention: &DeviceVaeAttention,
+    input: &Map,
+) -> Result<Map, NetworkError> {
+    let mut normed = clone_map(gpu, input)?;
+    gpu.group_norm(&attention.norm, &mut normed, -1)?;
+    let tokens = gpu.to_tokens(&normed)?;
 
-        let mut output = gpu.to_map(&projected, input.height, input.width)?;
-        gpu.add(&mut output.tensor, &input.tensor)?;
-        Ok(output)
-    }
+    let queries = gpu.dense(&attention.query, &tokens)?;
+    let keys = gpu.dense(&attention.key, &tokens)?;
+    let values = gpu.dense(&attention.value, &tokens)?;
+    let attended = gpu.attention(queries.view(), keys.view(), values.view(), 1, false)?;
+    let projected = gpu.dense(&attention.output, &attended)?;
+
+    let mut output = gpu.to_map(&projected, input.height, input.width)?;
+    gpu.add(&mut output.tensor, &input.tensor)?;
+    Ok(output)
+}
+
+fn upload_vae_attention(
+    gpu: &Arc<ImageGpu>,
+    attention: &crate::vae::AttentionBlock,
+) -> Result<DeviceVaeAttention, NetworkError> {
+    Ok(DeviceVaeAttention {
+        norm: upload_group_norm(gpu, &attention.norm)?,
+        query: upload_dense(gpu, &attention.query)?,
+        key: upload_dense(gpu, &attention.key)?,
+        value: upload_dense(gpu, &attention.value)?,
+        output: upload_dense(gpu, &attention.output)?,
+    })
 }
 
 fn upload_vae_resnet(
@@ -2864,6 +2971,28 @@ mod tests {
             (expected.channels, expected.height, expected.width)
         );
         assert_close("vae", &actual.data, &expected.data, 0.05);
+    }
+
+    #[test]
+    fn a_whole_vae_encode_matches_the_host_or_skips_without_a_device() {
+        let Some(gpu) = device() else { return };
+        let config = crate::vae::tests::tiny();
+        let path = std::env::temp_dir().join("rusting_brain_cuda_vae_encoder.safetensors");
+        crate::vae::tests::checkpoint(&config, &path);
+        let mut encoder = VaeEncoder::load(&path, "encoder.", config).expect("an encoder");
+        std::fs::remove_file(&path).ok();
+
+        // Every halving convolution pads one extra row and column at the end.
+        let image = map(3, 8, 8, 0.5);
+        let expected = encoder.encode(&image).expect("a host encode");
+        encoder.attach_device(gpu).expect("an upload");
+        let actual = encoder.encode(&image).expect("a device encode");
+
+        assert_eq!(
+            (actual.channels, actual.height, actual.width),
+            (expected.channels, expected.height, expected.width)
+        );
+        assert_close("vae encoder", &actual.data, &expected.data, 0.05);
     }
 
     #[test]

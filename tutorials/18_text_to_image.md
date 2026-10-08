@@ -56,8 +56,8 @@ takes. That is what fits SDXL's 2.6 billion UNet weights, or a 4B FLUX
 transformer, on a 12 GB card. The VAE decoder stays in `f32`: it is small and
 it is what the eye sees.
 
-`try_cuda` moves the UNet, the VAE decoder, the CLIP towers and, on a FLUX or
-SD3 model, the transformer and the T5 encoder onto the device. It returns
+`try_cuda` moves the UNet, both halves of the VAE, the CLIP towers and, on a
+FLUX or SD3 model, the transformer and the T5 encoder onto the device. It returns
 `false` and leaves everything on the CPU if there is no device or the model
 does not fit, so the same program runs on both. On the CPU a 1024x1024 SDXL
 image takes many minutes; on the GPU it takes seconds.
@@ -138,8 +138,7 @@ The VAE's encoder turns the picture into a latent, noise is added up to a
 point on the schedule, and only the rest of the schedule is run. `strength`
 picks that point: 1.0 throws the picture away and starts from pure noise, 0.0
 returns it untouched, and 0.3 to 0.8 keeps the composition and repaints the
-detail. It costs `strength` times the steps, plus the encoder, which runs on
-the CPU (see 18.6).
+detail. It costs `strength` times the steps, plus one pass of the encoder.
 
 ## 18.6 The script
 
@@ -148,13 +147,13 @@ the CPU (see 18.6).
 XL, int8 weights), it printed:
 
 ```text
-loaded in 6.3s
+loaded in 7.4s
 running on the GPU
 model asks for 50 steps, guidance 7.5, Euler
 step 25/25
 1024x1024 in 13.2s
 wrote image.png
-repainted in 117.2s
+repainted in 6.9s
 wrote repainted.png
 ```
 
@@ -164,11 +163,9 @@ light"` (`score_9` is a tag Pony was trained to read). The 13.2 seconds are
 shared with another job both cost some of it. Euler at its own 50 steps took
 about 45 seconds for a picture no better.
 
-The repaint is slow for a reason that has nothing to do with the denoiser.
-Half the schedule costs about 6 seconds on the device, but the VAE encoder
-runs on the CPU, and a 1024x1024 picture takes it close to two minutes. At
-512x512 it takes 10 to 18 seconds. Moving the encoder to the device is on the
-roadmap (C12).
+The repaint redoes half the schedule, so it costs about half the first run.
+The VAE encoder takes a quarter of a second of it on the device; on the CPU
+the same 1024x1024 encode takes close to two minutes.
 
 ## 18.7 When it goes wrong
 

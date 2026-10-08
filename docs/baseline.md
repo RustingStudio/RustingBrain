@@ -1446,3 +1446,19 @@ Tutorial program (`tutorials/code/18_text_to_image.rs`), 1024x1024, DPM++ 2M
 25 steps, Q8, RTX 3060 shared with another job, load 1.4-1.7: loaded in 6.3 s,
 text-to-image 13.2 s, image-to-image at strength 0.5 117.2 s, nearly all of
 it the CPU VAE encoder (C12).
+
+### Device VAE encoder (C12, 2026-10-08)
+
+pony-v6-xl VAE, RTX 3060 shared with another job, load 2.3-2.7, three runs
+each after one warm-up inside the same process:
+
+| Encode | CPU (before) | Device FP16 |
+|---|---|---|
+| 512x512 | 10-18 s | 0.060-0.063 s |
+| 1024x1024 | 117-140 s | 0.249-0.253 s |
+
+Against ComfyUI's FP32 CPU encoder on the same 512x512 image the device latent
+reads rel 0.066 (per-channel std and mean match to 3 digits; best scale
+0.998). Host F32 reads 0.012 and ComfyUI's default BF16 0.108. Tutorial
+program, load 2.3-3.0: text-to-image 13.2 s, image-to-image at strength 0.5
+6.9 s (117.2 s before).
