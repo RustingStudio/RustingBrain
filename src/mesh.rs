@@ -2003,8 +2003,46 @@ impl Mesh {
             }
         }
 
+        // Edges refused for folding since the last collapse round. A later
+        // collapse can move the neighbours that made them fold, so once the
+        // queue has nothing cheap left they are weighed again, for as long as
+        // a round still collapses something. Without this the result hung on
+        // which of several equally cheap edges the queue handed out first.
+        let mut refused: Vec<(u32, u32)> = Vec::new();
+        let mut progressed = false;
+        let retry = |queue: &mut std::collections::BinaryHeap<Collapse>,
+                     refused: &mut Vec<(u32, u32)>,
+                     progressed: &mut bool,
+                     positions: &[[f32; 3]],
+                     quadrics: &[Quadric],
+                     stamps: &[u32],
+                     vertex_alive: &[bool]| {
+            if !std::mem::take(progressed) || refused.is_empty() {
+                return false;
+            }
+            for (from, into) in refused.drain(..) {
+                if vertex_alive[from as usize] && vertex_alive[into as usize] {
+                    queue.extend(weigh((from, into), positions, quadrics, stamps));
+                }
+            }
+            true
+        };
+
         while live_faces > target_faces {
-            let Some(collapse) = queue.pop() else { break };
+            let Some(collapse) = queue.pop() else {
+                match retry(
+                    &mut queue,
+                    &mut refused,
+                    &mut progressed,
+                    &positions,
+                    &quadrics,
+                    &stamps,
+                    &vertex_alive,
+                ) {
+                    true => continue,
+                    false => break,
+                }
+            };
             let (from, into) = (collapse.from as usize, collapse.into as usize);
             if !vertex_alive[from] || !vertex_alive[into] {
                 continue;
@@ -2016,14 +2054,22 @@ impl Mesh {
             // costs more than the bound is also the cheapest one left.
             let error = f32::from_bits(collapse.key);
             if error > max_error {
-                break;
+                queue.push(collapse);
+                match retry(
+                    &mut queue,
+                    &mut refused,
+                    &mut progressed,
+                    &positions,
+                    &quadrics,
+                    &stamps,
+                    &vertex_alive,
+                ) {
+                    true => continue,
+                    false => break,
+                }
             }
             // A collapse that turns a face inside out is a fold, and a folded
             // mesh is worse than a coarse one.
-            // NOTE: a refused edge is dropped rather than re-priced, so an
-            // edge that only became safe later is never reconsidered. Pushing
-            // it back risks cycling on a collapse that is never taken; if a
-            // target is routinely missed, give the entry a retry count.
             if folds(
                 &positions,
                 &faces,
@@ -2033,9 +2079,11 @@ impl Mesh {
                 into,
                 collapse.position,
             ) {
+                refused.push((collapse.from, collapse.into));
                 continue;
             }
 
+            progressed = true;
             worst = worst.max(error);
             positions[into] = collapse.position;
             quadrics[into] = add_quadric(quadrics[into], quadrics[from]);
