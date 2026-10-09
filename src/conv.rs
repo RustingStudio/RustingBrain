@@ -2370,17 +2370,8 @@ impl TrainableBatchNorm2d {
         // over `rows`.
         let (mut mean, mut along) = (context.zeros(channels)?, context.zeros(channels)?);
         let scale = 1.0 / rows as f32;
-        column_sums(&context, &mut mean, &grad_y, None, rows, channels, scale)?;
-        let times = ColumnSum::Times(&cache.normalized);
-        column_sums(
-            &context,
-            &mut along,
-            &grad_y,
-            Some(times),
-            rows,
-            channels,
-            scale,
-        )?;
+        let times = ColumnSum::Times(&cache.normalized, &mut along);
+        column_sums(&context, &mut mean, &grad_y, Some(times), rows, channels, scale)?;
         let unused = context.zeros(channels)?;
         let (centre, slope) = match cache.training {
             true => (&mean, &along),
@@ -2424,8 +2415,11 @@ pub struct DeviceBatchNormCache {
 enum ColumnSum<'a> {
     /// `(x - centre[channel])^2`.
     Centred(&'a cudarc::driver::CudaSlice<f32>),
-    /// `x * other`, elementwise.
-    Times(&'a cudarc::driver::CudaSlice<f32>),
+    /// `x` as with none, and `x * other` elementwise into the second sum.
+    Times(
+        &'a cudarc::driver::CudaSlice<f32>,
+        &'a mut cudarc::driver::CudaSlice<f32>,
+    ),
 }
 
 /// `scale` times each channel's sum over the rows of `x[rows, channels]`,
@@ -2440,27 +2434,28 @@ fn column_sums(
     channels: usize,
     scale: f32,
 ) -> Result<(), NetworkError> {
-    let (other, mode) = match with {
-        None => (x, 0),
-        Some(ColumnSum::Centred(centre)) => (centre, 1),
-        Some(ColumnSum::Times(other)) => (other, 2),
-    };
     let [r, c] = [rows, channels].map(|v| v as i32);
-    unsafe {
-        context
-            .stream
-            .launch_builder(&context.image.col_sums)
-            .arg(out)
-            .arg(x)
-            .arg(other)
-            .arg(&r)
-            .arg(&c)
-            .arg(&scale)
-            .arg(&mode)
-            // COL_ROWS rows a thread, as the kernel reads them.
-            .launch(crate::cuda_training::cfg(rows.div_ceil(64) * channels))
-            .map_err(crate::cuda_training::cuda_err("column sum kernel"))?;
-    }
+    let mut launch = context.stream.launch_builder(&context.image.col_sums);
+    launch.arg(out);
+    // The kernel writes the second sum only under mode 2.
+    let mode = match with {
+        None => {
+            launch.arg(x).arg(x).arg(x);
+            0
+        }
+        Some(ColumnSum::Centred(centre)) => {
+            launch.arg(x).arg(x).arg(centre);
+            1
+        }
+        Some(ColumnSum::Times(other, second)) => {
+            launch.arg(second).arg(x).arg(other);
+            2
+        }
+    };
+    launch.arg(&r).arg(&c).arg(&scale).arg(&mode);
+    // COL_ROWS rows a thread, as the kernel reads them.
+    unsafe { launch.launch(crate::cuda_training::cfg(rows.div_ceil(64) * channels)) }
+        .map_err(crate::cuda_training::cuda_err("column sum kernel"))?;
     Ok(())
 }
 

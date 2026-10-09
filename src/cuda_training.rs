@@ -303,20 +303,22 @@ extern "C" __global__ void bn_bwd_prep(float*gy,const float*g,const float*xhat,
   gy[i]=d;
 }
 // `scale` times each channel's sum over the rows of `[rows, C]`: of x under
-// mode 0, of (x - other[c])^2 under mode 1, of x * other under mode 2. One
-// thread per (chunk of COL_ROWS rows, channel), channel fastest so a warp
-// reads neighbouring channels; partial sums are added into a zeroed `out`.
+// mode 0, of (x - other[c])^2 under mode 1, and under mode 2 of x into `out`
+// and of x * other into `out2` from the same read. One thread per (chunk of
+// COL_ROWS rows, channel), channel fastest so a warp reads neighbouring
+// channels; partial sums are added into a zeroed `out`.
 #define COL_ROWS 64
-extern "C" __global__ void col_sums(float*out,const float*x,const float*other,
+extern "C" __global__ void col_sums(float*out,float*out2,const float*x,const float*other,
     int rows,int C,float scale,int mode){
   long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   if(i>=(long long)(rows+COL_ROWS-1)/COL_ROWS*C)return;
-  int c=i%C,chunk=i/C;float a=0.f,m=mode==1?other[c]:0.f;
+  int c=i%C,chunk=i/C;float a=0.f,b=0.f,m=mode==1?other[c]:0.f;
   for(int r=chunk*COL_ROWS,end=min(rows,r+COL_ROWS);r<end;r++){
     long long at=(long long)r*C+c;float v=x[at];
-    if(mode==1){v-=m;v*=v;}else if(mode==2)v*=other[at];
+    if(mode==1){v-=m;v*=v;}else if(mode==2)b+=v*other[at];
     a+=v;}
   atomicAdd(&out[c],a*scale);
+  if(mode==2)atomicAdd(&out2[c],b*scale);
 }
 extern "C" __global__ void bn_bwd_apply(float*dx,const float*g,const float*xhat,const float*inv,
     const float*m1,const float*m2,const float*gamma,int total,int C){
