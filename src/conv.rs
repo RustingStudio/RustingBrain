@@ -2179,6 +2179,18 @@ impl TrainableBatchNorm2d {
         input: &DeviceImageBatch,
         training: bool,
     ) -> Result<(DeviceImageBatch, DeviceBatchNormCache), NetworkError> {
+        self.forward_device_with(input, training, false)
+    }
+
+    /// [`TrainableBatchNorm2d::forward_device`] with SiLU over the output
+    /// under `silu`, in the same kernel; the backward pass differentiates it too.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn forward_device_with(
+        &mut self,
+        input: &DeviceImageBatch,
+        training: bool,
+        silu: bool,
+    ) -> Result<(DeviceImageBatch, DeviceBatchNormCache), NetworkError> {
         let channels = self.channels();
         if input.channels != channels {
             return Err(NetworkError::InvalidTarget {
@@ -2259,6 +2271,7 @@ impl TrainableBatchNorm2d {
                 .arg(beta.value())
                 .arg(&n)
                 .arg(&c)
+                .arg(&(silu as i32))
                 .launch(crate::cuda_training::cfg(total))
                 .map_err(err("batch norm kernel"))?;
         }
@@ -2268,6 +2281,7 @@ impl TrainableBatchNorm2d {
                 normalized,
                 inv_std,
                 training,
+                silu,
             },
         ))
     }
@@ -2290,36 +2304,40 @@ impl TrainableBatchNorm2d {
             ));
         };
         let ones = context.filled(rows, 1.0)?;
-        let mut product = context.uninit(total)?;
-        let n = total as i32;
+        let (mut product, mut grad_y) = (context.uninit(total)?, context.uninit(total)?);
+        let [n, c] = [total, channels].map(|v| v as i32);
         unsafe {
             context
                 .stream
-                .launch_builder(&context.image.mul)
+                .launch_builder(&context.image.bn_bwd_prep)
+                .arg(&mut grad_y)
                 .arg(&mut product)
                 .arg(&grad.data)
                 .arg(&cache.normalized)
+                .arg(gamma.value())
+                .arg(beta.value())
                 .arg(&n)
+                .arg(&c)
+                .arg(&(cache.silu as i32))
                 .launch(crate::cuda_training::cfg(total))
-                .map_err(err("multiply kernel"))?;
+                .map_err(err("batch norm backward kernel"))?;
         }
         let (mut mean, mut along) = (context.zeros(channels)?, context.zeros(channels)?);
         if cache.training {
             let scale = 1.0 / rows as f32;
-            for (x, out) in [(&grad.data, &mut mean), (&product, &mut along)] {
+            for (x, out) in [(&grad_y, &mut mean), (&product, &mut along)] {
                 crate::gpu_transformer::gemm_lhs_transposed(
                     &context, &ones, 1, x, channels, out, channels, rows, 1, channels, scale, 0.0,
                 )?;
             }
         }
         let mut input_grad = context.uninit(total)?;
-        let c = channels as i32;
         unsafe {
             context
                 .stream
                 .launch_builder(&context.image.bn_bwd_apply)
                 .arg(&mut input_grad)
-                .arg(&grad.data)
+                .arg(&grad_y)
                 .arg(&cache.normalized)
                 .arg(&cache.inv_std)
                 .arg(&mean)
@@ -2331,7 +2349,7 @@ impl TrainableBatchNorm2d {
                 .map_err(err("batch norm backward kernel"))?;
         }
         gamma.accumulate_grad_device(&ones, &product, rows)?;
-        beta.accumulate_grad_device(&ones, &grad.data, rows)?;
+        beta.accumulate_grad_device(&ones, &grad_y, rows)?;
         Ok(grad.with_data(input_grad))
     }
 }
@@ -2342,6 +2360,7 @@ pub struct DeviceBatchNormCache {
     normalized: cudarc::driver::CudaSlice<f32>,
     inv_std: cudarc::driver::CudaSlice<f32>,
     training: bool,
+    silu: bool,
 }
 
 /// A depthwise convolution without bias, as ultralytics' `DWConv` and C2PSA's

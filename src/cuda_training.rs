@@ -249,10 +249,21 @@ extern "C" __global__ void bn_finish(float*mean,float*var,float*inv,float*run,in
   else{mean[c]=run[c];var[c]=run[C+c];}
   inv[c]=1.f/sqrtf(var[c]+eps);
 }
+// `act` runs SiLU over the normalized output.
 extern "C" __global__ void bn_apply(float*y,float*xhat,const float*x,const float*mean,const float*inv,
-    const float*gamma,const float*beta,int total,int C){
+    const float*gamma,const float*beta,int total,int C,int act){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
-  int c=i%C;float h=(x[i]-mean[c])*inv[c];xhat[i]=h;y[i]=h*gamma[c]+beta[c];
+  int c=i%C;float h=(x[i]-mean[c])*inv[c];xhat[i]=h;float v=h*gamma[c]+beta[c];
+  y[i]=act?v/(1.f+expf(-v)):v;
+}
+// The gradient at the batch norm's output, through the SiLU under `act`, and
+// that gradient times xhat, the two column sums the backward pass needs.
+extern "C" __global__ void bn_bwd_prep(float*gy,float*prod,const float*g,const float*xhat,
+    const float*gamma,const float*beta,int total,int C,int act){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C;float h=xhat[i],d=g[i];
+  if(act){float v=h*gamma[c]+beta[c],s=1.f/(1.f+expf(-v));d*=s*(1.f+v*(1.f-s));}
+  gy[i]=d;prod[i]=d*h;
 }
 extern "C" __global__ void bn_bwd_apply(float*dx,const float*g,const float*xhat,const float*inv,
     const float*m1,const float*m2,const float*gamma,int total,int C){
