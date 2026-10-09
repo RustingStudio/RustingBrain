@@ -502,7 +502,11 @@ impl GpuContext {
             &mut grad,
             columns,
             shape,
-            shape.input_elements(),
+            // A thread a float4 when the channels come in fours; see the kernel.
+            match shape.channels % 4 {
+                0 => shape.input_elements() / 4,
+                _ => shape.input_elements(),
+            },
             "bf16 col2im kernel",
         )?;
         Ok(grad)
