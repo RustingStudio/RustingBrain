@@ -391,7 +391,10 @@ impl ClipTextEncoder {
                 &mut hidden,
                 heads,
                 self.config.eps,
-                self.config.quick_gelu,
+                match self.config.quick_gelu {
+                    true => quick_gelu_value,
+                    false => crate::ffn::gelu,
+                },
                 true,
             )?;
         }
@@ -460,7 +463,7 @@ pub(crate) fn run_layer(
     hidden: &mut Matrix,
     heads: usize,
     eps: f32,
-    quick_gelu: bool,
+    activation: fn(f32) -> f32,
     causal: bool,
 ) -> Result<(), NetworkError> {
     let normed = layer.attention_norm.forward(hidden, eps);
@@ -476,19 +479,16 @@ pub(crate) fn run_layer(
 
     let normed = layer.mlp_norm.forward(hidden, eps);
     let mut wide = layer.mlp_in.forward(&normed)?;
-    wide.data.par_iter_mut().for_each(|value| {
-        *value = match quick_gelu {
-            true => quick_gelu_value(*value),
-            false => crate::ffn::gelu(*value),
-        }
-    });
+    wide.data
+        .par_iter_mut()
+        .for_each(|value| *value = activation(*value));
     add(hidden, &layer.mlp_out.forward(&wide)?);
     Ok(())
 }
 
 /// `x * sigmoid(1.702 * x)`, the activation the published towers were trained
 /// with.
-fn quick_gelu_value(value: f32) -> f32 {
+pub(crate) fn quick_gelu_value(value: f32) -> f32 {
     value / (1.0 + (-1.702 * value).exp())
 }
 

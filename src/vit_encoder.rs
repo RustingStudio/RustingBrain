@@ -63,7 +63,8 @@ pub struct VitEncoder {
     class_token: Vec<f32>,
     /// `[patches + 1, d_model]`.
     positions: Matrix,
-    pub(crate) pre_norm: Norm,
+    /// CLIP's `pre_layrnorm`; DINOv2 has none.
+    pub(crate) pre_norm: Option<Norm>,
     pub(crate) layers: Vec<Layer>,
     pub(crate) post_norm: Norm,
     /// `visual_projection`, which maps the class token into the space the
@@ -72,6 +73,9 @@ pub struct VitEncoder {
     projection: Option<Dense>,
     channels: usize,
     patch_size: usize,
+    /// The exact GELU rather than [`VitEncoderConfig::quick_gelu`]'s pick,
+    /// for DINOv2.
+    pub(crate) exact_gelu: bool,
     /// The same weights on a CUDA device, when one was attached.
     #[cfg(feature = "cuda")]
     device: Option<crate::cuda_image::DeviceVitEncoder>,
@@ -187,10 +191,80 @@ impl VitEncoder {
             patch,
             class_token,
             positions,
-            pre_norm,
+            pre_norm: Some(pre_norm),
             layers,
             channels,
             patch_size: patch_rows,
+            exact_gelu: false,
+            #[cfg(feature = "cuda")]
+            device: None,
+        })
+    }
+
+    /// A register-free DINOv2 tower as transformers saves `Dinov2Model`
+    /// (`facebook/dinov2-small`, `-base`), for square images `image_size`
+    /// pixels a side. The position table is resampled to that grid the way
+    /// transformers' `interpolate_pos_encoding` does it, bicubic without
+    /// corner alignment, and each layer's LayerScale is folded into the
+    /// projection in front of it. [`VitEncoder::encode`] then returns the
+    /// class token and the patch tokens through the final norm, which is
+    /// transformers' `last_hidden_state`; normalize images with
+    /// [`IMAGENET_MEAN`] and [`IMAGENET_STD`].
+    pub fn load_dinov2<P: AsRef<std::path::Path>>(
+        path: P,
+        image_size: usize,
+        precision: Precision,
+    ) -> Result<Self, NetworkError> {
+        let file = &mut ShardedSafeTensors::open(path)?;
+        let (values, shape) = file.tensor("embeddings.patch_embeddings.projection.weight")?;
+        let [d_model, channels, patch, patch_cols] = shape[..] else {
+            return Err(NetworkError::InvalidConfig(format!(
+                "the patch embedding is {shape:?}, which is not a convolution weight"
+            )));
+        };
+        if patch != patch_cols || image_size % patch != 0 || image_size == 0 {
+            return Err(NetworkError::InvalidConfig(format!(
+                "{image_size}-pixel images do not split into {patch}x{patch_cols} patches"
+            )));
+        }
+        let patch_embedding = Dense::new(
+            Matrix::from_vec(d_model, channels * patch * patch, values),
+            Some(
+                file.tensor("embeddings.patch_embeddings.projection.bias")?
+                    .0,
+            ),
+        )?;
+        let class_token = file.tensor("embeddings.cls_token")?.0;
+        let table = file.tensor("embeddings.position_embeddings")?.0;
+        let table = Matrix::from_vec(table.len() / d_model.max(1), d_model, table);
+        let mut layers = Vec::new();
+        while let Ok(layer) = read_dinov2_layer(file, layers.len(), precision) {
+            layers.push(layer);
+        }
+        let grid = (table.rows.max(1) - 1).isqrt();
+        if layers.is_empty() || class_token.len() != d_model || grid * grid + 1 != table.rows {
+            return Err(NetworkError::InvalidConfig(
+                "this is not a DINOv2 checkpoint: no layers, a class token of another width \
+                 or a position table that is not a square grid plus a class row"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            config: VitEncoderConfig {
+                num_heads: d_model / 64,
+                eps: 1e-6,
+                quick_gelu: false,
+            },
+            patch: patch_embedding,
+            class_token,
+            positions: resample_positions(&table, image_size / patch),
+            pre_norm: None,
+            layers,
+            post_norm: norm(file, "layernorm")?,
+            projection: None,
+            channels,
+            patch_size: patch,
+            exact_gelu: true,
             #[cfg(feature = "cuda")]
             device: None,
         })
@@ -274,14 +348,21 @@ impl VitEncoder {
             }
         }
 
-        let mut hidden = self.pre_norm.forward(&hidden, self.config.eps);
+        if let Some(norm) = &self.pre_norm {
+            hidden = norm.forward(&hidden, self.config.eps);
+        }
+        let activation = match (self.exact_gelu, self.config.quick_gelu) {
+            (true, _) => crate::ffn::gelu_erf,
+            (false, true) => crate::clip::quick_gelu_value,
+            (false, false) => crate::ffn::gelu,
+        };
         for layer in &self.layers {
             run_layer(
                 layer,
                 &mut hidden,
                 self.config.num_heads,
                 self.config.eps,
-                self.config.quick_gelu,
+                activation,
                 false,
             )?;
         }
@@ -372,6 +453,10 @@ impl VitEncoder {
 pub const CLIP_MEAN: [f32; 3] = [0.481_454_82, 0.457_827_5, 0.408_210_74];
 /// Per-channel standard deviation to match [`CLIP_MEAN`].
 pub const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
+/// Per-channel mean DINOv2's images were normalized with, over `[0, 1]` pixels.
+pub const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+/// Per-channel standard deviation to match [`IMAGENET_MEAN`].
+pub const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 /// Composites an RGBA image onto one flat colour and normalizes it for the
 /// tower.
@@ -444,6 +529,105 @@ pub fn read_image<P: AsRef<std::path::Path>>(
         }
     }
     Ok(map)
+}
+
+/// The class row then a square grid of positions, the grid resampled to
+/// `grid` a side as PyTorch's bicubic `interpolate` with `align_corners=False`
+/// does it (A = -0.75, edge rows repeated).
+fn resample_positions(table: &Matrix, grid: usize) -> Matrix {
+    let (from, width) = ((table.rows - 1).isqrt(), table.cols);
+    if from == grid {
+        return table.clone();
+    }
+    let cubic = |x: f32| {
+        const A: f32 = -0.75;
+        match x.abs() {
+            x if x <= 1.0 => ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0,
+            x => ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A,
+        }
+    };
+    let scale = from as f32 / grid as f32;
+    // Each output index's four source indices and weights.
+    let taps: Vec<[(usize, f32); 4]> = (0..grid)
+        .map(|out| {
+            let real = scale * (out as f32 + 0.5) - 0.5;
+            let floor = real.floor();
+            let t = real - floor;
+            std::array::from_fn(|k| {
+                let index = (floor as isize + k as isize - 1).clamp(0, from as isize - 1);
+                (index as usize, cubic(t + 1.0 - k as f32))
+            })
+        })
+        .collect();
+    let mut out = Matrix::new(grid * grid + 1, width);
+    out.row_mut(0).copy_from_slice(table.row(0));
+    for y in 0..grid {
+        for x in 0..grid {
+            let target = out.row_mut(1 + y * grid + x);
+            for &(sy, wy) in &taps[y] {
+                let mut row = vec![0.0f32; width];
+                for &(sx, wx) in &taps[x] {
+                    for (r, v) in row.iter_mut().zip(table.row(1 + sy * from + sx)) {
+                        *r += wx * v;
+                    }
+                }
+                for (t, r) in target.iter_mut().zip(row) {
+                    *t += wy * r;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A DINOv2 layer as a CLIP one: the same pre-norm attention and MLP, with
+/// each LayerScale multiplied into the projection it scales.
+fn read_dinov2_layer(
+    file: &mut ShardedSafeTensors,
+    index: usize,
+    precision: Precision,
+) -> Result<Layer, NetworkError> {
+    let layer = format!("encoder.layer.{index}");
+    let scaled = |file: &mut ShardedSafeTensors, name: &str, scale: &str| {
+        let mut dense = dense(file, name, Precision::F32)?;
+        let lambda = file.tensor(scale)?.0;
+        for (row, &l) in lambda.iter().enumerate() {
+            dense.weight.row_mut(row).iter_mut().for_each(|w| *w *= l);
+        }
+        if let Some(bias) = &mut dense.bias {
+            bias.iter_mut().zip(&lambda).for_each(|(b, l)| *b *= l);
+        }
+        if precision == Precision::Q8 {
+            dense.quantize();
+        }
+        Ok::<_, NetworkError>(dense)
+    };
+    Ok(Layer {
+        attention_norm: norm(file, &format!("{layer}.norm1"))?,
+        query: dense(
+            file,
+            &format!("{layer}.attention.attention.query"),
+            precision,
+        )?,
+        key: dense(file, &format!("{layer}.attention.attention.key"), precision)?,
+        value: dense(
+            file,
+            &format!("{layer}.attention.attention.value"),
+            precision,
+        )?,
+        output: scaled(
+            file,
+            &format!("{layer}.attention.output.dense"),
+            &format!("{layer}.layer_scale1.lambda1"),
+        )?,
+        mlp_norm: norm(file, &format!("{layer}.norm2"))?,
+        mlp_in: dense(file, &format!("{layer}.mlp.fc1"), precision)?,
+        mlp_out: scaled(
+            file,
+            &format!("{layer}.mlp.fc2"),
+            &format!("{layer}.layer_scale2.lambda1"),
+        )?,
+    })
 }
 
 fn read_layer(
@@ -688,7 +872,11 @@ pub(crate) mod tests {
                 *value += learned;
             }
         }
-        let expected = tower.pre_norm.forward(&expected, tiny().eps);
+        let expected = tower
+            .pre_norm
+            .as_ref()
+            .unwrap()
+            .forward(&expected, tiny().eps);
         let expected = tower.post_norm.forward(&expected, tiny().eps);
 
         for (got, want) in tokens.data.iter().zip(&expected.data) {
@@ -729,5 +917,47 @@ pub(crate) mod tests {
             assert!((clear.data[channel] - expected).abs() < 1e-6);
         }
         assert!(composite_rgba(&[0.0; 3], 1, [0.0; 3]).is_err());
+    }
+
+    /// Needs `RB_DINOV2_REF` from `scripts/dinov2_reference.py`.
+    #[test]
+    #[ignore]
+    fn dinov2_matches_transformers() {
+        let dir = std::path::PathBuf::from(std::env::var("RB_DINOV2_REF").unwrap());
+        let paths: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
+                .unwrap();
+        for name in ["small", "base"] {
+            let tower = VitEncoder::load_dinov2(paths[name].as_str().unwrap(), 224, Precision::F32)
+                .unwrap();
+            let mut reference =
+                crate::safetensors::SafeTensors::open(dir.join(format!("{name}.safetensors")))
+                    .unwrap();
+            let (pixels, _) = reference.tensor("pixels").unwrap();
+            let (tokens, _) = reference.tensor("tokens").unwrap();
+            let per_image = 3 * 224 * 224;
+            let mut images = Vec::new();
+            for image in 0..2 {
+                let mut map = FeatureMap::new(3, 224, 224);
+                map.data
+                    .copy_from_slice(&pixels[image * per_image..(image + 1) * per_image]);
+                images.push(map);
+            }
+            for (image, got) in images.iter().map(|m| tower.encode(m).unwrap()).enumerate() {
+                let expected = &tokens[image * got.data.len()..(image + 1) * got.data.len()];
+                // The patch rows, after the class token.
+                let (got, expected) = (&got.data[got.cols..], &expected[got.cols..]);
+                let scale = expected.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let gap = got
+                    .iter()
+                    .zip(expected)
+                    .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                eprintln!("dinov2-{name} image {image}: gap {gap:e} at scale {scale}");
+                assert!(
+                    gap <= 1e-3 * scale,
+                    "dinov2-{name}: gap {gap} at scale {scale}"
+                );
+            }
+        }
     }
 }

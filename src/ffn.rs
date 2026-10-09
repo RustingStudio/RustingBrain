@@ -245,6 +245,19 @@ pub fn silu_derivative(x: f32) -> f32 {
     s * (1.0 + x * (1.0 - s))
 }
 
+/// The exact GELU, `x * Phi(x)`, with `erf` from Abramowitz and Stegun
+/// 7.1.26 (absolute error under 1.5e-7): PyTorch's `nn.GELU()` default.
+pub fn gelu_erf(x: f32) -> f32 {
+    let z = (x as f64 * std::f64::consts::FRAC_1_SQRT_2).abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * z);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let erf = (1.0 - poly * (-z * z).exp()).copysign(x as f64);
+    (0.5 * x as f64 * (1.0 + erf)) as f32
+}
+
 /// The tanh approximation, which is what the GPT-2 and BERT reference
 /// implementations use and is a good deal cheaper than `erf`.
 pub fn gelu(x: f32) -> f32 {
