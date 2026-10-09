@@ -2525,7 +2525,12 @@ fn column_sums(
         None => (x, x),
     };
     let act = with_silu.is_some() as i32;
-    launch.arg(gamma).arg(beta).arg(&act).arg(stats.0).arg(stats.1);
+    launch
+        .arg(gamma)
+        .arg(beta)
+        .arg(&act)
+        .arg(stats.0)
+        .arg(stats.1);
     // COL_ROWS rows a thread, as the kernel reads them.
     unsafe { launch.launch(crate::cuda_training::cfg(rows.div_ceil(64) * channels)) }
         .map_err(crate::cuda_training::cuda_err("column sum kernel"))?;
@@ -3022,6 +3027,7 @@ pub fn pixel_attention_device(
             h * s + 2 * kd,
             hd,
             rows,
+            false,
         )?;
     }
     Ok((
@@ -3074,6 +3080,7 @@ pub fn pixel_attention_backward_device(
             h * hd,
             hd,
             rows,
+            false,
         )?;
     }
     let mut d_s = context.zeros(qkv.batch * span)?;
@@ -3410,6 +3417,7 @@ pub fn concat_channels_device(
             0,
             part.channels,
             rows,
+            false,
         )?;
         offset += part.channels;
     }
@@ -3435,6 +3443,29 @@ pub fn split_channels_device(
         .collect()
 }
 
+/// Adds `src` into `dst`'s channels from `offset` on, in place.
+#[cfg(feature = "cuda")]
+pub(crate) fn add_channels_device(
+    dst: &mut DeviceImageBatch,
+    offset: usize,
+    src: &DeviceImageBatch,
+) -> Result<(), NetworkError> {
+    let rows = src.batch * src.pixels();
+    let context = dst.context.clone();
+    copy_channels(
+        &context,
+        &mut dst.data,
+        dst.channels,
+        offset,
+        &src.data,
+        src.channels,
+        0,
+        src.channels,
+        rows,
+        true,
+    )
+}
+
 /// `width` channels from `offset`, copied out on the device.
 #[cfg(feature = "cuda")]
 pub fn slice_channels_device(
@@ -3454,6 +3485,7 @@ pub fn slice_channels_device(
         offset,
         width,
         rows,
+        false,
     )?;
     Ok(DeviceImageBatch {
         channels: width,
@@ -3473,14 +3505,16 @@ fn copy_channels(
     src_offset: usize,
     width: usize,
     rows: usize,
+    add: bool,
 ) -> Result<(), NetworkError> {
-    let [rows_arg, width_arg, dc, doff, sc, soff] = [
+    let [rows_arg, width_arg, dc, doff, sc, soff, add] = [
         rows,
         width,
         dst_channels,
         dst_offset,
         src_channels,
         src_offset,
+        add as usize,
     ]
     .map(|v| v as i32);
     unsafe {
@@ -3495,6 +3529,7 @@ fn copy_channels(
             .arg(&doff)
             .arg(&sc)
             .arg(&soff)
+            .arg(&add)
             .launch(crate::cuda_training::cfg(rows * width))
             .map_err(crate::cuda_training::cuda_err("channel copy kernel"))?;
     }
