@@ -644,6 +644,9 @@ enum Columns {
     /// rebuilding the columns costs a kernel and not a second crossing.
     #[cfg(feature = "cuda")]
     DeviceInput(cudarc::driver::CudaSlice<f32>),
+    /// Device columns as bf16, from a mixed-precision context.
+    #[cfg(feature = "cuda")]
+    DeviceNarrow(cudarc::driver::CudaSlice<u8>),
 }
 
 impl std::fmt::Debug for ConvCache {
@@ -838,7 +841,7 @@ impl TrainableConv2d {
                 Ok(self.col2im(&grad_columns, &cache.shape))
             }
             #[cfg(feature = "cuda")]
-            Columns::Device(_) | Columns::DeviceInput(_) => {
+            Columns::Device(_) | Columns::DeviceInput(_) | Columns::DeviceNarrow(_) => {
                 self.backward_on_device(cache, grad_output)
             }
             Columns::Input(input) => {
@@ -950,13 +953,29 @@ impl TrainableConv2d {
         })?;
         let shape = self.geometry(input.batch, input.height, input.width);
         let context = device.context();
-        // A 1x1 stride-1 convolution's columns are its input.
-        let columns = match shape.is_pointwise() {
-            true => None,
-            false => Some(context.im2col(&input.data, &shape)?),
+        // A 1x1 stride-1 convolution's columns are its input; a mixed-precision
+        // context builds the others as bf16 for a bf16 GEMM.
+        let (mut product, columns) = match (shape.is_pointwise(), context.mixed_precision) {
+            (true, _) => (
+                device.matmul_rhs_transposed_device(&input.data, shape.rows())?,
+                None,
+            ),
+            (false, true) => {
+                let columns = context.im2col_bf16(&input.data, &shape)?;
+                let weight = context.bf16_bytes(device.value())?;
+                (
+                    device.matmul_rhs_transposed_bf16(&columns, &weight, shape.rows())?,
+                    Some(Columns::DeviceNarrow(columns)),
+                )
+            }
+            (false, false) => {
+                let columns = context.im2col(&input.data, &shape)?;
+                (
+                    device.matmul_rhs_transposed_device(&columns, shape.rows())?,
+                    Some(Columns::Device(columns)),
+                )
+            }
         };
-        let mut product = device
-            .matmul_rhs_transposed_device(columns.as_ref().unwrap_or(&input.data), shape.rows())?;
         if let Some(bias) = self.bias.device.as_ref().filter(|_| self.has_bias) {
             context.add_bias_rows(&mut product, bias.value(), self.out_channels())?;
         }
@@ -975,7 +994,7 @@ impl TrainableConv2d {
                 // own, so a deep network holds one layer's worth rather than
                 // every layer's.
                 columns: match columns.filter(|_| !self.recompute_columns) {
-                    Some(columns) => Columns::Device(columns),
+                    Some(columns) => columns,
                     None => Columns::DeviceInput(input.data.clone()),
                 },
                 shape,
@@ -998,6 +1017,34 @@ impl TrainableConv2d {
             NetworkError::InvalidConfig("backward_device needs the weight on a device".into())
         })?;
         let context = device.context().clone();
+        if context.mixed_precision && !shape.is_pointwise() {
+            let rebuilt;
+            let columns = match &cache.columns {
+                Columns::DeviceNarrow(columns) => columns,
+                Columns::DeviceInput(input) => {
+                    rebuilt = context.im2col_bf16(input, shape)?;
+                    &rebuilt
+                }
+                _ => {
+                    return Err(NetworkError::InvalidConfig(
+                        "backward_device needs a cache from a mixed-precision forward pass".into(),
+                    ));
+                }
+            };
+            let grad = context.bf16_bytes(&grad_output.data)?;
+            device.accumulate_grad_bf16(&grad, columns, shape.rows())?;
+            let weight = context.bf16_bytes(device.value())?;
+            let grad_columns = device.matmul_bf16(&grad, &weight, shape.rows())?;
+            self.accumulate_bias_device(&context, grad_output, shape.rows())?;
+            return Ok(DeviceImageBatch {
+                batch: shape.batch,
+                height: shape.height,
+                width: shape.width,
+                channels: shape.channels,
+                data: context.col2im_bf16(&grad_columns, shape)?,
+                context,
+            });
+        }
         let rebuilt;
         let columns = match &cache.columns {
             Columns::Device(columns) => columns,
@@ -1014,12 +1061,7 @@ impl TrainableConv2d {
         };
         device.accumulate_grad_device(&grad_output.data, columns, shape.rows())?;
         let grad_columns = device.matmul_device(&grad_output.data, shape.rows())?;
-        if let Some(bias) = self.bias.device.as_mut().filter(|_| self.has_bias) {
-            // The column sum as a GEMM against ones, which keeps the negated
-            // accumulate convention in one place.
-            let ones = context.filled(shape.rows(), 1.0)?;
-            bias.accumulate_grad_device(&ones, &grad_output.data, shape.rows())?;
-        }
+        self.accumulate_bias_device(&context, grad_output, shape.rows())?;
         Ok(DeviceImageBatch {
             batch: shape.batch,
             height: shape.height,
@@ -1031,6 +1073,22 @@ impl TrainableConv2d {
             },
             context,
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn accumulate_bias_device(
+        &mut self,
+        context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
+        grad_output: &DeviceImageBatch,
+        rows: usize,
+    ) -> Result<(), NetworkError> {
+        if let Some(bias) = self.bias.device.as_mut().filter(|_| self.has_bias) {
+            // The column sum as a GEMM against ones, which keeps the negated
+            // accumulate convention in one place.
+            let ones = context.filled(rows, 1.0)?;
+            bias.accumulate_grad_device(&ones, &grad_output.data, rows)?;
+        }
+        Ok(())
     }
 
     /// [`TrainableConv2d::forward_device`] between an upload and a download.
@@ -3832,6 +3890,58 @@ mod tests {
                 (a - b).abs() < 1e-3,
                 "weight[{index}]: {a} on the host against {b} on the device"
             );
+        }
+    }
+
+    /// A 3x3 convolution on a mixed-precision device, where `im2col` builds
+    /// bf16 columns and all three GEMMs run in bf16, stays within bf16
+    /// rounding of the host.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_mixed_precision_convolution_tracks_the_host() {
+        let Some(_) = cuda_or_skip() else {
+            return;
+        };
+        let device = crate::param::CudaDevice::with_mixed_precision(0, 1024).unwrap();
+        // Columns kept and rebuilt, with channels in fours and not.
+        for (channels, recompute) in [(8, false), (6, true)] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(32);
+            let mut conv = TrainableConv2d::new(channels, 16, 3, 1, &mut rng).unwrap();
+            conv.bias.value.data = noise(1, 1, 16, 1, 3).tokens.data;
+            conv.set_recompute_columns(recompute);
+            let mut host = conv.clone();
+            conv.to_cuda_on(&device).unwrap();
+            let input = noise(2, 10, 9, channels, 1);
+            let grad = noise(2, 10, 9, 16, 2);
+            let (expected, cache) = host.forward(&input).unwrap();
+            let expected_grad = host.backward(&cache, &grad).unwrap();
+            let (output, cache) = conv.forward_device(&device.upload(&input).unwrap()).unwrap();
+            let input_grad = conv
+                .backward_device(&cache, &device.upload(&grad).unwrap())
+                .unwrap();
+            // bf16 keeps 8 bits of mantissa: about 0.4% per operand.
+            let near = |a: &[f32], b: &[f32], what: &str| {
+                let gap: f32 = a.iter().zip(b).map(|(a, b)| (a - b).powi(2)).sum();
+                let scale: f32 = b.iter().map(|b| b * b).sum();
+                assert!(gap.sqrt() < 1e-2 * scale.sqrt(), "{what}: {gap} against {scale}");
+            };
+            near(
+                &output.download().unwrap().tokens.data,
+                &expected.tokens.data,
+                "output",
+            );
+            near(
+                &input_grad.download().unwrap().tokens.data,
+                &expected_grad.tokens.data,
+                "input grad",
+            );
+            conv.to_cpu().unwrap();
+            near(
+                &conv.weight.weight.grad.data,
+                &host.weight.weight.grad.data,
+                "weight grad",
+            );
+            near(&conv.bias.grad.data, &host.bias.grad.data, "bias grad");
         }
     }
 

@@ -95,6 +95,7 @@ pub struct GpuContext {
     im2col_train: CudaFunction,
     im2col_bf16: CudaFunction,
     col2im_train: CudaFunction,
+    col2im_bf16: CudaFunction,
     bias_act: CudaFunction,
     bias_act4: CudaFunction,
     fill: CudaFunction,
@@ -201,6 +202,7 @@ impl GpuContext {
             im2col_train: get("im2col_train")?,
             im2col_bf16: get("im2col_bf16")?,
             col2im_train: get("col2im_train")?,
+            col2im_bf16: get("col2im_bf16")?,
             bias_act: get("bias_act")?,
             bias_act4: get("bias_act4")?,
             fill: get("fill_f32")?,
@@ -488,13 +490,31 @@ impl GpuContext {
         Ok(grad)
     }
 
+    /// [`GpuContext::col2im`] over bf16 column gradients.
+    pub(crate) fn col2im_bf16(
+        &self,
+        columns: &CudaSlice<u8>,
+        shape: &crate::conv::ConvGeometry,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut grad = self.uninit(shape.input_elements())?;
+        self.launch_conv(
+            &self.col2im_bf16,
+            &mut grad,
+            columns,
+            shape,
+            shape.input_elements(),
+            "bf16 col2im kernel",
+        )?;
+        Ok(grad)
+    }
+
     /// Both kernels take the same arguments and are launched over their own
     /// destination, so they share one launch.
-    fn launch_conv<D>(
+    fn launch_conv<D, S>(
         &self,
         kernel: &CudaFunction,
         destination: &mut CudaSlice<D>,
-        source: &CudaSlice<f32>,
+        source: &CudaSlice<S>,
         shape: &crate::conv::ConvGeometry,
         threads: usize,
         stage: &'static str,
@@ -1268,6 +1288,64 @@ impl DeviceParam {
             0.0,
         )?;
         Ok(output)
+    }
+
+    /// `input[rows, self.rows] . value -> [rows, cols]` over bf16 operands,
+    /// `weight` from [`GpuContext::bf16_bytes`], with a bf16 result.
+    pub(crate) fn matmul_bf16(
+        &self,
+        input: &CudaSlice<u8>,
+        weight: &CudaSlice<u8>,
+        rows: usize,
+    ) -> Result<CudaSlice<u8>, NetworkError> {
+        let mut output = self.context.uninit_bytes(2 * rows * self.cols)?;
+        act_plain(
+            &self.context,
+            &input.slice(..),
+            self.rows,
+            &weight.slice(..),
+            self.cols,
+            true,
+            true,
+            &mut output,
+            self.cols,
+            rows,
+            self.cols,
+            self.rows,
+            1.0,
+            0.0,
+        )?;
+        Ok(output)
+    }
+
+    /// [`DeviceParam::accumulate_grad_device`] over bf16 operands, accumulated
+    /// in FP32.
+    pub(crate) fn accumulate_grad_bf16(
+        &mut self,
+        grad_output: &CudaSlice<u8>,
+        input: &CudaSlice<u8>,
+        rows: usize,
+    ) -> Result<(), NetworkError> {
+        if self.frozen {
+            return Ok(());
+        }
+        let beta = self.grad_beta();
+        act_lhs_transposed(
+            &self.context,
+            &grad_output.slice(..),
+            self.rows,
+            &input.slice(..),
+            self.cols,
+            true,
+            false,
+            &mut self.negated_grad,
+            self.cols,
+            rows,
+            self.rows,
+            self.cols,
+            -1.0,
+            beta,
+        )
     }
 
     /// [`DeviceParam::accumulate_grad`] for operands that are already resident.
