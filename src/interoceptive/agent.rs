@@ -6,7 +6,7 @@ use super::loss::{double_bellman_targets, weighted_td_huber_loss};
 use super::market_sim::Action;
 use super::modulation::{GainCache, InteroceptiveCore, add_column_sums, temperature};
 use super::state::AccountBody;
-use super::trunk::{MarketTrunk, TrunkCache};
+use super::trunk::{CausalConfig, CausalTrunk, MarketTrunk, Trunk, TrunkState};
 use crate::matrix::Matrix;
 use crate::optimizers::{Optimizer, step_clipped};
 use crate::param::{Linear, Param};
@@ -27,6 +27,9 @@ pub struct AgentConfig {
     /// Updates between copies of the online network into the target network.
     pub target_sync: usize,
     pub seed: u64,
+    /// `Some` encodes the market with a [`CausalTrunk`] over the window's
+    /// candles instead of the two-layer MLP.
+    pub causal: Option<CausalConfig>,
 }
 
 impl AgentConfig {
@@ -41,6 +44,7 @@ impl AgentConfig {
             beta: 5.0,
             target_sync: 250,
             seed: 0,
+            causal: None,
         }
     }
 }
@@ -49,7 +53,7 @@ impl AgentConfig {
 /// with `h` the trunk's encoding of `s`.
 #[derive(Clone, Debug)]
 pub struct QNetwork {
-    pub trunk: MarketTrunk,
+    pub trunk: Trunk,
     pub core: InteroceptiveCore,
     pub head: Linear,
     pub head_bias: Param,
@@ -58,7 +62,7 @@ pub struct QNetwork {
 /// Everything [`QNetwork::backward`] needs from the forward pass.
 #[derive(Clone, Debug)]
 pub struct ForwardCache {
-    pub trunk: TrunkCache,
+    pub trunk: TrunkState,
     pub gain: GainCache,
     /// Modulated hidden state `h'`, `[n, hidden]`.
     pub h_mod: Matrix,
@@ -68,8 +72,22 @@ pub struct ForwardCache {
 
 impl QNetwork {
     pub fn new(obs_dim: usize, hidden: usize, rng: &mut StdRng) -> Self {
+        Self::with_trunk(
+            Trunk::Mlp(Box::new(MarketTrunk::new(obs_dim, hidden, rng))),
+            hidden,
+            rng,
+        )
+    }
+
+    /// A [`CausalTrunk`] in place of the MLP.
+    pub fn causal(obs_dim: usize, hidden: usize, config: &CausalConfig, rng: &mut StdRng) -> Self {
+        let trunk = CausalTrunk::new(obs_dim, hidden, config, rng);
+        Self::with_trunk(Trunk::Causal(Box::new(trunk)), hidden, rng)
+    }
+
+    fn with_trunk(trunk: Trunk, hidden: usize, rng: &mut StdRng) -> Self {
         Self {
-            trunk: MarketTrunk::new(obs_dim, hidden, rng),
+            trunk,
             core: InteroceptiveCore::new(hidden, Action::COUNT, rng),
             head: Linear::new(hidden, Action::COUNT, rng),
             head_bias: Param::zeros(1, Action::COUNT),
@@ -79,7 +97,7 @@ impl QNetwork {
     /// `obs` is `[n, obs_dim]`, `body` is `[n, 4]`.
     pub fn forward(&self, obs: &Matrix, body: &Matrix) -> ForwardCache {
         let trunk = self.trunk.forward(obs);
-        let (h_mod, gain) = self.core.modulate(&trunk.h, body);
+        let (h_mod, gain) = self.core.modulate(trunk.h(), body);
         let mut q = self.head.forward(&h_mod);
         for r in 0..q.rows {
             for (v, b) in q.row_mut(r).iter_mut().zip(&self.head_bias.value.data) {
@@ -102,7 +120,7 @@ impl QNetwork {
         let grad_h_mod = self.head.backward(&cache.h_mod, grad_q);
         let grad_h = self
             .core
-            .modulate_backward(&cache.trunk.h, body, &cache.gain, &grad_h_mod);
+            .modulate_backward(cache.trunk.h(), body, &cache.gain, &grad_h_mod);
         self.trunk.backward(obs, &cache.trunk, &grad_h);
     }
 
@@ -127,7 +145,10 @@ pub struct InteroceptiveAgent {
 impl InteroceptiveAgent {
     pub fn new(config: AgentConfig) -> Self {
         let mut rng = StdRng::seed_from_u64(config.seed);
-        let online = QNetwork::new(config.obs_dim, config.hidden, &mut rng);
+        let online = match &config.causal {
+            Some(causal) => QNetwork::causal(config.obs_dim, config.hidden, causal, &mut rng),
+            None => QNetwork::new(config.obs_dim, config.hidden, &mut rng),
+        };
         Self {
             target: online.clone(),
             online,
@@ -307,7 +328,25 @@ mod tests {
     #[test]
     fn backward_matches_finite_differences() {
         let mut rng = StdRng::seed_from_u64(3);
-        let mut net = QNetwork::new(3, 6, &mut rng);
+        let net = QNetwork::new(3, 6, &mut rng);
+        gradients_match_finite_differences(net, 3, &mut rng);
+    }
+
+    #[test]
+    fn a_causal_trunk_backward_matches_finite_differences() {
+        let mut rng = StdRng::seed_from_u64(4);
+        let config = CausalConfig {
+            lookback: 3,
+            d_model: 8,
+            layers: 2,
+            heads: 2,
+        };
+        // Three candles of five features, then two position features.
+        let net = QNetwork::causal(17, 6, &config, &mut rng);
+        gradients_match_finite_differences(net, 17, &mut rng);
+    }
+
+    fn gradients_match_finite_differences(mut net: QNetwork, obs_dim: usize, rng: &mut StdRng) {
         let mut random = |rows, cols| {
             Matrix::from_vec(
                 rows,
@@ -315,7 +354,7 @@ mod tests {
                 (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect(),
             )
         };
-        let obs = random(4, 3);
+        let obs = random(4, obs_dim);
         let body = Matrix::from_vec(4, 4, random(4, 4).data.iter().map(|v| v.abs()).collect());
         let weights = random(4, Action::COUNT);
         let loss = |net: &QNetwork| -> f32 {

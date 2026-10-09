@@ -44,7 +44,7 @@ pub use modulation::{InteroceptiveCore, temperature};
 pub use shock::Shock;
 pub use state::{AccountBody, SETPOINT};
 pub use trainer::{TrainReport, Trainer, TrainerConfig};
-pub use trunk::MarketTrunk;
+pub use trunk::{CausalConfig, CausalTrunk, MarketTrunk, Trunk};
 
 /// The spec's name for a batch of rows. Every tensor here is a row-major
 /// [`Matrix`](crate::matrix::Matrix): one row per sample.
