@@ -289,11 +289,12 @@ extern "C" __global__ void bn_finish(float*mean,float*var,float*inv,float*run,co
   else{mean[c]=run[c];var[c]=run[C+c];}
   inv[c]=1.f/sqrtf(var[c]+eps);
 }
-// `act` runs SiLU over the normalized output.
-extern "C" __global__ void bn_apply(float*y,float*xhat,const float*x,const float*mean,const float*inv,
+// `act` runs SiLU over the normalized output. The backward pass recomputes
+// the normalized values from x, so they are not written out.
+extern "C" __global__ void bn_apply(float*y,const float*x,const float*mean,const float*inv,
     const float*gamma,const float*beta,int total,int C,int act){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
-  int c=i%C;float h=(x[i]-mean[c])*inv[c];xhat[i]=h;float v=h*gamma[c]+beta[c];
+  int c=i%C;float h=(x[i]-mean[c])*inv[c];float v=h*gamma[c]+beta[c];
   y[i]=act?v/(1.f+expf(-v)):v;
 }
 // The gradient at the batch norm's output from the one after its SiLU,
@@ -306,28 +307,29 @@ __device__ __forceinline__ float bn_gy(float d,float xhat,float gamma,float beta
 // mode 0, of x - other[c] into `out` and its square into `out2` under mode 1
 // (one pass for a mean and variance, shifted by a guess at the mean so the
 // variance does not cancel away), and under mode 2 of x into `out`
-// and of x * other into `out2` from the same read, x first taken through
-// `bn_gy` with `other` as xhat when `act` is set. One thread per (chunk of
+// and of x * xhat into `out2` from the same read, xhat being
+// (other - mu[c]) * inv[c], x first taken through `bn_gy` when `act` is set. One thread per (chunk of
 // COL_ROWS rows, channel), channel fastest so a warp reads neighbouring
 // channels; partial sums are added into a zeroed `out`.
 #define COL_ROWS 64
 extern "C" __global__ void col_sums(float*out,float*out2,const float*x,const float*other,
-    int rows,int C,float scale,int mode,const float*gamma,const float*beta,int act){
+    int rows,int C,float scale,int mode,const float*gamma,const float*beta,int act,
+    const float*mu,const float*inv){
   long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   if(i>=(long long)(rows+COL_ROWS-1)/COL_ROWS*C)return;
   int c=i%C,chunk=i/C;float a=0.f,b=0.f,m=mode==1?other[c]:0.f;
-  float ga=act?gamma[c]:0.f,be=act?beta[c]:0.f;
+  float ga=act?gamma[c]:0.f,be=act?beta[c]:0.f,mc=mode==2?mu[c]:0.f,ic=mode==2?inv[c]:0.f;
   for(int r=chunk*COL_ROWS,end=min(rows,r+COL_ROWS);r<end;r++){
     long long at=(long long)r*C+c;float v=x[at];
-    if(mode==1){v-=m;b+=v*v;}else if(mode==2){float o=other[at];v=bn_gy(v,o,ga,be,act);b+=v*o;}
+    if(mode==1){v-=m;b+=v*v;}else if(mode==2){float o=(other[at]-mc)*ic;v=bn_gy(v,o,ga,be,act);b+=v*o;}
     a+=v;}
   atomicAdd(&out[c],a*scale);
   if(mode)atomicAdd(&out2[c],b*scale);
 }
-extern "C" __global__ void bn_bwd_apply(float*dx,const float*g,const float*xhat,const float*inv,
-    const float*m1,const float*m2,const float*gamma,const float*beta,int total,int C,int act){
+extern "C" __global__ void bn_bwd_apply(float*dx,const float*g,const float*input,const float*mu,
+    const float*inv,const float*m1,const float*m2,const float*gamma,const float*beta,int total,int C,int act){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
-  int c=i%C;float x=xhat[i],d=bn_gy(g[i],x,gamma[c],beta[c],act);
+  int c=i%C;float x=(input[i]-mu[c])*inv[c],d=bn_gy(g[i],x,gamma[c],beta[c],act);
   dx[i]=inv[c]*gamma[c]*(d-m1[c]-x*m2[c]);
 }
 extern "C" __global__ void upsample_nearest(float*y,const float*x,int total,int H,int W,int C,int f){

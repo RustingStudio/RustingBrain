@@ -2274,15 +2274,16 @@ impl TrainableBatchNorm2d {
         input: &DeviceImageBatch,
         training: bool,
     ) -> Result<(DeviceImageBatch, DeviceBatchNormCache), NetworkError> {
-        self.forward_device_with(input, training, false)
+        self.forward_device_with(input.clone(), training, false)
     }
 
     /// [`TrainableBatchNorm2d::forward_device`] with SiLU over the output
     /// under `silu`, in the same kernel; the backward pass differentiates it too.
+    /// Takes the input to keep it for the backward pass.
     #[cfg(feature = "cuda")]
     pub(crate) fn forward_device_with(
         &mut self,
-        input: &DeviceImageBatch,
+        input: DeviceImageBatch,
         training: bool,
         silu: bool,
     ) -> Result<(DeviceImageBatch, DeviceBatchNormCache), NetworkError> {
@@ -2341,14 +2342,13 @@ impl TrainableBatchNorm2d {
                 .launch(crate::cuda_training::cfg(channels))
                 .map_err(err("batch norm statistics kernel"))?;
         }
-        let (mut output, mut normalized) = (context.uninit(total)?, context.uninit(total)?);
+        let mut output = context.uninit(total)?;
         let n = total as i32;
         unsafe {
             context
                 .stream
                 .launch_builder(&context.image.bn_apply)
                 .arg(&mut output)
-                .arg(&mut normalized)
                 .arg(&input.data)
                 .arg(&mean)
                 .arg(&inv_std)
@@ -2363,7 +2363,8 @@ impl TrainableBatchNorm2d {
         Ok((
             input.with_data(output),
             DeviceBatchNormCache {
-                normalized,
+                input: input.data,
+                mean,
                 inv_std,
                 training,
                 silu,
@@ -2392,7 +2393,12 @@ impl TrainableBatchNorm2d {
         // are also beta's and gamma's gradients over `rows`.
         let (mut mean, mut along) = (context.zeros(channels)?, context.zeros(channels)?);
         let silu = cache.silu.then_some((gamma.value(), beta.value()));
-        let times = ColumnSum::Times(&cache.normalized, &mut along, silu);
+        let times = ColumnSum::Times(
+            &cache.input,
+            &mut along,
+            (&cache.mean, &cache.inv_std),
+            silu,
+        );
         let scale = 1.0 / rows as f32;
         column_sums(
             &context,
@@ -2416,7 +2422,8 @@ impl TrainableBatchNorm2d {
                 .launch_builder(&context.image.bn_bwd_apply)
                 .arg(&mut input_grad)
                 .arg(&grad.data)
-                .arg(&cache.normalized)
+                .arg(&cache.input)
+                .arg(&cache.mean)
                 .arg(&cache.inv_std)
                 .arg(centre)
                 .arg(slope)
@@ -2438,7 +2445,10 @@ impl TrainableBatchNorm2d {
 /// What [`TrainableBatchNorm2d::backward_device`] needs from the forward pass.
 #[cfg(feature = "cuda")]
 pub struct DeviceBatchNormCache {
-    normalized: cudarc::driver::CudaSlice<f32>,
+    /// The input and its statistics, from which the backward pass recomputes
+    /// the normalized values.
+    input: cudarc::driver::CudaSlice<f32>,
+    mean: cudarc::driver::CudaSlice<f32>,
     inv_std: cudarc::driver::CudaSlice<f32>,
     training: bool,
     silu: bool,
@@ -2453,12 +2463,17 @@ enum ColumnSum<'a> {
         &'a cudarc::driver::CudaSlice<f32>,
         &'a mut cudarc::driver::CudaSlice<f32>,
     ),
-    /// `x` as with none, and `x * other` elementwise into the second sum.
-    /// With gamma and beta, `x` is first taken back through the SiLU after a
-    /// batch norm whose normalized values `other` holds.
+    /// `x` as with none, and `x * xhat` elementwise into the second sum,
+    /// xhat being a batch norm's input normalized by the mean and inverse
+    /// standard deviation given. With gamma and beta, `x` is first taken back
+    /// through the SiLU after that batch norm.
     Times(
         &'a cudarc::driver::CudaSlice<f32>,
         &'a mut cudarc::driver::CudaSlice<f32>,
+        (
+            &'a cudarc::driver::CudaSlice<f32>,
+            &'a cudarc::driver::CudaSlice<f32>,
+        ),
         Option<(
             &'a cudarc::driver::CudaSlice<f32>,
             &'a cudarc::driver::CudaSlice<f32>,
@@ -2483,8 +2498,12 @@ fn column_sums(
     launch.arg(out);
     // The kernel writes the second sum only under mode 2.
     let with_silu = match &with {
-        Some(ColumnSum::Times(_, _, silu)) => *silu,
+        Some(ColumnSum::Times(_, _, _, silu)) => *silu,
         _ => None,
+    };
+    let stats = match &with {
+        Some(ColumnSum::Times(_, _, stats, _)) => *stats,
+        _ => (x, x),
     };
     let mode = match with {
         None => {
@@ -2495,7 +2514,7 @@ fn column_sums(
             launch.arg(second).arg(x).arg(centre);
             1
         }
-        Some(ColumnSum::Times(other, second, _)) => {
+        Some(ColumnSum::Times(other, second, _, _)) => {
             launch.arg(second).arg(x).arg(other);
             2
         }
@@ -2506,7 +2525,7 @@ fn column_sums(
         None => (x, x),
     };
     let act = with_silu.is_some() as i32;
-    launch.arg(gamma).arg(beta).arg(&act);
+    launch.arg(gamma).arg(beta).arg(&act).arg(stats.0).arg(stats.1);
     // COL_ROWS rows a thread, as the kernel reads them.
     unsafe { launch.launch(crate::cuda_training::cfg(rows.div_ceil(64) * channels)) }
         .map_err(crate::cuda_training::cuda_err("column sum kernel"))?;

@@ -1154,7 +1154,7 @@ impl Yolo11 {
                         }
                         Kernel::Depthwise(conv) => (conv.forward_device(x)?, None),
                     };
-                    let (out, norm) = norm.forward_device_with(&y, training, *act)?;
+                    let (out, norm) = norm.forward_device_with(y, training, *act)?;
                     (out, DeviceCache::Conv { dense, norm })
                 }
                 Op::Plain(conv) => {
