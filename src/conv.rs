@@ -628,7 +628,7 @@ impl ConvCache {
         match &self.columns {
             Columns::Input(_) => false,
             #[cfg(feature = "cuda")]
-            Columns::DeviceInput(_) => false,
+            Columns::DeviceInput(_) | Columns::DeviceElsewhere => false,
             _ => true,
         }
     }
@@ -647,6 +647,10 @@ enum Columns {
     /// Device columns as bf16, from a mixed-precision context.
     #[cfg(feature = "cuda")]
     DeviceNarrow(cudarc::driver::CudaSlice<u8>),
+    /// Nothing: the caller keeps the forward input and hands it to
+    /// [`TrainableConv2d::backward_device_from`].
+    #[cfg(feature = "cuda")]
+    DeviceElsewhere,
 }
 
 impl std::fmt::Debug for ConvCache {
@@ -841,7 +845,10 @@ impl TrainableConv2d {
                 Ok(self.col2im(&grad_columns, &cache.shape))
             }
             #[cfg(feature = "cuda")]
-            Columns::Device(_) | Columns::DeviceInput(_) | Columns::DeviceNarrow(_) => {
+            Columns::Device(_)
+            | Columns::DeviceInput(_)
+            | Columns::DeviceNarrow(_)
+            | Columns::DeviceElsewhere => {
                 self.backward_on_device(cache, grad_output)
             }
             Columns::Input(input) => {
@@ -942,6 +949,19 @@ impl TrainableConv2d {
         &self,
         input: &DeviceImageBatch,
     ) -> Result<(DeviceImageBatch, ConvCache), NetworkError> {
+        self.forward_device_keeping(input, true)
+    }
+
+    /// [`TrainableConv2d::forward_device`], with `keep_input` false for a
+    /// caller that keeps the input itself: a cache that would hold a copy of
+    /// it holds nothing, and the backward pass is
+    /// [`TrainableConv2d::backward_device_from`].
+    #[cfg(feature = "cuda")]
+    pub(crate) fn forward_device_keeping(
+        &self,
+        input: &DeviceImageBatch,
+        keep_input: bool,
+    ) -> Result<(DeviceImageBatch, ConvCache), NetworkError> {
         if input.channels != self.in_channels {
             return Err(NetworkError::InvalidConfig(format!(
                 "this convolution reads {} channels and was given {}",
@@ -995,7 +1015,8 @@ impl TrainableConv2d {
                 // every layer's.
                 columns: match columns.filter(|_| !self.recompute_columns) {
                     Some(columns) => columns,
-                    None => Columns::DeviceInput(input.data.clone()),
+                    None if keep_input => Columns::DeviceInput(input.data.clone()),
+                    None => Columns::DeviceElsewhere,
                 },
                 shape,
             },
@@ -1012,16 +1033,34 @@ impl TrainableConv2d {
         cache: &ConvCache,
         grad_output: &DeviceImageBatch,
     ) -> Result<DeviceImageBatch, NetworkError> {
+        self.backward_device_from(cache, None, grad_output)
+    }
+
+    /// [`TrainableConv2d::backward_device`] for a cache from
+    /// [`TrainableConv2d::forward_device_keeping`], given the forward input
+    /// when the cache did not keep it.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn backward_device_from(
+        &mut self,
+        cache: &ConvCache,
+        input: Option<&DeviceImageBatch>,
+        grad_output: &DeviceImageBatch,
+    ) -> Result<DeviceImageBatch, NetworkError> {
         let shape = &cache.shape;
+        let input = match &cache.columns {
+            Columns::DeviceInput(input) => Some(input),
+            Columns::DeviceElsewhere => input.map(|batch| &batch.data),
+            _ => None,
+        };
         let device = self.weight.weight.device.as_mut().ok_or_else(|| {
             NetworkError::InvalidConfig("backward_device needs the weight on a device".into())
         })?;
         let context = device.context().clone();
         if context.mixed_precision && !shape.is_pointwise() {
             let rebuilt;
-            let columns = match &cache.columns {
-                Columns::DeviceNarrow(columns) => columns,
-                Columns::DeviceInput(input) => {
+            let columns = match (&cache.columns, input) {
+                (Columns::DeviceNarrow(columns), _) => columns,
+                (_, Some(input)) => {
                     rebuilt = context.im2col_bf16(input, shape)?;
                     &rebuilt
                 }
@@ -1046,10 +1085,10 @@ impl TrainableConv2d {
             });
         }
         let rebuilt;
-        let columns = match &cache.columns {
-            Columns::Device(columns) => columns,
-            Columns::DeviceInput(input) if shape.is_pointwise() => input,
-            Columns::DeviceInput(input) => {
+        let columns = match (&cache.columns, input) {
+            (Columns::Device(columns), _) => columns,
+            (_, Some(input)) if shape.is_pointwise() => input,
+            (_, Some(input)) => {
                 rebuilt = context.im2col(input, shape)?;
                 &rebuilt
             }

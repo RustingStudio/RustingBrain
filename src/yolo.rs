@@ -1140,7 +1140,7 @@ impl Yolo11 {
                     let x = x.unwrap();
                     let (y, dense) = match kernel {
                         Kernel::Dense(conv) => {
-                            let (y, c) = conv.forward_device(x)?;
+                            let (y, c) = conv.forward_device_keeping(x, false)?;
                             (y, Some(c))
                         }
                         Kernel::Depthwise(conv) => (conv.forward_device(x)?, None),
@@ -1149,7 +1149,7 @@ impl Yolo11 {
                     (out, DeviceCache::Conv { dense, norm })
                 }
                 Op::Plain(conv) => {
-                    let (y, c) = conv.forward_device(x.unwrap())?;
+                    let (y, c) = conv.forward_device_keeping(x.unwrap(), false)?;
                     (y, DeviceCache::Plain(c))
                 }
                 Op::Fused { conv, act, narrow } => {
@@ -1223,12 +1223,16 @@ impl Yolo11 {
                 (Op::Conv { kernel, norm, .. }, DeviceCache::Conv { dense, norm: nc }) => {
                     let g = norm.backward_device(&nc, &g)?;
                     vec![match (kernel, dense) {
-                        (Kernel::Dense(conv), Some(c)) => conv.backward_device(&c, &g)?,
+                        (Kernel::Dense(conv), Some(c)) => {
+                            conv.backward_device_from(&c, Some(input(0)), &g)?
+                        }
                         (Kernel::Depthwise(conv), None) => conv.backward_device(input(0), &g)?,
                         _ => unreachable!("a cache from another kernel"),
                     }]
                 }
-                (Op::Plain(conv), DeviceCache::Plain(c)) => vec![conv.backward_device(&c, &g)?],
+                (Op::Plain(conv), DeviceCache::Plain(c)) => {
+                    vec![conv.backward_device_from(&c, Some(input(0)), &g)?]
+                }
                 (Op::Add, _) => vec![g.clone(), g],
                 (Op::Concat, _) => {
                     let widths: Vec<usize> = (0..node.inputs.len())
