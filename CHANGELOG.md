@@ -354,6 +354,7 @@
 
 ### Fixed
 
+- `Mesh::simplify` and `Mesh::simplify_within` no longer depend on which of several equally cheap edges the queue hands out first (J10). An edge refused because it would fold a face used to be dropped for good; now, once nothing cheap is left, the refused edges are weighed again for as long as a round still collapses something. A flat 6x6 grid within 1e-6 failed to reach its two corner faces in 3 of 200 runs before and in none of 400 after.
 - A device convolution asked to add into a map with a different channel
   count is an error, instead of writing past the end of that map.
 - A CLIP text or image tower saved by Transformers 5, whose keys leave off
