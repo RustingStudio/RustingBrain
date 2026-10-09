@@ -473,7 +473,8 @@ impl GpuContext {
         columns: &CudaSlice<f32>,
         shape: &crate::conv::ConvGeometry,
     ) -> Result<CudaSlice<f32>, NetworkError> {
-        let mut grad = self.zeros(shape.input_elements())?;
+        // The kernel gathers each input pixel's sum and writes it once.
+        let mut grad = self.uninit(shape.input_elements())?;
         self.launch_conv(
             &self.col2im_train,
             &mut grad,
@@ -1248,7 +1249,8 @@ impl DeviceParam {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<CudaSlice<f32>, NetworkError> {
-        let mut output = self.context.zeros(rows * self.cols)?;
+        // Beta 0: the GEMM writes every element without reading it.
+        let mut output = self.context.uninit(rows * self.cols)?;
         gemm_plain(
             &self.context,
             input,

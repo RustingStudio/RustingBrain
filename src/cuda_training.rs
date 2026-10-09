@@ -310,12 +310,18 @@ extern "C" __global__ void dw_bwd_input(float*dx,const float*g,const float*w,int
     a+=g[((long long)(b*OH+oy)*OW+ox)*C+c]*w[c*k*k+t];}
   dx[i]=a;
 }
+// One thread per (chunk of DW_ROWS output pixels, tap, channel), channel
+// fastest so a warp reads neighbouring channels; partial sums are added into
+// a zeroed `dw`.
+#define DW_ROWS 64
 extern "C" __global__ void dw_bwd_weight(float*dw,const float*g,const float*x,int B,int H,int W,int C,int k,int s,int OH,int OW){
-  int c=blockIdx.x/(k*k),t=blockIdx.x%(k*k),pad=k/2,n=B*OH*OW;float a=0.f;
-  for(int r=threadIdx.x;r<n;r+=blockDim.x){int ox=r%OW,q=r/OW,oy=q%OH,b=q/OH;
-    int sy=oy*s+t/k-pad,sx=ox*s+t%k-pad;
+  long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;int kk=k*k,n=B*OH*OW;
+  if(i>=(long long)(n+DW_ROWS-1)/DW_ROWS*kk*C)return;
+  int c=i%C,t=(i/C)%kk,chunk=i/((long long)C*kk),pad=k/2,dy=t/k-pad,dx=t%k-pad;float a=0.f;
+  for(int r=chunk*DW_ROWS,end=min(n,r+DW_ROWS);r<end;r++){int ox=r%OW,q=r/OW,oy=q%OH,b=q/OH;
+    int sy=oy*s+dy,sx=ox*s+dx;
     if(sy>=0&&sy<H&&sx>=0&&sx<W)a+=g[(long long)r*C+c]*x[((long long)(b*H+sy)*W+sx)*C+c];}
-  a=img_block_sum(a);if(threadIdx.x==0)dw[blockIdx.x]=a;
+  if(a!=0.f)atomicAdd(&dw[c*kk+t],a);
 }
 extern "C" __global__ void add_f32(float*out,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]+b[i];}
 extern "C" __global__ void mul_f32(float*out,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]*b[i];}
