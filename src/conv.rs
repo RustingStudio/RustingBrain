@@ -2349,48 +2349,35 @@ impl TrainableBatchNorm2d {
                 "backward_device needs gamma and beta on a device".into(),
             ));
         };
-        let mut grad_y = context.uninit(total)?;
-        let [n, c] = [total, channels].map(|v| v as i32);
-        unsafe {
-            context
-                .stream
-                .launch_builder(&context.image.bn_bwd_prep)
-                .arg(&mut grad_y)
-                .arg(&grad.data)
-                .arg(&cache.normalized)
-                .arg(gamma.value())
-                .arg(beta.value())
-                .arg(&n)
-                .arg(&c)
-                .arg(&(cache.silu as i32))
-                .launch(crate::cuda_training::cfg(total))
-                .map_err(err("batch norm backward kernel"))?;
-        }
-        // The two column means, which are also beta's and gamma's gradients
-        // over `rows`.
+        // The two column means of the gradient at the norm's output, which
+        // are also beta's and gamma's gradients over `rows`.
         let (mut mean, mut along) = (context.zeros(channels)?, context.zeros(channels)?);
+        let silu = cache.silu.then_some((gamma.value(), beta.value()));
+        let times = ColumnSum::Times(&cache.normalized, &mut along, silu);
         let scale = 1.0 / rows as f32;
-        let times = ColumnSum::Times(&cache.normalized, &mut along);
-        column_sums(&context, &mut mean, &grad_y, Some(times), rows, channels, scale)?;
+        column_sums(&context, &mut mean, &grad.data, Some(times), rows, channels, scale)?;
         let unused = context.zeros(channels)?;
         let (centre, slope) = match cache.training {
             true => (&mean, &along),
             false => (&unused, &unused),
         };
         let mut input_grad = context.uninit(total)?;
+        let [n, c] = [total, channels].map(|v| v as i32);
         unsafe {
             context
                 .stream
                 .launch_builder(&context.image.bn_bwd_apply)
                 .arg(&mut input_grad)
-                .arg(&grad_y)
+                .arg(&grad.data)
                 .arg(&cache.normalized)
                 .arg(&cache.inv_std)
                 .arg(centre)
                 .arg(slope)
                 .arg(gamma.value())
+                .arg(beta.value())
                 .arg(&n)
                 .arg(&c)
+                .arg(&(cache.silu as i32))
                 .launch(crate::cuda_training::cfg(total))
                 .map_err(err("batch norm backward kernel"))?;
         }
@@ -2416,9 +2403,12 @@ enum ColumnSum<'a> {
     /// `(x - centre[channel])^2`.
     Centred(&'a cudarc::driver::CudaSlice<f32>),
     /// `x` as with none, and `x * other` elementwise into the second sum.
+    /// With gamma and beta, `x` is first taken back through the SiLU after a
+    /// batch norm whose normalized values `other` holds.
     Times(
         &'a cudarc::driver::CudaSlice<f32>,
         &'a mut cudarc::driver::CudaSlice<f32>,
+        Option<(&'a cudarc::driver::CudaSlice<f32>, &'a cudarc::driver::CudaSlice<f32>)>,
     ),
 }
 
@@ -2438,6 +2428,10 @@ fn column_sums(
     let mut launch = context.stream.launch_builder(&context.image.col_sums);
     launch.arg(out);
     // The kernel writes the second sum only under mode 2.
+    let with_silu = match &with {
+        Some(ColumnSum::Times(_, _, silu)) => *silu,
+        _ => None,
+    };
     let mode = match with {
         None => {
             launch.arg(x).arg(x).arg(x);
@@ -2447,12 +2441,18 @@ fn column_sums(
             launch.arg(x).arg(x).arg(centre);
             1
         }
-        Some(ColumnSum::Times(other, second)) => {
+        Some(ColumnSum::Times(other, second, _)) => {
             launch.arg(second).arg(x).arg(other);
             2
         }
     };
     launch.arg(&r).arg(&c).arg(&scale).arg(&mode);
+    let (gamma, beta) = match with_silu {
+        Some(pair) => pair,
+        None => (x, x),
+    };
+    let act = with_silu.is_some() as i32;
+    launch.arg(gamma).arg(beta).arg(&act);
     // COL_ROWS rows a thread, as the kernel reads them.
     unsafe { launch.launch(crate::cuda_training::cfg(rows.div_ceil(64) * channels)) }
         .map_err(crate::cuda_training::cuda_err("column sum kernel"))?;
