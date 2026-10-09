@@ -125,10 +125,11 @@ __device__ __forceinline__ float block_max(float v,float*red){
 
 // The activation a layer asks for by number: 0 SiLU, 1 GELU (the tanh
 // approximation `ffn::gelu` uses), 2 the quick GELU the CLIP towers were
-// trained with.
+// trained with, 3 the exact GELU DINOv2 uses.
 __device__ __forceinline__ float act_of(float x,int kind){
   if(kind==0)return x/(1.f+expf(-x));
   if(kind==2)return x/(1.f+expf(-1.702f*x));
+  if(kind==3)return 0.5f*x*(1.f+erff(x*0.70710678f));
   float inner=0.7978846f*(x+0.044715f*x*x*x);
   return 0.5f*x*(1.f+tanhf(inner));
 }
@@ -3518,7 +3519,7 @@ fn run_clip_layer(
 pub struct DeviceVitEncoder {
     gpu: Arc<ImageGpu>,
     patch: DeviceDense,
-    pre_norm: DeviceNorm,
+    pre_norm: Option<DeviceNorm>,
     layers: Vec<DeviceClipLayer>,
     post_norm: DeviceNorm,
     heads: usize,
@@ -3537,12 +3538,19 @@ impl DeviceVitEncoder {
         let config = encoder.config();
         Ok(Self {
             patch: upload_dense(gpu, &encoder.patch)?,
-            pre_norm: upload_norm(gpu, &encoder.pre_norm)?,
+            pre_norm: encoder
+                .pre_norm
+                .as_ref()
+                .map(|norm| upload_norm(gpu, norm))
+                .transpose()?,
             layers: upload_clip_layers(gpu, &encoder.layers)?,
             post_norm: upload_norm(gpu, &encoder.post_norm)?,
             heads: config.num_heads,
             eps: config.eps,
-            activation: i32::from(config.quick_gelu) + 1,
+            activation: match encoder.exact_gelu {
+                true => 3,
+                false => i32::from(config.quick_gelu) + 1,
+            },
             gpu: gpu.clone(),
         })
     }
@@ -3564,7 +3572,9 @@ impl DeviceVitEncoder {
         let gpu = &self.gpu;
         let mut hidden = gpu.upload_matrix(embedding)?;
         gpu.dense_add(&self.patch, &gpu.upload_matrix(patches)?, &mut hidden)?;
-        let mut hidden = gpu.layer_norm(&self.pre_norm, &hidden, self.eps)?;
+        if let Some(norm) = &self.pre_norm {
+            hidden = gpu.layer_norm(norm, &hidden, self.eps)?;
+        }
         for layer in &self.layers {
             run_clip_layer(
                 gpu,
@@ -4283,23 +4293,29 @@ mod tests {
         let Some(gpu) = device() else { return };
         let path = std::env::temp_dir().join("rusting_brain_cuda_vit.safetensors");
         crate::vit_encoder::tests::checkpoint(&path, false);
-        let mut tower =
-            VitEncoder::load(&path, "", crate::vit_encoder::tests::tiny(), Precision::F32)
-                .expect("a tower");
+        // CLIP's layout, then DINOv2's: no pre-norm and the exact GELU.
+        for dinov2 in [false, true] {
+            let mut tower =
+                VitEncoder::load(&path, "", crate::vit_encoder::tests::tiny(), Precision::F32)
+                    .expect("a tower");
+            if dinov2 {
+                tower.pre_norm = None;
+                tower.exact_gelu = true;
+            }
+            let image = map(
+                tower.channels(),
+                tower.image_size(),
+                tower.image_size(),
+                0.27,
+            );
+            let expected = tower.encode(&image).expect("a host pass");
+            tower.attach_device(gpu.clone()).expect("an upload");
+            let actual = tower.encode(&image).expect("a device pass");
+
+            assert_eq!((actual.rows, actual.cols), (expected.rows, expected.cols));
+            assert_close("vit", &actual.data, &expected.data, 0.05);
+        }
         std::fs::remove_file(&path).ok();
-
-        let image = map(
-            tower.channels(),
-            tower.image_size(),
-            tower.image_size(),
-            0.27,
-        );
-        let expected = tower.encode(&image).expect("a host pass");
-        tower.attach_device(gpu).expect("an upload");
-        let actual = tower.encode(&image).expect("a device pass");
-
-        assert_eq!((actual.rows, actual.cols), (expected.rows, expected.cols));
-        assert_close("vit", &actual.data, &expected.data, 0.05);
     }
 
     #[test]

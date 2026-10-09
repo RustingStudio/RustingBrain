@@ -98,6 +98,7 @@
 
 ### Added
 
+- DINOv2 towers in `vit_encoder` (K12): `VitEncoder::load_dinov2(path, image_size, precision)` loads `facebook/dinov2-small` and `-base` safetensors; patch tokens are rows 1.. of `encode`, normalised with `IMAGENET_MEAN`/`IMAGENET_STD`. Within 4.2e-5 relative of HF `transformers` on two images. `ffn::gelu_erf` is the exact GELU, also on the device.
 - `DepthwiseConv2d` (no bias, padding k/2) and `pixel_attention`, the middle of ultralytics' `Attention` from its qkv map to the attended map and values, each with backward on host and device. The attention takes the qkv map rather than owning its convolutions, so C2PSA composes it from `TrainableConv2d`, `TrainableBatchNorm2d` and `DepthwiseConv2d` (K13a-ii).
 - Detection layers (K13a-i) in `conv`: `TrainableBatchNorm2d` with training and evaluating modes, PyTorch's running statistics and `fuse_into` a convolution; `upsample_nearest_batch`, `concat_channels`, `split_channels`, `max_pool_same` and their backwards; each with a device version, plus `add_device`.
 - Detection ops (K13b) in `detection`: `box_iou` with `Overlap::{Iou, Giou, Ciou}` and its gradient, `distribution_focal_loss`, `make_anchors`, `box_to_ltrb`/`ltrb_to_box`, `TaskAlignedAssigner`, `non_max_suppression` and `mean_average_precision`, all matching ultralytics 8.4.174 on exported fixtures. Host only; CUDA NMS waits for the Gate 3 profile.
