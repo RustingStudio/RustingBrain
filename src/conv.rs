@@ -2271,30 +2271,18 @@ impl TrainableBatchNorm2d {
         let (mut mean, mut variance) = (context.zeros(channels)?, context.zeros(channels)?);
         let mut inv_std = context.zeros(channels)?;
         if training {
-            let ones = context.filled(rows, 1.0)?;
             let scale = 1.0 / rows as f32;
-            let sum = |x: &cudarc::driver::CudaSlice<f32>,
-                       out: &mut cudarc::driver::CudaSlice<f32>| {
-                crate::gpu_transformer::gemm_lhs_transposed(
-                    context, &ones, 1, x, channels, out, channels, rows, 1, channels, scale, 0.0,
-                )
-            };
-            sum(&input.data, &mut mean)?;
-            let mut squares = context.uninit(total)?;
-            let [n, c] = [total, channels].map(|v| v as i32);
-            unsafe {
-                context
-                    .stream
-                    .launch_builder(&context.image.bn_center_sq)
-                    .arg(&mut squares)
-                    .arg(&input.data)
-                    .arg(&mean)
-                    .arg(&n)
-                    .arg(&c)
-                    .launch(crate::cuda_training::cfg(total))
-                    .map_err(err("batch norm variance kernel"))?;
-            }
-            sum(&squares, &mut variance)?;
+            column_sums(context, &mut mean, &input.data, None, rows, channels, scale)?;
+            let centre = ColumnSum::Centred(&mean);
+            column_sums(
+                context,
+                &mut variance,
+                &input.data,
+                Some(centre),
+                rows,
+                channels,
+                scale,
+            )?;
         }
         let unbias = rows as f32 / (rows as f32 - 1.0).max(1.0);
         let [c, train] = [channels as i32, training as i32];
@@ -2361,15 +2349,13 @@ impl TrainableBatchNorm2d {
                 "backward_device needs gamma and beta on a device".into(),
             ));
         };
-        let ones = context.filled(rows, 1.0)?;
-        let (mut product, mut grad_y) = (context.uninit(total)?, context.uninit(total)?);
+        let mut grad_y = context.uninit(total)?;
         let [n, c] = [total, channels].map(|v| v as i32);
         unsafe {
             context
                 .stream
                 .launch_builder(&context.image.bn_bwd_prep)
                 .arg(&mut grad_y)
-                .arg(&mut product)
                 .arg(&grad.data)
                 .arg(&cache.normalized)
                 .arg(gamma.value())
@@ -2380,15 +2366,26 @@ impl TrainableBatchNorm2d {
                 .launch(crate::cuda_training::cfg(total))
                 .map_err(err("batch norm backward kernel"))?;
         }
+        // The two column means, which are also beta's and gamma's gradients
+        // over `rows`.
         let (mut mean, mut along) = (context.zeros(channels)?, context.zeros(channels)?);
-        if cache.training {
-            let scale = 1.0 / rows as f32;
-            for (x, out) in [(&grad_y, &mut mean), (&product, &mut along)] {
-                crate::gpu_transformer::gemm_lhs_transposed(
-                    &context, &ones, 1, x, channels, out, channels, rows, 1, channels, scale, 0.0,
-                )?;
-            }
-        }
+        let scale = 1.0 / rows as f32;
+        column_sums(&context, &mut mean, &grad_y, None, rows, channels, scale)?;
+        let times = ColumnSum::Times(&cache.normalized);
+        column_sums(
+            &context,
+            &mut along,
+            &grad_y,
+            Some(times),
+            rows,
+            channels,
+            scale,
+        )?;
+        let unused = context.zeros(channels)?;
+        let (centre, slope) = match cache.training {
+            true => (&mean, &along),
+            false => (&unused, &unused),
+        };
         let mut input_grad = context.uninit(total)?;
         unsafe {
             context
@@ -2398,16 +2395,17 @@ impl TrainableBatchNorm2d {
                 .arg(&grad_y)
                 .arg(&cache.normalized)
                 .arg(&cache.inv_std)
-                .arg(&mean)
-                .arg(&along)
+                .arg(centre)
+                .arg(slope)
                 .arg(gamma.value())
                 .arg(&n)
                 .arg(&c)
                 .launch(crate::cuda_training::cfg(total))
                 .map_err(err("batch norm backward kernel"))?;
         }
-        gamma.accumulate_grad_device(&ones, &product, rows)?;
-        beta.accumulate_grad_device(&ones, &grad_y, rows)?;
+        let count = context.filled(1, rows as f32)?;
+        gamma.accumulate_grad_device(&count, &along, 1)?;
+        beta.accumulate_grad_device(&count, &mean, 1)?;
         Ok(grad.with_data(input_grad))
     }
 }
@@ -2419,6 +2417,51 @@ pub struct DeviceBatchNormCache {
     inv_std: cudarc::driver::CudaSlice<f32>,
     training: bool,
     silu: bool,
+}
+
+/// What [`column_sums`] sums besides plain values.
+#[cfg(feature = "cuda")]
+enum ColumnSum<'a> {
+    /// `(x - centre[channel])^2`.
+    Centred(&'a cudarc::driver::CudaSlice<f32>),
+    /// `x * other`, elementwise.
+    Times(&'a cudarc::driver::CudaSlice<f32>),
+}
+
+/// `scale` times each channel's sum over the rows of `x[rows, channels]`,
+/// added into `out`, which starts zeroed.
+#[cfg(feature = "cuda")]
+fn column_sums(
+    context: &crate::gpu_transformer::GpuContext,
+    out: &mut cudarc::driver::CudaSlice<f32>,
+    x: &cudarc::driver::CudaSlice<f32>,
+    with: Option<ColumnSum>,
+    rows: usize,
+    channels: usize,
+    scale: f32,
+) -> Result<(), NetworkError> {
+    let (other, mode) = match with {
+        None => (x, 0),
+        Some(ColumnSum::Centred(centre)) => (centre, 1),
+        Some(ColumnSum::Times(other)) => (other, 2),
+    };
+    let [r, c] = [rows, channels].map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.col_sums)
+            .arg(out)
+            .arg(x)
+            .arg(other)
+            .arg(&r)
+            .arg(&c)
+            .arg(&scale)
+            .arg(&mode)
+            // COL_ROWS rows a thread, as the kernel reads them.
+            .launch(crate::cuda_training::cfg(rows.div_ceil(64) * channels))
+            .map_err(crate::cuda_training::cuda_err("column sum kernel"))?;
+    }
+    Ok(())
 }
 
 /// A depthwise convolution without bias, as ultralytics' `DWConv` and C2PSA's
@@ -3915,7 +3958,9 @@ mod tests {
             let grad = noise(2, 10, 9, 16, 2);
             let (expected, cache) = host.forward(&input).unwrap();
             let expected_grad = host.backward(&cache, &grad).unwrap();
-            let (output, cache) = conv.forward_device(&device.upload(&input).unwrap()).unwrap();
+            let (output, cache) = conv
+                .forward_device(&device.upload(&input).unwrap())
+                .unwrap();
             let input_grad = conv
                 .backward_device(&cache, &device.upload(&grad).unwrap())
                 .unwrap();
@@ -3923,7 +3968,10 @@ mod tests {
             let near = |a: &[f32], b: &[f32], what: &str| {
                 let gap: f32 = a.iter().zip(b).map(|(a, b)| (a - b).powi(2)).sum();
                 let scale: f32 = b.iter().map(|b| b * b).sum();
-                assert!(gap.sqrt() < 1e-2 * scale.sqrt(), "{what}: {gap} against {scale}");
+                assert!(
+                    gap.sqrt() < 1e-2 * scale.sqrt(),
+                    "{what}: {gap} against {scale}"
+                );
             };
             near(
                 &output.download().unwrap().tokens.data,

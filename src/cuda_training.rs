@@ -281,7 +281,6 @@ extern "C" __global__ void gap_bwd(float*dx,const float*g,int total,int n,int C)
 }
 // Batch norm over `[rows, channels]`: the column sums go through cuBLAS, the
 // rest is one thread per element or channel.
-extern "C" __global__ void bn_center_sq(float*out,const float*x,const float*mean,int total,int C){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<total){float d=x[i]-mean[i%C];out[i]=d*d;}}
 extern "C" __global__ void bn_finish(float*mean,float*var,float*inv,float*run,int C,float eps,float momentum,float unbias,int training){
   int c=blockIdx.x*blockDim.x+threadIdx.x;if(c>=C)return;
   if(training){run[c]=(1.f-momentum)*run[c]+momentum*mean[c];run[C+c]=(1.f-momentum)*run[C+c]+momentum*var[c]*unbias;}
@@ -295,14 +294,29 @@ extern "C" __global__ void bn_apply(float*y,float*xhat,const float*x,const float
   int c=i%C;float h=(x[i]-mean[c])*inv[c];xhat[i]=h;float v=h*gamma[c]+beta[c];
   y[i]=act?v/(1.f+expf(-v)):v;
 }
-// The gradient at the batch norm's output, through the SiLU under `act`, and
-// that gradient times xhat, the two column sums the backward pass needs.
-extern "C" __global__ void bn_bwd_prep(float*gy,float*prod,const float*g,const float*xhat,
+// The gradient at the batch norm's output, through the SiLU under `act`.
+extern "C" __global__ void bn_bwd_prep(float*gy,const float*g,const float*xhat,
     const float*gamma,const float*beta,int total,int C,int act){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
-  int c=i%C;float h=xhat[i],d=g[i];
-  if(act){float v=h*gamma[c]+beta[c],s=1.f/(1.f+expf(-v));d*=s*(1.f+v*(1.f-s));}
-  gy[i]=d;prod[i]=d*h;
+  int c=i%C;float d=g[i];
+  if(act){float v=xhat[i]*gamma[c]+beta[c],s=1.f/(1.f+expf(-v));d*=s*(1.f+v*(1.f-s));}
+  gy[i]=d;
+}
+// `scale` times each channel's sum over the rows of `[rows, C]`: of x under
+// mode 0, of (x - other[c])^2 under mode 1, of x * other under mode 2. One
+// thread per (chunk of COL_ROWS rows, channel), channel fastest so a warp
+// reads neighbouring channels; partial sums are added into a zeroed `out`.
+#define COL_ROWS 64
+extern "C" __global__ void col_sums(float*out,const float*x,const float*other,
+    int rows,int C,float scale,int mode){
+  long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=(long long)(rows+COL_ROWS-1)/COL_ROWS*C)return;
+  int c=i%C,chunk=i/C;float a=0.f,m=mode==1?other[c]:0.f;
+  for(int r=chunk*COL_ROWS,end=min(rows,r+COL_ROWS);r<end;r++){
+    long long at=(long long)r*C+c;float v=x[at];
+    if(mode==1){v-=m;v*=v;}else if(mode==2)v*=other[at];
+    a+=v;}
+  atomicAdd(&out[c],a*scale);
 }
 extern "C" __global__ void bn_bwd_apply(float*dx,const float*g,const float*xhat,const float*inv,
     const float*m1,const float*m2,const float*gamma,int total,int C){
