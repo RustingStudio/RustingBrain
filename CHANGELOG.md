@@ -98,6 +98,7 @@
 
 ### Added
 
+- An ignored timing test, `cuda_image::lora::tests::an_sd15_step_at_512_is_timed`: one adapted forward and backward of Stable Diffusion 1.5's UNet at 512x512 on the device takes 191.0 ms on an RTX 3060 (65.1 forward, 125.9 backward; random weights of the 1.5 shapes), recorded in `docs/baseline.md` (G10 b-iii-c).
 - YOLO11 inference at 1280 under 15 ms, Gate 3 of the detection track (K13f). `Yolo11::fuse()` folds every batch norm into its convolution as ultralytics' `fuse()` does. On a `CudaDevice::with_mixed_precision` device, the fused 3x3 and strided convolutions build their `im2col` columns in bf16 and run bf16 GEMMs with an FP32 accumulator. `TrainableConv2d::infer_device(input, silu)` is a cache-free forward that adds the bias and SiLU in one kernel and reads a 1x1 convolution's input as its columns. `Yolo11::save_ultralytics(path)` writes an ultralytics state dict that `load_ultralytics` and ultralytics read back. `Validation::stages_ms` gives the time of each stage. On the 278 player val images (rect letterboxed, e.g. 1280x736), batch 1 on the 3060: upload 0.56 ms, forward 13.56 ms and download 0.47 ms, 14.6 ms for the model (37.7 ms unfused before), with mAP50 0.7390 (fp32: 0.7394). Decode on the host takes another 3.34 ms and NMS 0.02 ms. Other speedups: im2col reads and writes float4 with 32-bit indices, bias plus activation runs on float4, outputs written in full are left uninitialised, and a `Slice` node copies only its own channels.
 
   The API a consumer crate uses, with features `cuda,images`:
