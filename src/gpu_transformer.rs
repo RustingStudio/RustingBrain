@@ -92,8 +92,10 @@ pub struct GpuContext {
     gather: CudaFunction,
     scatter: CudaFunction,
     im2col_train: CudaFunction,
+    im2col_bf16: CudaFunction,
     col2im_train: CudaFunction,
     bias_act: CudaFunction,
+    bias_act4: CudaFunction,
     fill: CudaFunction,
     /// The group norm and SiLU kernels `conv`'s device layers launch.
     pub(crate) image: ImageTrainKernels,
@@ -196,8 +198,10 @@ impl GpuContext {
             gather: get("gather_rows")?,
             scatter: get("scatter_rows_neg")?,
             im2col_train: get("im2col_train")?,
+            im2col_bf16: get("im2col_bf16")?,
             col2im_train: get("col2im_train")?,
             bias_act: get("bias_act")?,
+            bias_act4: get("bias_act4")?,
             fill: get("fill_f32")?,
             image: ImageTrainKernels {
                 gn_stats: get("gn_stats")?,
@@ -325,8 +329,35 @@ impl GpuContext {
         bias: &CudaSlice<f32>,
         cols: usize,
     ) -> Result<(), NetworkError> {
+        self.add_bias_rows_then(rows, bias, cols, false)
+    }
+
+    /// [`GpuContext::add_bias_rows`], then SiLU under `silu`, in one pass.
+    pub(crate) fn add_bias_rows_then(
+        &self,
+        rows: &mut CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        cols: usize,
+        silu: bool,
+    ) -> Result<(), NetworkError> {
         let len = rows.len();
-        let (count, cols, none) = ((len / cols) as i32, cols as i32, 0i32);
+        let act = 4 * silu as i32;
+        if cols % 4 == 0 {
+            let (n4, cols4) = ((len / 4) as i32, (cols / 4) as i32);
+            unsafe {
+                self.stream
+                    .launch_builder(&self.bias_act4)
+                    .arg(rows)
+                    .arg(bias)
+                    .arg(&n4)
+                    .arg(&cols4)
+                    .arg(&act)
+                    .launch(cfg(len / 4))
+                    .map_err(cuda_err("bias kernel"))?;
+            }
+            return Ok(());
+        }
+        let (count, cols) = ((len / cols) as i32, cols as i32);
         unsafe {
             self.stream
                 .launch_builder(&self.bias_act)
@@ -334,7 +365,7 @@ impl GpuContext {
                 .arg(bias)
                 .arg(&count)
                 .arg(&cols)
-                .arg(&none)
+                .arg(&act)
                 .launch(cfg(len))
                 .map_err(cuda_err("bias kernel"))?;
         }
@@ -344,6 +375,16 @@ impl GpuContext {
     pub(crate) fn zeros(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {
         self.stream
             .alloc_zeros::<f32>(len)
+            .map_err(cuda_alloc_err("device allocation", len * 4))
+    }
+
+    /// [`GpuContext::zeros`] without the memset, for a buffer the next
+    /// kernel writes in full: an inference pass zeroed a few hundred of
+    /// these per image.
+    pub(crate) fn uninit(&self, len: usize) -> Result<CudaSlice<f32>, NetworkError> {
+        // SAFETY: every caller hands the buffer straight to a kernel or a
+        // GEMM with beta 0 that writes each element before anything reads it.
+        unsafe { self.stream.alloc::<f32>(len) }
             .map_err(cuda_alloc_err("device allocation", len * 4))
     }
 
@@ -360,15 +401,69 @@ impl GpuContext {
         input: &CudaSlice<f32>,
         shape: &crate::conv::ConvGeometry,
     ) -> Result<CudaSlice<f32>, NetworkError> {
-        let mut columns = self.zeros(shape.column_elements())?;
+        let mut columns = self.uninit(shape.column_elements())?;
+        // A float4 a thread when the channels come in fours; see the kernel.
+        let threads = match shape.channels % 4 {
+            0 => columns.len() / 4,
+            _ => columns.len(),
+        };
         self.launch_conv(
             &self.im2col_train,
             &mut columns,
             input,
             shape,
+            threads,
             "im2col kernel",
         )?;
         Ok(columns)
+    }
+
+    /// [`GpuContext::im2col`] rounded to bf16, two bytes an entry, for a GEMM
+    /// that rounds its operands to bf16 anyway.
+    pub(crate) fn im2col_bf16(
+        &self,
+        input: &CudaSlice<f32>,
+        shape: &crate::conv::ConvGeometry,
+    ) -> Result<CudaSlice<u8>, NetworkError> {
+        let len = shape.column_elements();
+        let mut columns = self.uninit_bytes(2 * len)?;
+        let threads = match shape.channels % 4 {
+            0 => len / 4,
+            _ => len,
+        };
+        self.launch_conv(
+            &self.im2col_bf16,
+            &mut columns,
+            input,
+            shape,
+            threads,
+            "bf16 im2col kernel",
+        )?;
+        Ok(columns)
+    }
+
+    /// `values` rounded to bf16, two bytes a value.
+    pub(crate) fn bf16_bytes(
+        &self,
+        values: &CudaSlice<f32>,
+    ) -> Result<CudaSlice<u8>, NetworkError> {
+        let n = values.len();
+        let mut out = self.uninit_bytes(2 * n)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.model.to_bf16)
+                .arg(&mut out)
+                .arg(values)
+                .arg(&(n as i32))
+                .launch(cfg(n))
+                .map_err(cuda_err("BF16 cast kernel"))?;
+        }
+        Ok(out)
+    }
+
+    fn uninit_bytes(&self, len: usize) -> Result<CudaSlice<u8>, NetworkError> {
+        // SAFETY: as `uninit`, every caller writes each byte first.
+        unsafe { self.stream.alloc::<u8>(len) }.map_err(cuda_alloc_err("device allocation", len))
     }
 
     /// The transpose of [`GpuContext::im2col`]: column gradients summed back
@@ -384,6 +479,7 @@ impl GpuContext {
             &mut grad,
             columns,
             shape,
+            shape.input_elements(),
             "col2im kernel",
         )?;
         Ok(grad)
@@ -391,15 +487,15 @@ impl GpuContext {
 
     /// Both kernels take the same arguments and are launched over their own
     /// destination, so they share one launch.
-    fn launch_conv(
+    fn launch_conv<D>(
         &self,
         kernel: &CudaFunction,
-        destination: &mut CudaSlice<f32>,
+        destination: &mut CudaSlice<D>,
         source: &CudaSlice<f32>,
         shape: &crate::conv::ConvGeometry,
+        threads: usize,
         stage: &'static str,
     ) -> Result<(), NetworkError> {
-        let elements = destination.len();
         let dimensions = [
             shape.batch,
             shape.channels,
@@ -418,7 +514,7 @@ impl GpuContext {
             for value in &dimensions {
                 launch.arg(value);
             }
-            launch.launch(cfg(elements)).map_err(cuda_err(stage))?;
+            launch.launch(cfg(threads)).map_err(cuda_err(stage))?;
         }
         Ok(())
     }
@@ -1097,13 +1193,42 @@ impl DeviceParam {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<CudaSlice<f32>, NetworkError> {
-        let mut output = self.context.zeros(rows * self.rows)?;
+        let mut output = self.context.uninit(rows * self.rows)?;
         gemm_rhs_transposed(
             &self.context,
             input,
             self.cols,
             &self.value,
             self.cols,
+            &mut output,
+            self.rows,
+            rows,
+            self.rows,
+            self.cols,
+            1.0,
+            0.0,
+        )?;
+        Ok(output)
+    }
+
+    /// [`DeviceParam::matmul_rhs_transposed_device`] over bf16 operands:
+    /// `input` and `weight` from [`GpuContext::im2col_bf16`] and
+    /// [`GpuContext::bf16_bytes`], accumulated in FP32.
+    pub(crate) fn matmul_rhs_transposed_bf16(
+        &self,
+        input: &CudaSlice<u8>,
+        weight: &CudaSlice<u8>,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut output = self.context.uninit(rows * self.rows)?;
+        act_rhs_transposed(
+            &self.context,
+            &input.slice(..),
+            self.cols,
+            &weight.slice(..),
+            self.cols,
+            true,
+            false,
             &mut output,
             self.rows,
             rows,
