@@ -167,10 +167,38 @@ extern "C" __global__ void col2im_train(float*grad,const float*columns,
     int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
   col2im_at(grad,columns,batch,channels,height,width,kernel,stride,pad,out_h,out_w);
 }
-// The same sum over bf16 column gradients, accumulated in FP32.
+// The same sum over bf16 column gradients, accumulated in FP32. With channels
+// in fours a thread sums four neighbouring channels, so a warp reads 256
+// contiguous bytes a tap rather than 64; the launch is a quarter the size.
+template<typename I> __device__ void col2im_bf16_four(float4*grad,const ushort4*columns,I idx,
+    int lanes,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
+  int c=(int)(idx%lanes);I p=idx/lanes;
+  int x=(int)(p%width);I q=p/width;
+  int y=(int)(q%height);I b=q/height;
+  I patch=(I)lanes*kernel*kernel;
+  float4 s=make_float4(0.f,0.f,0.f,0.f);
+  for(int ky=0;ky<kernel;ky++){
+    int sy=y+pad-ky;if(sy<0||sy%stride)continue;int oy=sy/stride;if(oy>=out_h)continue;
+    for(int kx=0;kx<kernel;kx++){
+      int sx=x+pad-kx;if(sx<0||sx%stride)continue;int ox=sx/stride;if(ox>=out_w)continue;
+      I row=(b*out_h+oy)*out_w+ox;
+      ushort4 v=columns[row*patch+(I)(ky*kernel+kx)*lanes+c];
+      s.x+=bf16_to_f32(v.x);s.y+=bf16_to_f32(v.y);s.z+=bf16_to_f32(v.z);s.w+=bf16_to_f32(v.w);
+    }
+  }
+  grad[idx]=s;
+}
 extern "C" __global__ void col2im_bf16(float*grad,const bf16_t*columns,
     int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
-  col2im_at(grad,columns,batch,channels,height,width,kernel,stride,pad,out_h,out_w);
+  if(channels%4){col2im_at(grad,columns,batch,channels,height,width,kernel,stride,pad,out_h,out_w);return;}
+  long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  int lanes=channels/4;
+  long long total=(long long)batch*height*width*lanes;
+  if(idx>=total)return;
+  // The column index reaches out_h * out_w * batch * patch.
+  if((long long)batch*out_h*out_w*lanes*kernel*kernel<2147483647LL)
+    col2im_bf16_four<int>((float4*)grad,(const ushort4*)columns,(int)idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+  else col2im_bf16_four<long long>((float4*)grad,(const ushort4*)columns,idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
 }
 // Group norm and SiLU over a device-resident `[batch * pixels, channels]`
 // image batch, for `conv::TrainableGroupNorm` and `conv::silu_device`. One
