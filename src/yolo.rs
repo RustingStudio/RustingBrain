@@ -1220,10 +1220,7 @@ impl Yolo11 {
             let node = &mut self.nodes[i];
             let input = |k: usize| &values[node.inputs[k]];
             let input_grads = match (&mut node.op, cache) {
-                (
-                    Op::Conv { kernel, norm, .. },
-                    DeviceCache::Conv { dense, norm: nc },
-                ) => {
+                (Op::Conv { kernel, norm, .. }, DeviceCache::Conv { dense, norm: nc }) => {
                     let g = norm.backward_device(&nc, &g)?;
                     vec![match (kernel, dense) {
                         (Kernel::Dense(conv), Some(c)) => conv.backward_device(&c, &g)?,

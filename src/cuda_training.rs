@@ -141,7 +141,9 @@ extern "C" __global__ void im2col_bf16(bf16_t*columns,const float*input,
 // One thread per input element, gathering every column entry that read it.
 // A scatter would need atomics and would not be reproducible run to run; this
 // costs kernel*kernel reads per element and is deterministic.
-extern "C" __global__ void col2im_train(float*grad,const float*columns,
+__device__ __forceinline__ float get_col(const float*p,long long i){return p[i];}
+__device__ __forceinline__ float get_col(const bf16_t*p,long long i){return bf16_to_f32(p[i]);}
+template<typename T> __device__ void col2im_at(float*grad,const T*columns,
     int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
   long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   long long total=(long long)batch*height*width*channels;
@@ -156,10 +158,19 @@ extern "C" __global__ void col2im_train(float*grad,const float*columns,
     for(int kx=0;kx<kernel;kx++){
       int sx=x+pad-kx;if(sx<0||sx%stride)continue;int ox=sx/stride;if(ox>=out_w)continue;
       long long row=((long long)b*out_h+oy)*out_w+ox;
-      s+=columns[row*patch+(long long)(ky*kernel+kx)*channels+c];
+      s+=get_col(columns,row*patch+(long long)(ky*kernel+kx)*channels+c);
     }
   }
   grad[idx]=s;
+}
+extern "C" __global__ void col2im_train(float*grad,const float*columns,
+    int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
+  col2im_at(grad,columns,batch,channels,height,width,kernel,stride,pad,out_h,out_w);
+}
+// The same sum over bf16 column gradients, accumulated in FP32.
+extern "C" __global__ void col2im_bf16(float*grad,const bf16_t*columns,
+    int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
+  col2im_at(grad,columns,batch,channels,height,width,kernel,stride,pad,out_h,out_w);
 }
 // Group norm and SiLU over a device-resident `[batch * pixels, channels]`
 // image batch, for `conv::TrainableGroupNorm` and `conv::silu_device`. One
