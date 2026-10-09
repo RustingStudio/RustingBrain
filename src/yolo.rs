@@ -840,6 +840,7 @@ pub fn detection_loss(
     use crate::detection::{
         Overlap, TaskAlignedAssigner, box_iou, box_to_ltrb, distribution_focal_loss, make_anchors,
     };
+    use rayon::prelude::*;
     let batch = maps[0].batch;
     assert_eq!(targets.len(), batch, "one target list per image");
     let sizes: Vec<(usize, usize)> = maps.iter().map(|m| (m.height, m.width)).collect();
@@ -880,78 +881,91 @@ pub fn detection_loss(
     };
 
     let assigner = TaskAlignedAssigner::yolo(&STRIDES);
-    let mut assignments = Vec::with_capacity(batch);
-    let mut predictions = Vec::with_capacity(batch);
-    for (image, labelled) in targets.iter().enumerate() {
-        let mut scores = Vec::with_capacity(anchors * classes);
-        let mut pixel_boxes = Vec::with_capacity(anchors);
-        let mut decoded = Vec::with_capacity(anchors);
-        for a in 0..anchors {
-            let at = (image * anchors + a) * channels;
-            let row = &rows[at..at + channels];
-            let (ltrb, probs) = softmax(row);
-            let s = strides[a];
-            let [px, py] = [points[a][0] / s, points[a][1] / s];
-            let grid = [px - ltrb[0], py - ltrb[1], px + ltrb[2], py + ltrb[3]];
-            pixel_boxes.push(grid.map(|v| v * s));
-            scores.extend(row[4 * REG_MAX..].iter().map(|&v| 1.0 / (1.0 + (-v).exp())));
-            decoded.push((grid, ltrb, probs));
-        }
-        let gt_classes: Vec<usize> = labelled.iter().map(|t| t.0).collect();
-        let gt_boxes: Vec<[f32; 4]> = labelled.iter().map(|t| t.1).collect();
-        assignments.push(assigner.assign(
-            &scores,
-            classes,
-            &pixel_boxes,
-            &points,
-            &gt_classes,
-            &gt_boxes,
-        ));
-        predictions.push(decoded);
-    }
+    // Each image decodes and assigns on its own, so the images run in parallel.
+    let (assignments, predictions): (Vec<_>, Vec<_>) = targets
+        .par_iter()
+        .enumerate()
+        .map(|(image, labelled)| {
+            let mut scores = Vec::with_capacity(anchors * classes);
+            let mut pixel_boxes = Vec::with_capacity(anchors);
+            let mut decoded = Vec::with_capacity(anchors);
+            for a in 0..anchors {
+                let at = (image * anchors + a) * channels;
+                let row = &rows[at..at + channels];
+                let (ltrb, probs) = softmax(row);
+                let s = strides[a];
+                let [px, py] = [points[a][0] / s, points[a][1] / s];
+                let grid = [px - ltrb[0], py - ltrb[1], px + ltrb[2], py + ltrb[3]];
+                pixel_boxes.push(grid.map(|v| v * s));
+                scores.extend(row[4 * REG_MAX..].iter().map(|&v| 1.0 / (1.0 + (-v).exp())));
+                decoded.push((grid, ltrb, probs));
+            }
+            let gt_classes: Vec<usize> = labelled.iter().map(|t| t.0).collect();
+            let gt_boxes: Vec<[f32; 4]> = labelled.iter().map(|t| t.1).collect();
+            let assignment = assigner.assign(
+                &scores,
+                classes,
+                &pixel_boxes,
+                &points,
+                &gt_classes,
+                &gt_boxes,
+            );
+            (assignment, decoded)
+        })
+        .unzip();
     let score_sum: f32 = assignments
         .iter()
         .flat_map(|a| &a.scores)
         .sum::<f32>()
         .max(1.0);
 
-    let mut loss = [0.0f32; 3];
     let scale = batch as f32 / score_sum;
-    for (image, (assignment, decoded)) in assignments.iter().zip(&predictions).enumerate() {
-        for a in 0..anchors {
-            let at = (image * anchors + a) * channels;
-            let targets = &assignment.scores[a * classes..(a + 1) * classes];
-            for (c, &t) in targets.iter().enumerate() {
-                let x = rows[at + 4 * REG_MAX + c];
-                loss[1] += x.max(0.0) - x * t + (-x.abs()).exp().ln_1p();
-                grad[at + 4 * REG_MAX + c] = LOSS_GAINS[1] * scale * (1.0 / (1.0 + (-x).exp()) - t);
-            }
-            if !assignment.foreground[a] {
-                continue;
-            }
-            let weight: f32 = targets.iter().sum();
-            let s = strides[a];
-            let target = assignment.boxes[a].map(|v| v / s);
-            let (grid, ltrb, probs) = &decoded[a];
-            let (iou, d_box) = box_iou(*grid, target, Overlap::Ciou);
-            loss[0] += (1.0 - iou) * weight;
-            // d(1 - iou) through x1 = px - l, y1 = py - t, x2 = px + r, y2 = py + b.
-            let d_ltrb = [d_box[0], d_box[1], -d_box[2], -d_box[3]]
-                .map(|d| LOSS_GAINS[0] * scale * weight * d);
-            let point = [points[a][0] / s, points[a][1] / s];
-            let target_ltrb = box_to_ltrb(point, target, (REG_MAX - 1) as f32);
-            for side in 0..4 {
-                let bins = &rows[at + side * REG_MAX..at + (side + 1) * REG_MAX];
-                let (dfl, d_dfl) = distribution_focal_loss(bins, target_ltrb[side]);
-                loss[2] += dfl * weight / 4.0;
-                for k in 0..REG_MAX {
-                    let p = probs[side * REG_MAX + k];
-                    grad[at + side * REG_MAX + k] += d_ltrb[side] * p * (k as f32 - ltrb[side])
-                        + LOSS_GAINS[2] * scale * weight / 4.0 * d_dfl[k];
+    let per_image: Vec<[f32; 3]> = grad
+        .par_chunks_mut(anchors * channels)
+        .zip(assignments.par_iter().zip(&predictions))
+        .enumerate()
+        .map(|(image, (grad, (assignment, decoded)))| {
+            let mut loss = [0.0f32; 3];
+            for a in 0..anchors {
+                let at = (image * anchors + a) * channels;
+                let local = a * channels;
+                let targets = &assignment.scores[a * classes..(a + 1) * classes];
+                for (c, &t) in targets.iter().enumerate() {
+                    let x = rows[at + 4 * REG_MAX + c];
+                    loss[1] += x.max(0.0) - x * t + (-x.abs()).exp().ln_1p();
+                    grad[local + 4 * REG_MAX + c] =
+                        LOSS_GAINS[1] * scale * (1.0 / (1.0 + (-x).exp()) - t);
+                }
+                if !assignment.foreground[a] {
+                    continue;
+                }
+                let weight: f32 = targets.iter().sum();
+                let s = strides[a];
+                let target = assignment.boxes[a].map(|v| v / s);
+                let (grid, ltrb, probs) = &decoded[a];
+                let (iou, d_box) = box_iou(*grid, target, Overlap::Ciou);
+                loss[0] += (1.0 - iou) * weight;
+                // d(1 - iou) through x1 = px - l, y1 = py - t, x2 = px + r, y2 = py + b.
+                let d_ltrb = [d_box[0], d_box[1], -d_box[2], -d_box[3]]
+                    .map(|d| LOSS_GAINS[0] * scale * weight * d);
+                let point = [points[a][0] / s, points[a][1] / s];
+                let target_ltrb = box_to_ltrb(point, target, (REG_MAX - 1) as f32);
+                for side in 0..4 {
+                    let bins = &rows[at + side * REG_MAX..at + (side + 1) * REG_MAX];
+                    let (dfl, d_dfl) = distribution_focal_loss(bins, target_ltrb[side]);
+                    loss[2] += dfl * weight / 4.0;
+                    for k in 0..REG_MAX {
+                        let p = probs[side * REG_MAX + k];
+                        grad[local + side * REG_MAX + k] +=
+                            d_ltrb[side] * p * (k as f32 - ltrb[side])
+                                + LOSS_GAINS[2] * scale * weight / 4.0 * d_dfl[k];
+                    }
                 }
             }
-        }
-    }
+            loss
+        })
+        .collect();
+    let loss: [f32; 3] = std::array::from_fn(|i| per_image.iter().map(|l| l[i]).sum());
     let loss = std::array::from_fn(|i| loss[i] / score_sum * LOSS_GAINS[i]);
 
     let grads = std::array::from_fn(|i| {
