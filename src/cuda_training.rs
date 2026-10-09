@@ -344,9 +344,10 @@ extern "C" __global__ void upsample_nearest_bwd(float*dx,const float*g,int total
     s+=g[((long long)(b*H*f+y*f+dy)*W*f+x*f+dx2)*C+c];
   dx[i]=s;
 }
-extern "C" __global__ void copy_channels(float*dst,const float*src,int rows,int width,int dC,int doff,int sC,int soff){
+// `add` adds into dst instead of overwriting it.
+extern "C" __global__ void copy_channels(float*dst,const float*src,int rows,int width,int dC,int doff,int sC,int soff,int add){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*width)return;
-  long long r=i/width;int c=i%width;dst[r*dC+doff+c]=src[r*sC+soff+c];
+  long long r=i/width;int c=i%width;float v=src[r*sC+soff+c];float*d=dst+r*dC+doff+c;*d=add?*d+v:v;
 }
 // Stride-one max pool padded to keep the size; `arg` is the winner's place in
 // the window, the first maximum on a tie as on the host.

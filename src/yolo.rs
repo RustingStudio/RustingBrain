@@ -1242,7 +1242,30 @@ impl Yolo11 {
                 (Op::Plain(conv), DeviceCache::Plain(c)) => {
                     vec![conv.backward_device_from(&c, Some(input(0)), &g)?]
                 }
-                (Op::Add, _) => vec![g.clone(), g],
+                (Op::Add, _) => {
+                    // An input with a gradient already takes `g` in place, so
+                    // `g` is copied only when neither has one.
+                    let [a, b] = [node.inputs[0], node.inputs[1]];
+                    let (shared, owner) = match grad[a].is_some() {
+                        true => (a, b),
+                        false => (b, a),
+                    };
+                    grad[shared] = Some(match grad[shared].take() {
+                        Some(mut sum) => {
+                            add_channels_device(&mut sum, 0, &g)?;
+                            sum
+                        }
+                        None => g.clone(),
+                    });
+                    grad[owner] = Some(match grad[owner].take() {
+                        Some(mut sum) => {
+                            add_channels_device(&mut sum, 0, &g)?;
+                            sum
+                        }
+                        None => g,
+                    });
+                    continue;
+                }
                 (Op::Concat, _) => {
                     let widths: Vec<usize> = (0..node.inputs.len())
                         .map(|k| input(k).channels())
@@ -1250,14 +1273,15 @@ impl Yolo11 {
                     split_channels_device(&g, &widths)?
                 }
                 (Op::Slice { offset, .. }, _) => {
-                    let channels = input(0).channels();
-                    let before = g.like(*offset)?;
-                    let after = g.like(channels - *offset - g.channels())?;
-                    let parts: Vec<&DeviceImageBatch> = [&before, &g, &after]
-                        .into_iter()
-                        .filter(|p| p.channels() > 0)
-                        .collect();
-                    vec![concat_channels_device(&parts)?]
+                    // Added into its channels of the input's gradient.
+                    let j = node.inputs[0];
+                    let mut sum = match grad[j].take() {
+                        Some(sum) => sum,
+                        None => input(0).like(input(0).channels())?,
+                    };
+                    add_channels_device(&mut sum, *offset, &g)?;
+                    grad[j] = Some(sum);
+                    continue;
                 }
                 (Op::Upsample, _) => vec![upsample_nearest_backward_device(&g, 2)?],
                 (Op::MaxPool(_), DeviceCache::MaxPool(c)) => {
@@ -1276,7 +1300,10 @@ impl Yolo11 {
             };
             for (&j, g) in node.inputs.iter().zip(input_grads) {
                 grad[j] = Some(match grad[j].take() {
-                    Some(sum) => add_device(&sum, &g)?,
+                    Some(mut sum) => {
+                        add_channels_device(&mut sum, 0, &g)?;
+                        sum
+                    }
                     None => g,
                 });
             }
