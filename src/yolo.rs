@@ -1099,8 +1099,8 @@ enum DeviceCache {
     /// the tape.
     Conv {
         dense: Option<ConvCache>,
+        /// SiLU, when the convolution has it, ran inside the batch norm.
         norm: crate::conv::DeviceBatchNormCache,
-        pre: Option<crate::conv::DeviceImageBatch>,
     },
     Plain(ConvCache),
     MaxPool(crate::conv::DeviceMaxPoolCache),
@@ -1145,12 +1145,8 @@ impl Yolo11 {
                         }
                         Kernel::Depthwise(conv) => (conv.forward_device(x)?, None),
                     };
-                    let (y, norm) = norm.forward_device(&y, training)?;
-                    let (out, pre) = match act {
-                        true => (silu_device(&y)?, Some(y)),
-                        false => (y, None),
-                    };
-                    (out, DeviceCache::Conv { dense, norm, pre })
+                    let (out, norm) = norm.forward_device_with(&y, training, *act)?;
+                    (out, DeviceCache::Conv { dense, norm })
                 }
                 Op::Plain(conv) => {
                     let (y, c) = conv.forward_device(x.unwrap())?;
@@ -1226,16 +1222,8 @@ impl Yolo11 {
             let input_grads = match (&mut node.op, cache) {
                 (
                     Op::Conv { kernel, norm, .. },
-                    DeviceCache::Conv {
-                        dense,
-                        norm: nc,
-                        pre,
-                    },
+                    DeviceCache::Conv { dense, norm: nc },
                 ) => {
-                    let g = match pre {
-                        Some(pre) => silu_backward_device(&pre, &g)?,
-                        None => g,
-                    };
                     let g = norm.backward_device(&nc, &g)?;
                     vec![match (kernel, dense) {
                         (Kernel::Dense(conv), Some(c)) => conv.backward_device(&c, &g)?,
