@@ -98,6 +98,48 @@
 
 ### Added
 
+- YOLO11 inference at 1280 under 15 ms, Gate 3 of the detection track (K13f). `Yolo11::fuse()` folds every batch norm into its convolution as ultralytics' `fuse()` does. On a `CudaDevice::with_mixed_precision` device, the fused 3x3 and strided convolutions build their `im2col` columns in bf16 and run bf16 GEMMs with an FP32 accumulator. `TrainableConv2d::infer_device(input, silu)` is a cache-free forward that adds the bias and SiLU in one kernel and reads a 1x1 convolution's input as its columns. `Yolo11::save_ultralytics(path)` writes an ultralytics state dict that `load_ultralytics` and ultralytics read back. `Validation::stages_ms` gives the time of each stage. On the 278 player val images (rect letterboxed, e.g. 1280x736), batch 1 on the 3060: upload 0.56 ms, forward 13.56 ms and download 0.47 ms, 14.6 ms for the model (37.7 ms unfused before), with mAP50 0.7390 (fp32: 0.7394). Decode on the host takes another 3.34 ms and NMS 0.02 ms. Other speedups: im2col reads and writes float4 with 32-bit indices, bias plus activation runs on float4, outputs written in full are left uninitialised, and a `Slice` node copies only its own channels.
+
+  The API a consumer crate uses, with features `cuda,images`:
+
+  ```rust
+  use rusting_brain::detection::{DetectionImage, non_max_suppression, read_yolo_split};
+  use rusting_brain::param::CudaDevice;
+  use rusting_brain::safetensors::SafeTensors;
+  use rusting_brain::yolo::{Yolo11, Yolo11Scale, decode, detection_loss, input_batch, validate};
+
+  // Load: weights exported from an ultralytics .pt as safetensors.
+  let mut model = Yolo11::new(Yolo11Scale::S, classes, &mut rng)?;
+  model.load_ultralytics(&mut SafeTensors::open("best.safetensors")?)?;
+  // or, to fine-tune from a checkpoint with other classes:
+  let skipped = model.transfer_ultralytics(&mut SafeTensors::open("yolo11s.safetensors")?)?;
+
+  // Train: see examples/yolo_detect.rs for ultralytics' full recipe.
+  let device = CudaDevice::new(0, 11000)?;
+  model.set_recompute_columns(true); // batch 4 at 1280 fits a 12 GB card
+  model.to_cuda_on(&device)?;
+  let images: Vec<DetectionImage> = /* DetectionImage::open(path, labels, 1280), augmented */;
+  let tape = model.forward_device(&device.upload(&input_batch(&refs))?, true)?;
+  let maps: Vec<_> = model.outputs_device(&tape).map(|m| m.download()).into_iter().collect::<Result<_, _>>()?;
+  let (losses, grads) = detection_loss([&maps[0], &maps[1], &maps[2]], classes, &targets);
+  let grads: Vec<_> = grads.iter().map(|g| device.upload(g)).collect::<Result<_, _>>()?;
+  model.backward_device(tape, [&grads[0], &grads[1], &grads[2]])?;
+  // then rusting_brain::optimizers::apply_step over model.params_mut(), and an
+  // rusting_brain::ema::Ema over model.state_mut()
+  model.to_cpu()?;
+  model.save_ultralytics("trained.safetensors")?;
+
+  // Run: fuse on the host, then infer one letterboxed image at a time.
+  let device = CudaDevice::with_mixed_precision(0, 8192)?;
+  let mut model = model.fuse();
+  model.to_cuda_on(&device)?;
+  let (image, _, _) = DetectionImage::open(path, &[], 1280)?.letterbox(736, 1280, false);
+  let tape = model.forward_device(&device.upload(&input_batch(&[&image]))?, false)?;
+  let maps: Vec<_> = model.outputs_device(&tape).map(|m| m.download()).into_iter().collect::<Result<_, _>>()?;
+  let (boxes, scores) = decode([&maps[0], &maps[1], &maps[2]], classes).remove(0);
+  let detections = non_max_suppression(&boxes, &scores, classes, 0.25, 0.7, 300);
+  // or validate(&mut model, &device, &val_images, 1280) for mAP50 and mAP50-95
+  ```
 - YOLO11 fine-tuning, Gate 2 of the detection track (K13e): `examples/yolo_detect.rs` reproduces ultralytics' training recipe and reaches val mAP50 0.7336 (mAP50-95 0.5467) on the player dataset in 25 epochs at batch 4 (1.57 h, 4.9 samples/s). New: `DetectionImage::affine` and `hsv` augmentations, `Yolo11::transfer_ultralytics` (loads a checkpoint with other classes, as `intersect_dicts`), `Yolo11::set_recompute_columns`, the Detect head's bias initialisation, `yolo::input_batch`, and `yolo::validate` returning `Validation`; `examples/yolo_val.rs` now calls `validate`.
 - GRU cell with backward through time (K9): `recurrent::Gru::new(input, hidden, rng)`, `forward_seq(x, batch, h0) -> (Matrix, GruCache)`, `backward_seq(&cache, grad_out, grad_h_last) -> (dx, dh0)`, `step` for a frame at a time, `params_mut`, `to_cuda_on` for the gate GEMMs. PyTorch's equations; every gradient within 1.7e-4 of finite differences over 16 steps.
 - `examples/yolo_val.rs` (K13d, Gate 1): validates YOLO11 weights on a YOLO dataset with ultralytics' rect batches, NMS and mAP. The trained player model scores mAP50 0.7394 and mAP50-95 0.5803 on its 278 val images, against ultralytics' 0.739 and 0.576.

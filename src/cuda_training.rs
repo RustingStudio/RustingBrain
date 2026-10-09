@@ -58,7 +58,9 @@ extern "C" __global__ void cast_act(void*dst,const float*src,int n,int narrow){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)store_act(dst,i,src[i],narrow);
 }
 
-extern "C" __global__ void bias_act(float *x,const float*b,int rows,int cols,int act){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*cols){float v=x[i]+b[i%cols];if(act==1)v=v>0?v:0;else if(act==2)v=1.f/(1.f+expf(-v));else if(act==3)v=tanhf(v);x[i]=v;}}
+extern "C" __global__ void bias_act(float *x,const float*b,int rows,int cols,int act){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*cols){float v=x[i]+b[i%cols];if(act==1)v=v>0?v:0;else if(act==2)v=1.f/(1.f+expf(-v));else if(act==3)v=tanhf(v);else if(act==4)v=v/(1.f+expf(-v));x[i]=v;}}
+// bias_act for SiLU or none, a float4 a thread: rows of `cols4` float4s.
+extern "C" __global__ void bias_act4(float4*x,const float4*b,int n4,int cols4,int act){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n4){float4 v=x[i],c=b[i%cols4];v.x+=c.x;v.y+=c.y;v.z+=c.z;v.w+=c.w;if(act==4){v.x/=1.f+expf(-v.x);v.y/=1.f+expf(-v.y);v.z/=1.f+expf(-v.z);v.w/=1.f+expf(-v.w);}x[i]=v;}}
 extern "C" __global__ void output_delta(float*d,const float*y,const float*t,int n,int act){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=t[i]-y[i];float a=y[i];if(act==1)v*=a>0;else if(act==2)v*=a*(1-a);else if(act==3)v*=1-a*a;d[i]=v;}}
 extern "C" __global__ void act_derivative(float*d,const float*a,int n,int act){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=a[i];if(act==1)d[i]*=v>0;else if(act==2)d[i]*=v*(1-v);else if(act==3)d[i]*=1-v*v;}}
 extern "C" __global__ void grad_b(float*g,const float*d,int batch,int out){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<out){float s=0;for(int b=0;b<batch;b++)s+=d[b*out+i];g[i]=s/(float)batch;}}
@@ -81,22 +83,60 @@ extern "C" __global__ void fill_f32(float*x,int n,float v){int i=blockIdx.x*bloc
 // `[batch * height * width, channels]` with the channel fastest, and a column
 // row holds `(ky * kernel + kx) * channels + channel`, which is the ordering
 // the weight `[out_channels, in_channels * kernel * kernel]` was trained in.
+// 64-bit division costs several times the 32-bit one, so the index type
+// follows the column matrix's size; and with channels in fours each thread
+// moves a float4 (the launch is a quarter the size), a quarter of the index
+// arithmetic per value.
+__device__ __forceinline__ void put_col(float*p,long long i,float v){p[i]=v;}
+__device__ __forceinline__ void put_col(float4*p,long long i,float4 v){p[i]=v;}
+__device__ __forceinline__ void put_col(bf16_t*p,long long i,float v){p[i]=f32_to_bf16(v);}
+__device__ __forceinline__ void put_col(ushort4*p,long long i,float4 v){
+  ushort4 o;o.x=f32_to_bf16(v.x);o.y=f32_to_bf16(v.y);o.z=f32_to_bf16(v.z);o.w=f32_to_bf16(v.w);p[i]=o;
+}
+template<typename I,typename V,typename W> __device__ void im2col_at(W*columns,const V*input,I idx,
+    int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
+  I patch=(I)channels*kernel*kernel;
+  I row=idx/patch,off=idx%patch;
+  int c=(int)(off%channels);I t=off/channels;
+  int kx=(int)(t%kernel),ky=(int)(t/kernel);
+  I plane=(I)out_h*out_w;
+  I b=row/plane;int rem=(int)(row%plane);
+  int oy=rem/out_w,ox=rem%out_w;
+  int y=oy*stride+ky-pad,x=ox*stride+kx-pad;
+  V v={};
+  if(y>=0&&y<height&&x>=0&&x<width)v=input[(((long long)b*height+y)*width+x)*channels+c];
+  put_col(columns,idx,v);
+}
 extern "C" __global__ void im2col_train(float*columns,const float*input,
     int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
   long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-  long long patch=(long long)channels*kernel*kernel;
-  long long total=(long long)batch*out_h*out_w*patch;
+  bool four=channels%4==0;
+  int lanes=four?channels/4:channels;
+  long long total=(long long)batch*out_h*out_w*lanes*kernel*kernel;
   if(idx>=total)return;
-  long long row=idx/patch,off=idx%patch;
-  int c=(int)(off%channels);long long t=off/channels;
-  int kx=(int)(t%kernel),ky=(int)(t/kernel);
-  int plane=out_h*out_w;
-  int b=(int)(row/plane),rem=(int)(row%plane);
-  int oy=rem/out_w,ox=rem%out_w;
-  int y=oy*stride+ky-pad,x=ox*stride+kx-pad;
-  float v=0.f;
-  if(y>=0&&y<height&&x>=0&&x<width)v=input[(((long long)b*height+y)*width+x)*channels+c];
-  columns[idx]=v;
+  if(four){
+    if(total<2147483647LL)im2col_at<int>((float4*)columns,(const float4*)input,(int)idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+    else im2col_at<long long>((float4*)columns,(const float4*)input,idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+  }else{
+    if(total<2147483647LL)im2col_at<int>(columns,input,(int)idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+    else im2col_at<long long>(columns,input,idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+  }
+}
+// The same columns rounded to bf16, for a GEMM that would round them anyway.
+extern "C" __global__ void im2col_bf16(bf16_t*columns,const float*input,
+    int batch,int channels,int height,int width,int kernel,int stride,int pad,int out_h,int out_w){
+  long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+  bool four=channels%4==0;
+  int lanes=four?channels/4:channels;
+  long long total=(long long)batch*out_h*out_w*lanes*kernel*kernel;
+  if(idx>=total)return;
+  if(four){
+    if(total<2147483647LL)im2col_at<int>((ushort4*)columns,(const float4*)input,(int)idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+    else im2col_at<long long>((ushort4*)columns,(const float4*)input,idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+  }else{
+    if(total<2147483647LL)im2col_at<int>(columns,input,(int)idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+    else im2col_at<long long>(columns,input,idx,lanes,height,width,kernel,stride,pad,out_h,out_w);
+  }
 }
 // One thread per input element, gathering every column entry that read it.
 // A scatter would need atomics and would not be reproducible run to run; this

@@ -60,6 +60,17 @@ pub enum Op {
     },
     /// A plain `nn.Conv2d` with bias, the Detect branches' last layer.
     Plain(TrainableConv2d),
+    /// A dense [`Op::Conv`] with its evaluating norm folded into the weights
+    /// and bias, from [`Yolo11::fuse`]. Inference only. `narrow` caches the
+    /// weight as bf16 for a mixed-precision device, made on the first device
+    /// forward pass.
+    // NOTE: the cache is not invalidated, which holds while a fused model's weights never change.
+    Fused {
+        conv: TrainableConv2d,
+        act: bool,
+        #[cfg(feature = "cuda")]
+        narrow: Option<cudarc::driver::CudaSlice<u8>>,
+    },
     Add,
     Concat,
     /// `width` channels from `offset`.
@@ -340,6 +351,20 @@ fn torch_layout(data: Vec<f32>, shape: &[usize]) -> Vec<f32> {
     moved
 }
 
+/// The inverse of [`torch_layout`].
+fn torch_order(data: &[f32], shape: &[usize]) -> Vec<f32> {
+    let &[_, inputs, kh, kw] = shape else {
+        return data.to_vec();
+    };
+    let taps = kh * kw;
+    (0..data.len())
+        .map(|index| {
+            let (out, input, tap) = (index / (inputs * taps), index / taps % inputs, index % taps);
+            data[(out * taps + tap) * inputs + input]
+        })
+        .collect()
+}
+
 impl Yolo11 {
     /// `yolo11.yaml` at `scale` with `classes` classes, initialised at random.
     pub fn new(scale: Yolo11Scale, classes: usize, rng: &mut StdRng) -> Result<Self, NetworkError> {
@@ -405,6 +430,10 @@ impl Yolo11 {
                     state.push((format!("{name}.weight"), &mut conv.weight.weight));
                     state.push((format!("{name}.bias"), &mut conv.bias));
                 }
+                Op::Fused { conv, .. } => {
+                    state.push((format!("{name}.conv.weight"), &mut conv.weight.weight));
+                    state.push((format!("{name}.conv.bias"), &mut conv.bias));
+                }
                 _ => {}
             }
         }
@@ -425,6 +454,29 @@ impl Yolo11 {
                 _ => {}
             }
         }
+    }
+
+    /// This model for inference: every dense convolution with its batch
+    /// norm's running statistics folded in, as ultralytics' `fuse()`. Needs
+    /// the parameters on the host; the result only infers.
+    pub fn fuse(&self) -> Self {
+        let mut fused = self.clone();
+        for node in &mut fused.nodes {
+            if let Op::Conv {
+                kernel: Kernel::Dense(conv),
+                norm,
+                act,
+            } = &node.op
+            {
+                node.op = Op::Fused {
+                    conv: norm.fuse_into(conv),
+                    act: *act,
+                    #[cfg(feature = "cuda")]
+                    narrow: None,
+                };
+            }
+        }
+        fused
     }
 
     /// The parameters an optimizer steps.
@@ -460,6 +512,66 @@ impl Yolo11 {
             param.value.data.copy_from_slice(&data);
         }
         Ok(())
+    }
+
+    /// Writes the model as an ultralytics state dict in safetensors, which
+    /// [`Yolo11::load_ultralytics`] reads back. Needs the parameters on the
+    /// host.
+    pub fn save_ultralytics(&self, path: impl AsRef<std::path::Path>) -> Result<(), NetworkError> {
+        let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+        for node in &self.nodes {
+            let (name, c) = (&node.name, node.channels);
+            // A weight's square kernel from its size and input channels.
+            let mut conv = |key: String, weight: &Param, inputs: usize| {
+                let k = ((weight.value.data.len() / (c * inputs)) as f64).sqrt() as usize;
+                let shape = vec![c, inputs, k, k];
+                tensors.push((key, shape.clone(), torch_order(&weight.value.data, &shape)));
+            };
+            match &node.op {
+                Op::Conv { kernel, .. } => match kernel {
+                    Kernel::Dense(dense) => conv(
+                        format!("{name}.conv.weight"),
+                        &dense.weight.weight,
+                        dense.in_channels(),
+                    ),
+                    Kernel::Depthwise(depthwise) => {
+                        conv(format!("{name}.conv.weight"), &depthwise.weight, 1)
+                    }
+                },
+                Op::Plain(dense) => conv(
+                    format!("{name}.weight"),
+                    &dense.weight.weight,
+                    dense.in_channels(),
+                ),
+                Op::Fused { conv: dense, .. } => conv(
+                    format!("{name}.conv.weight"),
+                    &dense.weight.weight,
+                    dense.in_channels(),
+                ),
+                _ => {}
+            }
+            let mut vector =
+                |key: String, values: &[f32]| tensors.push((key, vec![c], values.to_vec()));
+            match &node.op {
+                Op::Conv { norm, .. } => {
+                    let running = &norm.running.value.data;
+                    vector(format!("{name}.bn.weight"), &norm.gamma.value.data);
+                    vector(format!("{name}.bn.bias"), &norm.beta.value.data);
+                    vector(format!("{name}.bn.running_mean"), &running[..c]);
+                    vector(format!("{name}.bn.running_var"), &running[c..]);
+                }
+                Op::Plain(dense) => vector(format!("{name}.bias"), &dense.bias.value.data),
+                Op::Fused { conv: dense, .. } => {
+                    vector(format!("{name}.conv.bias"), &dense.bias.value.data)
+                }
+                _ => {}
+            }
+        }
+        let refs: Vec<(&str, &[usize], &[f32])> = tensors
+            .iter()
+            .map(|(name, shape, data)| (name.as_str(), &shape[..], &data[..]))
+            .collect();
+        crate::safetensors::write(path, &refs, &Default::default())
     }
 
     /// As [`Yolo11::load_ultralytics`] for fine-tuning from a checkpoint
@@ -542,6 +654,13 @@ impl Yolo11 {
                 Op::Plain(conv) => {
                     let (y, c) = conv.forward(x.unwrap())?;
                     (y, Cache::Plain(c))
+                }
+                Op::Fused { conv, act, .. } => {
+                    let (mut y, _) = conv.forward(x.unwrap())?;
+                    if *act {
+                        y.tokens.data.iter_mut().for_each(|v| *v = silu(*v));
+                    }
+                    (y, Cache::None)
                 }
                 Op::Add => {
                     let mut y = x.unwrap().clone();
@@ -645,6 +764,11 @@ impl Yolo11 {
                 (Op::Attention(shape), Cache::Attention(c)) => {
                     let halves = split_channels(&g, &[shape.dim(), shape.dim()]);
                     vec![pixel_attention_backward(&c, &halves[0], &halves[1])]
+                }
+                (Op::Fused { .. }, _) => {
+                    return Err(NetworkError::InvalidConfig(
+                        "a fused model only infers".into(),
+                    ));
                 }
                 _ => unreachable!("a cache from another op"),
             };
@@ -853,9 +977,12 @@ pub fn detection_loss(
 pub struct Validation {
     pub map50: f32,
     pub map50_95: f32,
-    /// Per image: the device forward pass with its download, and everything.
+    /// Per image: the upload, device forward pass and download, and everything.
     pub model_ms: f64,
     pub total_ms: f64,
+    /// Per image by stage: upload, forward, download, decode, NMS. Each stage
+    /// waits for the device before its clock stops.
+    pub stages_ms: [f64; 5],
 }
 
 /// ultralytics' validator: images by aspect in rect batches of 16 at
@@ -875,26 +1002,36 @@ pub fn validate(
     let aspect = |i: &crate::detection::DetectionImage| i.height as f32 / i.width as f32;
     let mut order: Vec<&_> = images.iter().collect();
     order.sort_by(|a, b| aspect(a).total_cmp(&aspect(b)));
-    let (mut results, mut model_time, mut total_time) =
-        (Vec::new(), Duration::ZERO, Duration::ZERO);
+    let mut results = Vec::new();
+    let mut stages = [Duration::ZERO; 5];
+    let context = device.context();
     for batch in order.chunks(16) {
         let aspects: Vec<f32> = batch.iter().map(|i| aspect(i)).collect();
         let [height, width] = rect_shape(&aspects, size, 32, 0.5);
         for image in batch {
             let (image, _, _) = image.letterbox(height, width, false);
             let input = input_batch(&[&image]);
-            let start = Instant::now();
-            let tape = model.forward_device(&device.upload(&input)?, false)?;
+            let mut clock = Instant::now();
+            let mut lap = |stage: usize| {
+                stages[stage] += clock.elapsed();
+                clock = Instant::now();
+            };
+            let input = device.upload(&input)?;
+            context.synchronize()?;
+            lap(0);
+            let tape = model.forward_device(&input, false)?;
+            context.synchronize()?;
+            lap(1);
             let maps = model
                 .outputs_device(&tape)
                 .map(|m| m.download())
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
-            let model_done = Instant::now();
+            lap(2);
             let (boxes, scores) = decode([&maps[0], &maps[1], &maps[2]], model.classes).remove(0);
+            lap(3);
             let detections = non_max_suppression(&boxes, &scores, model.classes, 0.001, 0.7, 300);
-            model_time += model_done - start;
-            total_time += start.elapsed();
+            lap(4);
             let labels = image
                 .classes
                 .iter()
@@ -906,11 +1043,13 @@ pub fn validate(
     }
     let [map50, map50_95] = mean_average_precision(&results);
     let n = results.len().max(1) as f64;
+    let stages_ms = stages.map(|d| d.as_secs_f64() * 1e3 / n);
     Ok(Validation {
         map50,
         map50_95,
-        model_ms: model_time.as_secs_f64() * 1e3 / n,
-        total_ms: total_time.as_secs_f64() * 1e3 / n,
+        model_ms: stages_ms[..3].iter().sum(),
+        total_ms: stages_ms.iter().sum(),
+        stages_ms,
     })
 }
 
@@ -1003,6 +1142,15 @@ impl Yolo11 {
                     let (y, c) = conv.forward_device(x.unwrap())?;
                     (y, DeviceCache::Plain(c))
                 }
+                Op::Fused { conv, act, narrow } => {
+                    if narrow.is_none() {
+                        *narrow = conv.bf16_weight()?;
+                    }
+                    (
+                        conv.infer_device_with(x.unwrap(), *act, narrow.as_ref())?,
+                        DeviceCache::None,
+                    )
+                }
                 Op::Add => (
                     add_device(x.unwrap(), &values[node.inputs[1]])?,
                     DeviceCache::None,
@@ -1012,14 +1160,10 @@ impl Yolo11 {
                         node.inputs.iter().map(|&i| &values[i]).collect();
                     (concat_channels_device(&parts)?, DeviceCache::None)
                 }
-                Op::Slice { offset, width } => {
-                    let x = x.unwrap();
-                    let (widths, part) = slice_widths(x.channels(), *offset, *width);
-                    (
-                        split_channels_device(x, &widths)?.swap_remove(part),
-                        DeviceCache::None,
-                    )
-                }
+                Op::Slice { offset, width } => (
+                    slice_channels_device(x.unwrap(), *offset, *width)?,
+                    DeviceCache::None,
+                ),
                 Op::Upsample => (upsample_nearest_device(x.unwrap(), 2)?, DeviceCache::None),
                 Op::MaxPool(k) => {
                     let (y, c) = max_pool_same_device(x.unwrap(), *k)?;
@@ -1110,6 +1254,11 @@ impl Yolo11 {
                 (Op::Attention(shape), DeviceCache::Attention(c)) => {
                     let halves = split_channels_device(&g, &[shape.dim(), shape.dim()])?;
                     vec![pixel_attention_backward_device(&c, &halves[0], &halves[1])?]
+                }
+                (Op::Fused { .. }, _) => {
+                    return Err(NetworkError::InvalidConfig(
+                        "a fused model only infers".into(),
+                    ));
                 }
                 _ => unreachable!("a cache from another op"),
             };
@@ -1243,6 +1392,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_saved_model_loads_back_exactly() {
+        let mut model = Yolo11::new(TINY, 2, &mut StdRng::seed_from_u64(1)).unwrap();
+        for (_, param) in model.state_mut() {
+            for (i, v) in param.value.data.iter_mut().enumerate() {
+                *v += (i % 7) as f32 * 0.01;
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("yolo_save_{}.safetensors", std::process::id()));
+        model.save_ultralytics(&path).unwrap();
+        let mut loaded = Yolo11::new(TINY, 2, &mut StdRng::seed_from_u64(2)).unwrap();
+        loaded
+            .load_ultralytics(&mut SafeTensors::open(&path).unwrap())
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let fused = model.fuse();
+        fused.save_ultralytics(&path).unwrap();
+        let mut fused_loaded = loaded.fuse();
+        fused_loaded
+            .load_ultralytics(&mut SafeTensors::open(&path).unwrap())
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        for (mut a, mut b) in [(model, loaded), (fused, fused_loaded)] {
+            for ((name, x), (_, y)) in a.state_mut().into_iter().zip(b.state_mut()) {
+                assert_eq!(x.value.data, y.value.data, "{name}");
+            }
+        }
+
+        // Saved from a real checkpoint, every tensor comes back as ultralytics
+        // wrote it, shape included.
+        let Ok(mut original) =
+            SafeTensors::open("/home/vasylt/cs2/fixtures/k13d_player_v1.safetensors")
+        else {
+            return;
+        };
+        let mut player = Yolo11::new(Yolo11Scale::S, 1, &mut StdRng::seed_from_u64(0)).unwrap();
+        player.load_ultralytics(&mut original).unwrap();
+        player.save_ultralytics(&path).unwrap();
+        let mut saved = SafeTensors::open(&path).unwrap();
+        let names: Vec<String> = saved.names().map(str::to_owned).collect();
+        assert!(names.len() > 300, "{} tensors", names.len());
+        for name in names {
+            assert_eq!(
+                saved.tensor(&name).unwrap(),
+                original.tensor(&name).unwrap(),
+                "{name}"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn device_yolo11_matches_the_host() {
@@ -1312,6 +1513,53 @@ mod tests {
                 true => assert_close(&got.value.data, &expected.value.data, 1e-4, &name),
                 false => assert_close(&got.grad.data, &expected.grad.data, 2e-3, &name),
             }
+        }
+        // Folding the norms in changes nothing but rounding, on either side.
+        let eval = host.forward(&input, false).unwrap();
+        let mut fused = host.fuse();
+        let host_fused = fused.forward(&input, false).unwrap();
+        fused.to_cuda_on(&device).unwrap();
+        let on_fused = fused
+            .forward_device(&device.upload(&input).unwrap(), false)
+            .unwrap();
+        for ((on_host, on_device), expected) in fused
+            .outputs(&host_fused)
+            .into_iter()
+            .zip(fused.outputs_device(&on_fused))
+            .zip(host.outputs(&eval))
+        {
+            assert_close(
+                &on_host.tokens.data,
+                &expected.tokens.data,
+                1e-4,
+                "fused host",
+            );
+            assert_close(
+                &on_device.download().unwrap().tokens.data,
+                &expected.tokens.data,
+                1e-4,
+                "fused device",
+            );
+        }
+        // Mixed precision runs the im2col convolutions as bf16 GEMMs; bf16
+        // keeps 8 bits of mantissa, so the maps stay within a few percent.
+        let mixed = crate::param::CudaDevice::with_mixed_precision(0, 4096).unwrap();
+        let mut fused = host.fuse();
+        fused.to_cuda_on(&mixed).unwrap();
+        let on_mixed = fused
+            .forward_device(&mixed.upload(&input).unwrap(), false)
+            .unwrap();
+        for (on_device, expected) in fused
+            .outputs_device(&on_mixed)
+            .into_iter()
+            .zip(host.outputs(&eval))
+        {
+            assert_close(
+                &on_device.download().unwrap().tokens.data,
+                &expected.tokens.data,
+                5e-2,
+                "fused mixed device",
+            );
         }
     }
 

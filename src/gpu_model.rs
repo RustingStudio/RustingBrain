@@ -84,7 +84,7 @@ pub(crate) struct ModelKernels {
     add: CudaFunction,
     cross_entropy: CudaFunction,
     cross_entropy_bf16: CudaFunction,
-    to_bf16: CudaFunction,
+    pub(crate) to_bf16: CudaFunction,
     from_bf16: CudaFunction,
     accumulate_bf16: CudaFunction,
     cast_act: CudaFunction,

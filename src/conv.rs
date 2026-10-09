@@ -844,6 +844,88 @@ impl TrainableConv2d {
         }
     }
 
+    /// [`TrainableConv2d::forward_device`] for inference: no cache, SiLU under
+    /// `silu` fused into the bias, and a 1x1 stride-1 kernel reads the input
+    /// as its columns instead of copying it into them.
+    #[cfg(feature = "cuda")]
+    pub fn infer_device(
+        &self,
+        input: &DeviceImageBatch,
+        silu: bool,
+    ) -> Result<DeviceImageBatch, NetworkError> {
+        self.infer_device_with(input, silu, None)
+    }
+
+    /// [`TrainableConv2d::infer_device`] with the weight also given as bf16
+    /// bytes, from [`TrainableConv2d::bf16_weight`]: a convolution that needs
+    /// `im2col` then builds its columns as bf16 too, half the bytes, and runs
+    /// a bf16 GEMM with an FP32 accumulator.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn infer_device_with(
+        &self,
+        input: &DeviceImageBatch,
+        silu: bool,
+        narrow_weight: Option<&cudarc::driver::CudaSlice<u8>>,
+    ) -> Result<DeviceImageBatch, NetworkError> {
+        if input.channels != self.in_channels {
+            return Err(NetworkError::InvalidConfig(format!(
+                "this convolution reads {} channels and was given {}",
+                self.in_channels, input.channels
+            )));
+        }
+        let device = self.weight.weight.device.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig("infer_device needs the weight on a device".into())
+        })?;
+        let shape = self.geometry(input.batch, input.height, input.width);
+        let context = device.context();
+        let mut product = match ((self.kernel, self.stride, self.padding), narrow_weight) {
+            ((1, 1, 0), _) => device.matmul_rhs_transposed_device(&input.data, shape.rows())?,
+            (_, Some(weight)) => device.matmul_rhs_transposed_bf16(
+                &context.im2col_bf16(&input.data, &shape)?,
+                weight,
+                shape.rows(),
+            )?,
+            _ => device.matmul_rhs_transposed_device(
+                &context.im2col(&input.data, &shape)?,
+                shape.rows(),
+            )?,
+        };
+        let bias = self
+            .bias
+            .device
+            .as_ref()
+            .filter(|_| self.has_bias)
+            .ok_or_else(|| {
+                NetworkError::InvalidConfig("infer_device needs a bias on the device".into())
+            })?;
+        context.add_bias_rows_then(&mut product, bias.value(), self.out_channels(), silu)?;
+        Ok(DeviceImageBatch {
+            batch: input.batch,
+            height: shape.out_height,
+            width: shape.out_width,
+            channels: self.out_channels(),
+            data: product,
+            context: context.clone(),
+        })
+    }
+
+    /// The device weight as bf16 bytes for [`TrainableConv2d::infer_device_with`],
+    /// when its context runs mixed precision and this convolution needs
+    /// `im2col`; `None` otherwise.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn bf16_weight(
+        &self,
+    ) -> Result<Option<cudarc::driver::CudaSlice<u8>>, NetworkError> {
+        let Some(device) = self.weight.weight.device.as_ref() else {
+            return Ok(None);
+        };
+        let context = device.context();
+        match context.mixed_precision && (self.kernel, self.stride, self.padding) != (1, 1, 0) {
+            true => context.bf16_bytes(device.value()).map(Some),
+            false => Ok(None),
+        }
+    }
+
     /// The forward pass for an input that is already on the device, leaving
     /// the output there too. Needs [`TrainableConv2d::to_cuda_on`] first.
     #[cfg(feature = "cuda")]
@@ -1626,7 +1708,7 @@ fn silu_launch(
 ) -> Result<DeviceImageBatch, NetworkError> {
     let context = &input.context;
     let total = input.data.len();
-    let mut output = context.zeros(total)?;
+    let mut output = context.uninit(total)?;
     let n = total as i32;
     let mut launch = match grad {
         None => context.stream.launch_builder(&context.image.silu),
@@ -2377,7 +2459,7 @@ impl DepthwiseConv2d {
         let (oh, ow) = self.output_size(input.height, input.width);
         let context = &input.context;
         let total = input.batch * oh * ow * input.channels;
-        let mut out = context.zeros(total)?;
+        let mut out = context.uninit(total)?;
         let dims = self.dims(input);
         unsafe {
             let mut launch = context.stream.launch_builder(&context.image.dw_fwd);
@@ -3086,7 +3168,7 @@ pub fn add_device(
             actual: b.data.len(),
         });
     }
-    let mut out = context.zeros(total)?;
+    let mut out = context.uninit(total)?;
     let n = total as i32;
     unsafe {
         context
@@ -3110,7 +3192,7 @@ pub fn concat_channels_device(
     let first = parts[0];
     let channels: usize = parts.iter().map(|p| p.channels).sum();
     let rows = first.batch * first.pixels();
-    let mut out = first.context.zeros(rows * channels)?;
+    let mut out = first.context.uninit(rows * channels)?;
     let mut offset = 0;
     for part in parts {
         copy_channels(
@@ -3138,30 +3220,40 @@ pub fn split_channels_device(
     input: &DeviceImageBatch,
     widths: &[usize],
 ) -> Result<Vec<DeviceImageBatch>, NetworkError> {
-    let rows = input.batch * input.pixels();
     let mut offset = 0;
     widths
         .iter()
         .map(|&width| {
-            let mut out = input.context.zeros(rows * width)?;
-            copy_channels(
-                &input.context,
-                &mut out,
-                width,
-                0,
-                &input.data,
-                input.channels,
-                offset,
-                width,
-                rows,
-            )?;
             offset += width;
-            Ok(DeviceImageBatch {
-                channels: width,
-                ..input.with_data(out)
-            })
+            slice_channels_device(input, offset - width, width)
         })
         .collect()
+}
+
+/// `width` channels from `offset`, copied out on the device.
+#[cfg(feature = "cuda")]
+pub fn slice_channels_device(
+    input: &DeviceImageBatch,
+    offset: usize,
+    width: usize,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let rows = input.batch * input.pixels();
+    let mut out = input.context.uninit(rows * width)?;
+    copy_channels(
+        &input.context,
+        &mut out,
+        width,
+        0,
+        &input.data,
+        input.channels,
+        offset,
+        width,
+        rows,
+    )?;
+    Ok(DeviceImageBatch {
+        channels: width,
+        ..input.with_data(out)
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -3219,7 +3311,7 @@ pub fn max_pool_same_device(
 ) -> Result<(DeviceImageBatch, DeviceMaxPoolCache), NetworkError> {
     let context = &input.context;
     let total = input.data.len();
-    let mut out = context.zeros(total)?;
+    let mut out = context.uninit(total)?;
     let mut argmax = context
         .stream
         .alloc_zeros::<i32>(total)
@@ -3284,7 +3376,7 @@ fn image_launch(
     dims: &[usize],
 ) -> Result<cudarc::driver::CudaSlice<f32>, NetworkError> {
     let context = &input.context;
-    let mut out = context.zeros(total)?;
+    let mut out = context.uninit(total)?;
     let n = total as i32;
     let dims: Vec<i32> = dims.iter().map(|&d| d as i32).collect();
     let mut launch = context.stream.launch_builder(kernel(context));
