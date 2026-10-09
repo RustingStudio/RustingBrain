@@ -556,6 +556,12 @@ pub struct ConvGeometry {
 }
 
 impl ConvGeometry {
+    /// A 1x1 kernel at stride 1 without padding: each column row is the
+    /// input pixel itself.
+    pub fn is_pointwise(&self) -> bool {
+        self.kernel == 1 && self.stride == 1 && self.padding == 0
+    }
+
     /// Values in the input map.
     pub fn input_elements(&self) -> usize {
         self.batch * self.height * self.width * self.channels
@@ -944,8 +950,13 @@ impl TrainableConv2d {
         })?;
         let shape = self.geometry(input.batch, input.height, input.width);
         let context = device.context();
-        let columns = context.im2col(&input.data, &shape)?;
-        let mut product = device.matmul_rhs_transposed_device(&columns, shape.rows())?;
+        // A 1x1 stride-1 convolution's columns are its input.
+        let columns = match shape.is_pointwise() {
+            true => None,
+            false => Some(context.im2col(&input.data, &shape)?),
+        };
+        let mut product = device
+            .matmul_rhs_transposed_device(columns.as_ref().unwrap_or(&input.data), shape.rows())?;
         if let Some(bias) = self.bias.device.as_ref().filter(|_| self.has_bias) {
             context.add_bias_rows(&mut product, bias.value(), self.out_channels())?;
         }
@@ -963,9 +974,9 @@ impl TrainableConv2d {
                 // option: they are freed before the next layer allocates its
                 // own, so a deep network holds one layer's worth rather than
                 // every layer's.
-                columns: match self.recompute_columns {
-                    true => Columns::DeviceInput(input.data.clone()),
-                    false => Columns::Device(columns),
+                columns: match columns.filter(|_| !self.recompute_columns) {
+                    Some(columns) => Columns::Device(columns),
+                    None => Columns::DeviceInput(input.data.clone()),
                 },
                 shape,
             },
@@ -990,6 +1001,7 @@ impl TrainableConv2d {
         let rebuilt;
         let columns = match &cache.columns {
             Columns::Device(columns) => columns,
+            Columns::DeviceInput(input) if shape.is_pointwise() => input,
             Columns::DeviceInput(input) => {
                 rebuilt = context.im2col(input, shape)?;
                 &rebuilt
@@ -1013,7 +1025,10 @@ impl TrainableConv2d {
             height: shape.height,
             width: shape.width,
             channels: shape.channels,
-            data: context.col2im(&grad_columns, shape)?,
+            data: match shape.is_pointwise() {
+                true => grad_columns,
+                false => context.col2im(&grad_columns, shape)?,
+            },
             context,
         })
     }
@@ -2517,8 +2532,10 @@ impl DepthwiseConv2d {
             dims.iter().for_each(|d| {
                 launch.arg(d);
             });
+            // DW_ROWS output pixels a thread, as the kernel reads them.
+            let pixels = input.batch * dims[6] as usize * dims[7] as usize;
             launch
-                .launch(group_blocks(taps))
+                .launch(crate::cuda_training::cfg(pixels.div_ceil(64) * taps))
                 .map_err(err("depthwise weight gradient kernel"))?;
         }
         let one = context.filled(1, 1.0)?;
@@ -3810,7 +3827,8 @@ mod tests {
         };
         let mut rng = rand::rngs::StdRng::seed_from_u64(31);
         let mut first = TrainableConv2d::new(6, 8, 3, 2, &mut rng).unwrap();
-        let mut second = TrainableConv2d::new(8, 5, 3, 1, &mut rng).unwrap();
+        // A 1x1 convolution, whose columns are its input.
+        let mut second = TrainableConv2d::new(8, 5, 1, 1, &mut rng).unwrap();
         first.bias.value.data = noise(1, 1, 8, 1, 3).tokens.data;
         second.bias.value.data = noise(1, 1, 5, 1, 4).tokens.data;
         second.set_recompute_columns(true);
