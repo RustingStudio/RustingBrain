@@ -13,7 +13,9 @@
 //! ```
 //!
 //! `--steps N` stops after N batches and prints the time per stage, for
-//! sizing a run before starting it.
+//! sizing a run before starting it. `--warmup N` shortens the warmup to N
+//! batches, so such a run can time the steady state, where the optimizer
+//! steps once every 64 samples.
 
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -40,6 +42,7 @@ struct Args {
     close_mosaic: usize,
     val_every: usize,
     steps: Option<usize>,
+    warmup: Option<usize>,
     seed: u64,
 }
 
@@ -52,6 +55,7 @@ fn args() -> Result<Args, Box<dyn std::error::Error>> {
         close_mosaic: 10,
         val_every: 10,
         steps: None,
+        warmup: None,
         seed: 0,
     };
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -67,6 +71,7 @@ fn args() -> Result<Args, Box<dyn std::error::Error>> {
             "--close-mosaic" => args.close_mosaic = value.parse()?,
             "--val-every" => args.val_every = value.parse()?,
             "--steps" => args.steps = Some(value.parse()?),
+            "--warmup" => args.warmup = Some(value.parse()?),
             "--seed" => args.seed = value.parse()?,
             other => return Err(format!("unknown flag {other}").into()),
         }
@@ -149,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let batches = train.len().div_ceil(args.batch);
-    let warmup = (3 * batches).max(100);
+    let warmup = args.warmup.unwrap_or((3 * batches).max(100)).max(1);
     let full_accumulate = (NOMINAL_BATCH as f32 / args.batch as f32).round().max(1.0);
     let decay = 5e-4 * args.batch as f32 * full_accumulate / NOMINAL_BATCH as f32;
     let lr0 = 0.002;
