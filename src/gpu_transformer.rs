@@ -3046,8 +3046,8 @@ mod tests {
     /// multiple of it, so the run covers an off-diagonal tile, the masked
     /// diagonal, and a ragged tail.
     ///
-    /// `DISABLED` is process-wide. Nothing else here is eligible for the fused
-    /// path, so flipping it cannot disturb a test running alongside.
+    /// The switch that turns the fused path off is per thread, so flipping it
+    /// cannot disturb a test running alongside.
     #[test]
     fn fused_attention_matches_the_three_kernel_path_or_skips_without_device() {
         if !cuda_or_skip() {
@@ -3086,11 +3086,11 @@ mod tests {
         fused.to_cuda(0, 8192).unwrap();
         let (fused_logits, _) = fused.forward_train(&[&ids[..]]).unwrap();
 
-        crate::cuda_flash::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::cuda_flash::OFF_ON_THIS_THREAD.set(true);
         let mut split = model();
         split.to_cuda(0, 8192).unwrap();
         let split_forward = split.forward_train(&[&ids[..]]);
-        crate::cuda_flash::DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::cuda_flash::OFF_ON_THIS_THREAD.set(false);
         let (split_logits, _) = split_forward.unwrap();
 
         // Both device paths round their matmul operands to BF16, so neither is
@@ -3163,13 +3163,13 @@ mod tests {
         fused.train_step(&[&ids[..]]).unwrap();
         let (fused_logits, _) = fused.forward_train(&[&ids[..]]).unwrap();
 
-        crate::cuda_flash::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::cuda_flash::OFF_ON_THIS_THREAD.set(true);
         let mut split = model();
         split.to_cuda(0, 8192).unwrap();
         let stepped = split
             .train_step(&[&ids[..]])
             .and_then(|_| split.forward_train(&[&ids[..]]));
-        crate::cuda_flash::DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::cuda_flash::OFF_ON_THIS_THREAD.set(false);
         let (split_logits, _) = stepped.unwrap();
 
         // A wrong gradient moves a parameter the wrong way, and plain gradient
