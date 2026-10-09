@@ -275,6 +275,14 @@ impl Builder<'_> {
             let c = self.dwconv(format!("{name}.cv3.{i}.1.0"), c, true);
             let c = self.conv(format!("{name}.cv3.{i}.1.1"), c, c3, 1, 1, true)?;
             let c = self.plain(format!("{name}.cv3.{i}.2"), c, classes)?;
+            // Detect.bias_init: boxes start at one, classes at a prior of
+            // five objects per 640 image.
+            let prior = (5.0 / classes as f32 / (640.0 / STRIDES[i]).powi(2)).ln();
+            for (node, value) in [(b, 1.0), (c, prior)] {
+                if let Op::Plain(conv) = &mut self.nodes[node].op {
+                    conv.bias.value.data.fill(value);
+                }
+            }
             outputs[i] = self.concat(vec![b, c]);
         }
         Ok(outputs)
@@ -403,6 +411,22 @@ impl Yolo11 {
         state
     }
 
+    /// Has every dense convolution keep its input rather than its `im2col`
+    /// columns for the backward pass, which rebuilds them: at a 1280 input
+    /// the columns are most of a training step's memory.
+    pub fn set_recompute_columns(&mut self, recompute: bool) {
+        for node in &mut self.nodes {
+            match &mut node.op {
+                Op::Conv {
+                    kernel: Kernel::Dense(conv),
+                    ..
+                }
+                | Op::Plain(conv) => conv.set_recompute_columns(recompute),
+                _ => {}
+            }
+        }
+    }
+
     /// The parameters an optimizer steps.
     pub fn params_mut(&mut self) -> Vec<&mut Param> {
         self.state_mut()
@@ -436,6 +460,39 @@ impl Yolo11 {
             param.value.data.copy_from_slice(&data);
         }
         Ok(())
+    }
+
+    /// As [`Yolo11::load_ultralytics`] for fine-tuning from a checkpoint
+    /// with other classes: tensors missing or of another size are left at
+    /// their initialisation, as ultralytics' `intersect_dicts` leaves them.
+    /// Returns their names.
+    pub fn transfer_ultralytics(
+        &mut self,
+        tensors: &mut SafeTensors,
+    ) -> Result<Vec<String>, NetworkError> {
+        let mut skipped = Vec::new();
+        for (name, param) in self.state_mut() {
+            let data = match name.strip_suffix(".running") {
+                Some(bn) => {
+                    tensors
+                        .tensor(&format!("{bn}.running_mean"))
+                        .and_then(|(mut mean, _)| {
+                            mean.extend(tensors.tensor(&format!("{bn}.running_var"))?.0);
+                            Ok(mean)
+                        })
+                }
+                None => tensors
+                    .tensor(&name)
+                    .map(|(data, shape)| torch_layout(data, &shape)),
+            };
+            match data {
+                Ok(data) if data.len() == param.value.data.len() => {
+                    param.value.data.copy_from_slice(&data)
+                }
+                _ => skipped.push(name),
+            }
+        }
+        Ok(skipped)
     }
 
     /// Runs the graph, batch norms on batch statistics under `training`.
@@ -789,6 +846,90 @@ pub fn detection_loss(
         out
     });
     (loss, grads)
+}
+
+/// What [`validate`] measured.
+#[derive(Clone, Copy, Debug)]
+pub struct Validation {
+    pub map50: f32,
+    pub map50_95: f32,
+    /// Per image: the device forward pass with its download, and everything.
+    pub model_ms: f64,
+    pub total_ms: f64,
+}
+
+/// ultralytics' validator: images by aspect in rect batches of 16 at
+/// `size` (stride 32, pad 0.5), each letterboxed without upscaling and run on
+/// its own; conf 0.001, NMS IoU 0.7, at most 300 boxes. `images` come at a
+/// long side of `size`, as [`crate::detection::DetectionImage::open`] gives
+/// them.
+#[cfg(feature = "cuda")]
+pub fn validate(
+    model: &mut Yolo11,
+    device: &crate::param::CudaDevice,
+    images: &[crate::detection::DetectionImage],
+    size: usize,
+) -> Result<Validation, NetworkError> {
+    use crate::detection::{mean_average_precision, non_max_suppression, rect_shape};
+    use std::time::{Duration, Instant};
+    let aspect = |i: &crate::detection::DetectionImage| i.height as f32 / i.width as f32;
+    let mut order: Vec<&_> = images.iter().collect();
+    order.sort_by(|a, b| aspect(a).total_cmp(&aspect(b)));
+    let (mut results, mut model_time, mut total_time) =
+        (Vec::new(), Duration::ZERO, Duration::ZERO);
+    for batch in order.chunks(16) {
+        let aspects: Vec<f32> = batch.iter().map(|i| aspect(i)).collect();
+        let [height, width] = rect_shape(&aspects, size, 32, 0.5);
+        for image in batch {
+            let (image, _, _) = image.letterbox(height, width, false);
+            let input = input_batch(&[&image]);
+            let start = Instant::now();
+            let tape = model.forward_device(&device.upload(&input)?, false)?;
+            let maps = model
+                .outputs_device(&tape)
+                .map(|m| m.download())
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            let model_done = Instant::now();
+            let (boxes, scores) = decode([&maps[0], &maps[1], &maps[2]], model.classes).remove(0);
+            let detections = non_max_suppression(&boxes, &scores, model.classes, 0.001, 0.7, 300);
+            model_time += model_done - start;
+            total_time += start.elapsed();
+            let labels = image
+                .classes
+                .iter()
+                .copied()
+                .zip(image.boxes.iter().copied())
+                .collect();
+            results.push((detections, labels));
+        }
+    }
+    let [map50, map50_95] = mean_average_precision(&results);
+    let n = results.len().max(1) as f64;
+    Ok(Validation {
+        map50,
+        map50_95,
+        model_ms: model_time.as_secs_f64() * 1e3 / n,
+        total_ms: total_time.as_secs_f64() * 1e3 / n,
+    })
+}
+
+/// Same-sized images as one channels-last batch scaled to `0..1`.
+pub fn input_batch(images: &[&crate::detection::DetectionImage]) -> ImageBatch {
+    let (height, width) = (images[0].height, images[0].width);
+    let pixels = images
+        .iter()
+        .flat_map(|i| {
+            assert_eq!((i.height, i.width), (height, width), "one size per batch");
+            i.rgb.iter().map(|&v| v as f32 / 255.0)
+        })
+        .collect();
+    ImageBatch::from_tokens(
+        images.len(),
+        height,
+        width,
+        crate::matrix::Matrix::from_vec(images.len() * height * width, 3, pixels),
+    )
 }
 
 /// [`Tape`] on a device, from [`Yolo11::forward_device`].

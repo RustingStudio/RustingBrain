@@ -242,6 +242,107 @@ impl DetectionImage {
         (image, ratio, [left, top])
     }
 
+    /// ultralytics' `RandomPerspective` with no rotation, shear or
+    /// perspective, given its draws: the image scaled by `scale` about its
+    /// centre, which lands at `centre` (`[x, y]` in the output), on a
+    /// `width x height` grey canvas, bilinear. Boxes follow and are clipped;
+    /// those left narrower or shorter than 2 pixels, with under a tenth of
+    /// their scaled area, or more elongated than 100:1 are dropped, as its
+    /// `box_candidates` does.
+    pub fn affine(&self, width: usize, height: usize, scale: f32, centre: [f32; 2]) -> Self {
+        let half = [self.width as f32 / 2.0, self.height as f32 / 2.0];
+        let mut rgb = vec![PAD; width * height * 3];
+        for y in 0..height {
+            let sy = (y as f32 - centre[1]) / scale + half[1];
+            for x in 0..width {
+                let sx = (x as f32 - centre[0]) / scale + half[0];
+                let (x0, y0) = (sx.floor(), sy.floor());
+                let (fx, fy) = (sx - x0, sy - y0);
+                let (x0, y0) = (x0 as isize, y0 as isize);
+                for c in 0..3 {
+                    // Taps outside the image read the border grey, as
+                    // `warpAffine` with a constant border does.
+                    let at = |xx: isize, yy: isize| match xx >= 0
+                        && yy >= 0
+                        && (xx as usize) < self.width
+                        && (yy as usize) < self.height
+                    {
+                        true => self.rgb[(yy as usize * self.width + xx as usize) * 3 + c] as f32,
+                        false => PAD as f32,
+                    };
+                    let top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * fx;
+                    let bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * fx;
+                    rgb[(y * width + x) * 3 + c] = (top + (bottom - top) * fy).round() as u8;
+                }
+            }
+        }
+        let (mut classes, mut boxes) = (Vec::new(), Vec::new());
+        for (&class, b) in self.classes.iter().zip(&self.boxes) {
+            let map = |v: f32, axis: usize| (v - half[axis]) * scale + centre[axis];
+            let moved = [
+                map(b[0], 0).clamp(0.0, width as f32),
+                map(b[1], 1).clamp(0.0, height as f32),
+                map(b[2], 0).clamp(0.0, width as f32),
+                map(b[3], 1).clamp(0.0, height as f32),
+            ];
+            let (w1, h1) = ((b[2] - b[0]) * scale, (b[3] - b[1]) * scale);
+            let (w2, h2) = (moved[2] - moved[0], moved[3] - moved[1]);
+            let aspect = (w2 / (h2 + 1e-16)).max(h2 / (w2 + 1e-16));
+            if w2 > 2.0 && h2 > 2.0 && w2 * h2 / (w1 * h1 + 1e-16) > 0.1 && aspect < 100.0 {
+                classes.push(class);
+                boxes.push(moved);
+            }
+        }
+        Self {
+            width,
+            height,
+            rgb,
+            classes,
+            boxes,
+        }
+    }
+
+    /// ultralytics' `RandomHSV` given its draws: hue, saturation and value
+    /// multiplied by `gains` in OpenCV's 8-bit HSV (hue in `0..180`, wrapping).
+    pub fn hsv(&mut self, gains: [f32; 3]) {
+        for pixel in self.rgb.chunks_exact_mut(3) {
+            let [r, g, b] = [pixel[0], pixel[1], pixel[2]].map(f32::from);
+            let max = r.max(g).max(b);
+            let delta = max - r.min(g).min(b);
+            let mut hue = match delta == 0.0 {
+                true => 0.0,
+                false if max == r => 60.0 * (g - b) / delta,
+                false if max == g => 120.0 + 60.0 * (b - r) / delta,
+                false => 240.0 + 60.0 * (r - g) / delta,
+            };
+            if hue < 0.0 {
+                hue += 360.0;
+            }
+            let saturation = match max == 0.0 {
+                true => 0.0,
+                false => 255.0 * delta / max,
+            };
+            let hue = ((hue / 2.0).round() * gains[0]).rem_euclid(180.0) * 2.0;
+            let saturation = (saturation.round() * gains[1]).clamp(0.0, 255.0) / 255.0;
+            let value = (max * gains[2]).clamp(0.0, 255.0);
+            // Back to RGB from hue in degrees.
+            let chroma = value * saturation;
+            let x = chroma * (1.0 - ((hue / 60.0).rem_euclid(2.0) - 1.0).abs());
+            let [r, g, b] = match (hue / 60.0) as usize {
+                0 => [chroma, x, 0.0],
+                1 => [x, chroma, 0.0],
+                2 => [0.0, chroma, x],
+                3 => [0.0, x, chroma],
+                4 => [x, 0.0, chroma],
+                _ => [chroma, 0.0, x],
+            };
+            let m = value - chroma;
+            for (out, v) in pixel.iter_mut().zip([r, g, b]) {
+                *out = (v + m).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
     /// Mirrors the image and its boxes left to right.
     pub fn flip_horizontal(&mut self) {
         for row in self.rgb.chunks_exact_mut(self.width * 3) {
@@ -796,6 +897,28 @@ pub fn mean_average_precision(images: &[LabelledDetections]) -> [f32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_identity_affine_and_unit_hsv_keep_the_image() {
+        let rgb = (0..40 * 20 * 3).map(|v| (v * 7 % 256) as u8).collect();
+        let labels = [YoloLabel {
+            class: 0,
+            xywh: [0.5, 0.5, 0.5, 0.5],
+        }];
+        let image = DetectionImage::new(40, 20, rgb, &labels);
+        assert_eq!(image.affine(40, 20, 1.0, [20.0, 10.0]), image);
+        let mut tinted = image.clone();
+        tinted.hsv([1.0, 1.0, 1.0]);
+        for (a, b) in tinted.rgb.iter().zip(&image.rgb) {
+            assert!(a.abs_diff(*b) <= 3, "{a} vs {b}");
+        }
+        // Halved about the centre, the box halves and stays centred; pushed
+        // off the canvas it is dropped.
+        let half = image.affine(40, 20, 0.5, [20.0, 10.0]);
+        assert_eq!(half.boxes, vec![[15.0, 7.5, 25.0, 12.5]]);
+        let gone = image.affine(40, 20, 1.0, [80.0, 10.0]);
+        assert!(gone.boxes.is_empty());
+    }
 
     fn tile(width: usize, height: usize, shade: u8, label: YoloLabel) -> DetectionImage {
         DetectionImage::new(width, height, vec![shade; width * height * 3], &[label])
