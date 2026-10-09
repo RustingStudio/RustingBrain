@@ -152,6 +152,7 @@ pub mod vae;
 pub mod vision;
 pub mod vit_encoder;
 pub mod webdataset;
+pub mod yolo;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_flash;

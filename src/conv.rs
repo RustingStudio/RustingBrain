@@ -501,6 +501,15 @@ impl DeviceImageBatch {
         self.height * self.width
     }
 
+    /// Zeros in this batch's shape with `channels` channels.
+    pub fn like(&self, channels: usize) -> Result<Self, NetworkError> {
+        let data = self.context.zeros(self.batch * self.pixels() * channels)?;
+        Ok(Self {
+            channels,
+            ..self.with_data(data)
+        })
+    }
+
     /// Another buffer of this shape.
     fn with_data(&self, data: cudarc::driver::CudaSlice<f32>) -> Self {
         Self {
@@ -508,6 +517,13 @@ impl DeviceImageBatch {
             context: self.context.clone(),
             ..*self
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Clone for DeviceImageBatch {
+    fn clone(&self) -> Self {
+        self.with_data(self.data.clone())
     }
 }
 
@@ -2731,7 +2747,7 @@ pub fn pixel_attention_device(
             ..qkv.with_data(values)
         },
         DevicePixelAttentionCache {
-            qkv: qkv.with_data(qkv.data.clone()),
+            qkv: qkv.clone(),
             shape,
             probabilities,
         },
