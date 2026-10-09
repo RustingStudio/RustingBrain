@@ -98,6 +98,7 @@
 
 ### Added
 
+- GRU cell with backward through time (K9): `recurrent::Gru::new(input, hidden, rng)`, `forward_seq(x, batch, h0) -> (Matrix, GruCache)`, `backward_seq(&cache, grad_out, grad_h_last) -> (dx, dh0)`, `step` for a frame at a time, `params_mut`, `to_cuda_on` for the gate GEMMs. PyTorch's equations; every gradient within 1.7e-4 of finite differences over 16 steps.
 - `examples/yolo_val.rs` (K13d, Gate 1): validates YOLO11 weights on a YOLO dataset with ultralytics' rect batches, NMS and mAP. The trained player model scores mAP50 0.7394 and mAP50-95 0.5803 on its 278 val images, against ultralytics' 0.739 and 0.576.
 - YOLO11 graph (K13a-iii): `yolo::Yolo11` builds any YOLO11 scale, loads an ultralytics state dict (`load_ultralytics`), and runs forward and backward on the host or the device (`forward_device`, `backward_device`). `yolo::decode` turns the raw maps into boxes and scores for `detection::non_max_suppression`; `yolo::detection_loss` is ultralytics' `v8DetectionLoss` with its gradient. Matches ultralytics 8.4.174 within 1e-4.
 - DINOv2 towers in `vit_encoder` (K12): `VitEncoder::load_dinov2(path, image_size, precision)` loads `facebook/dinov2-small` and `-base` safetensors; patch tokens are rows 1.. of `encode`, normalised with `IMAGENET_MEAN`/`IMAGENET_STD`. Within 4.2e-5 relative of HF `transformers` on two images. `ffn::gelu_erf` is the exact GELU, also on the device.

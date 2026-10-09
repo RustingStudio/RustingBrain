@@ -133,6 +133,7 @@ pub mod optimizers;
 pub mod param;
 pub mod pipeline;
 pub mod quantized;
+pub mod recurrent;
 pub mod rng;
 pub mod rope;
 pub mod safetensors;
