@@ -1739,3 +1739,23 @@ released the lock).
 
 The device-resident path is 10.1x faster. The head after the pooled features
 is not in either number.
+
+## SD 1.5 UNet LoRA step on the device (G10 b-iii-c, 2026-10-09)
+
+One adapted forward and backward pass of Stable Diffusion 1.5's UNet at
+512x512 (a 64x64 latent, 77 prompt tokens, batch 1) on the RTX 3060, FP16:
+`DeviceUnet::forward_adapted` keeps the tape, `backward_adapted` sums every
+adapter gradient on the device. Rank-2 adapters on `to_q`, `to_k`, `to_v` and
+`to_out.0` of every attention. The weights are random (the 1.5 checkpoint is
+not on this machine); the cost of the step is its shapes. Test
+`cuda_image::lora::tests::an_sd15_step_at_512_is_timed` (ignored), release
+build, one warm-up and five timed steps. Load average 10.4 at the start and
+8.1 at the end.
+
+| Part | ms |
+|---|---|
+| forward with tape | 65.1 |
+| backward to adapter gradients | 125.9 |
+| step | 191.0 (all five 191.0) |
+
+The optimizer update and the noise sampling are not in the number.

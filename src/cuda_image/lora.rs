@@ -798,4 +798,55 @@ mod tests {
         assert!(overall < 2e-2, "gradients off by {overall} overall");
         assert!(worst.0 < 1e-1, "{} off by {}", worst.1, worst.0);
     }
+
+    /// G10 b-iii-c: one adapted forward and backward of Stable Diffusion
+    /// 1.5's UNet at 512x512 (a 64x64 latent, 77 prompt tokens), timed for
+    /// `docs/baseline.md`. The weights are random: the step's cost is its
+    /// shapes, and the 1.5 checkpoint is not on this machine.
+    ///
+    /// ```bash
+    /// cargo test --release --features cuda --lib an_sd15_step -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "builds a 3.4 GB random UNet; run by hand to time a step"]
+    fn an_sd15_step_at_512_is_timed() {
+        let Some(gpu) = device() else { return };
+        let config = crate::unet::UnetConfig::default();
+        let unet = random(&config, "rusting_brain_sd15_step.safetensors");
+        let lora = adapters(&unet);
+        let mut conditioning = conditioning(&config, 64, 1.0);
+        conditioning.text = Matrix::new(77, config.cross_dim);
+        let latent = latent(&config, 64);
+        let model = DeviceUnet::upload(&gpu, &unet).unwrap();
+        let mut adapters = DeviceAdapters::upload(&gpu, &unet, &lora).unwrap();
+        let (scaled, time) = prepare(&unet, &latent, 1.5, &conditioning).unwrap();
+        let mut grad = FeatureMap::new(config.out_channels, 64, 64);
+        grad.data
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, value)| *value = ((i % 7) as f32 - 3.0) * 1e-3);
+
+        let mut step = || {
+            let started = std::time::Instant::now();
+            let (_, tape) = model
+                .forward_adapted(&adapters, &scaled, &time, &conditioning.text)
+                .unwrap();
+            gpu.synchronize().unwrap();
+            let forward = started.elapsed();
+            model.backward_adapted(&mut adapters, tape, &grad).unwrap();
+            gpu.synchronize().unwrap();
+            (forward, started.elapsed())
+        };
+        step();
+        let runs: Vec<_> = (0..5).map(|_| step()).collect();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let best = runs.iter().min_by_key(|run| run.1).unwrap();
+        eprintln!(
+            "SD 1.5 adapted step at 512x512: {:.1} ms (forward {:.1} ms, backward {:.1} ms), best of 5; all {:?}",
+            ms(best.1),
+            ms(best.0),
+            ms(best.1 - best.0),
+            runs.iter().map(|run| ms(run.1).round()).collect::<Vec<_>>()
+        );
+    }
 }
