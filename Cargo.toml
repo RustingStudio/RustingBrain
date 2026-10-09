@@ -99,6 +99,10 @@ name = "yolo_val"
 required-features = ["cuda", "images"]
 
 [[example]]
+name = "yolo_detect"
+required-features = ["cuda", "images"]
+
+[[example]]
 name = "train_dit_lora"
 required-features = ["cuda", "images"]
 
