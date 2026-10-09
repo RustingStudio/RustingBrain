@@ -281,9 +281,11 @@ extern "C" __global__ void gap_bwd(float*dx,const float*g,int total,int n,int C)
 }
 // Batch norm over `[rows, channels]`: the column sums go through cuBLAS, the
 // rest is one thread per element or channel.
-extern "C" __global__ void bn_finish(float*mean,float*var,float*inv,float*run,int C,float eps,float momentum,float unbias,int training){
+extern "C" __global__ void bn_finish(float*mean,float*var,float*inv,float*run,const float*shift,int C,float eps,float momentum,float unbias,int training){
   int c=blockIdx.x*blockDim.x+threadIdx.x;if(c>=C)return;
-  if(training){run[c]=(1.f-momentum)*run[c]+momentum*mean[c];run[C+c]=(1.f-momentum)*run[C+c]+momentum*var[c]*unbias;}
+  // Training sums came shifted by `shift` (col_sums' mode 1).
+  if(training){float s=mean[c],m=shift[c]+s;mean[c]=m;var[c]=fmaxf(var[c]-s*s,0.f);
+    run[c]=(1.f-momentum)*run[c]+momentum*m;run[C+c]=(1.f-momentum)*run[C+c]+momentum*var[c]*unbias;}
   else{mean[c]=run[c];var[c]=run[C+c];}
   inv[c]=1.f/sqrtf(var[c]+eps);
 }
@@ -301,7 +303,9 @@ __device__ __forceinline__ float bn_gy(float d,float xhat,float gamma,float beta
   return d;
 }
 // `scale` times each channel's sum over the rows of `[rows, C]`: of x under
-// mode 0, of (x - other[c])^2 under mode 1, and under mode 2 of x into `out`
+// mode 0, of x - other[c] into `out` and its square into `out2` under mode 1
+// (one pass for a mean and variance, shifted by a guess at the mean so the
+// variance does not cancel away), and under mode 2 of x into `out`
 // and of x * other into `out2` from the same read, x first taken through
 // `bn_gy` with `other` as xhat when `act` is set. One thread per (chunk of
 // COL_ROWS rows, channel), channel fastest so a warp reads neighbouring
@@ -315,10 +319,10 @@ extern "C" __global__ void col_sums(float*out,float*out2,const float*x,const flo
   float ga=act?gamma[c]:0.f,be=act?beta[c]:0.f;
   for(int r=chunk*COL_ROWS,end=min(rows,r+COL_ROWS);r<end;r++){
     long long at=(long long)r*C+c;float v=x[at];
-    if(mode==1){v-=m;v*=v;}else if(mode==2){float o=other[at];v=bn_gy(v,o,ga,be,act);b+=v*o;}
+    if(mode==1){v-=m;b+=v*v;}else if(mode==2){float o=other[at];v=bn_gy(v,o,ga,be,act);b+=v*o;}
     a+=v;}
   atomicAdd(&out[c],a*scale);
-  if(mode==2)atomicAdd(&out2[c],b*scale);
+  if(mode)atomicAdd(&out2[c],b*scale);
 }
 extern "C" __global__ void bn_bwd_apply(float*dx,const float*g,const float*xhat,const float*inv,
     const float*m1,const float*m2,const float*gamma,const float*beta,int total,int C,int act){
