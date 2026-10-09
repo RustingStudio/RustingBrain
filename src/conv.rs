@@ -2210,7 +2210,7 @@ impl TrainableBatchNorm2d {
                 )
             };
             sum(&input.data, &mut mean)?;
-            let mut squares = context.zeros(total)?;
+            let mut squares = context.uninit(total)?;
             let [n, c] = [total, channels].map(|v| v as i32);
             unsafe {
                 context
@@ -2244,7 +2244,7 @@ impl TrainableBatchNorm2d {
                 .launch(crate::cuda_training::cfg(channels))
                 .map_err(err("batch norm statistics kernel"))?;
         }
-        let (mut output, mut normalized) = (context.zeros(total)?, context.zeros(total)?);
+        let (mut output, mut normalized) = (context.uninit(total)?, context.uninit(total)?);
         let n = total as i32;
         unsafe {
             context
@@ -2290,7 +2290,7 @@ impl TrainableBatchNorm2d {
             ));
         };
         let ones = context.filled(rows, 1.0)?;
-        let mut product = context.zeros(total)?;
+        let mut product = context.uninit(total)?;
         let n = total as i32;
         unsafe {
             context
@@ -2312,7 +2312,7 @@ impl TrainableBatchNorm2d {
                 )?;
             }
         }
-        let mut input_grad = context.zeros(total)?;
+        let mut input_grad = context.uninit(total)?;
         let c = channels as i32;
         unsafe {
             context
@@ -2510,7 +2510,7 @@ impl DepthwiseConv2d {
         let context = input.context.clone();
         let err = crate::cuda_training::cuda_err;
         let total = input.data.len();
-        let mut input_grad = context.zeros(total)?;
+        let mut input_grad = context.uninit(total)?;
         let mut weight_grad = context.zeros(taps)?;
         unsafe {
             let mut launch = context.stream.launch_builder(&context.image.dw_bwd_input);

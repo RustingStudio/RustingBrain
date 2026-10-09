@@ -124,7 +124,7 @@ fn groups(model: &mut Yolo11) -> (Vec<&mut Param>, Vec<&mut Param>) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = args()?;
-    let device = CudaDevice::new(0, 11000)?;
+    let device = CudaDevice::with_mixed_precision(0, 11000)?;
     let mut rng = StdRng::seed_from_u64(args.seed);
     let mut model = Yolo11::new(Yolo11Scale::S, 1, &mut rng)?;
     let skipped = model.transfer_ultralytics(&mut SafeTensors::open(&args.weights)?)?;
@@ -167,14 +167,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let make = |chunk: Vec<usize>, seed: u64| {
             let train = Arc::clone(&train);
             std::thread::spawn(move || {
-                chunk
+                let images = chunk
                     .par_iter()
                     .enumerate()
                     .map(|(k, &i)| {
                         let mut rng = StdRng::seed_from_u64(seed ^ (k as u64) << 32);
                         sample(&train, i, mosaic_on, &mut rng)
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                let input = input_batch(&images.iter().collect::<Vec<_>>());
+                (images, input)
             })
         };
         let mut next = Some(make(chunks[0].clone(), rng.r#gen()));
@@ -193,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let t = Instant::now();
-            let images = next
+            let (images, input) = next
                 .take()
                 .expect("a batch is always queued")
                 .join()
@@ -211,7 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect()
                 })
                 .collect();
-            let input = device.upload(&input_batch(&images.iter().collect::<Vec<_>>()))?;
+            let input = device.upload(&input)?;
             timings[0] += t.elapsed();
 
             let t = Instant::now();
