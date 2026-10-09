@@ -848,9 +848,7 @@ impl TrainableConv2d {
             Columns::Device(_)
             | Columns::DeviceInput(_)
             | Columns::DeviceNarrow(_)
-            | Columns::DeviceElsewhere => {
-                self.backward_on_device(cache, grad_output)
-            }
+            | Columns::DeviceElsewhere => self.backward_on_device(cache, grad_output),
             Columns::Input(input) => {
                 self.accumulate_bias_grad(&grad_output.tokens);
                 let columns = self.im2col(input, &cache.shape);
@@ -2314,7 +2312,15 @@ impl TrainableBatchNorm2d {
             // Shifted by the first pixel's values, which keeps the variance
             // from cancelling away; `bn_finish` takes the shift back out.
             let shift = ColumnSum::Shifted(&input.data, &mut variance);
-            column_sums(context, &mut mean, &input.data, Some(shift), rows, channels, scale)?;
+            column_sums(
+                context,
+                &mut mean,
+                &input.data,
+                Some(shift),
+                rows,
+                channels,
+                scale,
+            )?;
         }
         let unbias = rows as f32 / (rows as f32 - 1.0).max(1.0);
         let [c, train] = [channels as i32, training as i32];
@@ -2388,7 +2394,15 @@ impl TrainableBatchNorm2d {
         let silu = cache.silu.then_some((gamma.value(), beta.value()));
         let times = ColumnSum::Times(&cache.normalized, &mut along, silu);
         let scale = 1.0 / rows as f32;
-        column_sums(&context, &mut mean, &grad.data, Some(times), rows, channels, scale)?;
+        column_sums(
+            &context,
+            &mut mean,
+            &grad.data,
+            Some(times),
+            rows,
+            channels,
+            scale,
+        )?;
         let unused = context.zeros(channels)?;
         let (centre, slope) = match cache.training {
             true => (&mean, &along),
@@ -2445,7 +2459,10 @@ enum ColumnSum<'a> {
     Times(
         &'a cudarc::driver::CudaSlice<f32>,
         &'a mut cudarc::driver::CudaSlice<f32>,
-        Option<(&'a cudarc::driver::CudaSlice<f32>, &'a cudarc::driver::CudaSlice<f32>)>,
+        Option<(
+            &'a cudarc::driver::CudaSlice<f32>,
+            &'a cudarc::driver::CudaSlice<f32>,
+        )>,
     ),
 }
 

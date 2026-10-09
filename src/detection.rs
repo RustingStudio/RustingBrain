@@ -626,29 +626,43 @@ impl TaskAlignedAssigner {
         let mut overlaps = vec![0.0f32; gts * anchors];
         let mut metric = vec![0.0f32; gts * anchors];
         let mut positive = vec![false; gts * anchors];
-        for (g, (&gt, &class)) in gt_boxes.iter().zip(gt_classes).enumerate() {
-            let [cx, cy, w, h] = xyxy_to_xywh(gt);
-            let [x1, y1, x2, y2] =
-                xywh_to_xyxy([cx, cy, w.max(self.min_side), h.max(self.min_side)]);
-            let inside: Vec<bool> = points
-                .iter()
-                .map(|&[px, py]| px - x1 > EPS && py - y1 > EPS && x2 - px > EPS && y2 - py > EPS)
-                .collect();
-            let row = g * anchors..(g + 1) * anchors;
-            for a in (0..anchors).filter(|&a| inside[a]) {
-                let overlap = box_iou(gt, pred_boxes[a], Overlap::Ciou).0.max(0.0);
-                overlaps[row.start + a] = overlap;
-                metric[row.start + a] =
-                    scores[a * num_classes + class].powf(self.alpha) * overlap.powf(self.beta);
-            }
-            // The top candidates by metric, ties to the lower anchor, kept
-            // only where the anchor lies inside the box.
-            let mut order: Vec<usize> = (0..anchors).collect();
-            order.sort_by(|&a, &b| metric[row.start + b].total_cmp(&metric[row.start + a]));
-            for &a in order.iter().take(self.topk).filter(|&&a| inside[a]) {
-                positive[row.start + a] = true;
-            }
-        }
+        // Each labelled box picks its candidates on its own, in parallel.
+        use rayon::prelude::*;
+        let rows = overlaps
+            .par_chunks_mut(anchors)
+            .zip(metric.par_chunks_mut(anchors));
+        let rows = rows.zip(positive.par_chunks_mut(anchors));
+        rows.zip(gt_boxes.par_iter().zip(gt_classes)).for_each(
+            |(((overlaps, metric), positive), (&gt, &class))| {
+                let [cx, cy, w, h] = xyxy_to_xywh(gt);
+                let [x1, y1, x2, y2] =
+                    xywh_to_xyxy([cx, cy, w.max(self.min_side), h.max(self.min_side)]);
+                let inside: Vec<bool> = points
+                    .iter()
+                    .map(|&[px, py]| {
+                        px - x1 > EPS && py - y1 > EPS && x2 - px > EPS && y2 - py > EPS
+                    })
+                    .collect();
+                for a in (0..anchors).filter(|&a| inside[a]) {
+                    let overlap = box_iou(gt, pred_boxes[a], Overlap::Ciou).0.max(0.0);
+                    overlaps[a] = overlap;
+                    metric[a] =
+                        scores[a * num_classes + class].powf(self.alpha) * overlap.powf(self.beta);
+                }
+                // The top candidates by metric, ties to the lower anchor, kept
+                // only where the anchor lies inside the box.
+                let mut order: Vec<usize> = (0..anchors).collect();
+                let top = self.topk.min(anchors);
+                if top < anchors {
+                    order.select_nth_unstable_by(top, |&a, &b| {
+                        metric[b].total_cmp(&metric[a]).then(a.cmp(&b))
+                    });
+                }
+                for &a in order[..top].iter().filter(|&&a| inside[a]) {
+                    positive[a] = true;
+                }
+            },
+        );
         for a in 0..anchors {
             let claims = (0..gts).filter(|&g| positive[g * anchors + a]).count();
             if claims > 1 {

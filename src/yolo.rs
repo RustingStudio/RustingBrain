@@ -860,12 +860,11 @@ pub fn detection_loss(
         let pixels = sizes[i].0 * sizes[i].1;
         maps[i].tokens.row(image * pixels + a + pixels - ends[i])
     };
-    let mut grad = vec![0.0f32; batch * anchors * channels];
-
-    // The predicted distances in grid units and each side's softmax.
-    let softmax = |row: &[f32]| -> ([f32; 4], Vec<f32>) {
-        let mut probs = vec![0.0f32; 4 * REG_MAX];
-        let ltrb = std::array::from_fn(|side| {
+    // The predicted distances in grid units, each side's softmax, and the box
+    // they make in grid units.
+    let decode = |a: usize, row: &[f32]| -> ([f32; 4], [f32; 4], [f32; 4 * REG_MAX]) {
+        let mut probs = [0.0f32; 4 * REG_MAX];
+        let ltrb: [f32; 4] = std::array::from_fn(|side| {
             let bins = &row[side * REG_MAX..(side + 1) * REG_MAX];
             let max = bins.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let sum: f32 = bins.iter().map(|&v| (v - max).exp()).sum();
@@ -877,41 +876,43 @@ pub fn detection_loss(
             }
             mean
         });
-        (ltrb, probs)
+        let s = strides[a];
+        let [px, py] = [points[a][0] / s, points[a][1] / s];
+        let grid = [px - ltrb[0], py - ltrb[1], px + ltrb[2], py + ltrb[3]];
+        (grid, ltrb, probs)
     };
 
     let assigner = TaskAlignedAssigner::yolo(&STRIDES);
-    // Each image decodes and assigns on its own, so the images run in parallel.
-    let (assignments, predictions): (Vec<_>, Vec<_>) = targets
+    // Each image decodes its anchors in parallel and assigns on its own.
+    let assignments: Vec<_> = targets
         .par_iter()
         .enumerate()
         .map(|(image, labelled)| {
-            let mut scores = Vec::with_capacity(anchors * classes);
-            let mut pixel_boxes = Vec::with_capacity(anchors);
-            let mut decoded = Vec::with_capacity(anchors);
-            for a in 0..anchors {
-                let row = row(image, a);
-                let (ltrb, probs) = softmax(row);
-                let s = strides[a];
-                let [px, py] = [points[a][0] / s, points[a][1] / s];
-                let grid = [px - ltrb[0], py - ltrb[1], px + ltrb[2], py + ltrb[3]];
-                pixel_boxes.push(grid.map(|v| v * s));
-                scores.extend(row[4 * REG_MAX..].iter().map(|&v| 1.0 / (1.0 + (-v).exp())));
-                decoded.push((grid, ltrb, probs));
-            }
+            let mut scores = vec![0.0f32; anchors * classes];
+            let mut pixel_boxes = vec![[0.0f32; 4]; anchors];
+            scores
+                .par_chunks_mut(classes)
+                .zip(pixel_boxes.par_iter_mut())
+                .enumerate()
+                .for_each(|(a, (scores, pixel_box))| {
+                    let row = row(image, a);
+                    *pixel_box = decode(a, row).0.map(|v| v * strides[a]);
+                    for (score, &v) in scores.iter_mut().zip(&row[4 * REG_MAX..]) {
+                        *score = 1.0 / (1.0 + (-v).exp());
+                    }
+                });
             let gt_classes: Vec<usize> = labelled.iter().map(|t| t.0).collect();
             let gt_boxes: Vec<[f32; 4]> = labelled.iter().map(|t| t.1).collect();
-            let assignment = assigner.assign(
+            assigner.assign(
                 &scores,
                 classes,
                 &pixel_boxes,
                 &points,
                 &gt_classes,
                 &gt_boxes,
-            );
-            (assignment, decoded)
+            )
         })
-        .unzip();
+        .collect();
     let score_sum: f32 = assignments
         .iter()
         .flat_map(|a| &a.scores)
@@ -919,21 +920,35 @@ pub fn detection_loss(
         .max(1.0);
 
     let scale = batch as f32 / score_sum;
-    let per_image: Vec<[f32; 3]> = grad
-        .par_chunks_mut(anchors * channels)
-        .zip(assignments.par_iter().zip(&predictions))
+    // Each map's gradient, one block an image, so an image's anchors write
+    // their own three blocks.
+    let mut grads: Vec<Vec<f32>> = sizes
+        .iter()
+        .map(|(h, w)| vec![0.0f32; batch * h * w * channels])
+        .collect();
+    let [g0, g1, g2] = &mut grads[..] else {
+        unreachable!("three maps")
+    };
+    let block = |i: usize| sizes[i].0 * sizes[i].1 * channels;
+    let per_image: Vec<[f32; 3]> = g0
+        .par_chunks_mut(block(0))
+        .zip(g1.par_chunks_mut(block(1)))
+        .zip(g2.par_chunks_mut(block(2)))
+        .zip(&assignments)
         .enumerate()
-        .map(|(image, (grad, (assignment, decoded)))| {
+        .map(|(image, (((b0, b1), b2), assignment))| {
+            let image_grads = [b0, b1, b2];
             let mut loss = [0.0f32; 3];
             for a in 0..anchors {
                 let row = row(image, a);
-                let local = a * channels;
+                let i = ends.iter().position(|&end| a < end).expect("an anchor");
+                let local = (a + sizes[i].0 * sizes[i].1 - ends[i]) * channels;
+                let grad = &mut image_grads[i][local..local + channels];
                 let targets = &assignment.scores[a * classes..(a + 1) * classes];
                 for (c, &t) in targets.iter().enumerate() {
                     let x = row[4 * REG_MAX + c];
                     loss[1] += x.max(0.0) - x * t + (-x.abs()).exp().ln_1p();
-                    grad[local + 4 * REG_MAX + c] =
-                        LOSS_GAINS[1] * scale * (1.0 / (1.0 + (-x).exp()) - t);
+                    grad[4 * REG_MAX + c] = LOSS_GAINS[1] * scale * (1.0 / (1.0 + (-x).exp()) - t);
                 }
                 if !assignment.foreground[a] {
                     continue;
@@ -941,8 +956,8 @@ pub fn detection_loss(
                 let weight: f32 = targets.iter().sum();
                 let s = strides[a];
                 let target = assignment.boxes[a].map(|v| v / s);
-                let (grid, ltrb, probs) = &decoded[a];
-                let (iou, d_box) = box_iou(*grid, target, Overlap::Ciou);
+                let (grid, ltrb, probs) = decode(a, row);
+                let (iou, d_box) = box_iou(grid, target, Overlap::Ciou);
                 loss[0] += (1.0 - iou) * weight;
                 // d(1 - iou) through x1 = px - l, y1 = py - t, x2 = px + r, y2 = py + b.
                 let d_ltrb = [d_box[0], d_box[1], -d_box[2], -d_box[3]]
@@ -955,9 +970,8 @@ pub fn detection_loss(
                     loss[2] += dfl * weight / 4.0;
                     for k in 0..REG_MAX {
                         let p = probs[side * REG_MAX + k];
-                        grad[local + side * REG_MAX + k] +=
-                            d_ltrb[side] * p * (k as f32 - ltrb[side])
-                                + LOSS_GAINS[2] * scale * weight / 4.0 * d_dfl[k];
+                        grad[side * REG_MAX + k] += d_ltrb[side] * p * (k as f32 - ltrb[side])
+                            + LOSS_GAINS[2] * scale * weight / 4.0 * d_dfl[k];
                     }
                 }
             }
@@ -967,20 +981,16 @@ pub fn detection_loss(
     let loss: [f32; 3] = std::array::from_fn(|i| per_image.iter().map(|l| l[i]).sum());
     let loss = std::array::from_fn(|i| loss[i] / score_sum * LOSS_GAINS[i]);
 
+    let mut grads = grads.into_iter();
     let grads = std::array::from_fn(|i| {
-        let m = maps[i];
-        let mut out = ImageBatch::new(batch, m.height, m.width, channels);
-        let offset: usize = sizes[..i].iter().map(|(h, w)| h * w).sum();
-        let pixels = m.height * m.width;
-        out.tokens
-            .data
-            .par_chunks_mut(pixels * channels)
-            .enumerate()
-            .for_each(|(image, out)| {
-                let at = (image * anchors + offset) * channels;
-                out.copy_from_slice(&grad[at..at + out.len()]);
-            });
-        out
+        let (h, w) = sizes[i];
+        let data = grads.next().expect("three maps");
+        ImageBatch::from_tokens(
+            batch,
+            h,
+            w,
+            crate::matrix::Matrix::from_vec(batch * h * w, channels, data),
+        )
     });
     (loss, grads)
 }
