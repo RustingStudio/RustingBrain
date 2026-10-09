@@ -2562,6 +2562,29 @@ mod tests {
         assert!(0.0 < error && error < 5e-2, "image: relative error {error}");
     }
 
+    /// Writes a Stable Diffusion 1.x-shaped pipeline (one CLIP tower, a
+    /// two-level UNet, an autoencoder with its encoder) into `RB_TINY_SD`:
+    /// the model `scripts/unet_lora_trained_check.py` swaps a diffusers UNet
+    /// into and runs `train_unet_lora` on.
+    #[test]
+    #[ignore]
+    fn publish_a_tiny_sd() {
+        let directory = std::path::PathBuf::from(std::env::var("RB_TINY_SD").unwrap());
+        let clip = crate::clip::ClipTextConfig {
+            vocab_size: 320,
+            bos_token: 300,
+            eos_token: 301,
+            ..crate::clip::tests::tiny()
+        };
+        let unet = UnetConfig {
+            cross_dim: clip.d_model,
+            ..crate::unet::tests::tiny()
+        };
+        publish_unet(&directory, &unet, &clip, None);
+        let loaded = ImagePipeline::load(&directory).unwrap();
+        assert!(loaded.image_encoder.is_some());
+    }
+
     /// Writes a FLUX.1-shaped pipeline (CLIP and T5, two of each block kind)
     /// with 64-wide heads, which the device DiT takes, into `RB_TINY_FLUX`:
     /// the model `scripts/dit_lora_trained_check.py` runs `train_dit_lora` on.

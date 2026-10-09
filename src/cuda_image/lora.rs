@@ -399,6 +399,52 @@ impl DeviceUnet {
         Ok((download_map(gpu, &output)?, tape))
     }
 
+    /// One noise-prediction training step on `lora`, as diffusers'
+    /// `train_text_to_image_lora` takes it: `noise` is added to `latent` at
+    /// level `sigma`, the model predicts it, and the optimizer steps on the
+    /// adapters with the gradient clipped to a norm of 1. Returns the mean
+    /// squared error before the step.
+    ///
+    /// NOTE: the adapters go up and their gradients come down every
+    /// step, a few MB at rank 16 on SD 1.5; keep them on the device with a
+    /// device optimizer once that shows in a profile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn noise_step(
+        &self,
+        unet: &Unet,
+        lora: &mut UnetLora,
+        latent: &FeatureMap,
+        noise: &FeatureMap,
+        sigma: f32,
+        conditioning: &crate::mmdit::Conditioning,
+        optimizer: &crate::optimizers::Optimizer,
+        step: usize,
+    ) -> Result<f32, NetworkError> {
+        let mut noisy = latent.clone();
+        noisy
+            .data
+            .iter_mut()
+            .zip(&noise.data)
+            .for_each(|(x, n)| *x += sigma * n);
+        let (scaled, time) = crate::unet_lora::prepare(unet, &noisy, sigma, conditioning)?;
+        let mut adapters = DeviceAdapters::upload(&self.gpu, unet, lora)?;
+        let (prediction, tape) =
+            self.forward_adapted(&adapters, &scaled, &time, &conditioning.text)?;
+        let count = prediction.data.len() as f32;
+        let mut grad = prediction;
+        let mut loss = 0.0;
+        for (p, n) in grad.data.iter_mut().zip(&noise.data) {
+            let error = *p - n;
+            loss += error * error;
+            *p = 2.0 * error / count;
+        }
+        self.backward_adapted(&mut adapters, tape, &grad)?;
+        adapters.add_gradients(&self.gpu, lora)?;
+        crate::optimizers::step_clipped(&mut lora.params_mut(), optimizer, step, 1.0, 1.0)?;
+        crate::optimizers::zero_grad(&mut lora.params_mut());
+        Ok(loss / count)
+    }
+
     /// Adds `dL/d(adapter)` to the gradients `adapters` keep on the device,
     /// given `dL/d(prediction)` of the pass that made `tape`. The way back
     /// reads the tape from its end: the output, the way up handing one
@@ -681,6 +727,7 @@ mod tests {
     use super::*;
     use crate::unet::tests::{conditioning, latent, random, tiny};
     use crate::unet_lora::{prepare, tests::adapters};
+    use rand::SeedableRng;
 
     #[test]
     fn an_adapted_device_pass_matches_the_host_or_skips_without_a_device() {
@@ -730,6 +777,49 @@ mod tests {
         assert_eq!(
             records.joined.len(),
             unet.up.iter().map(|b| b.resnets.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn noise_steps_lower_the_loss_or_skip_without_a_device() {
+        let Some(gpu) = device() else { return };
+        let config = tiny();
+        let unet = random(&config, "rusting_brain_cuda_unet_noise_step.safetensors");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let mut lora = UnetLora::new(&unet, 4, 4.0, &mut rng);
+        let (latent, conditioning) = (latent(&config, 8), conditioning(&config, 8, 1.0));
+        let noise = crate::diffusion::noise(1, latent.data.len(), Some(1));
+        let noise = FeatureMap::from_vec(latent.channels, 8, 8, noise.data).unwrap();
+        let model = DeviceUnet::upload(&gpu, &unet).unwrap();
+        let optimizer = crate::optimizers::Optimizer::adam(1e-2);
+        // Rank-4 adapters on the one attention level of the tiny UNet fit
+        // fixed noise slowly: about 7% in 30 steps, 11% in 200.
+        let losses: Vec<f32> = (1..=30)
+            .map(|step| {
+                model
+                    .noise_step(
+                        &unet,
+                        &mut lora,
+                        &latent,
+                        &noise,
+                        1.5,
+                        &conditioning,
+                        &optimizer,
+                        step,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            losses[29] < 0.95 * losses[0],
+            "the loss went from {} to {}",
+            losses[0],
+            losses[29]
+        );
+        assert!(
+            lora.adapters
+                .values()
+                .any(|l| l.up.value.data.iter().any(|v| *v != 0.0))
         );
     }
 

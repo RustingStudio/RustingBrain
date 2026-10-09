@@ -113,6 +113,47 @@ impl UnetLora {
         Ok(result)
     }
 
+    /// Fresh adapters of `rank` on every attention projection, as PEFT starts
+    /// them: `down` random, `up` zero, so the model is unchanged until the
+    /// first step, and `alpha / rank` the scale.
+    pub fn new(unet: &Unet, rank: usize, alpha: f32, rng: &mut rand::rngs::StdRng) -> Self {
+        let adapters = projections(unet)
+            .into_iter()
+            .map(|(name, dense)| {
+                let lora = Lora::new(dense.in_dim(), dense.out_dim(), rank, alpha, rng);
+                (name, lora)
+            })
+            .collect();
+        Self { adapters }
+    }
+
+    /// Writes the adapters as a diffusers PEFT file (`unet.{module}.lora_A`
+    /// and `lora_B`), each adapter's scale folded into `lora_B`, so
+    /// [`read_peft`](Self::read_peft) at scale 1 and diffusers'
+    /// `load_lora_weights` (alpha defaults to the rank) give back the same
+    /// model.
+    pub fn write_peft(&self, path: impl AsRef<std::path::Path>) -> Result<(), NetworkError> {
+        let mut tensors = Vec::new();
+        for (module, lora) in &self.adapters {
+            let (down, up) = (&lora.down.value, &lora.up.value);
+            tensors.push((
+                format!("unet.{module}.lora_A.weight"),
+                vec![down.rows, down.cols],
+                down.data.clone(),
+            ));
+            tensors.push((
+                format!("unet.{module}.lora_B.weight"),
+                vec![up.rows, up.cols],
+                up.data.iter().map(|value| value * lora.scale).collect(),
+            ));
+        }
+        let views: Vec<_> = tensors
+            .iter()
+            .map(|(name, shape, data)| (name.as_str(), &shape[..], &data[..]))
+            .collect();
+        crate::safetensors::write(path, &views, &BTreeMap::new())
+    }
+
     /// Every adapter factor, for an optimizer.
     pub fn params_mut(&mut self) -> Vec<&mut Param> {
         self.adapters
@@ -866,6 +907,98 @@ pub(crate) mod tests {
             })
             .collect();
         UnetLora { adapters }
+    }
+
+    /// Needs `RB_UNET_LORA_TRAINED` from `scripts/unet_lora_trained_check.py
+    /// check`, run on what `train_unet_lora` wrote.
+    #[test]
+    #[ignore]
+    fn a_trained_unet_lora_loads_as_diffusers_loads_it() {
+        let dir = std::path::PathBuf::from(std::env::var("RB_UNET_LORA_TRAINED").unwrap());
+        let reference: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
+                .unwrap();
+        let floats = |value: &serde_json::Value| -> Vec<f32> {
+            let values = value.as_array().unwrap().iter();
+            values.map(|x| x.as_f64().unwrap() as f32).collect()
+        };
+        let model = std::path::PathBuf::from(reference["model"].as_str().unwrap());
+        let config = crate::unet::UnetConfig::from_file(model.join("unet/config.json")).unwrap();
+        let unet = Unet::load_at(
+            model.join("unet/diffusion_pytorch_model.safetensors"),
+            config.clone(),
+            crate::transformer::Precision::F32,
+        )
+        .unwrap();
+        let latent = FeatureMap::from_vec(4, 8, 8, floats(&reference["latent"])).unwrap();
+        let conditioning = Conditioning {
+            text: Matrix::from_vec(5, config.cross_dim, floats(&reference["text"])),
+            pooled: vec![],
+            height: 8,
+            width: 8,
+            guidance: 0.0,
+        };
+        let sigma = reference["sigma"].as_f64().unwrap() as f32;
+        let worst = |got: &[f32], want: &[f32]| {
+            let largest = want.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+            let error = got
+                .iter()
+                .zip(want)
+                .fold(0.0f32, |max, (got, want)| max.max((got - want).abs()));
+            error / largest
+        };
+        let (plain, adapted) = (floats(&reference["plain"]), floats(&reference["adapted"]));
+        // Training has to have moved the model, or matching says nothing.
+        let moved = worst(&adapted, &plain);
+        assert!(
+            moved > 1e-3,
+            "the LoRA moves diffusers' prediction by {moved}"
+        );
+        assert_eq!(
+            reference["adapters"].as_u64().unwrap() as usize,
+            projections(&unet).len()
+        );
+
+        let file = reference["lora"].as_str().unwrap();
+        let lora = UnetLora::read_peft(file, &unet, 1.0).unwrap();
+        let (ours, _) = lora.forward(&unet, &latent, sigma, &conditioning).unwrap();
+        let error = worst(&ours.data, &adapted);
+        eprintln!("read_peft is off diffusers by {error}; the LoRA moves it by {moved}");
+        assert!(
+            error < 1e-4,
+            "read_peft is off diffusers by {error}, moved {moved}"
+        );
+    }
+
+    #[test]
+    fn written_adapters_read_back_to_the_same_prediction() {
+        let config = tiny();
+        let unet = random(&config, "rusting_brain_unet_lora_write.safetensors");
+        let fresh = UnetLora::new(&unet, 2, 4.0, &mut rand::rngs::StdRng::seed_from_u64(0));
+        assert_eq!(fresh.adapters.len(), projections(&unet).len());
+        assert!(fresh.adapters.values().all(|lora| lora.scale == 2.0));
+        let (latent, conditioning) = (latent(&config, 8), conditioning(&config, 8, 1.0));
+        let (plain, _) = UnetLora::default()
+            .forward(&unet, &latent, 1.5, &conditioning)
+            .unwrap();
+        let (untrained, _) = fresh.forward(&unet, &latent, 1.5, &conditioning).unwrap();
+        assert_eq!(untrained.data, plain.data, "a zero `up` changes nothing");
+
+        let lora = adapters(&unet);
+        let path = std::env::temp_dir().join("rusting_brain_unet_lora_written.safetensors");
+        lora.write_peft(&path).unwrap();
+        let read = UnetLora::read_peft(&path, &unet, 1.0).unwrap();
+        std::fs::remove_file(path).ok();
+        assert_eq!(read.adapters.len(), lora.adapters.len());
+        let (expected, _) = lora.forward(&unet, &latent, 1.5, &conditioning).unwrap();
+        let (actual, _) = read.forward(&unet, &latent, 1.5, &conditioning).unwrap();
+        let worst = actual
+            .data
+            .iter()
+            .zip(&expected.data)
+            .fold(0.0f32, |max, (a, b)| max.max((a - b).abs()));
+        assert!(worst < 1e-5, "{worst}");
+        assert_ne!(expected.data, plain.data);
     }
 
     #[test]
