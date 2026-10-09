@@ -354,6 +354,7 @@
 
 ### Fixed
 
+- The CUDA test suite no longer fails at random in tests that need the fused attention kernel (J11). Two parity tests turned that kernel off through a process-wide switch while they ran, so a test running alongside them on another thread lost it too. The tests' switch is now per thread; `RUSTING_BRAIN_NO_FLASH` still turns the kernel off for the whole process. A full `cargo test --features cuda,images --lib` failed in 5 of 6 runs before and in none of 6 after.
 - `Mesh::simplify` and `Mesh::simplify_within` no longer depend on which of several equally cheap edges the queue hands out first (J10). An edge refused because it would fold a face used to be dropped for good; now, once nothing cheap is left, the refused edges are weighed again for as long as a round still collapses something. A flat 6x6 grid within 1e-6 failed to reach its two corner faces in 3 of 200 runs before and in none of 400 after.
 - A device convolution asked to add into a map with a different channel
   count is an error, instead of writing past the end of that map.

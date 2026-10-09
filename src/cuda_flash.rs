@@ -26,7 +26,6 @@ use cudarc::driver::sys::CUfunction_attribute;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Query rows and key columns of one tile, and the head width of the image
@@ -1088,20 +1087,26 @@ pub(crate) fn eligible(mixed_precision: bool, head_dim: usize) -> bool {
     mixed_precision && matches!(head_dim, 64 | 128) && !disabled()
 }
 
-/// Set by `RUSTING_BRAIN_NO_FLASH`, and by the parity test that runs the same
-/// model both ways. An escape hatch worth keeping: a fused attention kernel is
-/// the kind of thing that is wrong on exactly one shape, and a run that can
-/// fall back without a rebuild is a run that can be bisected.
-pub(crate) static DISABLED: AtomicBool = AtomicBool::new(false);
-
+/// Set by `RUSTING_BRAIN_NO_FLASH`. An escape hatch worth keeping: a fused
+/// attention kernel is the kind of thing that is wrong on exactly one shape,
+/// and a run that can fall back without a rebuild is a run that can be
+/// bisected.
 pub(crate) fn disabled() -> bool {
-    static FROM_ENV: OnceLock<()> = OnceLock::new();
-    FROM_ENV.get_or_init(|| {
-        if std::env::var_os("RUSTING_BRAIN_NO_FLASH").is_some() {
-            DISABLED.store(true, Ordering::Relaxed);
-        }
-    });
-    DISABLED.load(Ordering::Relaxed)
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    #[cfg(test)]
+    if OFF_ON_THIS_THREAD.get() {
+        return true;
+    }
+    *FROM_ENV.get_or_init(|| std::env::var_os("RUSTING_BRAIN_NO_FLASH").is_some())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The parity tests' switch, which runs the same model both ways. It is
+    /// per thread because a process-wide one turned the fused path off under
+    /// whichever other test was running alongside.
+    pub(crate) static OFF_ON_THIS_THREAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
