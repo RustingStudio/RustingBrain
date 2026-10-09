@@ -847,20 +847,20 @@ pub fn detection_loss(
     let (points, strides) = make_anchors(&sizes, &STRIDES);
     let anchors = points.len();
     let channels = 4 * REG_MAX + classes;
-    // Each image's rows gathered anchor-major, and their gradients.
-    let mut rows = vec![0.0f32; batch * anchors * channels];
-    for image in 0..batch {
-        let mut a = 0;
-        for m in &maps {
-            let pixels = m.height * m.width;
-            for r in image * pixels..(image + 1) * pixels {
-                let at = (image * anchors + a) * channels;
-                rows[at..at + channels].copy_from_slice(m.tokens.row(r));
-                a += 1;
-            }
-        }
-    }
-    let mut grad = vec![0.0f32; rows.len()];
+    // Anchor `a` of an image: its map and the pixel in it, maps in order.
+    let ends: Vec<usize> = sizes
+        .iter()
+        .scan(0, |end, (h, w)| {
+            *end += h * w;
+            Some(*end)
+        })
+        .collect();
+    let row = |image: usize, a: usize| -> &[f32] {
+        let i = ends.iter().position(|&end| a < end).expect("an anchor");
+        let pixels = sizes[i].0 * sizes[i].1;
+        maps[i].tokens.row(image * pixels + a + pixels - ends[i])
+    };
+    let mut grad = vec![0.0f32; batch * anchors * channels];
 
     // The predicted distances in grid units and each side's softmax.
     let softmax = |row: &[f32]| -> ([f32; 4], Vec<f32>) {
@@ -890,8 +890,7 @@ pub fn detection_loss(
             let mut pixel_boxes = Vec::with_capacity(anchors);
             let mut decoded = Vec::with_capacity(anchors);
             for a in 0..anchors {
-                let at = (image * anchors + a) * channels;
-                let row = &rows[at..at + channels];
+                let row = row(image, a);
                 let (ltrb, probs) = softmax(row);
                 let s = strides[a];
                 let [px, py] = [points[a][0] / s, points[a][1] / s];
@@ -927,11 +926,11 @@ pub fn detection_loss(
         .map(|(image, (grad, (assignment, decoded)))| {
             let mut loss = [0.0f32; 3];
             for a in 0..anchors {
-                let at = (image * anchors + a) * channels;
+                let row = row(image, a);
                 let local = a * channels;
                 let targets = &assignment.scores[a * classes..(a + 1) * classes];
                 for (c, &t) in targets.iter().enumerate() {
-                    let x = rows[at + 4 * REG_MAX + c];
+                    let x = row[4 * REG_MAX + c];
                     loss[1] += x.max(0.0) - x * t + (-x.abs()).exp().ln_1p();
                     grad[local + 4 * REG_MAX + c] =
                         LOSS_GAINS[1] * scale * (1.0 / (1.0 + (-x).exp()) - t);
@@ -951,7 +950,7 @@ pub fn detection_loss(
                 let point = [points[a][0] / s, points[a][1] / s];
                 let target_ltrb = box_to_ltrb(point, target, (REG_MAX - 1) as f32);
                 for side in 0..4 {
-                    let bins = &rows[at + side * REG_MAX..at + (side + 1) * REG_MAX];
+                    let bins = &row[side * REG_MAX..(side + 1) * REG_MAX];
                     let (dfl, d_dfl) = distribution_focal_loss(bins, target_ltrb[side]);
                     loss[2] += dfl * weight / 4.0;
                     for k in 0..REG_MAX {
@@ -973,14 +972,14 @@ pub fn detection_loss(
         let mut out = ImageBatch::new(batch, m.height, m.width, channels);
         let offset: usize = sizes[..i].iter().map(|(h, w)| h * w).sum();
         let pixels = m.height * m.width;
-        for image in 0..batch {
-            for p in 0..pixels {
-                let at = (image * anchors + offset + p) * channels;
-                out.tokens
-                    .row_mut(image * pixels + p)
-                    .copy_from_slice(&grad[at..at + channels]);
-            }
-        }
+        out.tokens
+            .data
+            .par_chunks_mut(pixels * channels)
+            .enumerate()
+            .for_each(|(image, out)| {
+                let at = (image * anchors + offset) * channels;
+                out.copy_from_slice(&grad[at..at + out.len()]);
+            });
         out
     });
     (loss, grads)
