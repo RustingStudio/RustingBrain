@@ -294,36 +294,37 @@ extern "C" __global__ void bn_apply(float*y,float*xhat,const float*x,const float
   int c=i%C;float h=(x[i]-mean[c])*inv[c];xhat[i]=h;float v=h*gamma[c]+beta[c];
   y[i]=act?v/(1.f+expf(-v)):v;
 }
-// The gradient at the batch norm's output, through the SiLU under `act`.
-extern "C" __global__ void bn_bwd_prep(float*gy,const float*g,const float*xhat,
-    const float*gamma,const float*beta,int total,int C,int act){
-  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
-  int c=i%C;float d=g[i];
-  if(act){float v=xhat[i]*gamma[c]+beta[c],s=1.f/(1.f+expf(-v));d*=s*(1.f+v*(1.f-s));}
-  gy[i]=d;
+// The gradient at the batch norm's output from the one after its SiLU,
+// when `act` says a SiLU follows.
+__device__ __forceinline__ float bn_gy(float d,float xhat,float gamma,float beta,int act){
+  if(act){float v=xhat*gamma+beta,s=1.f/(1.f+expf(-v));d*=s*(1.f+v*(1.f-s));}
+  return d;
 }
 // `scale` times each channel's sum over the rows of `[rows, C]`: of x under
 // mode 0, of (x - other[c])^2 under mode 1, and under mode 2 of x into `out`
-// and of x * other into `out2` from the same read. One thread per (chunk of
+// and of x * other into `out2` from the same read, x first taken through
+// `bn_gy` with `other` as xhat when `act` is set. One thread per (chunk of
 // COL_ROWS rows, channel), channel fastest so a warp reads neighbouring
 // channels; partial sums are added into a zeroed `out`.
 #define COL_ROWS 64
 extern "C" __global__ void col_sums(float*out,float*out2,const float*x,const float*other,
-    int rows,int C,float scale,int mode){
+    int rows,int C,float scale,int mode,const float*gamma,const float*beta,int act){
   long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
   if(i>=(long long)(rows+COL_ROWS-1)/COL_ROWS*C)return;
   int c=i%C,chunk=i/C;float a=0.f,b=0.f,m=mode==1?other[c]:0.f;
+  float ga=act?gamma[c]:0.f,be=act?beta[c]:0.f;
   for(int r=chunk*COL_ROWS,end=min(rows,r+COL_ROWS);r<end;r++){
     long long at=(long long)r*C+c;float v=x[at];
-    if(mode==1){v-=m;v*=v;}else if(mode==2)b+=v*other[at];
+    if(mode==1){v-=m;v*=v;}else if(mode==2){float o=other[at];v=bn_gy(v,o,ga,be,act);b+=v*o;}
     a+=v;}
   atomicAdd(&out[c],a*scale);
   if(mode==2)atomicAdd(&out2[c],b*scale);
 }
 extern "C" __global__ void bn_bwd_apply(float*dx,const float*g,const float*xhat,const float*inv,
-    const float*m1,const float*m2,const float*gamma,int total,int C){
+    const float*m1,const float*m2,const float*gamma,const float*beta,int total,int C,int act){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
-  int c=i%C;dx[i]=inv[c]*gamma[c]*(g[i]-m1[c]-xhat[i]*m2[c]);
+  int c=i%C;float x=xhat[i],d=bn_gy(g[i],x,gamma[c],beta[c],act);
+  dx[i]=inv[c]*gamma[c]*(d-m1[c]-x*m2[c]);
 }
 extern "C" __global__ void upsample_nearest(float*y,const float*x,int total,int H,int W,int C,int f){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
