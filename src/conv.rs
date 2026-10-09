@@ -2311,17 +2311,10 @@ impl TrainableBatchNorm2d {
         let mut inv_std = context.zeros(channels)?;
         if training {
             let scale = 1.0 / rows as f32;
-            column_sums(context, &mut mean, &input.data, None, rows, channels, scale)?;
-            let centre = ColumnSum::Centred(&mean);
-            column_sums(
-                context,
-                &mut variance,
-                &input.data,
-                Some(centre),
-                rows,
-                channels,
-                scale,
-            )?;
+            // Shifted by the first pixel's values, which keeps the variance
+            // from cancelling away; `bn_finish` takes the shift back out.
+            let shift = ColumnSum::Shifted(&input.data, &mut variance);
+            column_sums(context, &mut mean, &input.data, Some(shift), rows, channels, scale)?;
         }
         let unbias = rows as f32 / (rows as f32 - 1.0).max(1.0);
         let [c, train] = [channels as i32, training as i32];
@@ -2333,6 +2326,7 @@ impl TrainableBatchNorm2d {
                 .arg(&mut variance)
                 .arg(&mut inv_std)
                 .arg(running.value_mut())
+                .arg(&input.data)
                 .arg(&c)
                 .arg(&self.eps)
                 .arg(&self.momentum)
@@ -2439,8 +2433,12 @@ pub struct DeviceBatchNormCache {
 /// What [`column_sums`] sums besides plain values.
 #[cfg(feature = "cuda")]
 enum ColumnSum<'a> {
-    /// `(x - centre[channel])^2`.
-    Centred(&'a cudarc::driver::CudaSlice<f32>),
+    /// `x - centre[channel]` in place of `x`, and its square into the second
+    /// sum.
+    Shifted(
+        &'a cudarc::driver::CudaSlice<f32>,
+        &'a mut cudarc::driver::CudaSlice<f32>,
+    ),
     /// `x` as with none, and `x * other` elementwise into the second sum.
     /// With gamma and beta, `x` is first taken back through the SiLU after a
     /// batch norm whose normalized values `other` holds.
@@ -2476,8 +2474,8 @@ fn column_sums(
             launch.arg(x).arg(x).arg(x);
             0
         }
-        Some(ColumnSum::Centred(centre)) => {
-            launch.arg(x).arg(x).arg(centre);
+        Some(ColumnSum::Shifted(centre, second)) => {
+            launch.arg(second).arg(x).arg(centre);
             1
         }
         Some(ColumnSum::Times(other, second, _)) => {
@@ -4605,6 +4603,34 @@ mod tests {
         let through = |input: &ImageBatch| max_pool_same(input, 5).0.tokens;
         let gap = pooled_gap(through, &distinct, &weights.tokens.data, &back.tokens.data);
         assert!(gap < 1e-3, "max pool {gap}");
+    }
+
+    /// The device batch norm sums a mean and variance in one pass, shifted by
+    /// the running mean; a fresh norm (running mean zero) over values far
+    /// from zero is where that shift does the least, and it still has to
+    /// match the host's two-pass statistics.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_device_batch_norm_over_offset_values_matches_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let mut input = noise(4, 48, 48, 6, 3);
+        input.tokens.data.iter_mut().for_each(|v| *v += 30.0);
+        let mut host = batch_norm_for_tests();
+        let mut resident = batch_norm_for_tests();
+        resident.to_cuda_on(&device).unwrap();
+        let (expected, _) = host.forward(&input, true).unwrap();
+        let (output, _) = resident
+            .forward_device(&device.upload(&input).unwrap(), true)
+            .unwrap();
+        let output = output.download().unwrap().tokens.data;
+        let gap = output
+            .iter()
+            .zip(&expected.tokens.data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(gap < 5e-4, "normalized values {gap} apart");
     }
 
     /// The detection layers on the device against the host.
