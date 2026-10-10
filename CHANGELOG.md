@@ -4,6 +4,7 @@
 
 ### Changed
 
+- `Dataset::shuffle` moves rows instead of cloning them: 200,000 rows of 64 features shuffle in about 5 ms instead of 31 ms, with no second copy of the data held (R4, RustingTrade P08). Same order for the same seed.
 - `Param::step` (and so every `TransformerLm`, flow and image model step, on CPU and CUDA) no longer applies weight decay to one-row parameters: biases and norm gains keep their value, and matrices decay as before (R2, asked by RustingLLM). `Network` already skipped its biases. A rank-1 LoRA `down` matrix is one row too and is no longer decayed.
 - `marching_tetrahedra` and `marching_tetrahedra_sparse` now wind every face outward, from the field's inside (below the isovalue) to its outside (K11). Before, the winding followed the tetrahedron table and could point either way.
 - `TrainableConv2d::to_cuda_on` moves the bias to the device as well; the host-input `forward`/`backward` now run through the device-resident pair, so the bias add and its gradient no longer happen on the host. `bias.value`/`bias.grad` are stale until `to_cpu`, as for the weight.

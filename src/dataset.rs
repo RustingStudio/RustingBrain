@@ -459,8 +459,17 @@ impl Dataset {
             indexes.shuffle(&mut rng);
         }
 
-        self.inputs = indexes.iter().map(|&i| self.inputs[i].clone()).collect();
-        self.targets = indexes.iter().map(|&i| self.targets[i].clone()).collect();
+        // Moves the rows; each index occurs once, so none is taken twice.
+        let mut inputs = std::mem::take(&mut self.inputs);
+        let mut targets = std::mem::take(&mut self.targets);
+        self.inputs = indexes
+            .iter()
+            .map(|&i| std::mem::take(&mut inputs[i]))
+            .collect();
+        self.targets = indexes
+            .iter()
+            .map(|&i| std::mem::take(&mut targets[i]))
+            .collect();
     }
 
     /// [`split`](Dataset::split), keeping each class's share of the rows on
@@ -1437,6 +1446,21 @@ impl BatchSource for JsonlStream {
 mod tests {
     use super::*;
     use crate::TrainConfig;
+
+    #[test]
+    fn a_seeded_shuffle_permutes_the_rows_in_pairs_and_repeats() {
+        let rows = |n: usize| (0..n).map(|i| vec![i as f32]).collect::<Vec<_>>();
+        let mut data = Dataset::new(rows(50), rows(50));
+        data.shuffle(Some(7));
+        assert_eq!(data.inputs, data.targets);
+        assert_ne!(data.inputs, rows(50));
+        let mut sorted = data.inputs.clone();
+        sorted.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(sorted, rows(50));
+        let mut again = Dataset::new(rows(50), rows(50));
+        again.shuffle(Some(7));
+        assert_eq!(again.inputs, data.inputs);
+    }
 
     /// A `.npy` file built by hand, byte for byte as `numpy.save` writes one:
     /// magic, version 1, a u16 header length, then the dict padded to a
