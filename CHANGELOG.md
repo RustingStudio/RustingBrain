@@ -4,6 +4,7 @@
 
 ### Changed
 
+- `Param::step` (and so every `TransformerLm`, flow and image model step, on CPU and CUDA) no longer applies weight decay to one-row parameters: biases and norm gains keep their value, and matrices decay as before (R2, asked by RustingLLM). `Network` already skipped its biases. A rank-1 LoRA `down` matrix is one row too and is no longer decayed.
 - `marching_tetrahedra` and `marching_tetrahedra_sparse` now wind every face outward, from the field's inside (below the isovalue) to its outside (K11). Before, the winding followed the tetrahedron table and could point either way.
 - `TrainableConv2d::to_cuda_on` moves the bias to the device as well; the host-input `forward`/`backward` now run through the device-resident pair, so the bias add and its gradient no longer happen on the host. `bias.value`/`bias.grad` are stale until `to_cpu`, as for the weight.
 - `Param::step` (and so `apply_step` and `step_clipped`) panics on step 0 instead of turning every parameter NaN through Adam's bias correction; steps count from 1 (asked by RustingChop). An assert rather than an error, as the consumer allowed: the signatures stay the same.

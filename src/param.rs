@@ -588,12 +588,24 @@ impl Param {
     /// accumulated gradient, which lets a caller accumulate over a batch and
     /// average once here.
     ///
+    /// Weight decay applies to parameters with more than one row only. A
+    /// one-row parameter is a bias or a norm gain, and shrinking those
+    /// towards zero only fights the model (the nanoGPT rule).
+    ///
     /// [`Schedule::rate`]: crate::optimizers::Schedule::rate
     pub fn step(&mut self, optimizer: &Optimizer, step: usize, scale: f32) {
         assert!(step > 0, "optimizer steps count from 1");
         if self.frozen {
             return;
         }
+        let undecayed;
+        let optimizer = match self.value.rows == 1 {
+            true => {
+                undecayed = optimizer.without_weight_decay();
+                &undecayed
+            }
+            false => optimizer,
+        };
         #[cfg(feature = "cuda")]
         if let Some(device) = &mut self.device {
             device.step(optimizer, step, scale);
@@ -1136,6 +1148,70 @@ mod tests {
         let mut param = Param::new(Matrix::from_vec(1, 1, vec![1.0]));
         param.grad.data[0] = 0.5;
         param.step(&Optimizer::adam(1e-2), 0, 1.0);
+    }
+
+    /// One step with a zero gradient: only the decay moves anything.
+    fn decay_one_step(
+        optimizer: &Optimizer,
+        #[cfg(feature = "cuda")] device: Option<&CudaDevice>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut matrix = Param::new(Matrix::from_vec(2, 2, vec![1.0, -2.0, 3.0, -4.0]));
+        let mut gain = Param::new(Matrix::from_vec(1, 3, vec![1.0, 2.0, 3.0]));
+        #[cfg(feature = "cuda")]
+        if let Some(device) = device {
+            matrix.to_cuda_on(device).unwrap();
+            gain.to_cuda_on(device).unwrap();
+        }
+        matrix.step(optimizer, 1, 1.0);
+        gain.step(optimizer, 1, 1.0);
+        matrix.to_cpu().unwrap();
+        gain.to_cpu().unwrap();
+        (matrix.value.data, gain.value.data)
+    }
+
+    #[test]
+    fn weight_decay_shrinks_matrices_and_leaves_one_row_parameters_alone() {
+        for optimizer in [
+            Optimizer::adam_with_weight_decay(0.1, 0.5),
+            Optimizer::lion_with_weight_decay(0.1, 0.5),
+        ] {
+            let (matrix, gain) = decay_one_step(
+                &optimizer,
+                #[cfg(feature = "cuda")]
+                None,
+            );
+            // Shrunk by lr * wd = 0.05.
+            for (after, before) in matrix.iter().zip([1.0f32, -2.0, 3.0, -4.0]) {
+                assert!(
+                    (after - 0.95 * before).abs() < 1e-6,
+                    "{optimizer:?}: {after}"
+                );
+            }
+            assert_eq!(gain, [1.0, 2.0, 3.0], "{optimizer:?}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn weight_decay_on_the_device_matches_the_host_or_skips_without_device() {
+        let Some(device) = cuda_or_skip(256) else {
+            return;
+        };
+        for optimizer in [
+            Optimizer::adam_with_weight_decay(0.1, 0.5),
+            Optimizer::lion_with_weight_decay(0.1, 0.5),
+        ] {
+            let host = decay_one_step(&optimizer, None);
+            let cuda = decay_one_step(&optimizer, Some(&device));
+            for (a, b) in host
+                .0
+                .iter()
+                .chain(&host.1)
+                .zip(cuda.0.iter().chain(&cuda.1))
+            {
+                assert!((a - b).abs() < 1e-6, "{optimizer:?}: host {a}, device {b}");
+            }
+        }
     }
 
     #[test]

@@ -117,6 +117,15 @@ impl Optimizer {
         }
     }
 
+    /// The same optimizer with its weight decay set to zero.
+    pub(crate) fn without_weight_decay(&self) -> Self {
+        let mut optimizer = self.clone();
+        if let Self::Adam { weight_decay, .. } | Self::Lion { weight_decay, .. } = &mut optimizer {
+            *weight_decay = 0.0;
+        }
+        optimizer
+    }
+
     /// The current learning rate, which is worth logging next to the loss.
     pub fn learning_rate(&self) -> f32 {
         match self {
