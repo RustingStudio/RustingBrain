@@ -150,6 +150,8 @@ pub struct Schedule {
     warmup: usize,
     steps: usize,
     floor: f32,
+    /// `Some(fraction)` for warmup-stable-decay; `None` for cosine.
+    linear_tail: Option<f32>,
 }
 
 impl Schedule {
@@ -161,6 +163,25 @@ impl Schedule {
             warmup,
             steps,
             floor: 0.1,
+            linear_tail: None,
+        }
+    }
+
+    /// Warmup-stable-decay: `warmup` steps rising to `peak`, the peak held,
+    /// then a linear decay to the floor over the last `decay_fraction` of
+    /// `steps`.
+    ///
+    /// Every rate before the decay starts is the peak whatever `steps` is, so
+    /// a run can be extended by raising `steps` before its decay begins.
+    pub fn warmup_stable_decay(
+        peak: f32,
+        warmup: usize,
+        steps: usize,
+        decay_fraction: f32,
+    ) -> Self {
+        Self {
+            linear_tail: Some(decay_fraction.clamp(0.0, 1.0)),
+            ..Self::warmup_cosine(peak, warmup, steps)
         }
     }
 
@@ -180,6 +201,18 @@ impl Schedule {
             // `step + 1`, so the first step is not a forward and backward pass
             // at a learning rate of zero, which changes nothing.
             return self.peak * (step + 1) as f32 / self.warmup as f32;
+        }
+        if let Some(fraction) = self.linear_tail {
+            let decay = (self.steps as f32 * fraction).round() as usize;
+            let start = self.steps.saturating_sub(decay).max(self.warmup);
+            if step < start {
+                return self.peak;
+            }
+            let progress = match self.steps > start {
+                true => ((step - start) as f32 / (self.steps - start) as f32).min(1.0),
+                false => 1.0,
+            };
+            return self.peak * (1.0 - (1.0 - self.floor) * progress);
         }
         let decay = self.steps.saturating_sub(self.warmup);
         if decay == 0 {
@@ -415,6 +448,27 @@ mod tests {
         assert!(Schedule::warmup_cosine(1.0, 0, 100).floor(0.0).rate(100) < 1e-6);
         // Warmup as long as the run: nothing left to decay over.
         assert!((Schedule::warmup_cosine(1.0, 100, 100).rate(100) - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn warmup_stable_decay_holds_the_peak_then_falls_linearly_to_the_floor() {
+        // Warmup 10, stable to step 80, linear decay over the last 20 steps.
+        let schedule = Schedule::warmup_stable_decay(1.0, 10, 100, 0.2).floor(0.0);
+
+        assert!((schedule.rate(0) - 0.1).abs() < 1e-6);
+        for step in 9..=80 {
+            assert_eq!(schedule.rate(step), 1.0);
+        }
+        assert!((schedule.rate(90) - 0.5).abs() < 1e-6);
+        assert!(schedule.rate(100) < 1e-6);
+        assert!(schedule.rate(10_000) < 1e-6);
+        // Extending the run before the decay leaves every rate so far alone.
+        let longer = Schedule::warmup_stable_decay(1.0, 10, 200, 0.2).floor(0.0);
+        for step in 0..=80 {
+            assert_eq!(schedule.rate(step), longer.rate(step));
+        }
+        // The default floor is a tenth, as for the cosine.
+        assert!((Schedule::warmup_stable_decay(1.0, 10, 100, 0.2).rate(100) - 0.1).abs() < 1e-6);
     }
 
     #[test]
