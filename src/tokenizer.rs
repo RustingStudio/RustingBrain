@@ -591,6 +591,37 @@ impl Bpe {
         vocab_size: usize,
         specials: &[&str],
     ) -> Result<String, NetworkError> {
+        Self::train(texts, vocab_size, specials, false)
+    }
+
+    /// [`Bpe::train_json`] with Qwen2's split instead of GPT-2's: every digit
+    /// is a word of its own, so no token spans two digits and numbers are
+    /// read one digit at a time.
+    ///
+    /// The file carries the rule as a `Split` pre-tokenizer, so
+    /// [`Bpe::from_json`] and Hugging Face `tokenizers` both encode with it.
+    ///
+    /// ```
+    /// # use rusting_brain::Bpe;
+    /// let corpus = ["port 8080", "port 8080", "port 8080"];
+    /// let bpe = Bpe::from_json(&Bpe::train_json_split_digits(corpus, 300, &[])?)?;
+    /// assert_eq!(bpe.encode(" 8080")?.len(), 5);
+    /// # Ok::<(), rusting_brain::NetworkError>(())
+    /// ```
+    pub fn train_json_split_digits<S: AsRef<str>>(
+        texts: impl IntoIterator<Item = S>,
+        vocab_size: usize,
+        specials: &[&str],
+    ) -> Result<String, NetworkError> {
+        Self::train(texts, vocab_size, specials, true)
+    }
+
+    fn train<S: AsRef<str>>(
+        texts: impl IntoIterator<Item = S>,
+        vocab_size: usize,
+        specials: &[&str],
+        split_digits: bool,
+    ) -> Result<String, NetworkError> {
         let mut tokens: Vec<String> = specials
             .iter()
             .map(|special| special.to_string())
@@ -622,7 +653,11 @@ impl Bpe {
                     .flat_map(|piece| piece.split(special))
                     .collect();
             }
-            for word in pieces.into_iter().flat_map(pre_tokenize) {
+            let split = |piece: &str| match split_digits {
+                true => split_llama3(piece, 1),
+                false => pre_tokenize(piece),
+            };
+            for word in pieces.into_iter().flat_map(split) {
                 *counts.entry(word).or_default() += 1;
             }
         }
@@ -741,7 +776,15 @@ impl Bpe {
             "padding": null,
             "added_tokens": added,
             "normalizer": null,
-            "pre_tokenizer": byte_level,
+            "pre_tokenizer": match split_digits {
+                false => byte_level.clone(),
+                true => serde_json::json!({"type": "Sequence", "pretokenizers": [
+                    {"type": "Split", "pattern": {"Regex": QWEN2_SPLIT},
+                     "behavior": "Isolated", "invert": false},
+                    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false,
+                     "use_regex": false},
+                ]}),
+            },
             "post_processor": null,
             "decoder": byte_level,
             "model": {
@@ -1596,6 +1639,34 @@ pub(crate) mod tests {
         // No merge crosses a special token.
         assert!(bpe.token_id("<|endoftext|>the").is_none());
         for text in ["the cat sat<|endoftext|><pad>", "unseen: naïve 東京 🦀"] {
+            assert_eq!(bpe.decode(&bpe.encode(text).unwrap()), text);
+        }
+    }
+
+    #[test]
+    fn a_digit_split_tokenizer_never_learns_a_token_spanning_two_digits() {
+        let corpus = ["port 8080 and 8080, year 2024 2024 2024"; 4];
+        let has_digit_pair = |bpe: &Bpe| {
+            bpe.tokens
+                .iter()
+                .any(|token| token.chars().filter(char::is_ascii_digit).count() > 1)
+        };
+        // The GPT-2 split keeps a number whole, so it does learn them.
+        let gpt2 = Bpe::from_json(&Bpe::train_json(corpus, 300, &[]).unwrap()).unwrap();
+        assert!(has_digit_pair(&gpt2));
+
+        let json = Bpe::train_json_split_digits(corpus, 300, &["<fim>"]).unwrap();
+        assert_eq!(
+            json,
+            Bpe::train_json_split_digits(corpus, 300, &["<fim>"]).unwrap()
+        );
+        let bpe = Bpe::from_json(&json).unwrap();
+        assert_eq!(bpe.split_digits, Some(1));
+        assert!(!has_digit_pair(&bpe));
+        // Words still merge, and every digit is its own token.
+        assert_eq!(bpe.encode("port").unwrap().len(), 1);
+        assert_eq!(bpe.encode(" 2024").unwrap().len(), 5);
+        for text in ["port 8080<fim>year 12345", "unseen: naïve 東京 🦀  x\n"] {
             assert_eq!(bpe.decode(&bpe.encode(text).unwrap()), text);
         }
     }
