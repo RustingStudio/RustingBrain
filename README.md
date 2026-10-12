@@ -593,8 +593,9 @@ planned.
 
 ## License
 
-RustingBrain is released under the RustingBrain License 1.0. You can use,
-modify, and distribute it, including in commercial projects, but redistributed
-copies must keep the license and credit Vasyl Trefilov as the original author.
+RustingBrain is released under the RustingBrain License 1.1. You can use,
+modify, and distribute it, and sell projects built with it, but you may not
+sell RustingBrain itself. Redistributed copies must keep the license and credit
+Vasyl Trefilov as the original author.
 
 See [LICENSE.md](LICENSE.md) for the full terms.

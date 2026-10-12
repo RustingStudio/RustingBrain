@@ -5,7 +5,7 @@
 //!
 //! ```bash
 //! cargo run --release --features cuda,images --example yolo_val -- \
-//!     /home/vasylt/cs2/fixtures/k13d_player_v1.safetensors /home/vasylt/cs2/dataset 1 [tf32]
+//!     /home/vasylt/Code/games/cs2/fixtures/k13d_player_v1.safetensors /home/vasylt/Code/games/cs2/dataset 1 [tf32]
 //! ```
 //!
 //! The model runs fused, as ultralytics validates it; `tf32` runs mixed
@@ -23,10 +23,10 @@ use std::path::Path;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let weights = args.get(1).map_or(
-        "/home/vasylt/cs2/fixtures/k13d_player_v1.safetensors",
+        "/home/vasylt/Code/games/cs2/fixtures/k13d_player_v1.safetensors",
         |a| a,
     );
-    let root = Path::new(args.get(2).map_or("/home/vasylt/cs2/dataset", |a| a));
+    let root = Path::new(args.get(2).map_or("/home/vasylt/Code/games/cs2/dataset", |a| a));
     let classes: usize = args.get(3).map_or(Ok(1), |a| a.parse())?;
     let device = match args.get(4).map(String::as_str) {
         Some("tf32") => CudaDevice::with_mixed_precision(0, 8192)?,

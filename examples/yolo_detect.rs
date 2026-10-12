@@ -8,8 +8,8 @@
 //!
 //! ```bash
 //! cargo run --release --features cuda,images --example yolo_detect -- \
-//!     --weights /home/vasylt/cs2/fixtures/k13d_yolo11s.safetensors \
-//!     --data /home/vasylt/cs2/dataset --epochs 100 --batch 8
+//!     --weights /home/vasylt/Code/games/cs2/fixtures/k13d_yolo11s.safetensors \
+//!     --data /home/vasylt/Code/games/cs2/dataset --epochs 100 --batch 8
 //! ```
 //!
 //! `--steps N` stops after N batches and prints the time per stage, for
@@ -48,8 +48,8 @@ struct Args {
 
 fn args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args = Args {
-        weights: "/home/vasylt/cs2/fixtures/k13d_yolo11s.safetensors".into(),
-        data: "/home/vasylt/cs2/dataset".into(),
+        weights: "/home/vasylt/Code/games/cs2/fixtures/k13d_yolo11s.safetensors".into(),
+        data: "/home/vasylt/Code/games/cs2/dataset".into(),
         epochs: 100,
         batch: 8,
         close_mosaic: 10,

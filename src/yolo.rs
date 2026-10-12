@@ -1349,7 +1349,7 @@ mod tests {
 
     #[test]
     fn detection_loss_matches_ultralytics() {
-        let fixture = "/home/vasylt/cs2/fixtures/k13e_loss.safetensors";
+        let fixture = "/home/vasylt/Code/games/cs2/fixtures/k13e_loss.safetensors";
         let Ok(mut tensors) = SafeTensors::open(fixture) else {
             eprintln!("skipped: no {fixture}");
             return;
@@ -1372,7 +1372,7 @@ mod tests {
 
     #[test]
     fn yolo11_matches_ultralytics() {
-        let fixture = "/home/vasylt/cs2/fixtures/k13a_yolo11_tiny.safetensors";
+        let fixture = "/home/vasylt/Code/games/cs2/fixtures/k13a_yolo11_tiny.safetensors";
         let Ok(mut tensors) = SafeTensors::open(fixture) else {
             eprintln!("skipped: no {fixture}");
             return;
@@ -1463,7 +1463,7 @@ mod tests {
         // Saved from a real checkpoint, every tensor comes back as ultralytics
         // wrote it, shape included.
         let Ok(mut original) =
-            SafeTensors::open("/home/vasylt/cs2/fixtures/k13d_player_v1.safetensors")
+            SafeTensors::open("/home/vasylt/Code/games/cs2/fixtures/k13d_player_v1.safetensors")
         else {
             return;
         };
@@ -1607,7 +1607,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn player_model_matches_ultralytics_on_sixteen_val_images() {
-        let fixtures = "/home/vasylt/cs2/fixtures";
+        let fixtures = "/home/vasylt/Code/games/cs2/fixtures";
         let (Ok(mut weights), Ok(mut reference)) = (
             SafeTensors::open(format!("{fixtures}/k13d_player_v1.safetensors")),
             SafeTensors::open(format!("{fixtures}/k13d_player_val16.safetensors")),

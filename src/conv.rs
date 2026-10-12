@@ -4898,7 +4898,7 @@ mod tests {
 
     #[test]
     fn pixel_attention_matches_ultralytics() {
-        let fixture = std::path::Path::new("/home/vasylt/cs2/fixtures/k13a_attention.json");
+        let fixture = std::path::Path::new("/home/vasylt/Code/games/cs2/fixtures/k13a_attention.json");
         let Ok(text) = std::fs::read_to_string(fixture) else {
             eprintln!("skipped: no {}", fixture.display());
             return;
