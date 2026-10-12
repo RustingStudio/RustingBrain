@@ -3,7 +3,7 @@
 //!
 //! ```bash
 //! cargo run --release --features cuda --example cuda_image_bench -- \
-//!     /home/vasylt/ml/models/pony-v6-xl
+//!     /home/vasylt/Code/ai/ml/models/pony-v6-xl
 //! ```
 //!
 //! `SIZES` is a comma-separated list of square image sides, `512,1024` by

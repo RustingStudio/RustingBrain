@@ -1272,7 +1272,7 @@ two buys no time; it halves the weights' memory.
 
 ## Image path kernel shares (C6 part 4, 2026-10-07)
 
-`nsys profile --trace=cuda` on `cuda_image_bench /home/vasylt/ml/models/pony-v6-xl`
+`nsys profile --trace=cuda` on `cuda_image_bench /home/vasylt/Code/ai/ml/models/pony-v6-xl`
 with `SIZES=1024 CPU=0 QUANTIZE=1`: one UNet pass 0.251 s (first 0.40 s),
 VAE decode 0.53 s, peak 7.45 GB. Kernel time 1847 ms: FP16 GEMMs 25.2% +
 22.2% + 5.9% + 2.3%, `im2col` 18.7% (2804), `image_attention_fwd` 7.2%,
@@ -1412,7 +1412,7 @@ only.
 ## Classifier-free guidance batching, estimated (C7, 2026-10-08)
 
 Quiet GPU, load 4-6, `SIZES=512,1024 CPU=0 QUANTIZE=1 cuda_image_bench
-/home/vasylt/ml/models/pony-v6-xl`: one UNet pass 0.071 s at 512x512 and
+/home/vasylt/Code/ai/ml/models/pony-v6-xl`: one UNet pass 0.071 s at 512x512 and
 0.254 s at 1024x1024 (VAE decode 0.13 and 0.54 s, peak 7.79 GB). Four times
 the latent pixels costs 3.6 times the time, so a batch-2 pass at 512 can be
 at most about 10% quicker than two passes; at 1024 the pass is already as

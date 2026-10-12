@@ -1053,17 +1053,17 @@ mod tests {
     }
 
     /// Boxes, shape and pixels against ultralytics 8.4.174 on the CS2 player
-    /// dataset, exported by `/home/vasylt/cs2/fixtures/export_k13c_data.py`.
+    /// dataset, exported by `/home/vasylt/Code/games/cs2/fixtures/export_k13c_data.py`.
     #[cfg(feature = "images")]
     #[test]
     fn the_pipeline_matches_ultralytics_on_the_player_dataset() {
-        let fixture = Path::new("/home/vasylt/cs2/fixtures/k13c_data.json");
+        let fixture = Path::new("/home/vasylt/Code/games/cs2/fixtures/k13c_data.json");
         let Ok(text) = std::fs::read_to_string(fixture) else {
             eprintln!("skipped: no {}", fixture.display());
             return;
         };
         let data: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let root = Path::new("/home/vasylt/cs2/dataset");
+        let root = Path::new("/home/vasylt/Code/games/cs2/dataset");
         let labels_of = |split: &str, file: &str| {
             let stem = Path::new(file).file_stem().unwrap().to_str().unwrap();
             parse_yolo_labels(
@@ -1153,7 +1153,7 @@ mod tests {
     }
 
     fn load_ops() -> Option<serde_json::Value> {
-        let fixture = Path::new("/home/vasylt/cs2/fixtures/k13b_ops.json");
+        let fixture = Path::new("/home/vasylt/Code/games/cs2/fixtures/k13b_ops.json");
         let Ok(text) = std::fs::read_to_string(fixture) else {
             eprintln!("skipped: no {}", fixture.display());
             return None;
@@ -1194,7 +1194,7 @@ mod tests {
     }
 
     /// Against ultralytics 8.4.174, exported by
-    /// `/home/vasylt/cs2/fixtures/export_k13b_ops.py`.
+    /// `/home/vasylt/Code/games/cs2/fixtures/export_k13b_ops.py`.
     #[test]
     fn detection_ops_match_ultralytics() {
         let Some(data) = load_ops() else { return };
