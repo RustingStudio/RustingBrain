@@ -1,11 +1,11 @@
 [package]
 name = "rusting_brain"
-version = "3.0.1"
+version = "4.0.0"
 edition = "2024"
 description = "A Rust deep-learning library for training and running transformer language models, dense and mixture-of-experts, on CPU or CUDA."
 readme = "README.md"
 license-file = "LICENSE.md"
-rust-version = "1.85"
+rust-version = "1.88"
 documentation = "https://docs.rs/rusting_brain"
 homepage = "https://github.com/Vasyl-Trefilov/RustingBrain"
 repository = "https://github.com/Vasyl-Trefilov/RustingBrain.git"

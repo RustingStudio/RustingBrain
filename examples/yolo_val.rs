@@ -26,7 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/home/vasylt/Code/games/cs2/fixtures/k13d_player_v1.safetensors",
         |a| a,
     );
-    let root = Path::new(args.get(2).map_or("/home/vasylt/Code/games/cs2/dataset", |a| a));
+    let root = Path::new(
+        args.get(2)
+            .map_or("/home/vasylt/Code/games/cs2/dataset", |a| a),
+    );
     let classes: usize = args.get(3).map_or(Ok(1), |a| a.parse())?;
     let device = match args.get(4).map(String::as_str) {
         Some("tf32") => CudaDevice::with_mixed_precision(0, 8192)?,

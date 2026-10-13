@@ -119,7 +119,7 @@ impl ShapeVaeConfig {
                 self.free_bits
             )));
         }
-        if self.head_dim % 2 != 0 {
+        if !self.head_dim.is_multiple_of(2) {
             return Err(NetworkError::InvalidConfig(format!(
                 "head_dim must be even, got {}",
                 self.head_dim

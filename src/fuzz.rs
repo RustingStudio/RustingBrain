@@ -134,18 +134,18 @@ fn glb_survives_corruption() {
 fn tokenizer_json_survives_corruption() {
     let bpe = crate::tokenizer::tests::tokenizer_json(&["a b", "ab c"], &["ab", "abc"], None);
     survives("bpe", bpe.as_bytes(), |bytes| {
-        if let Ok(bpe) = Bpe::from_json(&String::from_utf8_lossy(bytes)) {
-            if let Ok(ids) = bpe.encode("abc ab\u{e9} <|end|>") {
-                bpe.decode(&ids);
-            }
+        if let Ok(bpe) = Bpe::from_json(&String::from_utf8_lossy(bytes))
+            && let Ok(ids) = bpe.encode("abc ab\u{e9} <|end|>")
+        {
+            bpe.decode(&ids);
         }
     });
     let unigram = crate::tokenizer::tests::unigram_json();
     survives("unigram", unigram.as_bytes(), |bytes| {
-        if let Ok(unigram) = Unigram::from_json(&String::from_utf8_lossy(bytes)) {
-            if let Ok(ids) = unigram.encode("hello world") {
-                unigram.decode(&ids);
-            }
+        if let Ok(unigram) = Unigram::from_json(&String::from_utf8_lossy(bytes))
+            && let Ok(ids) = unigram.encode("hello world")
+        {
+            unigram.decode(&ids);
         }
     });
 }
@@ -154,7 +154,7 @@ fn tokenizer_json_survives_corruption() {
 fn npy_and_idx_survive_corruption() {
     let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), }";
     let mut header = header.to_string();
-    while (10 + header.len() + 1) % 64 != 0 {
+    while !(10 + header.len() + 1).is_multiple_of(64) {
         header.push(' ');
     }
     header.push('\n');

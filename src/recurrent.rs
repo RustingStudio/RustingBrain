@@ -87,7 +87,7 @@ impl Gru {
     /// absent). Returns every step's hidden state, `[batch * t, hidden]`.
     pub fn forward_seq(&self, x: &Matrix, batch: usize, h0: Option<&Matrix>) -> (Matrix, GruCache) {
         assert!(
-            batch > 0 && x.rows % batch == 0,
+            batch > 0 && x.rows.is_multiple_of(batch),
             "{} rows do not split into {batch} sequences",
             x.rows
         );

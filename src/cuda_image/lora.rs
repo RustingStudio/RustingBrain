@@ -362,7 +362,7 @@ fn pop<T>(list: &mut Vec<T>) -> Result<T, NetworkError> {
 impl DeviceUnet {
     /// [`DeviceUnet::forward`] with `adapters` on the attention projections,
     /// keeping what the backward pass reads. `latent` and `time` are what
-    /// [`crate::unet_lora::prepare`] makes of a latent and a noise level.
+    /// `unet_lora::prepare` makes of a latent and a noise level.
     pub fn forward_adapted(
         &self,
         adapters: &DeviceAdapters,

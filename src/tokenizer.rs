@@ -381,11 +381,11 @@ impl Bpe {
             if symbols.is_empty() {
                 continue;
             }
-            if self.ignore_merges {
-                if let Some(id) = self.vocab.get(&symbols.concat()) {
-                    ids.push(*id);
-                    continue;
-                }
+            if self.ignore_merges
+                && let Some(id) = self.vocab.get(&symbols.concat())
+            {
+                ids.push(*id);
+                continue;
             }
             if let Some(suffix) = &self.end_of_word {
                 symbols

@@ -133,7 +133,7 @@ impl Rope {
         base: f32,
         scaling: Option<RopeScaling>,
     ) -> Result<Self, NetworkError> {
-        if head_dim == 0 || head_dim % 2 != 0 {
+        if head_dim == 0 || !head_dim.is_multiple_of(2) {
             return Err(NetworkError::InvalidConfig(format!(
                 "rope head_dim must be even and non-zero, got {head_dim}"
             )));
@@ -254,7 +254,7 @@ impl Rope {
             )));
         }
 
-        if seq_len == 0 || tensor.rows % seq_len != 0 {
+        if seq_len == 0 || !tensor.rows.is_multiple_of(seq_len) {
             return Err(NetworkError::InvalidConfig(format!(
                 "rope got {} rows, which do not divide into sequences of {seq_len}",
                 tensor.rows
