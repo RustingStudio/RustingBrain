@@ -77,7 +77,7 @@ impl TimestepEmbedding {
         d_cond: usize,
         rng: &mut StdRng,
     ) -> Result<Self, NetworkError> {
-        if frequencies == 0 || frequencies % 2 != 0 {
+        if frequencies == 0 || !frequencies.is_multiple_of(2) {
             return Err(NetworkError::InvalidConfig(format!(
                 "a sinusoidal basis needs an even, non-zero width, not {frequencies}"
             )));
@@ -407,7 +407,7 @@ impl AdaLayerNorm {
                 actual: triple.cols,
             });
         }
-        if seq_len == 0 || input.rows % seq_len != 0 {
+        if seq_len == 0 || !input.rows.is_multiple_of(seq_len) {
             return Err(NetworkError::InvalidConfig(format!(
                 "{} rows do not split into sequences of {seq_len}",
                 input.rows
@@ -500,7 +500,7 @@ fn check_gate(
             residual.rows, residual.cols, branch.rows, branch.cols
         )));
     }
-    if seq_len == 0 || branch.rows % seq_len != 0 {
+    if seq_len == 0 || !branch.rows.is_multiple_of(seq_len) {
         return Err(NetworkError::InvalidConfig(format!(
             "{} rows do not split into sequences of {seq_len}",
             branch.rows

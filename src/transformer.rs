@@ -149,13 +149,13 @@ impl TransformerConfig {
             }
         }
 
-        if self.n_heads % self.n_kv_heads != 0 || self.n_kv_heads > self.n_heads {
+        if !self.n_heads.is_multiple_of(self.n_kv_heads) || self.n_kv_heads > self.n_heads {
             return Err(NetworkError::InvalidConfig(format!(
                 "n_heads ({}) must be a multiple of n_kv_heads ({})",
                 self.n_heads, self.n_kv_heads
             )));
         }
-        if self.head_dim % 2 != 0 {
+        if !self.head_dim.is_multiple_of(2) {
             return Err(NetworkError::InvalidConfig(format!(
                 "head_dim must be even for rotary embeddings, got {}",
                 self.head_dim

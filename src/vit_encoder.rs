@@ -222,7 +222,7 @@ impl VitEncoder {
                 "the patch embedding is {shape:?}, which is not a convolution weight"
             )));
         };
-        if patch != patch_cols || image_size % patch != 0 || image_size == 0 {
+        if patch != patch_cols || !image_size.is_multiple_of(patch) || image_size == 0 {
             return Err(NetworkError::InvalidConfig(format!(
                 "{image_size}-pixel images do not split into {patch}x{patch_cols} patches"
             )));

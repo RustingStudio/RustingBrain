@@ -40,7 +40,7 @@ keeps it. Then open a **new** terminal so your `PATH` updates.
 cargo --version
 ```
 
-You want something like `cargo 1.85.0` or newer. RustingBrain needs **1.85+**
+You want something like `cargo 1.88.0` or newer. RustingBrain needs **1.88+**
 because it uses the 2024 edition.
 
 If you get "command not found", your terminal hasn't picked up the new `PATH`.
@@ -215,7 +215,7 @@ Both are off by default, which is why the basic install is so small.
 | Symptom | Fix |
 |---------|-----|
 | `cargo: command not found` | Open a new terminal. If it persists, re-run the rustup installer. |
-| `error: package requires rustc 1.85` | `rustup update` |
+| `error: package requires rustc 1.88` | `rustup update` |
 | `linker 'cc' not found` (Linux) | `sudo apt install build-essential` (Debian/Ubuntu) or `sudo pacman -S base-devel` (Arch) |
 | `link.exe not found` (Windows) | Install "Desktop development with C++" from the Visual Studio Installer. |
 | Compile is very slow the first time | Normal. It's compiling dependencies once. Subsequent builds are cached. |

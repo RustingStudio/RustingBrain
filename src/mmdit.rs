@@ -163,7 +163,7 @@ impl DitConfig {
     }
 
     fn check(&self) -> Result<(), NetworkError> {
-        if self.num_heads == 0 || self.d_model % self.num_heads != 0 {
+        if self.num_heads == 0 || !self.d_model.is_multiple_of(self.num_heads) {
             return Err(NetworkError::InvalidConfig(format!(
                 "{} heads do not divide {} model dimensions",
                 self.num_heads, self.d_model

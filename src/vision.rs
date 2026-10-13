@@ -92,7 +92,7 @@ impl VitConfig {
     }
 
     fn check(&self) -> Result<(), NetworkError> {
-        if self.patch_size == 0 || self.image_size % self.patch_size != 0 {
+        if self.patch_size == 0 || !self.image_size.is_multiple_of(self.patch_size) {
             return Err(NetworkError::InvalidConfig(format!(
                 "a {}-pixel image does not divide into {}-pixel patches",
                 self.image_size, self.patch_size

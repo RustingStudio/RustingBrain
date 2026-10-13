@@ -972,7 +972,11 @@ impl ImagePipeline {
     /// downstream can represent a fraction of a patch.
     pub fn patch_grid(&self, width: usize, height: usize) -> Result<(usize, usize), NetworkError> {
         let block = self.upscale() * self.config.patch;
-        if width == 0 || height == 0 || width % block != 0 || height % block != 0 {
+        if width == 0
+            || height == 0
+            || !width.is_multiple_of(block)
+            || !height.is_multiple_of(block)
+        {
             return Err(NetworkError::InvalidConfig(format!(
                 "a {width}x{height} image does not divide into {block}-pixel patches"
             )));

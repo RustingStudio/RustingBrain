@@ -1282,7 +1282,7 @@ impl GroupNorm {
         bias: Vec<f32>,
         eps: f32,
     ) -> Result<Self, NetworkError> {
-        if groups == 0 || weight.is_empty() || weight.len() % groups != 0 {
+        if groups == 0 || weight.is_empty() || !weight.len().is_multiple_of(groups) {
             return Err(NetworkError::InvalidConfig(format!(
                 "{} channels do not divide into {groups} groups",
                 weight.len()
@@ -1357,7 +1357,7 @@ pub struct GroupNormCache {
 impl TrainableGroupNorm {
     /// Scale ones, shift zeros.
     pub fn new(groups: usize, channels: usize, eps: f32) -> Result<Self, NetworkError> {
-        if groups == 0 || channels == 0 || channels % groups != 0 {
+        if groups == 0 || channels == 0 || !channels.is_multiple_of(groups) {
             return Err(NetworkError::InvalidConfig(format!(
                 "{channels} channels do not divide into {groups} groups"
             )));
@@ -1868,7 +1868,7 @@ pub fn upsample_nearest(map: &FeatureMap, factor: usize) -> FeatureMap {
 /// PyTorch's `pixel_shuffle` uses, so a checkpoint's weights line up.
 pub fn pixel_shuffle(map: &FeatureMap, factor: usize) -> Result<FeatureMap, NetworkError> {
     let square = factor * factor;
-    if factor == 0 || map.channels % square != 0 {
+    if factor == 0 || !map.channels.is_multiple_of(square) {
         return Err(NetworkError::InvalidConfig(format!(
             "{} channels do not shuffle by {factor}",
             map.channels
@@ -1902,7 +1902,7 @@ pub fn pixel_shuffle(map: &FeatureMap, factor: usize) -> Result<FeatureMap, Netw
 /// The inverse of [`pixel_shuffle`]: resolution back into channels, which is
 /// how FLUX.2 packs a latent before the transformer sees it.
 pub fn pixel_unshuffle(map: &FeatureMap, factor: usize) -> Result<FeatureMap, NetworkError> {
-    if factor == 0 || map.height % factor != 0 || map.width % factor != 0 {
+    if factor == 0 || !map.height.is_multiple_of(factor) || !map.width.is_multiple_of(factor) {
         return Err(NetworkError::InvalidConfig(format!(
             "a {}x{} map does not unshuffle by {factor}",
             map.height, map.width
@@ -4898,7 +4898,8 @@ mod tests {
 
     #[test]
     fn pixel_attention_matches_ultralytics() {
-        let fixture = std::path::Path::new("/home/vasylt/Code/games/cs2/fixtures/k13a_attention.json");
+        let fixture =
+            std::path::Path::new("/home/vasylt/Code/games/cs2/fixtures/k13a_attention.json");
         let Ok(text) = std::fs::read_to_string(fixture) else {
             eprintln!("skipped: no {}", fixture.display());
             return;

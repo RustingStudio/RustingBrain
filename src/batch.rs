@@ -253,7 +253,7 @@ impl<'a> Layout<'a> {
     /// every row.
     pub fn check(&self, rows: usize) -> Result<(), NetworkError> {
         let seq_len = self.seq_len(rows);
-        if rows % seq_len != 0 {
+        if !rows.is_multiple_of(seq_len) {
             return Err(NetworkError::InvalidConfig(format!(
                 "{rows} rows do not divide into sequences of {seq_len}"
             )));

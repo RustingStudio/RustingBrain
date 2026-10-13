@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## 4.0.0
+
+A major version because 3.0.1 broke the 3.0.0 API in a patch release; 3.0.1 is
+yanked and its changes are released here. Code written for 3.0.0 needs these
+changes:
+
+- `AgentConfig::causal` is a new field (`None` keeps the old MLP trunk). Build
+  from `AgentConfig::new` and set fields, or name the field in a literal.
+- `ClipTextConfig::argmax_pool` is a new field (`ClipTextConfig::default()`
+  sets `true`). Name it, or use `..Default::default()`.
+- `QNetwork::trunk` is now a `Trunk` (`Trunk::Mlp` holds the old
+  `MarketTrunk`), and `ForwardCache::trunk` is a `TrunkState`
+  (`TrunkState::Mlp` holds the old `TrunkCache`). Read the trunk's output
+  through `TrunkState::h()`.
+- The minimum Rust version is 1.88, up from 1.85. The `cuda` feature already
+  needed 1.88 through `cudarc`'s `libloading` dependency.
 
 ### Changed
 

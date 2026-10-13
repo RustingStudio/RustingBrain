@@ -834,13 +834,13 @@ impl FlowTransformer {
         times: &[f32],
     ) -> Result<usize, NetworkError> {
         let config = self.config;
-        if latent.cols != config.latent_dim || latent.rows % config.latents != 0 {
+        if latent.cols != config.latent_dim || !latent.rows.is_multiple_of(config.latents) {
             return Err(NetworkError::InvalidConfig(format!(
                 "the latent is [{}, {}] and this model wants a multiple of [{}, {}]",
                 latent.rows, latent.cols, config.latents, config.latent_dim
             )));
         }
-        if tokens.cols != config.cond_dim || tokens.rows % config.cond_tokens != 0 {
+        if tokens.cols != config.cond_dim || !tokens.rows.is_multiple_of(config.cond_tokens) {
             return Err(NetworkError::InvalidConfig(format!(
                 "the condition is [{}, {}] and this model wants a multiple of [{}, {}]",
                 tokens.rows, tokens.cols, config.cond_tokens, config.cond_dim

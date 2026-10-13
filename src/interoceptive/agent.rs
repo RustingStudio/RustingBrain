@@ -253,7 +253,7 @@ impl InteroceptiveAgent {
             self.config.max_grad_norm,
         )
         .expect("host parameters cannot fail a step");
-        if self.updates % self.config.target_sync == 0 {
+        if self.updates.is_multiple_of(self.config.target_sync) {
             self.target = self.online.clone();
         }
         loss

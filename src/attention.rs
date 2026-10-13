@@ -183,7 +183,7 @@ impl MultiHeadAttention {
                 "attention needs at least one query head and one key/value head".into(),
             ));
         }
-        if num_kv_heads > num_heads || num_heads % num_kv_heads != 0 {
+        if num_kv_heads > num_heads || !num_heads.is_multiple_of(num_kv_heads) {
             return Err(NetworkError::InvalidConfig(format!(
                 "num_heads ({num_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
             )));
@@ -794,7 +794,7 @@ impl MultiHeadAttention {
                 "cross-attention needs at least one query and one key per sequence".into(),
             ));
         }
-        if queries_in.rows % q_len != 0 || kv_in.rows % kv_len != 0 {
+        if !queries_in.rows.is_multiple_of(q_len) || !kv_in.rows.is_multiple_of(kv_len) {
             return Err(NetworkError::InvalidConfig(format!(
                 "{} query rows and {} key rows do not split into sequences of {q_len} and {kv_len}",
                 queries_in.rows, kv_in.rows
