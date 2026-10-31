@@ -1893,3 +1893,54 @@ For the P phase: `head_norm_rope` at 7.3 ms a call for a per-head norm and
 rotation is far off bandwidth and is the cheapest target; attention is 24 ms a
 block against diffusers' whole step of 1.54 s over 25 blocks; and the 12 s host
 prompt encode is the largest single stage of a request.
+
+## FLUX.2-klein-4B prompt encoder on the device (P1, 2026-11-01)
+
+`ImagePipeline::to_cuda` now uploads the Qwen3 prompt encoder (cut at 27
+layers) beside the transformer (`src/cuda_text_encoder.rs`). Each layer: RMS
+norm, one fused q/k/v projection, a per-head norm and half-split rotation in
+one kernel, the fused attention kernel (32 query heads over 8 key heads, every
+row reading only the real tokens' keys, as diffusers' mask does), the output
+projection added into an FP32 residual, then the SwiGLU MLP. The states after
+layers 9, 18 and 27 are read back and laid side by side.
+
+Parity against diffusers' `prompt_embeds` (all 512 positions, 3 x 2560 wide),
+test `pipeline::tests::flux2_klein_device_encoder_matches_diffusers`
+(`RB_FLUX2_REF`, `RB_FLUX2_ENCODER=f32` for the second row), which also
+encodes once on the host first. RTX 3060, under the GPU lock.
+
+| Weights | Activations into the GEMMs | Host | Device | Encode, 4 calls (ms) |
+|---|---|---|---|---|
+| Q8 | BF16 (first try) | 0.0251 | 0.02587 | 625 / 204 / 199 / 199 |
+| Q8 | FP32 (kept) | 0.02505 | 0.02492 | 605 / 430 / 429 / 428 |
+| F32 checkpoint as BF16 | BF16 (kept) | 6.2e-6 | 6.16e-3 | 395 / 161 / 158 / 158 |
+
+BF16 activations on top of Q8's rounding put the device over the host's
+0.025, so int8 weights keep FP32 activations (they are dequantized into a
+scratch buffer per call either way); BF16 weights keep BF16 activations. Load
+average 0.9-4.3 over these runs; the first call each run includes cuBLAS and
+kernel warmup. `flux2_klein_matches_diffusers` with `RB_FLUX2_CUDA=1` passes
+with the encoder on the device: embeddings 0.0249, step 0 0.0141, final latent
+0.0441, image 0.0263 (K14 device: 0.025, 0.0141, 0.044, 0.026).
+
+`examples/text_to_image.rs`, the F3 command (`QUANTIZE=1 CUDA=0 WIDTH=1024
+HEIGHT=1024 SEED=0 peakvram.sh`), three runs under the lock, load 7.1, 6.5,
+4.8 at their starts and 3.5 after. Run 1 / 2 / 3, mean (spread), seconds:
+
+| Stage | F3 (encoder on the host) | P1 (encoder on the device) |
+|---|---|---|
+| Load from disk | 20.1 (0.2) | 23.7 / 26.8 / 20.4, 23.6 (6.4) |
+| Upload to the device | 5.9 (0.0) | 15.3 / 18.6 / 8.3, 14.1 (10.3) |
+| Prompt encode | 12.4 (1.0) | 0.8 / 0.7 / 0.7, 0.73 (0.1) |
+| Denoise + decode | 10.5 | 10.3 / 10.3 / 10.3, 10.3 (0.0) |
+| Encode + denoise + decode | 22.9 (1.1) | 11.1 / 11.0 / 11.0, 11.0 (0.1) |
+| Process start to image | 48.9 (1.0) | 50.1 / 56.4 / 39.8, 48.8 (16.6) |
+| Peak VRAM (nvidia-smi) | 6754 MiB | 10402 MiB (all 3) |
+| Peak host RSS | 7.1-7.2 GiB | 5.7-7.3 GiB |
+
+The upload grows by the encoder's int8 weights (about 2.7 GB) and its spread
+follows the load (another loop was reading from disk); run 3 at load 4.8 took
+8.3 s. The request path a server keeps warm is the encode + denoise + decode
+row: 22.9 to 11.0 s. 10402 MiB leaves about 1.9 GB on the 12 GB card at
+1024x1024, so the encoder stays resident; there is no encode-then-free step.
+The three PNGs are byte for byte the same and show the lighthouse in fog.
