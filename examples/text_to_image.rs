@@ -63,15 +63,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("loading {directory}");
-    let started = std::time::Instant::now();
+    let run = std::time::Instant::now();
+    let started = run;
     let mut pipeline = ImagePipeline::load_at(&directory, precision)?;
     println!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
     // Opt-in, and never fatal: a device that is not there leaves the run
     // exactly where it was.
     if let Some(device) = std::env::var("CUDA").ok().and_then(|v| v.parse().ok()) {
+        let started = std::time::Instant::now();
         match pipeline.try_cuda(device) {
-            true => println!("running on CUDA device {device}"),
+            true => println!(
+                "running on CUDA device {device}, uploaded in {:.1}s",
+                started.elapsed().as_secs_f32()
+            ),
             false => println!("no usable CUDA device {device}, staying on the CPU"),
         }
     }
@@ -86,6 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipeline.config.guidance = guidance;
     }
 
+    let started = std::time::Instant::now();
     let conditioning = pipeline.condition(&prompt, width, height)?;
     // Classifier-free guidance denoises a second prompt alongside the real one
     // and steps along the difference, so a guidance above one costs two
@@ -98,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         false => None,
     };
+    println!("prompt encoded in {:.1}s", started.elapsed().as_secs_f32());
     let steps = pipeline.config.steps;
     let started = std::time::Instant::now();
     let latent =
@@ -106,12 +113,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             true
         })?;
+    let denoised = started.elapsed();
 
     let (columns, rows) = pipeline.patch_grid(width, height)?;
     let image = pipeline.decode(&latent, columns, rows)?;
     println!(
-        "\n{width}x{height} in {:.1}s",
-        started.elapsed().as_secs_f32()
+        "\n{width}x{height} in {:.1}s (denoise {:.2}s, decode {:.2}s), {:.1}s since loading began",
+        started.elapsed().as_secs_f32(),
+        denoised.as_secs_f32(),
+        (started.elapsed() - denoised).as_secs_f32(),
+        run.elapsed().as_secs_f32()
     );
 
     save_png(&image, &output)?;

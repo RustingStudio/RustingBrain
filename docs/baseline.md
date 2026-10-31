@@ -1806,3 +1806,90 @@ decode in 10.4 / 10.6 / 10.5 s (mean 10.5, spread 0.2); about 50 s a run end
 to end with the prompt encoded on the host. The three PNGs are byte for byte
 the same; one is kept as
 `RustingFrame/tools/ref/flux2/rustingbrain_1024.png`.
+
+## FLUX.2-klein-4B speed at 1024x1024 against diffusers (F3, 2026-11-01)
+
+FLUX.2-klein-4B, 1024x1024, the model's default of 4 steps (distilled, so
+guidance 1 and one transformer pass a step), seed 0, prompt "a lighthouse on a
+rocky coast in fog". RTX 3060 12 GB, Ryzen 5 7600X. Every run under the GPU
+lock; the page cache was warm for both sides. Three timed runs each; numbers
+are run 1 / 2 / 3, then mean and spread (max - min), in seconds.
+
+RustingBrain, Q8 (`examples/text_to_image.rs`, which now prints each stage):
+Qwen3 encoder on the host at Q8, transformer and VAE on the device (Q8
+weights dequantized into BF16 GEMMs, BF16 activations). Load average
+4.5-6.7 (other loops running).
+
+```
+pgrep -l dota2 && exit 1; pgrep -x cs2 && exit 1; uptime; flock /home/vasylt/Code/rusting/.gpu.lock \
+  env QUANTIZE=1 CUDA=0 WIDTH=1024 HEIGHT=1024 SEED=0 peakvram.sh \
+  ./target/release/examples/text_to_image <FLUX.2-klein-4B> "a lighthouse on a rocky coast in fog" out.png
+```
+
+(`peakvram.sh` polls `nvidia-smi --query-compute-apps` every 100 ms for the
+run's PID and `VmHWM` from `/proc`.)
+
+diffusers 0.42.1, torch cu132, BF16 (`RustingFrame/tools/f3_diffusers_bench.py`):
+no offload hooks. The transformer and VAE are loaded straight onto the GPU
+(`device_map="cuda"`), the Qwen3 encoder stays on the CPU in BF16, the same
+split as ours. Both large parts on the card are 14.7 GiB of weights against
+12 GB, and `enable_model_cpu_offload()` holds all of them in host RAM (about
+15 GB), which the shared machine could not spare under the 4 GB margin. One
+warmup, then three timed runs, each stage ended by `torch.cuda.synchronize()`.
+"Denoise" includes latent and schedule setup; "decode" is unpack, batch-norm
+undo, VAE decode and conversion to PIL. Default SDPA attention. Load average
+3.0-3.1.
+
+| Stage | RustingBrain Q8 | mean (spread) | diffusers BF16 | mean (spread) |
+|---|---|---|---|---|
+| Load from disk | 20.1 / 20.2 / 20.0 (reads BF16, quantizes) | 20.1 (0.2) | 4.1 (once) | 4.1 |
+| Upload to the device | 5.9 / 5.9 / 5.9 | 5.9 (0.0) | in the load | - |
+| Prompt encode, host | 13.0 / 12.0 / 12.2 (Q8) | 12.4 (1.0) | 3.97 / 2.75 / 2.72 (BF16) | 3.15 (1.25) |
+| Denoise, 4 steps | 10.05 / 9.95 / 9.87 | 9.96 (0.18) | 6.39 / 6.34 / 6.38 | 6.37 (0.05) |
+| One step | 2.49 mean | - | 1.73-1.77 first, 1.54 after | 1.59 |
+| VAE decode | 0.54 / 0.52 / 0.60 | 0.55 (0.08) | 0.61 / 0.61 / 0.61 | 0.61 (0.00) |
+| Encode + denoise + decode | 23.6 / 22.5 / 22.7 | 22.9 (1.1) | 10.97 / 9.70 / 9.71 | 10.13 (1.27) |
+| Process start to image | 49.6 / 48.6 / 48.6 | 48.9 (1.0) | - | - |
+| Peak VRAM | 6754 MiB (nvidia-smi, all 3) | | 9.77 GiB allocated, 10.56 reserved, 10956 MiB nvidia-smi | |
+| Peak host RSS | 7.1-7.2 GiB | | 9.4 GiB | |
+
+An earlier diffusers run (load 4.7 before, 3.5 after) gave encode 3.52 (1.59), denoise
+6.39 (0.12), decode 0.62 (0.02), total 10.53 (1.65); it then ran out of
+device memory in its encoder-on-GPU part, which the script now frees first.
+The encoder on the GPU in diffusers (transformer dropped, 7.80 GiB
+allocated): 0.22 / 0.22 / 0.22 s, moved there in 1.0 s.
+
+So on the device RustingBrain's transformer is 1.56x slower than diffusers'
+(2.49 against 1.59 s a step), its decoder is level, and its host prompt encode
+is 3.9x slower than torch's BF16 on the same CPU and 56x slower than the
+encoder on the GPU. Each side's three PNGs are byte for byte the same. The two
+sides' images differ in composition (each draws its own seed-0 noise) and both
+show a clean lighthouse in fog:
+`RustingFrame/tools/ref/f3/rustingbrain_q8_1024_run{1,2,3}.png`,
+`RustingFrame/tools/ref/f3/diffusers_bf16_1024_{warmup,run1,run2,run3}.png`.
+
+**F32 does not fit.** `Precision::F32` holds the host model in F32 before the
+upload and keeps the transformer there afterwards: transformer 3.876B
+parameters = 14.4 GiB, the encoder cut at layer 27 about 3.11B = 11.6 GiB,
+VAE 0.3 GiB, so about 26 GiB of host RAM against 18-19 GB available of the
+machine's 30. Not run. On the device the F32 model would upload BF16 weights
+(7.2 GiB transformer), the same footprint as diffusers' 9.77 GiB peak, so the
+card is not the limit; the host is.
+
+nsys over one Q8 run (`nsys profile -t cuda`, same command, under the lock,
+load 2.7-3.9). Kernel time 10.48 s, nearly all of it the 4 denoise steps:
+
+| Kernel | Time | Share | Calls | Per call |
+|---|---|---|---|---|
+| `cutlass_80_tensorop_s16816gemm_bf16_256x128` | 3.00 s | 28.6% | 164 | 18.3 ms |
+| `flash_attention_fwd_128` | 2.44 s | 23.3% | 100 | 24.4 ms |
+| `head_norm_rope` | 1.74 s | 16.6% | 240 | 7.3 ms |
+| `ampere_s16816gemm_bf16_128x128` | 0.82 s | 7.8% | 80 | 10.2 ms |
+| `bias_gelu` | 0.55 s | 5.2% | 536 | 1.0 ms |
+
+Then `ampere_s16816gemm_bf16_256x128` 0.29 s, `dequantize_q8` 0.27 s,
+`quantize_rows_q8` 0.27 s. Host-to-device copies 1.10 s (the weight upload).
+For the P phase: `head_norm_rope` at 7.3 ms a call for a per-head norm and
+rotation is far off bandwidth and is the cheapest target; attention is 24 ms a
+block against diffusers' whole step of 1.54 s over 25 blocks; and the 12 s host
+prompt encode is the largest single stage of a request.
