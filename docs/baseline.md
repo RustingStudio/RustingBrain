@@ -1759,3 +1759,50 @@ build, one warm-up and five timed steps. Load average 10.4 at the start and
 | step | 191.0 (all five 191.0) |
 
 The optimizer update and the noise sampling are not in the number.
+
+## FLUX.2-klein-4B reference check (K14, 2026-11-01)
+
+FLUX.2-klein-4B, 512x512, 4 steps, seed 0, prompt "a lighthouse on a rocky
+coast in fog". Reference: diffusers `Flux2KleinPipeline`'s own helpers, run on
+the CPU in F32 from the BF16 checkpoint (`scripts/flux2_reference.py`; the
+cut-down transformer in `scripts/flux2_blocks_reference.py`). Our side reads
+diffusers' noise from the dump. Tests `pipeline::tests::flux2_klein_matches_diffusers`
+and `flux2_klein_blocks_match_diffusers`, both ignored, `RB_FLUX2_REF` set.
+Relative L2 error. Before this item the pipeline did not load the model at
+all (no FLUX.2 layout), so there is no "before" column.
+
+| Part | Host | Device (RTX 3060) |
+|---|---|---|
+| Token ids, 512 with 21 real | exact | exact (host tokenizer) |
+| Prompt embeddings, encoder F32 | 6.2e-6 | (encoder stays on the host) |
+| Prompt embeddings, encoder Q8 | 0.025 | 0.025 |
+| Sigmas (empirical mu 2.0307) | 3.3e-8 | 3.3e-8 |
+| Transformer, first 2 double + 2 single blocks, F32 (device: BF16) | 1.4e-6 | 0.0025 |
+| Transformer, first 2 double + 2 single blocks, Q8 | 0.0075 | 0.0084 |
+| Step-0 prediction, whole transformer Q8, reference embeddings | 0.0127 | 0.0141 |
+| Final latent after 4 steps, Q8 | 0.036 | 0.044 |
+| Autoencoder input (batch norm undone, unpacked) | 4.4e-8 | 4.4e-8 |
+| Decoded image from diffusers' final latent | 1.8e-4 | 7.9e-4 |
+| Decoded image, whole chain | 0.023 | 0.026 |
+
+Against C11's gates: the encoder (F32 6.2e-6, Q8 0.025 against CLIP-G's
+0.021-0.025), the schedule and the decoder (1.8e-4 against the VAE's 0.012)
+are inside them. The Q8 transformer is not: 0.0127 at step 0 against the SDXL
+UNet's 0.001-0.006. That is Q8's per-row rounding, not a wrong layer: the same
+real weights through four blocks in F32 sit at 1.4e-6, and holding the shared
+modulations in F32 moved the four-block Q8 error only from 0.0075 to 0.0074.
+The whole transformer in F32 needs about 16 GB, which the machine could not
+spare beside the other loop (19 GB free), so it was not run. The device runs
+BF16 activations, which is the 0.0025.
+
+Load: host run 1.4-8.3 (other projects), device run 1.6-4.8. Host, Q8: load
+18.8 s, one transformer step at 512x512 58 s, four 240 s, decode 16 s.
+Device: load 27.1 s, one step 0.90 s, four steps 2.66 s, decode 0.19 s.
+
+`examples/text_to_image.rs` (`QUANTIZE=1 CUDA=0 WIDTH=1024 HEIGHT=1024
+STEPS=4 SEED=0`), RTX 3060, three runs under the GPU lock, load 1.4-5.2:
+loaded in 19.5 / 17.9 / 18.0 s (mean 18.5, spread 1.6), four steps and the
+decode in 10.4 / 10.6 / 10.5 s (mean 10.5, spread 0.2); about 50 s a run end
+to end with the prompt encoded on the host. The three PNGs are byte for byte
+the same; one is kept as
+`RustingFrame/tools/ref/flux2/rustingbrain_1024.png`.

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- FLUX.2-klein loads and runs through `ImagePipeline`, checked stage by stage
+  against diffusers (`docs/baseline.md`, K14). New public items:
+  `ChatPrompt`, `ImagePipeline::sample_latent_from_noise`, `TextEncoder::forward_layers`,
+  `VaeDecoder::patch_norm`. A diffusers-layout DiT loaded at Q8 no longer
+  panics. Breaking for code that names these: `DynamicShift` gains
+  `empirical` and `DynamicShift::shift` takes the step count,
+  `PromptEncoder::Sequence` gains `chat` (`None` keeps the old behaviour), and
+  `VaeConfig` gains `batch_norm_eps`.
+
 ## 4.0.0
 
 A major version because 3.0.1 broke the 3.0.0 API in a patch release; 3.0.1 is
