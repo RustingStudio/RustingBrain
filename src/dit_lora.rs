@@ -255,6 +255,9 @@ impl DitLora {
     /// device path writes where an adapter's rows say, so it refuses one
     /// that does not.
     pub(crate) fn check(&self, dit: &Dit) -> Result<(), NetworkError> {
+        if dit.swiglu && !self.adapters.is_empty() {
+            return Err(swiglu_unsupported());
+        }
         for (key, list) in &self.adapters {
             let dense = projection(dit, key).ok_or_else(|| {
                 NetworkError::InvalidConfig(format!("{key} names a block the model lacks"))
@@ -325,6 +328,9 @@ impl DitLora {
         timestep: f32,
         conditioning: &Conditioning,
     ) -> Result<(Matrix, Tape), NetworkError> {
+        if dit.swiglu {
+            return Err(swiglu_unsupported());
+        }
         let config = dit.config();
         let (heads, eps) = (config.num_heads, config.eps);
         let vector = dit.vector(timestep, conditioning)?;
@@ -921,6 +927,12 @@ fn map(matrix: &Matrix, function: fn(f32) -> f32) -> Matrix {
         matrix.cols,
         matrix.data.iter().map(|value| function(*value)).collect(),
     )
+}
+
+/// FLUX.2's SwiGLU feed-forwards have no adapter path yet: this file runs
+/// and differentiates the GELU ones only.
+fn swiglu_unsupported() -> NetworkError {
+    NetworkError::InvalidConfig("LoRA on a SwiGLU (FLUX.2) denoiser is not supported yet".into())
 }
 
 /// `grad * gelu'(pre)`.

@@ -991,6 +991,21 @@ pub(crate) fn write_checkpoint(
     write(path, &flat, &BTreeMap::new()).unwrap();
 }
 
+/// Reads every tensor of a checkpoint back as floats, so a test can add to a
+/// file another fixture wrote.
+#[cfg(test)]
+pub(crate) fn read_checkpoint(path: &std::path::Path) -> BTreeMap<String, (Vec<usize>, Vec<f32>)> {
+    let mut file = ShardedSafeTensors::open(path).unwrap();
+    let names: Vec<String> = file.names().map(str::to_string).collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let (values, shape) = file.tensor(&name).unwrap();
+            (name, (shape, values))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
