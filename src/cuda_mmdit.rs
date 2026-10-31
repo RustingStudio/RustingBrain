@@ -120,10 +120,14 @@ extern "C" __global__ void gelu_bwd(float*g,const float*pre,int n){
   g[i]*=0.5f*(1.f+th)+0.5f*x*(1.f-th*th)*0.7978846f*(1.f+3.f*0.044715f*x*x);
 }
 // `dst = act(src[:, off..off + cols] + bias[off..])`, where the activation is
-// the tanh GELU or none. `dst` is `[rows, cols]`, `src` has row stride `stride`.
+// the tanh GELU (`gelu` 1) or none (0). `dst` is `[rows, cols]`, `src` has row
+// stride `stride`. With `gelu` 2 it is SwiGLU instead, without a bias:
+// `silu(src[:, c]) * src[:, cols + c]`, so `src` is twice as wide as `dst`.
 extern "C" __global__ void bias_gelu(float*dst,const float*src,const float*bias,int rows,int cols,int stride,int off,int gelu,int has_bias){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*cols)return;int r=i/cols,c=i-r*cols;
-  float v=src[(size_t)r*stride+off+c];if(has_bias)v+=bias[off+c];
+  float v=src[(size_t)r*stride+off+c];
+  if(gelu==2){dst[i]=v/(1.f+expf(-v))*src[(size_t)r*stride+off+cols+c];return;}
+  if(has_bias)v+=bias[off+c];
   if(gelu)v=0.5f*v*(1.f+tanhf(0.7978846f*(v+0.044715f*v*v*v)));
   dst[i]=v;
 }
@@ -261,10 +265,16 @@ pub struct DeviceDit {
     quantized: bool,
     image_in: Linear,
     text_in: Linear,
-    /// Every block's modulation projection stacked, in the order
-    /// [`DeviceDit::forward`] reads them: each double block's image then text
-    /// stream, each single block, then the final layer.
+    /// Every distinct modulation projection stacked, in the order
+    /// [`DeviceDit::forward`] first reads them: each double block's image
+    /// then text stream, each single block, then the final layer.
     modulation: Linear,
+    /// Where in the stacked modulation each of those readers' rows start,
+    /// in that order. FLUX.2's blocks share three projections, so several
+    /// readers point at the same rows.
+    slots: Vec<usize>,
+    /// Whether the feed-forwards are SwiGLU, as FLUX.2's are.
+    swiglu: bool,
     double: Vec<(DeviceStream, DeviceStream)>,
     single: Vec<DeviceSingle>,
     final_out: Linear,
@@ -337,7 +347,7 @@ impl DeviceDit {
             })
         };
 
-        let modulations: Vec<&Dense> = dit
+        let readers: Vec<&Dense> = dit
             .double
             .iter()
             .flat_map(|block| {
@@ -349,6 +359,19 @@ impl DeviceDit {
             .chain(dit.single.iter().map(|block| &block.modulation.projection))
             .chain([&dit.final_modulation])
             .collect();
+        // A projection several blocks share is stacked once.
+        let mut modulations: Vec<&Dense> = Vec::new();
+        let mut slots = Vec::new();
+        for &layer in &readers {
+            let index = match modulations.iter().position(|seen| std::ptr::eq(*seen, layer)) {
+                Some(index) => index,
+                None => {
+                    modulations.push(layer);
+                    modulations.len() - 1
+                }
+            };
+            slots.push(modulations[..index].iter().map(|seen| seen.out_dim()).sum());
+        }
         let (mut weights, mut biases) = (Vec::new(), Vec::new());
         for layer in &modulations {
             weights.extend_from_slice(&layer.weight_f32().data);
@@ -403,6 +426,8 @@ impl DeviceDit {
             gelu_bwd: get("gelu_bwd")?,
             gate_rows: get("gate_rows")?,
             quantized: quantized.get(),
+            slots,
+            swiglu: dit.swiglu,
             image_in: dense(&dit.image_in)?,
             text_in: dense(&dit.text_in)?,
             modulation,
@@ -501,11 +526,10 @@ impl DeviceDit {
 
         let mut text = self.input(&gpu, &self.text_in, &conditioning.text)?;
         let mut image = self.input(&gpu, &self.image_in, patches)?;
-        let mut at = 0;
+        let mut slots = self.slots.iter();
         let mut triple = |count: usize| {
-            let view = modulation.slice(at..at + count * width);
-            at += count * width;
-            view
+            let at = *slots.next().expect("one slot per modulation reader");
+            modulation.slice(at..at + count * width)
         };
 
         let mut double = Vec::new();
@@ -689,6 +713,7 @@ impl DeviceDit {
             }
             let (merged, log_sum_exp, qkv) = self.attention(&gpu, &qkv, rows, heads, width)?;
             let activated = self.gelu(&gpu, &pre, rows, mlp_dim)?;
+            let mlp_width = block.mlp_out.inner;
             let mut output = gpu.uninit(rows * width)?;
             self.project(
                 &gpu,
@@ -709,7 +734,7 @@ impl DeviceDit {
             self.adapt(
                 &gpu,
                 adapted("fused_out"),
-                &[(merged.all(), width), (activated.all(), mlp_dim)],
+                &[(merged.all(), width), (activated.all(), mlp_width)],
                 rows,
                 &mut output.slice_mut(..),
                 width,
@@ -785,6 +810,11 @@ impl DeviceDit {
         if self.quantized {
             return Err(NetworkError::InvalidConfig(
                 "the device backward needs BF16 base weights, not int8 ones".into(),
+            ));
+        }
+        if self.swiglu {
+            return Err(NetworkError::InvalidConfig(
+                "the device backward runs GELU denoisers only, not SwiGLU (FLUX.2) ones".into(),
             ));
         }
         if tape.double.len() != self.double.len() || tape.single.len() != self.single.len() {
@@ -1399,7 +1429,8 @@ impl DeviceDit {
         gpu.narrowed(&out.slice(..), rows * width, true)
     }
 
-    /// The tanh GELU of `pre`, narrow.
+    /// The tanh GELU of `pre`, narrow, or for a SwiGLU model SwiGLU, which
+    /// is half as wide as `pre`'s `cols`.
     ///
     /// NOTE: a pass of its own rather than fused into the bias add, so
     /// that `pre` is there for the backward pass; one kernel writing both
@@ -1411,6 +1442,10 @@ impl DeviceDit {
         rows: usize,
         cols: usize,
     ) -> Result<Act, NetworkError> {
+        let (stride, cols, mode) = match self.swiglu {
+            true => (cols, cols / 2, 2i32),
+            false => (cols, cols, 1),
+        };
         let mut out = gpu.uninit(rows * cols)?;
         unsafe {
             self.context
@@ -1421,9 +1456,9 @@ impl DeviceDit {
                 .arg(pre)
                 .arg(&(rows as i32))
                 .arg(&(cols as i32))
-                .arg(&(cols as i32))
+                .arg(&(stride as i32))
                 .arg(&0i32)
-                .arg(&1i32)
+                .arg(&mode)
                 .arg(&0i32)
                 .launch(cfg(rows * cols))
                 .map_err(cuda_err("MMDiT GELU kernel"))?;
@@ -1753,12 +1788,30 @@ mod tests {
 
     #[test]
     fn a_device_dit_matches_the_host_or_skips_without_device() {
-        let Some(context) = cuda_or_skip() else {
-            return;
-        };
         let config = config();
         let path = std::env::temp_dir().join("rusting_brain_cuda_mmdit.safetensors");
         checkpoint(&config, &path);
+        device_matches_host(&config, &path);
+    }
+
+    /// FLUX.2's shape: shared modulations, SwiGLU, four rotary axes, no
+    /// biases and no pooled prompt.
+    #[test]
+    fn a_flux2_device_dit_matches_the_host_or_skips_without_device() {
+        let config = DitConfig {
+            pooled_dim: 0,
+            axes_dim: vec![16, 16, 16, 16],
+            ..config()
+        };
+        let path = std::env::temp_dir().join("rusting_brain_cuda_mmdit_flux2.safetensors");
+        crate::mmdit::tests::flux2_checkpoint(&config, &path);
+        device_matches_host(&config, &path);
+    }
+
+    fn device_matches_host(config: &DitConfig, path: &std::path::Path) {
+        let Some(context) = cuda_or_skip() else {
+            return;
+        };
         let (height, width) = (3, 5);
         let patches = Matrix::from_vec(
             height * width,
@@ -1767,9 +1820,9 @@ mod tests {
                 .map(|index| (index as f32 * 0.23).cos())
                 .collect(),
         );
-        let conditioning = conditioning(&config, height, width);
+        let conditioning = conditioning(config, height, width);
         for precision in [Precision::F32, Precision::Q8] {
-            let dit = Dit::load_at(&path, "", config.clone(), precision).unwrap();
+            let dit = Dit::load_at(path, "", config.clone(), precision).unwrap();
             let device = DeviceDit::upload(&context, &dit).unwrap();
             let expected = dit.forward_with(&patches, 0.4, &conditioning).unwrap();
             let actual = device

@@ -104,16 +104,40 @@ pub struct DynamicShift {
     pub max_shift: f32,
     pub base_seq_len: usize,
     pub max_seq_len: usize,
+    /// FLUX.2's pipeline ignores the four numbers above and takes the
+    /// exponent from a fit over the image size and the step count instead,
+    /// `compute_empirical_mu` in diffusers.
+    pub empirical: bool,
 }
 
 impl DynamicShift {
-    /// The shift for an image of this many patches.
-    pub fn shift(&self, patches: usize) -> f32 {
+    /// The shift for an image of this many patches, sampled in `steps`.
+    pub fn shift(&self, patches: usize, steps: usize) -> f32 {
+        if self.empirical {
+            return empirical_mu(patches, steps).exp();
+        }
         let span = self.max_seq_len.saturating_sub(self.base_seq_len).max(1) as f32;
         let slope = (self.max_shift - self.base_shift) / span;
         let offset = self.base_shift - slope * self.base_seq_len as f32;
         (slope * patches as f32 + offset).exp()
     }
+}
+
+/// diffusers' `compute_empirical_mu` for FLUX.2: two lines in the sequence
+/// length, fitted at 10 and at 200 steps, and a line between them in the
+/// step count. Long sequences take the 200-step line alone.
+fn empirical_mu(patches: usize, steps: usize) -> f32 {
+    let (a1, b1) = (8.738_095_24e-05_f64, 1.898_333_33);
+    let (a2, b2) = (0.000_169_27_f64, 0.456_666_66);
+    let length = patches as f64;
+    let at_200 = a2 * length + b2;
+    if patches > 4300 {
+        return at_200 as f32;
+    }
+    let at_10 = a1 * length + b1;
+    let slope = (at_200 - at_10) / 190.0;
+    let offset = at_200 - 200.0 * slope;
+    (slope * steps as f64 + offset) as f32
 }
 
 /// How long a T5 prompt is padded to when its tokenizer does not say, which is
@@ -251,6 +275,10 @@ pub enum PromptEncoder {
     Sequence {
         tokenizer: Bpe,
         encoder: TextEncoder,
+        /// Set for a model that reads its prompt through a chat template and
+        /// from several layers at once, which is FLUX.2. Left empty, the
+        /// prompt is read bare and from the last layer.
+        chat: Option<ChatPrompt>,
     },
     /// A T5 encoder over sentencepiece, padded to the length the model was
     /// tuned for.
@@ -293,6 +321,46 @@ pub enum PromptEncoder {
     },
 }
 
+/// How FLUX.2 reads a prompt through its Qwen3 encoder: wrapped in the
+/// chat template with thinking switched off, padded to a fixed length, and
+/// taken from the states after several layers, laid side by side per token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatPrompt {
+    /// What comes before the prompt and after it.
+    pub prefix: String,
+    pub suffix: String,
+    /// How many tokens the sequence is truncated or padded to.
+    pub length: usize,
+    /// The token the padding is made of.
+    pub pad: u32,
+    /// Which states are read, as how many layers have run: 9 is the state
+    /// after the ninth layer. No final norm is applied.
+    pub layers: Vec<usize>,
+}
+
+impl ChatPrompt {
+    /// `Flux2KleinPipeline`'s: Qwen3's template for one user turn and an
+    /// empty thought, 512 tokens, the states after layers 9, 18 and 27.
+    pub fn flux2(pad: u32) -> Self {
+        Self {
+            prefix: "<|im_start|>user\n".into(),
+            suffix: "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".into(),
+            length: 512,
+            pad,
+            layers: vec![9, 18, 27],
+        }
+    }
+
+    /// The token ids for `prompt`, padded, and how many of them are real.
+    pub fn tokenize(&self, tokenizer: &Bpe, prompt: &str) -> Result<(Vec<u32>, usize), NetworkError> {
+        let mut ids = tokenizer.encode(&format!("{}{prompt}{}", self.prefix, self.suffix))?;
+        ids.truncate(self.length);
+        let real = ids.len();
+        ids.resize(self.length, self.pad);
+        Ok((ids, real))
+    }
+}
+
 impl PromptEncoder {
     /// Every CLIP tower this encoder holds, in the order it reads them.
     #[cfg(feature = "cuda")]
@@ -322,7 +390,9 @@ impl PromptEncoder {
     /// How wide one hidden state is.
     pub fn d_model(&self) -> usize {
         match self {
-            Self::Sequence { encoder, .. } => encoder.config().d_model,
+            Self::Sequence { encoder, chat, .. } => {
+                encoder.config().d_model * chat.as_ref().map_or(1, |chat| chat.layers.len())
+            }
             Self::T5 { encoder, .. } => encoder.config().d_model,
             Self::Clip { encoder, .. } => encoder.config().d_model,
             // Side by side, so the widths add.
@@ -348,6 +418,8 @@ impl PromptEncoder {
                 .unwrap_or(encoder.config().d_model)
         };
         match self {
+            // FLUX.2 pools nothing: its denoiser takes no pooled vector.
+            Self::Sequence { chat: Some(_), .. } => None,
             Self::Sequence { encoder, .. } => Some(encoder.config().d_model),
             Self::T5 { .. } => None,
             Self::Clip { encoder, .. } => Some(projected(encoder)),
@@ -362,7 +434,17 @@ impl PromptEncoder {
     /// produces one.
     pub fn encode(&self, prompt: &str) -> Result<(Matrix, Option<Vec<f32>>), NetworkError> {
         match self {
-            Self::Sequence { tokenizer, encoder } => {
+            Self::Sequence {
+                tokenizer,
+                encoder,
+                chat: Some(chat),
+            } => {
+                let (ids, real) = chat.tokenize(tokenizer, prompt)?;
+                Ok((encoder.forward_layers(&ids, real, &chat.layers)?, None))
+            }
+            Self::Sequence {
+                tokenizer, encoder, ..
+            } => {
                 let hidden = encoder.encode(tokenizer, prompt)?;
                 let pooled = encoder.pool(&hidden);
                 Ok((hidden, Some(pooled)))
@@ -581,6 +663,14 @@ impl ImagePipeline {
 
         let decoder_config = crate::vae::VaeConfig::from_file(part("vae/config.json"))?;
         let scheduler = read_json(&part("scheduler/scheduler_config.json"));
+        // FLUX.2 is told apart by its pipeline's name: its prompt, schedule
+        // and latent all differ from FLUX.1's in ways no part's own
+        // configuration records.
+        let flux2 = read_json(&part("model_index.json")).is_some_and(|json| {
+            json.get("_class_name")
+                .and_then(|name| name.as_str())
+                .is_some_and(|name| name.starts_with("Flux2"))
+        });
         // Which denoiser a model has is which directory it published it in.
         let unet = part("unet/config.json").exists();
 
@@ -644,7 +734,12 @@ impl ImagePipeline {
                 .as_ref()
                 .and_then(|scheduler| number(scheduler, "shift"))
                 .unwrap_or(defaults.shift),
-            dynamic_shift: scheduler.as_ref().and_then(dynamic_shift),
+            dynamic_shift: scheduler.as_ref().and_then(dynamic_shift).map(|dynamic| {
+                DynamicShift {
+                    empirical: flux2,
+                    ..dynamic
+                }
+            }),
             // The Stable Diffusion line predicts noise along a beta schedule
             // and was trained with the prompt dropped part of the time, so it
             // is sampled with guidance over more steps than a distilled model
@@ -652,9 +747,11 @@ impl ImagePipeline {
             betas: unet.then(|| ddim_betas(scheduler.as_ref())),
             // A published scheduler names the solver it was tuned with.
             solver: scheduler.as_ref().map_or(defaults.solver, solver_named),
-            steps: match unet {
-                true => 50,
-                false => defaults.steps,
+            // klein is distilled to four steps.
+            steps: match (unet, flux2) {
+                (true, _) => 50,
+                (false, true) => 4,
+                (false, false) => defaults.steps,
             },
             guidance: match unet {
                 true => 7.5,
@@ -775,14 +872,42 @@ impl ImagePipeline {
                             true => "model.",
                             false => "",
                         };
+                        let tokenizer = Bpe::from_file(words.join("tokenizer.json"))?;
+                        let mut encoder_config =
+                            crate::text_encoder::TextEncoderConfig::from_file(&states_config)?;
+                        let chat = match flux2 {
+                            false => None,
+                            true => {
+                                let pad = read_json(&words.join("tokenizer_config.json"))
+                                    .and_then(|json| {
+                                        let pad = json.get("pad_token")?;
+                                        tokenizer
+                                            .token_id(pad.get("content").unwrap_or(pad).as_str()?)
+                                    })
+                                    .ok_or_else(|| {
+                                        NetworkError::InvalidConfig(
+                                            "FLUX.2's tokenizer names no padding token".into(),
+                                        )
+                                    })?;
+                                Some(ChatPrompt::flux2(pad))
+                            }
+                        };
+                        // Layers past the deepest one read are never run, so
+                        // they are not loaded either.
+                        if let Some(deepest) =
+                            chat.as_ref().and_then(|chat| chat.layers.iter().max())
+                        {
+                            encoder_config.layers = encoder_config.layers.min(*deepest);
+                        }
                         PromptEncoder::Sequence {
-                            tokenizer: Bpe::from_file(words.join("tokenizer.json"))?,
+                            tokenizer,
                             encoder: TextEncoder::read_at(
                                 &mut encoder_file,
                                 prefix,
-                                crate::text_encoder::TextEncoderConfig::from_file(&states_config)?,
+                                encoder_config,
                                 precision,
                             )?,
+                            chat,
                         }
                     }
                 };
@@ -1043,7 +1168,30 @@ impl ImagePipeline {
         on_step: impl FnMut(usize, &Matrix) -> bool,
     ) -> Result<Matrix, NetworkError> {
         let patches = conditioning.height * conditioning.width;
+        let start = noise(patches, self.denoiser.in_channels(), seed);
+        self.sample_latent_from_noise(conditioning, unconditional, start, seed, on_step)
+    }
+
+    /// [`ImagePipeline::sample_latent_guided`] from noise the caller drew,
+    /// packed as the denoiser reads it and at unit scale: the run scales it
+    /// to the schedule's first level. This is how a run is lined up with
+    /// another implementation's, which draws its noise its own way.
+    pub fn sample_latent_from_noise(
+        &mut self,
+        conditioning: Conditioning,
+        unconditional: Option<Conditioning>,
+        mut start: Matrix,
+        seed: Option<u64>,
+        on_step: impl FnMut(usize, &Matrix) -> bool,
+    ) -> Result<Matrix, NetworkError> {
+        let patches = conditioning.height * conditioning.width;
         let channels = self.denoiser.in_channels();
+        if start.rows != patches || start.cols != channels {
+            return Err(NetworkError::InvalidConfig(format!(
+                "the noise is {}x{} and the run wants {patches}x{channels}",
+                start.rows, start.cols
+            )));
+        }
         self.denoiser.set_conditioning(conditioning);
         if let Some(unconditional) = unconditional {
             self.denoiser.set_unconditional(unconditional);
@@ -1052,7 +1200,6 @@ impl ImagePipeline {
         let scheduler = self.scheduler(patches);
         // A run starts at the noisiest level the schedule holds, which is one
         // for flow matching and far above it for DDIM.
-        let mut start = noise(patches, channels, seed);
         let first = scheduler.sigmas(self.config.steps)?[0];
         start.data.iter_mut().for_each(|value| *value *= first);
 
@@ -1076,7 +1223,7 @@ impl ImagePipeline {
                 train_steps,
             },
             None => Scheduler::flow_match(match self.config.dynamic_shift {
-                Some(dynamic) => dynamic.shift(patches),
+                Some(dynamic) => dynamic.shift(patches, self.config.steps),
                 None => self.config.shift,
             }),
         }
@@ -1204,7 +1351,16 @@ impl ImagePipeline {
         columns: usize,
         rows: usize,
     ) -> Result<FeatureMap, NetworkError> {
-        let packed = FeatureMap::from_tokens(latent, rows, columns)?;
+        let packed = match self.decoder.patch_norm() {
+            // FLUX.2's denoiser works on batch-normalised patches, so the
+            // statistics are put back before the autoencoder sees them.
+            Some((mean, std)) => {
+                let mut latent = latent.clone();
+                normalise_patches(&mut latent, mean, std, false)?;
+                FeatureMap::from_tokens(&latent, rows, columns)?
+            }
+            None => FeatureMap::from_tokens(latent, rows, columns)?,
+        };
         let unpacked = pixel_shuffle(&packed, self.config.patch)?;
         self.decoder.decode(&unpacked)
     }
@@ -1212,7 +1368,11 @@ impl ImagePipeline {
     /// Packs a latent into the patch grid a denoiser reads, which is the
     /// inverse of what [`ImagePipeline::decode`] undoes.
     pub fn pack(&self, latent: &FeatureMap) -> Result<Matrix, NetworkError> {
-        Ok(pixel_unshuffle(latent, self.config.patch)?.to_tokens())
+        let mut packed = pixel_unshuffle(latent, self.config.patch)?.to_tokens();
+        if let Some((mean, std)) = self.decoder.patch_norm() {
+            normalise_patches(&mut packed, mean, std, true)?;
+        }
+        Ok(packed)
     }
 
     /// The whole run: prompt in, image out.
@@ -1470,6 +1630,32 @@ fn number(json: &serde_json::Value, name: &str) -> Option<f32> {
         .map(|value| value as f32)
 }
 
+/// `(x - mean) / std` per packed column when `forward`, and its inverse
+/// otherwise: the batch norm FLUX.2's autoencoder keeps over patches.
+fn normalise_patches(
+    latent: &mut Matrix,
+    mean: &[f32],
+    std: &[f32],
+    forward: bool,
+) -> Result<(), NetworkError> {
+    if mean.len() != latent.cols || std.len() != latent.cols {
+        return Err(NetworkError::InvalidConfig(format!(
+            "the autoencoder normalises {}-channel patches and the latent has {}",
+            mean.len(),
+            latent.cols
+        )));
+    }
+    for row in latent.data.chunks_mut(mean.len()) {
+        for ((value, mean), std) in row.iter_mut().zip(mean).zip(std) {
+            *value = match forward {
+                true => (*value - mean) / std,
+                false => *value * std + mean,
+            };
+        }
+    }
+    Ok(())
+}
+
 /// The size-dependent shift, for the schedulers that say they use one.
 fn dynamic_shift(scheduler: &serde_json::Value) -> Option<DynamicShift> {
     if !scheduler
@@ -1490,6 +1676,7 @@ fn dynamic_shift(scheduler: &serde_json::Value) -> Option<DynamicShift> {
         max_shift: number(scheduler, "max_shift").unwrap_or(1.15),
         base_seq_len: length("base_image_seq_len", 256),
         max_seq_len: length("max_image_seq_len", 4096),
+        empirical: false,
     })
 }
 
@@ -1551,6 +1738,7 @@ mod tests {
             norm_groups: 4,
             scaling_factor: 0.5,
             shift_factor: 0.25,
+            batch_norm_eps: 1e-4,
         };
         let text = denoiser_encoder_config();
         let dit = DitConfig {
@@ -1586,7 +1774,11 @@ mod tests {
 
         (
             ImagePipeline::new(
-                PromptEncoder::Sequence { tokenizer, encoder },
+                PromptEncoder::Sequence {
+                    tokenizer,
+                    encoder,
+                    chat: None,
+                },
                 denoiser,
                 decoder,
                 config.clone(),
@@ -1820,9 +2012,9 @@ mod tests {
         // fixed shift is then only the fallback.
         let dynamic = loaded.config.dynamic_shift.expect("the scheduler says so");
         assert_eq!(dynamic.base_seq_len, 256);
-        assert!((dynamic.shift(256) - 0.5f32.exp()).abs() < 1e-5);
-        assert!((dynamic.shift(4096) - 1.15f32.exp()).abs() < 1e-5);
-        assert!(dynamic.shift(1024) > dynamic.shift(256));
+        assert!((dynamic.shift(256, 28) - 0.5f32.exp()).abs() < 1e-5);
+        assert!((dynamic.shift(4096, 28) - 1.15f32.exp()).abs() < 1e-5);
+        assert!(dynamic.shift(1024, 28) > dynamic.shift(256, 28));
     }
 
     /// Writes a directory shaped the way a Stable Diffusion release is: a
@@ -2401,7 +2593,11 @@ mod tests {
         assert_eq!(denoiser.pooled_dim(), Some(16));
         assert!(
             ImagePipeline::new(
-                PromptEncoder::Sequence { tokenizer, encoder },
+                PromptEncoder::Sequence {
+                    tokenizer,
+                    encoder,
+                    chat: None,
+                },
                 denoiser,
                 decoder,
                 config
@@ -2457,6 +2653,7 @@ mod tests {
             norm_groups: 4,
             scaling_factor: 0.5,
             shift_factor: 0.25,
+            batch_norm_eps: 1e-4,
         };
         let dit = DitConfig {
             in_channels: 16,
@@ -2644,5 +2841,270 @@ mod tests {
         assert_eq!(conditioning.text.rows, length);
         assert_eq!(conditioning.text.cols, t5.d_model);
         assert_eq!(conditioning.pooled.len(), clip.d_model);
+    }
+
+    #[test]
+    fn flux2_takes_its_shift_from_the_empirical_fit() {
+        let dynamic = DynamicShift {
+            base_shift: 0.5,
+            max_shift: 1.15,
+            base_seq_len: 256,
+            max_seq_len: 4096,
+            empirical: true,
+        };
+        // diffusers' `compute_empirical_mu(1024, 4)`, and the levels its
+        // scheduler builds from it for a 512x512 image in four steps.
+        assert!((empirical_mu(1024, 4) - 2.030_689_7).abs() < 1e-5);
+        let sigmas = Scheduler::flow_match(dynamic.shift(1024, 4))
+            .sigmas(4)
+            .unwrap();
+        for (got, want) in sigmas
+            .iter()
+            .zip([1.0, 0.958_085_4, 0.883_982, 0.717_496_6, 0.0])
+        {
+            assert!((got - want).abs() < 1e-5, "{sigmas:?}");
+        }
+        // Past 4300 patches the 200-step line holds alone, whatever the
+        // step count.
+        let long = (0.000_169_27 * 5000.0 + 0.456_666_66) as f32;
+        assert!((empirical_mu(5000, 4) - long).abs() < 1e-6);
+        assert_eq!(empirical_mu(5000, 4), empirical_mu(5000, 50));
+        // The fitted lines are not the configured ones.
+        let configured = DynamicShift {
+            empirical: false,
+            ..dynamic
+        };
+        assert!((configured.shift(1024, 4).ln() - 2.030_689_7).abs() > 0.1);
+    }
+
+    #[test]
+    fn patch_statistics_are_taken_out_and_put_back() {
+        let mut latent = Matrix::from_vec(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let (mean, std) = ([1.0, -1.0, 0.5], [2.0, 0.5, 1.0]);
+        normalise_patches(&mut latent, &mean, &std, true).unwrap();
+        assert_eq!(latent.data[..3], [0.0, 6.0, 2.5]);
+        normalise_patches(&mut latent, &mean, &std, false).unwrap();
+        assert_eq!(latent.data, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(normalise_patches(&mut latent, &mean[..2], &std[..2], true).is_err());
+    }
+
+    #[test]
+    fn a_chat_prompt_is_wrapped_padded_and_counted() {
+        let tokenizer = crate::tokenizer::tests::tokenizer(&[], &[], None);
+        let chat = ChatPrompt {
+            length: 128,
+            ..ChatPrompt::flux2(7)
+        };
+        let wrapped = tokenizer
+            .encode(&format!("{}fog{}", chat.prefix, chat.suffix))
+            .unwrap();
+        let (ids, real) = chat.tokenize(&tokenizer, "fog").unwrap();
+        assert_eq!(ids.len(), 128);
+        assert_eq!(real, wrapped.len());
+        assert_eq!(ids[..real], wrapped[..]);
+        assert!(ids[real..].iter().all(|&id| id == 7));
+        // Too long a prompt is cut, and every token left is real.
+        let short = ChatPrompt { length: 5, ..chat };
+        let (ids, real) = short.tokenize(&tokenizer, "fog").unwrap();
+        assert_eq!((ids.as_slice(), real), (&wrapped[..5], 5));
+    }
+
+    /// Relative L2 distance of `got` from `want`.
+    fn relative(got: &[f32], want: &[f32]) -> f32 {
+        assert_eq!(got.len(), want.len());
+        let (gap, norm) = got.iter().zip(want).fold((0.0f64, 0.0f64), |(g, n), (a, b)| {
+            (g + ((a - b) as f64).powi(2), n + (*b as f64).powi(2))
+        });
+        (gap / norm).sqrt() as f32
+    }
+
+    /// FLUX.2-klein-4B against `scripts/flux2_reference.py`, stage by stage.
+    /// `RB_FLUX2_REF` is the script's output, `RB_FLUX2_MODEL` the model
+    /// (default the local copy), `RB_FLUX2_ENCODER=f32` adds a run of the
+    /// prompt encoder in F32 on its own (about 12 GB) and `RB_FLUX2_CUDA=1`
+    /// moves the pipeline to the device. The denoiser is Q8: in F32 it alone
+    /// needs about 16 GB.
+    #[test]
+    #[ignore = "needs FLUX.2-klein-4B and the output of scripts/flux2_reference.py"]
+    fn flux2_klein_matches_diffusers() {
+        let env = |name: &str| std::env::var(name).ok();
+        let dir = std::path::PathBuf::from(env("RB_FLUX2_REF").expect("RB_FLUX2_REF"));
+        let model = std::path::PathBuf::from(
+            env("RB_FLUX2_MODEL")
+                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
+                .unwrap();
+        let prompt = settings["prompt"].as_str().unwrap();
+        let mut reference =
+            crate::safetensors::SafeTensors::open(dir.join("flux2.safetensors")).unwrap();
+        let mut read = |name: &str| reference.tensor(name).unwrap().0;
+        let mut report = Vec::new();
+        let mut gate = |stage: &str, error: f32, limit: f32| {
+            eprintln!("flux2 {stage}: relative L2 {error:.3e} (gate {limit:.0e})");
+            report.push((stage.to_string(), error, limit));
+        };
+
+        // Token ids, exactly.
+        let tokenizer = Bpe::from_file(model.join("tokenizer/tokenizer.json")).unwrap();
+        let chat = ChatPrompt::flux2(tokenizer.token_id("<|endoftext|>").unwrap());
+        let (ids, real) = chat.tokenize(&tokenizer, prompt).unwrap();
+        let want_ids: Vec<u32> = read("input_ids").iter().map(|&id| id as u32).collect();
+        let want_real = read("attention_mask").iter().filter(|&&m| m > 0.0).count();
+        assert_eq!(ids, want_ids);
+        assert_eq!(real, want_real);
+        let embeds = read("prompt_embeds");
+
+        if env("RB_FLUX2_ENCODER").as_deref() == Some("f32") {
+            let mut file =
+                crate::safetensors::ShardedSafeTensors::open(weights(&model.join("text_encoder")).unwrap())
+                    .unwrap();
+            let mut config =
+                TextEncoderConfig::from_file(model.join("text_encoder/config.json")).unwrap();
+            config.layers = 27;
+            let encoder = PromptEncoder::Sequence {
+                tokenizer: Bpe::from_file(model.join("tokenizer/tokenizer.json")).unwrap(),
+                encoder: TextEncoder::read_at(&mut file, "model.", config, Precision::F32).unwrap(),
+                chat: Some(chat.clone()),
+            };
+            drop(file);
+            let started = std::time::Instant::now();
+            let (got, pooled) = encoder.encode(prompt).unwrap();
+            eprintln!("flux2 encoder f32: {:?}", started.elapsed());
+            assert!(pooled.is_none());
+            gate("prompt embeds, encoder F32", relative(&got.data, &embeds), 1e-3);
+        }
+
+        let started = std::time::Instant::now();
+        #[allow(unused_mut)]
+        let mut pipeline = ImagePipeline::load_at(&model, Precision::Q8).unwrap();
+        #[cfg(feature = "cuda")]
+        if env("RB_FLUX2_CUDA").as_deref() == Some("1") {
+            pipeline.to_cuda(0).unwrap();
+        }
+        eprintln!("flux2 load: {:?}", started.elapsed());
+        assert_eq!(pipeline.config.steps, 4);
+
+        let (got, _) = pipeline.encoder.encode(prompt).unwrap();
+        gate("prompt embeds, encoder Q8", relative(&got.data, &embeds), 0.03);
+
+        let levels = pipeline.scheduler(1024).sigmas(4).unwrap();
+        gate("sigmas", relative(&levels, &read("sigmas")), 1e-5);
+
+        // The noise is NCHW and diffusers packs it as one token per
+        // position, row-major, with the channels as columns.
+        let grid = read("noise");
+        let mut noise = Matrix::new(1024, 128);
+        for channel in 0..128 {
+            for token in 0..1024 {
+                noise.data[token * 128 + channel] = grid[channel * 1024 + token];
+            }
+        }
+        let conditioning = Conditioning {
+            text: Matrix::from_vec(512, 7680, embeds),
+            pooled: Vec::new(),
+            height: 32,
+            width: 32,
+            guidance: pipeline.config.embedded_guidance,
+        };
+
+        pipeline.denoiser.set_conditioning(conditioning.clone());
+        let started = std::time::Instant::now();
+        let prediction = pipeline.denoiser.denoise(&noise, levels[0]).unwrap();
+        eprintln!("flux2 one step: {:?}", started.elapsed());
+        // Q8 rounding, not a wrong layer: `flux2_klein_blocks_match_diffusers`
+        // puts the same blocks at 1e-6 in F32. Over C11's 0.006 for SDXL's
+        // UNet, which is why these gates are Q8's own.
+        gate("step-0 prediction", relative(&prediction.data, &read("step0_pred")), 0.02);
+
+        let started = std::time::Instant::now();
+        let latent = pipeline
+            .sample_latent_from_noise(conditioning, None, noise, None, |_, _| true)
+            .unwrap();
+        eprintln!("flux2 four steps: {:?}", started.elapsed());
+        let final_latents = read("final_latents");
+        gate("final latent, 4 steps", relative(&latent.data, &final_latents), 0.05);
+
+        // What the autoencoder is handed, from diffusers' own final latent.
+        let want_latent = Matrix::from_vec(1024, 128, final_latents);
+        let (mean, std) = pipeline.decoder.patch_norm().unwrap();
+        let mut unnormalised = want_latent.clone();
+        normalise_patches(&mut unnormalised, mean, std, false).unwrap();
+        let unpacked =
+            pixel_shuffle(&FeatureMap::from_tokens(&unnormalised, 32, 32).unwrap(), 2).unwrap();
+        gate("autoencoder input", relative(&unpacked.data, &read("vae_latent")), 1e-5);
+
+        let image = read("image");
+        let started = std::time::Instant::now();
+        let decoded = pipeline.decode(&want_latent, 32, 32).unwrap();
+        eprintln!("flux2 decode: {:?}", started.elapsed());
+        gate("decoded image, reference latent", relative(&decoded.data, &image), 0.012);
+        let decoded = pipeline.decode(&latent, 32, 32).unwrap();
+        gate("decoded image, whole chain", relative(&decoded.data, &image), 0.03);
+
+        let failed: Vec<_> = report.iter().filter(|(_, error, limit)| error > limit).collect();
+        assert!(failed.is_empty(), "over the gate: {failed:?}");
+    }
+
+    /// The transformer cut to its first two double and two single blocks,
+    /// in F32 and in Q8, against `scripts/flux2_blocks_reference.py`. The
+    /// whole one in F32 does not fit beside everything else on this machine,
+    /// and this separates a wrong layer from Q8's rounding. Same variables as
+    /// [`flux2_klein_matches_diffusers`].
+    #[test]
+    #[ignore = "needs FLUX.2-klein-4B and the output of scripts/flux2_blocks_reference.py"]
+    fn flux2_klein_blocks_match_diffusers() {
+        let env = |name: &str| std::env::var(name).ok();
+        let dir = std::path::PathBuf::from(env("RB_FLUX2_REF").expect("RB_FLUX2_REF"));
+        let model = std::path::PathBuf::from(
+            env("RB_FLUX2_MODEL")
+                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
+        );
+        let mut reference =
+            crate::safetensors::SafeTensors::open(dir.join("flux2.safetensors")).unwrap();
+        let grid = reference.tensor("noise").unwrap().0;
+        let embeds = reference.tensor("prompt_embeds").unwrap().0;
+        let want = crate::safetensors::SafeTensors::open(dir.join("flux2_blocks.safetensors"))
+            .unwrap()
+            .tensor("step0_pred_blocks")
+            .unwrap()
+            .0;
+        let mut noise = Matrix::new(1024, 128);
+        for channel in 0..128 {
+            for token in 0..1024 {
+                noise.data[token * 128 + channel] = grid[channel * 1024 + token];
+            }
+        }
+        let config = DitConfig {
+            double_blocks: 2,
+            single_blocks: 2,
+            ..DitConfig::from_file(model.join("transformer/config.json")).unwrap()
+        };
+        let path = weights(&model.join("transformer")).unwrap();
+        // The device runs BF16 activations, and BF16 weights for an F32
+        // model, so its F32 gate is BF16's.
+        let device = cfg!(feature = "cuda") && env("RB_FLUX2_CUDA").as_deref() == Some("1");
+        let f32_limit = if device { 0.01 } else { 1e-4 };
+        for (precision, limit) in [(Precision::F32, f32_limit), (Precision::Q8, 0.02)] {
+            #[allow(unused_mut)]
+            let mut dit = Dit::load_at(&path, "", config.clone(), precision).unwrap();
+            #[cfg(feature = "cuda")]
+            if env("RB_FLUX2_CUDA").as_deref() == Some("1") {
+                dit.attach_device(&crate::gpu_transformer::GpuContext::new(0).unwrap())
+                    .unwrap();
+            }
+            dit.set_conditioning(Conditioning {
+                text: Matrix::from_vec(512, 7680, embeds.clone()),
+                pooled: Vec::new(),
+                height: 32,
+                width: 32,
+                guidance: 0.0,
+            });
+            let got = dit.denoise(&noise, 1.0).unwrap();
+            let error = relative(&got.data, &want);
+            eprintln!("flux2 2+2 blocks {precision:?}: relative L2 {error:.3e} (gate {limit:.0e})");
+            assert!(error <= limit, "{precision:?}: {error}");
+        }
     }
 }

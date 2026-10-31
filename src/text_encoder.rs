@@ -25,7 +25,7 @@
 
 use crate::conv::Dense;
 use crate::matrix::Matrix;
-use crate::mmdit::attention;
+use crate::mmdit::attention_over;
 use crate::network::NetworkError;
 use crate::safetensors::ShardedSafeTensors;
 use crate::tokenizer::Bpe;
@@ -203,6 +203,56 @@ impl TextEncoder {
 
     /// The hidden states for a sequence of token ids, `[tokens, d_model]`.
     pub fn forward(&self, ids: &[u32]) -> Result<Matrix, NetworkError> {
+        let hidden = self.run(ids, ids.len(), self.layers.len(), |_, _| {})?;
+        Ok(rms_norm(&hidden, &self.final_norm, self.config.eps))
+    }
+
+    /// The hidden states after each of `layers` layers, laid side by side per
+    /// token, `[tokens, layers.len() * d_model]`: the output FLUX.2 reads,
+    /// which takes three depths of the model rather than its last one, and
+    /// takes them without the final norm.
+    ///
+    /// Only the first `real` of `ids` are the prompt; the rest are padding.
+    /// Every position, padding included, attends causally and to none of the
+    /// padding's keys, which is what the attention mask a padded batch is
+    /// encoded with does. The layers past the deepest one asked for are not
+    /// run.
+    pub fn forward_layers(
+        &self,
+        ids: &[u32],
+        real: usize,
+        layers: &[usize],
+    ) -> Result<Matrix, NetworkError> {
+        let deepest = layers.iter().copied().max().unwrap_or(0);
+        if layers.is_empty() || layers.contains(&0) || deepest > self.layers.len() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "this encoder has {} layers and the output asks for those after {layers:?}",
+                self.layers.len()
+            )));
+        }
+        let width = self.config.d_model;
+        let mut output = Matrix::new(ids.len(), layers.len() * width);
+        self.run(ids, real, deepest, |done, hidden| {
+            for (slot, _) in layers.iter().enumerate().filter(|(_, layer)| **layer == done) {
+                for token in 0..hidden.rows {
+                    output.row_mut(token)[slot * width..(slot + 1) * width]
+                        .copy_from_slice(hidden.row(token));
+                }
+            }
+        })?;
+        Ok(output)
+    }
+
+    /// The first `depth` layers over `ids`, of which the first `real` are
+    /// attended to. `after` sees the hidden states after every layer, counted
+    /// from one.
+    fn run(
+        &self,
+        ids: &[u32],
+        real: usize,
+        depth: usize,
+        mut after: impl FnMut(usize, &Matrix),
+    ) -> Result<Matrix, NetworkError> {
         if ids.is_empty() {
             return Err(NetworkError::InvalidConfig(
                 "an empty prompt has no hidden states".into(),
@@ -228,7 +278,7 @@ impl TextEncoder {
         );
         let rotary = Rotary::new(ids.len(), head_dim, self.config.rope_theta);
 
-        for layer in &self.layers {
+        for (index, layer) in self.layers[..depth].iter().enumerate() {
             let normed = rms_norm(&hidden, &layer.input_norm, self.config.eps);
             let mut queries = layer.query.forward(&normed)?;
             let mut keys = layer.key.forward(&normed)?;
@@ -243,13 +293,14 @@ impl TextEncoder {
             rotary.apply(&mut queries, heads);
             rotary.apply(&mut keys, kv_heads);
 
-            let attended = attention(
+            let attended = attention_over(
                 &queries,
                 &keys,
                 &values,
                 heads,
                 kv_heads,
                 self.config.causal,
+                real,
             );
             let projected = layer.output.forward(&attended)?;
             for (value, delta) in hidden.data.iter_mut().zip(&projected.data) {
@@ -267,9 +318,9 @@ impl TextEncoder {
             for (value, delta) in hidden.data.iter_mut().zip(&projected.data) {
                 *value += delta;
             }
+            after(index + 1, &hidden);
         }
-
-        Ok(rms_norm(&hidden, &self.final_norm, self.config.eps))
+        Ok(hidden)
     }
 
     /// Tokenizes a prompt and returns its hidden states.
@@ -510,6 +561,44 @@ pub(crate) mod tests {
         }
         // The later tokens are new, so the pooled vector moves.
         assert_ne!(encoder.pool(&short), encoder.pool(&long));
+    }
+
+    #[test]
+    fn stacked_layers_are_the_states_after_each_depth_and_padding_is_not_read() {
+        let config = TextEncoderConfig {
+            layers: 3,
+            ..tiny()
+        };
+        let encoder = encoder(&config, "rusting_brain_text_layers.safetensors", true);
+        let width = config.d_model;
+
+        // The last depth, normed, is the ordinary output.
+        let ids = [3, 7, 1, 4];
+        let stacked = encoder.forward_layers(&ids, ids.len(), &[1, 3]).unwrap();
+        assert_eq!((stacked.rows, stacked.cols), (4, 2 * width));
+        let mut last = Matrix::new(4, width);
+        for token in 0..4 {
+            last.row_mut(token)
+                .copy_from_slice(&stacked.row(token)[width..]);
+        }
+        let normed = rms_norm(&last, &encoder.final_norm, config.eps);
+        let plain = encoder.forward(&ids).unwrap();
+        for (first, second) in normed.data.iter().zip(&plain.data) {
+            assert!((first - second).abs() < 1e-5, "{first} vs {second}");
+        }
+
+        // Two real tokens, then padding. No state reads a padded key, so the
+        // padding's ids change only the padded positions' own states, and a
+        // padded position does not see the padding before it.
+        let first = encoder.forward_layers(&[3, 7, 9, 9], 2, &[2, 3]).unwrap();
+        let second = encoder.forward_layers(&[3, 7, 5, 9], 2, &[2, 3]).unwrap();
+        for token in [0, 1, 3] {
+            for (a, b) in first.row(token).iter().zip(second.row(token)) {
+                assert!((a - b).abs() < 1e-5, "token {token}: {a} vs {b}");
+            }
+        }
+        assert_ne!(first.row(2), second.row(2));
+        assert!(encoder.forward_layers(&ids, 4, &[4]).is_err());
     }
 
     #[test]

@@ -40,6 +40,9 @@ pub struct VaeConfig {
     /// stored as `(value - shift) * scaling`, so decoding undoes that first.
     pub scaling_factor: f32,
     pub shift_factor: f32,
+    /// The epsilon of the batch norm FLUX.2 puts over the packed latent, see
+    /// [`VaeDecoder::patch_norm`]. Unused by a VAE that has none.
+    pub batch_norm_eps: f32,
 }
 
 impl Default for VaeConfig {
@@ -53,13 +56,15 @@ impl Default for VaeConfig {
             norm_groups: 32,
             scaling_factor: 0.18215,
             shift_factor: 0.0,
+            batch_norm_eps: 1e-4,
         }
     }
 }
 
 impl VaeConfig {
-    /// The FLUX and FLUX.2 decoder: sixteen latent channels and the scale and
-    /// shift those models were trained with.
+    /// The FLUX.1 decoder: sixteen latent channels and the scale and shift
+    /// that model was trained with. FLUX.2's has thirty-two channels and
+    /// neither, and [`VaeConfig::from_file`] reads it from its own file.
     pub fn flux() -> Self {
         Self {
             latent_channels: 16,
@@ -76,6 +81,8 @@ impl VaeConfig {
             .map_err(|error| NetworkError::InvalidDataset(format!("vae config.json: {error}")))?;
 
         let default = Self::default();
+        let flux2 = json.get("_class_name").and_then(|name| name.as_str())
+            == Some("AutoencoderKLFlux2");
         let number = |name: &str, fallback: usize| -> usize {
             json.get(name)
                 .and_then(|value| value.as_u64())
@@ -107,9 +114,19 @@ impl VaeConfig {
             },
             layers_per_block: number("layers_per_block", default.layers_per_block),
             norm_groups: number("norm_num_groups", default.norm_groups),
-            scaling_factor: float("scaling_factor", default.scaling_factor),
+            // FLUX.2's autoencoder normalizes its latent with a batch norm
+            // over the packed patches instead, and records no scale at all;
+            // the Stable Diffusion default would shrink its latent five times.
+            scaling_factor: float(
+                "scaling_factor",
+                match flux2 {
+                    true => 1.0,
+                    false => default.scaling_factor,
+                },
+            ),
             // Only the models that need an offset record one.
             shift_factor: float("shift_factor", 0.0),
+            batch_norm_eps: float("batch_norm_eps", default.batch_norm_eps),
         })
     }
 
@@ -237,6 +254,9 @@ pub struct VaeDecoder {
     /// latent and the decoder, mirroring the encoder's `quant_conv`. It lives
     /// beside `decoder.` rather than inside it, and the FLUX line has none.
     pub(crate) post_quant: Option<Conv2d>,
+    /// FLUX.2's batch-norm statistics over the packed latent, as a mean and a
+    /// standard deviation per packed channel. See [`VaeDecoder::patch_norm`].
+    patch_norm: Option<(Vec<f32>, Vec<f32>)>,
     pub(crate) conv_in: Conv2d,
     pub(crate) mid_first: ResnetBlock,
     pub(crate) mid_attention: AttentionBlock,
@@ -253,6 +273,17 @@ impl VaeDecoder {
     /// The configuration this decoder was built for.
     pub fn config(&self) -> &VaeConfig {
         &self.config
+    }
+
+    /// The mean and standard deviation of every packed latent channel, for
+    /// an autoencoder that normalizes its latent after packing it, which is
+    /// FLUX.2's. A sampled latent is `(packed - mean) / std`, so a pipeline
+    /// multiplies and adds these back before unpacking; the decoder itself
+    /// never sees the packed form.
+    pub fn patch_norm(&self) -> Option<(&[f32], &[f32])> {
+        self.patch_norm
+            .as_ref()
+            .map(|(mean, std)| (mean.as_slice(), std.as_slice()))
     }
 
     /// Reads a decoder out of a checkpoint under the `diffusers` key names.
@@ -289,6 +320,17 @@ impl VaeDecoder {
         // `post_quant_conv` sits one level up from the decoder's own keys.
         let root = prefix.strip_suffix("decoder.").unwrap_or("");
         let post_quant = read_conv(file, &format!("{root}post_quant_conv"), 1, 0).ok();
+        let patch_norm = match (
+            file.tensor(&format!("{root}bn.running_mean")),
+            file.tensor(&format!("{root}bn.running_var")),
+        ) {
+            (Ok((mean, _)), Ok((variance, _))) => {
+                let eps = config.batch_norm_eps;
+                let std = variance.iter().map(|value| (value + eps).sqrt()).collect();
+                Some((mean, std))
+            }
+            _ => None,
+        };
         let conv_in = read_conv(file, &format!("{prefix}conv_in"), 1, 1)?;
         let mid = format!("{prefix}mid_block");
         let mid_first = read_resnet(file, &format!("{mid}.resnets.0"), config.norm_groups)?;
@@ -336,6 +378,7 @@ impl VaeDecoder {
         Ok(Self {
             config,
             post_quant,
+            patch_norm,
             conv_in,
             mid_first,
             mid_attention,
@@ -1053,7 +1096,50 @@ pub(crate) mod tests {
             norm_groups: 4,
             scaling_factor: 0.5,
             shift_factor: 0.25,
+            batch_norm_eps: 1e-4,
         }
+    }
+
+    #[test]
+    fn a_flux2_autoencoder_reads_no_scale_and_its_patch_norm() {
+        // FLUX.2's config names no scaling factor. Falling back to Stable
+        // Diffusion's 0.18215 divides the latent by it before decoding, which
+        // washes the picture out; the model's own normalization is the batch
+        // norm over the packed latent instead.
+        let directory = std::env::temp_dir().join("rusting_brain_vae_flux2");
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"_class_name": "AutoencoderKLFlux2", "latent_channels": 4,
+                "block_out_channels": [8, 16], "layers_per_block": 1,
+                "norm_num_groups": 4, "batch_norm_eps": 0.0001}"#,
+        )
+        .unwrap();
+        let config = VaeConfig::from_file(&config_path).unwrap();
+        assert_eq!(config.scaling_factor, 1.0);
+        assert_eq!(config.shift_factor, 0.0);
+        assert_eq!(config.batch_norm_eps, 1e-4);
+
+        let path = directory.join("vae.safetensors");
+        checkpoint_at(&config, &path, true);
+        let decoder = VaeDecoder::load(&path, "decoder.", config.clone()).unwrap();
+        assert!(decoder.patch_norm().is_none());
+
+        // The statistics are over the packed channels, four per latent
+        // channel for a 2x2 patch.
+        let mut tensors = crate::safetensors::read_checkpoint(&path);
+        let packed = config.latent_channels * 4;
+        tensors.insert(
+            "bn.running_mean".into(),
+            (vec![packed], (0..packed).map(|index| index as f32).collect()),
+        );
+        tensors.insert("bn.running_var".into(), (vec![packed], vec![3.9999; packed]));
+        crate::safetensors::write_checkpoint(&path, &tensors);
+        let decoder = VaeDecoder::load(&path, "decoder.", config).unwrap();
+        let (mean, std) = decoder.patch_norm().unwrap();
+        assert_eq!(mean[5], 5.0);
+        assert!((std[5] - 2.0).abs() < 1e-6);
     }
 
     #[test]

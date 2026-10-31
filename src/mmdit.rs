@@ -14,15 +14,19 @@
 //! - **Double stream**: image and text each have their own norms, projections
 //!   and feed-forward, and meet only inside the attention, where the two
 //!   token sequences are concatenated. FLUX runs nineteen of these,
-//!   FLUX.2-klein eight.
+//!   FLUX.2-klein-4B five.
 //! - **Single stream**: the two sequences are already concatenated, so one set
 //!   of weights covers both, and the attention and the feed-forward share one
-//!   fused projection. FLUX runs thirty-eight, FLUX.2-klein forty-eight.
+//!   fused projection. FLUX runs thirty-eight, FLUX.2-klein-4B twenty.
 //!
 //! Positions are rotary, in two dimensions: each attention head's dimensions
 //! are split between the patch's row and its column, so the model knows where
 //! in the image a patch sits. Text tokens sit at the origin, where the
-//! rotation is the identity.
+//! rotation is the identity, except in FLUX.2, whose fourth axis counts them.
+//!
+//! FLUX.2 changes three more things, all read from its checkpoint: every
+//! block of a kind shares one modulation instead of owning its own, the
+//! feed-forwards are SwiGLU instead of GELU, and nothing has a bias.
 //!
 //! [`Dit::load`] reads a checkpoint under the key names Black Forest Labs
 //! publishes FLUX with. Inference only, like the rest of the hosting path.
@@ -35,6 +39,7 @@ use crate::network::NetworkError;
 use crate::safetensors::ShardedSafeTensors;
 use crate::transformer::Precision;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// The shape of a denoiser, which a checkpoint's own configuration names.
 #[derive(Clone, Debug, PartialEq)]
@@ -206,35 +211,41 @@ pub(crate) struct Positions {
 }
 
 impl Positions {
-    /// Text tokens at the origin, then one entry per patch in row-major order.
+    /// Text tokens first, then one entry per patch in row-major order.
+    ///
+    /// A patch's row and column go on the second and third axes when there
+    /// are three or more, and on the only two when there are two; the first
+    /// of three stays at zero. A fourth axis, which only FLUX.2 has, counts
+    /// the text tokens, which otherwise all sit at the origin. The angles are
+    /// taken in double precision, as the reference does: a text position of
+    /// five hundred at the fastest frequency is an angle no `f32` holds to
+    /// the last bit.
     pub(crate) fn new(config: &DitConfig, text_len: usize, height: usize, width: usize) -> Self {
         let pairs = config.head_dim() / 2;
         let tokens = text_len + height * width;
         let mut cos = vec![0.0; tokens * pairs];
         let mut sin = vec![0.0; tokens * pairs];
+        let axes = config.axes_dim.len();
+        let (row_axis, column_axis) = (axes.min(3).saturating_sub(2), axes.min(3) - 1);
 
         for token in 0..tokens {
-            // Axes beyond the last two are the ones FLUX keeps at zero, so
-            // only the final two carry the patch's row and column.
-            let (row, column) = if token < text_len {
-                (0.0, 0.0)
+            let mut position = [0.0f64; 4];
+            if token < text_len {
+                position[3] = token as f64;
             } else {
                 let patch = token - text_len;
-                ((patch / width) as f32, (patch % width) as f32)
-            };
+                position[row_axis] = (patch / width) as f64;
+                position[column_axis] = (patch % width) as f64;
+            }
 
             let mut pair = 0;
             for (axis, dim) in config.axes_dim.iter().enumerate() {
-                let position = match config.axes_dim.len() - axis {
-                    2 => row,
-                    1 => column,
-                    _ => 0.0,
-                };
+                let position = position.get(axis).copied().unwrap_or(0.0);
                 for index in 0..dim / 2 {
-                    let omega = config.theta.powf(-2.0 * index as f32 / *dim as f32);
+                    let omega = (config.theta as f64).powf(-2.0 * index as f64 / *dim as f64);
                     let angle = position * omega;
-                    cos[token * pairs + pair] = angle.cos();
-                    sin[token * pairs + pair] = angle.sin();
+                    cos[token * pairs + pair] = angle.cos() as f32;
+                    sin[token * pairs + pair] = angle.sin() as f32;
                     pair += 1;
                 }
             }
@@ -318,10 +329,25 @@ pub(crate) fn attention(
     kv_heads: usize,
     causal: bool,
 ) -> Matrix {
+    attention_over(queries, keys, values, num_heads, kv_heads, causal, keys.rows)
+}
+
+/// [`attention`] over only the first `limit` keys, which is how a padded
+/// prompt keeps its padding out of every query's view: the padded positions
+/// still get a state, but nothing reads the padding's keys.
+pub(crate) fn attention_over(
+    queries: &Matrix,
+    keys: &Matrix,
+    values: &Matrix,
+    num_heads: usize,
+    kv_heads: usize,
+    causal: bool,
+    limit: usize,
+) -> Matrix {
     let tokens = queries.rows;
     // Cross-attention reads a different sequence from the one it writes, so the
     // keys are counted on their own.
-    let context = keys.rows;
+    let context = keys.rows.min(limit.max(1));
     let head_dim = queries.cols / num_heads;
     let group = num_heads / kv_heads.max(1);
     let scale = (head_dim as f32).sqrt().recip();
@@ -336,7 +362,10 @@ pub(crate) fn attention(
             let mut weights = vec![0.0; context];
             for query_token in 0..tokens {
                 let query = &queries.row(query_token)[offset..offset + head_dim];
-                let visible = if causal { query_token + 1 } else { context };
+                let visible = match causal {
+                    true => (query_token + 1).min(context),
+                    false => context,
+                };
                 let mut largest = f32::NEG_INFINITY;
                 for (key_token, weight) in weights[..visible].iter_mut().enumerate() {
                     let key = &keys.row(key_token)[kv_offset..kv_offset + head_dim];
@@ -490,7 +519,9 @@ pub(crate) struct DoubleBlock {
 /// One side of a double-stream block.
 #[derive(Clone, Debug)]
 pub(crate) struct Stream {
-    pub(crate) modulation: Modulation,
+    /// Shared between every block of the model in FLUX.2, owned by one block
+    /// in FLUX.1.
+    pub(crate) modulation: Arc<Modulation>,
     pub(crate) qkv: Dense,
     pub(crate) query_norm: HeadNorm,
     pub(crate) key_norm: HeadNorm,
@@ -538,22 +569,43 @@ impl Stream {
         shift: &[f32],
         scale: &[f32],
         eps: f32,
+        swiglu: bool,
     ) -> Result<Matrix, NetworkError> {
         let normed = modulate(&layer_norm(tokens, eps), shift, scale);
-        let mut hidden = self.mlp_in.forward(&normed)?;
+        let hidden = self.mlp_in.forward(&normed)?;
+        self.mlp_out.forward(&activate(hidden, swiglu))
+    }
+}
+
+/// The feed-forward's activation: the tanh GELU, or for FLUX.2 SwiGLU, which
+/// is `silu(first half) * second half` and so halves the width.
+pub(crate) fn activate(mut hidden: Matrix, swiglu: bool) -> Matrix {
+    if !swiglu {
         hidden
             .data
             .par_iter_mut()
             .for_each(|value| *value = gelu(*value));
-        self.mlp_out.forward(&hidden)
+        return hidden;
     }
+    let half = hidden.cols / 2;
+    let mut output = Matrix::new(hidden.rows, half);
+    output
+        .data
+        .par_chunks_mut(half)
+        .zip(hidden.data.par_chunks(hidden.cols))
+        .for_each(|(target, row)| {
+            for ((target, gate), up) in target.iter_mut().zip(&row[..half]).zip(&row[half..]) {
+                *target = silu(*gate) * up;
+            }
+        });
+    output
 }
 
 /// One set of weights over the concatenated sequence, with the attention and
 /// the feed-forward sharing a projection.
 #[derive(Clone, Debug)]
 pub(crate) struct SingleBlock {
-    pub(crate) modulation: Modulation,
+    pub(crate) modulation: Arc<Modulation>,
     pub(crate) fused_in: Dense,
     pub(crate) fused_out: Dense,
     pub(crate) query_norm: HeadNorm,
@@ -574,6 +626,9 @@ pub struct Dit {
     pub(crate) single: Vec<SingleBlock>,
     pub(crate) final_modulation: Dense,
     pub(crate) final_out: Dense,
+    /// Whether the feed-forwards are SwiGLU, which FLUX.2's are, rather than
+    /// GELU.
+    pub(crate) swiglu: bool,
     conditioning: Option<Conditioning>,
     unconditional: Option<Conditioning>,
     #[cfg(feature = "cuda")]
@@ -674,12 +729,30 @@ impl Dit {
                 })
             };
 
+        // FLUX.2 writes one modulation per kind of block, which every block
+        // of that kind reads.
+        let shared = match layout {
+            Layout::Flux2 => {
+                let mut shared = |name: &str, chunks: usize| {
+                    Ok::<_, NetworkError>(Arc::new(Modulation {
+                        projection: dense(file, &format!("{prefix}{name}.linear"), precision)?,
+                        chunks,
+                    }))
+                };
+                Some([
+                    shared("double_stream_modulation_img", 2)?,
+                    shared("double_stream_modulation_txt", 2)?,
+                    shared("single_stream_modulation", 1)?,
+                ])
+            }
+            _ => None,
+        };
         let double = (0..config.double_blocks)
             .map(|index| {
                 let base = format!("{prefix}{}.{index}", layout.double_blocks());
                 Ok(DoubleBlock {
-                    image: read_stream(file, &base, layout, true, precision)?,
-                    text: read_stream(file, &base, layout, false, precision)?,
+                    image: read_stream(file, &base, layout, true, shared.as_ref(), precision)?,
+                    text: read_stream(file, &base, layout, false, shared.as_ref(), precision)?,
                 })
             })
             .collect::<Result<Vec<_>, NetworkError>>()?;
@@ -687,7 +760,7 @@ impl Dit {
         let single = (0..config.single_blocks)
             .map(|index| {
                 let base = format!("{prefix}{}.{index}", layout.single_blocks());
-                read_single(file, &base, layout, precision)
+                read_single(file, &base, layout, shared.as_ref(), precision)
             })
             .collect::<Result<Vec<_>, NetworkError>>()?;
 
@@ -703,13 +776,18 @@ impl Dit {
             )));
         }
 
+        // Swapped while it is still float: a quantized layer keeps no float
+        // rows to move.
         let mut final_modulation = dense(
             file,
             &format!("{prefix}{}", layout.final_modulation()),
-            precision,
+            Precision::F32,
         )?;
         if layout.final_scale_first() {
             swap_halves(&mut final_modulation);
+        }
+        if precision == Precision::Q8 {
+            final_modulation.quantize();
         }
 
         Ok(Self {
@@ -730,6 +808,7 @@ impl Dit {
             single,
             final_modulation,
             final_out: dense(file, &format!("{prefix}{}", layout.final_out()), precision)?,
+            swiglu: layout == Layout::Flux2,
             config,
             conditioning: None,
             unconditional: None,
@@ -760,10 +839,11 @@ impl Dit {
             layers.push(&mut embedder.input);
             layers.push(&mut embedder.output);
         }
+        let mut modulations: Vec<&mut Arc<Modulation>> = Vec::new();
         for block in &mut self.double {
             for stream in [&mut block.image, &mut block.text] {
+                modulations.push(&mut stream.modulation);
                 layers.extend([
-                    &mut stream.modulation.projection,
                     &mut stream.qkv,
                     &mut stream.projection,
                     &mut stream.mlp_in,
@@ -772,13 +852,27 @@ impl Dit {
             }
         }
         for block in &mut self.single {
-            layers.extend([
-                &mut block.modulation.projection,
-                &mut block.fused_in,
-                &mut block.fused_out,
-            ]);
+            modulations.push(&mut block.modulation);
+            layers.extend([&mut block.fused_in, &mut block.fused_out]);
         }
         layers.into_par_iter().for_each(Dense::quantize);
+
+        // A modulation several blocks share is quantized once, and every
+        // block is pointed at the one quantized copy.
+        let mut done: Vec<(Arc<Modulation>, Arc<Modulation>)> = Vec::new();
+        for modulation in modulations {
+            let quantized = match done.iter().find(|(from, _)| Arc::ptr_eq(from, modulation)) {
+                Some((_, to)) => to.clone(),
+                None => {
+                    let mut copy = (**modulation).clone();
+                    copy.projection.quantize();
+                    let copy = Arc::new(copy);
+                    done.push((modulation.clone(), copy.clone()));
+                    copy
+                }
+            };
+            *modulation = quantized;
+        }
     }
 
     /// One forward pass: patches in, predicted velocity out.
@@ -909,19 +1003,20 @@ impl Dit {
                 &block.text.projection.forward(&text_attended)?,
                 &text_mod[0][2],
             );
+            let swiglu = self.swiglu;
             let image_mlp =
                 block
                     .image
-                    .feed_forward(&image, &image_mod[1][0], &image_mod[1][1], eps)?;
+                    .feed_forward(&image, &image_mod[1][0], &image_mod[1][1], eps, swiglu)?;
             gated_add(&mut image, &image_mlp, &image_mod[1][2]);
-            let text_mlp = block
-                .text
-                .feed_forward(&text, &text_mod[1][0], &text_mod[1][1], eps)?;
+            let text_mlp =
+                block
+                    .text
+                    .feed_forward(&text, &text_mod[1][0], &text_mod[1][1], eps, swiglu)?;
             gated_add(&mut text, &text_mlp, &text_mod[1][2]);
         }
 
         let mut hidden = concatenate(&text, &image);
-        let mlp_dim = self.config.mlp_dim();
         for block in &self.single {
             let modulation = block.modulation.forward(&vector)?;
             let (shift, scale, gate) = (&modulation[0][0], &modulation[0][1], &modulation[0][2]);
@@ -929,6 +1024,9 @@ impl Dit {
             let fused = block.fused_in.forward(&normed)?;
 
             let width = self.config.d_model;
+            // What follows the values is the feed-forward's input, twice as
+            // wide as its output under SwiGLU.
+            let mlp_dim = fused.cols - 3 * width;
             let mut queries = Matrix::new(fused.rows, width);
             let mut keys = Matrix::new(fused.rows, width);
             let mut values = Matrix::new(fused.rows, width);
@@ -949,9 +1047,7 @@ impl Dit {
             positions.apply(&mut keys, heads);
             let attended = attention(&queries, &keys, &values, heads, heads, false);
 
-            mlp.data
-                .par_iter_mut()
-                .for_each(|value| *value = gelu(*value));
+            let mlp = activate(mlp, self.swiglu);
             let output = block
                 .fused_out
                 .forward(&concatenate_columns(&attended, &mlp))?;
@@ -1060,50 +1156,57 @@ enum Layout {
     Reference,
     /// The names diffusers repacks them under.
     Diffusers,
+    /// FLUX.2 under diffusers' names: the modulations sit outside the blocks,
+    /// one per kind, and the feed-forwards are SwiGLU.
+    Flux2,
 }
 
 impl Layout {
     /// Reads the layout off the file, by the name its blocks go by.
     fn detect(file: &ShardedSafeTensors, prefix: &str) -> Self {
         let blocks = format!("{prefix}transformer_blocks.");
-        match file.names().any(|name| name.starts_with(&blocks)) {
-            true => Self::Diffusers,
-            false => Self::Reference,
+        let shared = format!("{prefix}double_stream_modulation_img.linear.weight");
+        if file.names().any(|name| name == shared) {
+            Self::Flux2
+        } else if file.names().any(|name| name.starts_with(&blocks)) {
+            Self::Diffusers
+        } else {
+            Self::Reference
         }
     }
 
     fn double_blocks(self) -> &'static str {
         match self {
             Self::Reference => "double_blocks",
-            Self::Diffusers => "transformer_blocks",
+            Self::Diffusers | Self::Flux2 => "transformer_blocks",
         }
     }
 
     fn single_blocks(self) -> &'static str {
         match self {
             Self::Reference => "single_blocks",
-            Self::Diffusers => "single_transformer_blocks",
+            Self::Diffusers | Self::Flux2 => "single_transformer_blocks",
         }
     }
 
     fn embedder_layers(self) -> (&'static str, &'static str) {
         match self {
             Self::Reference => ("in_layer", "out_layer"),
-            Self::Diffusers => ("linear_1", "linear_2"),
+            Self::Diffusers | Self::Flux2 => ("linear_1", "linear_2"),
         }
     }
 
     fn image_in(self) -> &'static str {
         match self {
             Self::Reference => "img_in",
-            Self::Diffusers => "x_embedder",
+            Self::Diffusers | Self::Flux2 => "x_embedder",
         }
     }
 
     fn text_in(self) -> &'static str {
         match self {
             Self::Reference => "txt_in",
-            Self::Diffusers => "context_embedder",
+            Self::Diffusers | Self::Flux2 => "context_embedder",
         }
     }
 
@@ -1111,6 +1214,7 @@ impl Layout {
         match self {
             Self::Reference => "time_in",
             Self::Diffusers => "time_text_embed.timestep_embedder",
+            Self::Flux2 => "time_guidance_embed.timestep_embedder",
         }
     }
 
@@ -1118,6 +1222,7 @@ impl Layout {
         match self {
             Self::Reference => "vector_in",
             Self::Diffusers => "time_text_embed.text_embedder",
+            Self::Flux2 => "time_guidance_embed.text_embedder",
         }
     }
 
@@ -1125,27 +1230,28 @@ impl Layout {
         match self {
             Self::Reference => "guidance_in",
             Self::Diffusers => "time_text_embed.guidance_embedder",
+            Self::Flux2 => "time_guidance_embed.guidance_embedder",
         }
     }
 
     fn final_modulation(self) -> &'static str {
         match self {
             Self::Reference => "final_layer.adaLN_modulation.1",
-            Self::Diffusers => "norm_out.linear",
+            Self::Diffusers | Self::Flux2 => "norm_out.linear",
         }
     }
 
     fn final_out(self) -> &'static str {
         match self {
             Self::Reference => "final_layer.linear",
-            Self::Diffusers => "proj_out",
+            Self::Diffusers | Self::Flux2 => "proj_out",
         }
     }
 
     /// Whether the final modulation emits the scale before the shift, which
     /// diffusers does and the reference implementation does not.
     fn final_scale_first(self) -> bool {
-        self == Self::Diffusers
+        self != Self::Reference
     }
 }
 
@@ -1165,6 +1271,7 @@ fn read_stream(
     base: &str,
     layout: Layout,
     image: bool,
+    shared: Option<&[Arc<Modulation>; 3]>,
     precision: Precision,
 ) -> Result<Stream, NetworkError> {
     let names: [&str; 8] = match (layout, image) {
@@ -1187,6 +1294,26 @@ fn read_stream(
             "txt_attn.norm.key_norm.scale",
             "txt_attn.proj",
             "txt_mlp",
+        ],
+        (Layout::Flux2, true) => [
+            "",
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.norm_q.weight",
+            "attn.norm_k.weight",
+            "attn.to_out.0",
+            "ff",
+        ],
+        (Layout::Flux2, false) => [
+            "",
+            "attn.add_q_proj",
+            "attn.add_k_proj",
+            "attn.add_v_proj",
+            "attn.norm_added_q.weight",
+            "attn.norm_added_k.weight",
+            "attn.to_add_out",
+            "ff_context",
         ],
         (Layout::Diffusers, true) => [
             "norm1.linear",
@@ -1222,18 +1349,24 @@ fn read_stream(
     let (mlp_in, mlp_out) = match layout {
         Layout::Reference => (format!("{mlp}.0"), format!("{mlp}.2")),
         Layout::Diffusers => (format!("{mlp}.0.proj"), format!("{mlp}.2")),
+        Layout::Flux2 => (format!("{mlp}.linear_in"), format!("{mlp}.linear_out")),
     };
 
     Ok(Stream {
-        modulation: Modulation {
-            projection: dense(file, &format!("{base}.{modulation}"), precision)?,
-            chunks: 2,
+        modulation: match shared {
+            Some(shared) => shared[usize::from(!image)].clone(),
+            None => Arc::new(Modulation {
+                projection: dense(file, &format!("{base}.{modulation}"), precision)?,
+                chunks: 2,
+            }),
         },
         qkv: match layout {
             Layout::Reference => dense(file, &format!("{base}.{queries}"), precision)?,
             // Three projections written separately are the one fused
             // projection this model runs, stacked in query, key, value order.
-            Layout::Diffusers => stacked(file, base, &[queries, keys, values], precision)?,
+            Layout::Diffusers | Layout::Flux2 => {
+                stacked(file, base, &[queries, keys, values], precision)?
+            }
         },
         query_norm: head_norm(file, &format!("{base}.{query_norm}"))?,
         key_norm: head_norm(file, &format!("{base}.{key_norm}"))?,
@@ -1247,24 +1380,36 @@ fn read_single(
     file: &mut ShardedSafeTensors,
     base: &str,
     layout: Layout,
+    shared: Option<&[Arc<Modulation>; 3]>,
     precision: Precision,
 ) -> Result<SingleBlock, NetworkError> {
     Ok(match layout {
+        // The attention's projections and the feed-forward's input are
+        // already one, written that way, as is the output.
+        Layout::Flux2 => SingleBlock {
+            modulation: shared
+                .map(|shared| shared[2].clone())
+                .ok_or_else(|| NetworkError::InvalidConfig(format!("{base}: no modulation")))?,
+            fused_in: dense(file, &format!("{base}.attn.to_qkv_mlp_proj"), precision)?,
+            fused_out: dense(file, &format!("{base}.attn.to_out"), precision)?,
+            query_norm: head_norm(file, &format!("{base}.attn.norm_q.weight"))?,
+            key_norm: head_norm(file, &format!("{base}.attn.norm_k.weight"))?,
+        },
         Layout::Reference => SingleBlock {
-            modulation: Modulation {
+            modulation: Arc::new(Modulation {
                 projection: dense(file, &format!("{base}.modulation.lin"), precision)?,
                 chunks: 1,
-            },
+            }),
             fused_in: dense(file, &format!("{base}.linear1"), precision)?,
             fused_out: dense(file, &format!("{base}.linear2"), precision)?,
             query_norm: head_norm(file, &format!("{base}.norm.query_norm.scale"))?,
             key_norm: head_norm(file, &format!("{base}.norm.key_norm.scale"))?,
         },
         Layout::Diffusers => SingleBlock {
-            modulation: Modulation {
+            modulation: Arc::new(Modulation {
                 projection: dense(file, &format!("{base}.norm.linear"), precision)?,
                 chunks: 1,
-            },
+            }),
             // Attention and feed-forward share one projection here too, and
             // the feed-forward's half is written after the values.
             fused_in: stacked(
@@ -1603,6 +1748,82 @@ pub(crate) mod tests {
         out
     }
 
+    /// A FLUX.2-shaped tiny model: four rotary axes, no pooled prompt.
+    pub(crate) fn flux2_tiny() -> DitConfig {
+        DitConfig {
+            pooled_dim: 0,
+            axes_dim: vec![2, 2, 2, 2],
+            ..tiny()
+        }
+    }
+
+    /// A checkpoint under FLUX.2's diffusers names: one modulation per kind
+    /// of block outside the blocks, SwiGLU feed-forwards twice as wide in as
+    /// out, and no biases anywhere.
+    pub(crate) fn flux2_checkpoint(config: &DitConfig, path: &std::path::Path) {
+        // Random weights at a `1 / sqrt(fan in)` scale, norm scales near one.
+        let mut tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
+        let mut state = 0x2545_f491u32;
+        let mut add = |name: String, shape: Vec<usize>| {
+            let count = shape.iter().product::<usize>();
+            let fan_in = *shape.last().unwrap() as f32;
+            let values = (0..count)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let uniform = state as f32 / u32::MAX as f32 * 2.0 - 1.0;
+                    match shape.len() {
+                        1 => 1.0 + 0.1 * uniform,
+                        _ => uniform * (3.0 / fan_in).sqrt(),
+                    }
+                })
+                .collect();
+            tensors.insert(name, (shape, values));
+        };
+        let (dim, mlp, head) = (config.d_model, config.mlp_dim(), config.head_dim());
+        let mut linear = |name: &str, input: usize, output: usize| {
+            add(format!("{name}.weight"), vec![output, input])
+        };
+        linear("x_embedder", config.in_channels, dim);
+        linear("context_embedder", config.text_dim, dim);
+        linear("time_guidance_embed.timestep_embedder.linear_1", 256, dim);
+        linear("time_guidance_embed.timestep_embedder.linear_2", dim, dim);
+        linear("double_stream_modulation_img.linear", dim, 6 * dim);
+        linear("double_stream_modulation_txt.linear", dim, 6 * dim);
+        linear("single_stream_modulation.linear", dim, 3 * dim);
+        for index in 0..config.double_blocks {
+            let base = format!("transformer_blocks.{index}");
+            for name in ["to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj"] {
+                linear(&format!("{base}.attn.{name}"), dim, dim);
+            }
+            linear(&format!("{base}.attn.to_out.0"), dim, dim);
+            linear(&format!("{base}.attn.to_add_out"), dim, dim);
+            for ff in ["ff", "ff_context"] {
+                linear(&format!("{base}.{ff}.linear_in"), dim, 2 * mlp);
+                linear(&format!("{base}.{ff}.linear_out"), mlp, dim);
+            }
+        }
+        for index in 0..config.single_blocks {
+            let base = format!("single_transformer_blocks.{index}");
+            linear(&format!("{base}.attn.to_qkv_mlp_proj"), dim, 3 * dim + 2 * mlp);
+            linear(&format!("{base}.attn.to_out"), dim + mlp, dim);
+        }
+        linear("norm_out.linear", dim, 2 * dim);
+        linear("proj_out", dim, config.out_channels);
+        for index in 0..config.double_blocks {
+            for name in ["norm_q", "norm_k", "norm_added_q", "norm_added_k"] {
+                add(format!("transformer_blocks.{index}.attn.{name}.weight"), vec![head]);
+            }
+        }
+        for index in 0..config.single_blocks {
+            for name in ["norm_q", "norm_k"] {
+                add(format!("single_transformer_blocks.{index}.attn.{name}.weight"), vec![head]);
+            }
+        }
+        crate::safetensors::write_checkpoint(path, &tensors);
+    }
+
     pub(crate) fn conditioning(config: &DitConfig, height: usize, width: usize) -> Conditioning {
         Conditioning {
             text: Matrix::from_vec(
@@ -1634,12 +1855,8 @@ pub(crate) mod tests {
         let config = tiny();
         let path = std::env::temp_dir().join("rusting_brain_dit_diffusers.safetensors");
         crate::safetensors::write_checkpoint(&path, &diffusers_tensors(&config));
-        let mut diffusers = Dit::load(&path, "", config.clone()).unwrap();
-        std::fs::remove_file(&path).ok();
-        let mut reference = model(&config, "rusting_brain_dit_reference.safetensors");
-
-        diffusers.set_conditioning(conditioning(&config, 2, 3));
-        reference.set_conditioning(conditioning(&config, 2, 3));
+        let reference_path = std::env::temp_dir().join("rusting_brain_dit_reference.safetensors");
+        checkpoint(&config, &reference_path);
         let patches = Matrix::from_vec(
             6,
             config.in_channels,
@@ -1648,15 +1865,27 @@ pub(crate) mod tests {
                 .collect(),
         );
 
-        let expected = reference.denoise(&patches, 0.7).unwrap();
-        let actual = diffusers.denoise(&patches, 0.7).unwrap();
-        assert_eq!((actual.rows, actual.cols), (expected.rows, expected.cols));
-        for (actual, expected) in actual.data.iter().zip(&expected.data) {
-            assert!(
-                (actual - expected).abs() < 1e-5,
-                "{actual} is not {expected}"
-            );
+        // At Q8 too: the diffusers final modulation is reordered on load,
+        // which once panicked on a layer already quantized.
+        for precision in [Precision::F32, Precision::Q8] {
+            let mut diffusers = Dit::load_at(&path, "", config.clone(), precision).unwrap();
+            let mut reference =
+                Dit::load_at(&reference_path, "", config.clone(), precision).unwrap();
+            diffusers.set_conditioning(conditioning(&config, 2, 3));
+            reference.set_conditioning(conditioning(&config, 2, 3));
+
+            let expected = reference.denoise(&patches, 0.7).unwrap();
+            let actual = diffusers.denoise(&patches, 0.7).unwrap();
+            assert_eq!((actual.rows, actual.cols), (expected.rows, expected.cols));
+            for (actual, expected) in actual.data.iter().zip(&expected.data) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{precision:?}: {actual} is not {expected}"
+                );
+            }
         }
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&reference_path).ok();
     }
 
     #[test]
@@ -1926,5 +2155,90 @@ pub(crate) mod tests {
         // A rotation preserves each pair's length.
         let norm = |row: &[f32]| row.iter().map(|value| value * value).sum::<f32>();
         assert!((norm(values.row(5)) - norm(before.row(5))).abs() < 1e-2);
+    }
+
+    #[test]
+    fn swiglu_gates_the_second_half_by_the_silu_of_the_first() {
+        let hidden = Matrix::from_vec(2, 4, vec![1.0, -2.0, 3.0, 4.0, 0.0, 0.5, -1.0, 2.0]);
+        let out = activate(hidden, true);
+        assert_eq!((out.rows, out.cols), (2, 2));
+        let expected = [silu(1.0) * 3.0, silu(-2.0) * 4.0, 0.0, silu(0.5) * 2.0];
+        for (actual, expected) in out.data.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} is not {expected}");
+        }
+        let plain = activate(Matrix::from_vec(1, 2, vec![1.0, -1.0]), false);
+        assert_eq!(plain.data, vec![gelu(1.0), gelu(-1.0)]);
+    }
+
+    #[test]
+    fn a_flux2_checkpoint_shares_one_modulation_per_kind_of_block() {
+        let config = flux2_tiny();
+        let path = std::env::temp_dir().join("rusting_brain_dit_flux2.safetensors");
+        flux2_checkpoint(&config, &path);
+        let mut dit = Dit::load(&path, "", config.clone()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(dit.swiglu);
+        assert_eq!(dit.pooled_dim(), None);
+        let shared = |dit: &Dit| {
+            Arc::ptr_eq(&dit.double[0].image.modulation, &dit.double[1].image.modulation)
+                && Arc::ptr_eq(&dit.double[0].text.modulation, &dit.double[1].text.modulation)
+                && Arc::ptr_eq(&dit.single[0].modulation, &dit.single[1].modulation)
+                && !Arc::ptr_eq(&dit.double[0].image.modulation, &dit.double[0].text.modulation)
+        };
+        assert!(shared(&dit));
+
+        let conditioning = conditioning(&config, 2, 3);
+        let patches = Matrix::from_vec(
+            6,
+            config.in_channels,
+            (0..6 * config.in_channels)
+                .map(|index| (index as f32 * 0.2).sin())
+                .collect(),
+        );
+        let float = dit.forward_with(&patches, 0.7, &conditioning).unwrap();
+        assert_eq!((float.rows, float.cols), (6, config.out_channels));
+        assert!(float.data.iter().all(|value| value.is_finite()));
+
+        // Quantizing keeps one copy per kind, and the prediction.
+        dit.quantize();
+        assert!(shared(&dit));
+        assert!(dit.double[0].image.modulation.projection.is_quantized());
+        let bytes = dit.forward_with(&patches, 0.7, &conditioning).unwrap();
+        let error = bytes
+            .data
+            .iter()
+            .zip(&float.data)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let scale = float.data.iter().fold(0.0f32, |most, value| most.max(value.abs()));
+        assert!(error < 0.05 * scale.max(1e-3), "{error} against {scale}");
+    }
+
+    #[test]
+    fn four_rotary_axes_count_the_text_and_place_patches_on_the_middle_two() {
+        // FLUX.2's ids: text (0, 0, 0, i), patch (0, row, column, 0).
+        let config = DitConfig {
+            axes_dim: vec![2, 2, 2, 2],
+            theta: 2000.0,
+            ..flux2_tiny()
+        };
+        let positions = Positions::new(&config, 3, 2, 2);
+        let pairs = positions.pairs;
+        assert_eq!(pairs, 4);
+        let angle = |token: usize, pair: usize| {
+            positions.sin[token * pairs + pair].atan2(positions.cos[token * pairs + pair])
+        };
+        // Text token 2 turns by 2 on the fourth axis, and nowhere else.
+        assert!((angle(2, 3) - 2.0).abs() < 1e-6);
+        for pair in 0..3 {
+            assert_eq!(angle(2, pair), 0.0);
+        }
+        // The patch at row 1, column 0 is the fifth token; row 1 at
+        // column 1 the sixth.
+        assert!((angle(5, 1) - 1.0).abs() < 1e-6);
+        assert_eq!(angle(5, 2), 0.0);
+        assert!((angle(6, 1) - 1.0).abs() < 1e-6 && (angle(6, 2) - 1.0).abs() < 1e-6);
+        assert_eq!((angle(6, 0), angle(6, 3)), (0.0, 0.0));
     }
 }
