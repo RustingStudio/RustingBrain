@@ -1031,10 +1031,12 @@ impl ImagePipeline {
 
     /// Moves everything that has a device path onto CUDA device `device`.
     ///
-    /// That is the denoiser, both halves of the VAE, every CLIP tower and a gated
-    /// T5 encoder. The UNet runs on the FP16 image kernels; a transformer
-    /// denoiser and T5 run on the BF16 ones, because T5 1.1's activations pass
-    /// FP16's range. The original ungated T5 stays on the host.
+    /// That is the denoiser, both halves of the VAE, every CLIP tower, a gated
+    /// T5 encoder and a LLaMA-family one (FLUX.2's Qwen3) where it fits. The
+    /// UNet runs on the FP16 image kernels; a transformer denoiser and both
+    /// language-model encoders run on the BF16 ones, because T5 1.1's
+    /// activations pass FP16's range. The original ungated T5 stays on the
+    /// host.
     ///
     /// Fails closed. Whatever was uploaded before the failure is dropped with
     /// the error, and every part that did not move is still the CPU one, so a
@@ -1055,14 +1057,21 @@ impl ImagePipeline {
         if let Some(pooled) = &mut self.pooled {
             pooled.encoder.attach_device(gpu)?;
         }
+        let sequence = matches!(self.encoder, PromptEncoder::Sequence { .. });
         let t5 = self.encoder.t5().filter(|t5| t5.config().gated);
-        if t5.is_some() || matches!(self.denoiser, ImageDenoiser::Transformer(_)) {
+        if sequence || t5.is_some() || matches!(self.denoiser, ImageDenoiser::Transformer(_)) {
             let context = crate::gpu_transformer::GpuContext::new(device)?;
             if let Some(t5) = t5 {
                 t5.attach_device(&context)?;
             }
             if let ImageDenoiser::Transformer(dit) = &mut self.denoiser {
                 dit.attach_device(&context)?;
+            }
+            // After the denoiser, and allowed to fail: a prompt encoder that
+            // does not fit beside it (FLUX.2-klein's Qwen3 in BF16 on a 12 GB
+            // card) or has no device path stays on the host, where it worked.
+            if let PromptEncoder::Sequence { encoder, .. } = &mut self.encoder {
+                encoder.attach_device(&context).ok();
             }
         }
         Ok(())
@@ -2982,6 +2991,10 @@ mod tests {
         #[cfg(feature = "cuda")]
         if env("RB_FLUX2_CUDA").as_deref() == Some("1") {
             pipeline.to_cuda(0).unwrap();
+            let PromptEncoder::Sequence { encoder, .. } = &pipeline.encoder else {
+                panic!("FLUX.2 takes a sequence encoder")
+            };
+            assert!(encoder.on_device(), "to_cuda left the Q8 encoder on the host");
         }
         eprintln!("flux2 load: {:?}", started.elapsed());
         assert_eq!(pipeline.config.steps, 4);
@@ -3045,6 +3058,95 @@ mod tests {
 
         let failed: Vec<_> = report.iter().filter(|(_, error, limit)| error > limit).collect();
         assert!(failed.is_empty(), "over the gate: {failed:?}");
+    }
+
+    /// FLUX.2-klein's Qwen3 prompt encoder on the device against diffusers'
+    /// prompt embeddings, all 512 positions of the three stacked layers, at
+    /// Q8 (int8 weights) and, with `RB_FLUX2_ENCODER=f32`, from the F32 host
+    /// encoder (BF16 weights, about 12 GB of host memory). Same variables as
+    /// [`flux2_klein_matches_diffusers`]; skips without a device.
+    #[test]
+    #[ignore = "needs FLUX.2-klein-4B, the output of scripts/flux2_reference.py and a device"]
+    fn flux2_klein_device_encoder_matches_diffusers() {
+        #[cfg(feature = "cuda")]
+        {
+            let env = |name: &str| std::env::var(name).ok();
+            let context = match crate::cuda_training::cuda_doctor(0, 8192) {
+                Ok(_) => crate::gpu_transformer::GpuContext::new(0).unwrap(),
+                Err(NetworkError::Cuda(message))
+                    if message.contains("NO_DEVICE")
+                        || message.contains("no CUDA-capable device") =>
+                {
+                    crate::cuda_training::skip_without_cuda();
+                    return;
+                }
+                Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
+            };
+            let dir = std::path::PathBuf::from(env("RB_FLUX2_REF").expect("RB_FLUX2_REF"));
+            let model = std::path::PathBuf::from(
+                env("RB_FLUX2_MODEL")
+                    .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
+            );
+            let settings: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("reference.json")).unwrap(),
+            )
+            .unwrap();
+            let prompt = settings["prompt"].as_str().unwrap();
+            let embeds = crate::safetensors::SafeTensors::open(dir.join("flux2.safetensors"))
+                .unwrap()
+                .tensor("prompt_embeds")
+                .unwrap()
+                .0;
+            let tokenizer = Bpe::from_file(model.join("tokenizer/tokenizer.json")).unwrap();
+            let chat = ChatPrompt::flux2(tokenizer.token_id("<|endoftext|>").unwrap());
+
+            // Q8's own 0.025 on the host is the gate for int8 weights; BF16
+            // weights from the F32 encoder sit near BF16's rounding.
+            let mut runs = vec![(Precision::Q8, 0.025)];
+            if env("RB_FLUX2_ENCODER").as_deref() == Some("f32") {
+                runs.push((Precision::F32, 0.01));
+            }
+            let mut failed = Vec::new();
+            for (precision, limit) in runs {
+                let mut file = crate::safetensors::ShardedSafeTensors::open(
+                    weights(&model.join("text_encoder")).unwrap(),
+                )
+                .unwrap();
+                let mut config =
+                    TextEncoderConfig::from_file(model.join("text_encoder/config.json")).unwrap();
+                config.layers = 27;
+                let mut encoder = PromptEncoder::Sequence {
+                    tokenizer: tokenizer.clone(),
+                    encoder: TextEncoder::read_at(&mut file, "model.", config, precision).unwrap(),
+                    chat: Some(chat.clone()),
+                };
+                drop(file);
+                let host = relative(&encoder.encode(prompt).unwrap().0.data, &embeds);
+                eprintln!("flux2 device encoder {precision:?}: host relative L2 {host:.4e}");
+                let PromptEncoder::Sequence { encoder: inner, .. } = &mut encoder else {
+                    unreachable!()
+                };
+                let started = std::time::Instant::now();
+                inner.attach_device(&context).unwrap();
+                eprintln!("flux2 device encoder {precision:?}: upload {:?}", started.elapsed());
+                let mut times = Vec::new();
+                let mut got = None;
+                for _ in 0..4 {
+                    let started = std::time::Instant::now();
+                    got = Some(encoder.encode(prompt).unwrap().0);
+                    times.push(started.elapsed());
+                }
+                let error = relative(&got.unwrap().data, &embeds);
+                eprintln!(
+                    "flux2 device encoder {precision:?}: relative L2 {error:.4e} (gate {limit}), \
+                     encodes {times:?}"
+                );
+                if error > limit {
+                    failed.push((precision, error));
+                }
+            }
+            assert!(failed.is_empty(), "over the gate: {failed:?}");
+        }
     }
 
     /// The transformer cut to its first two double and two single blocks,

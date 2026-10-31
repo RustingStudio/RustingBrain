@@ -92,28 +92,30 @@ impl TextEncoderConfig {
 }
 
 /// One transformer layer of the encoder.
-struct Layer {
-    input_norm: Vec<f32>,
-    query: Dense,
-    key: Dense,
-    value: Dense,
-    output: Dense,
+pub(crate) struct Layer {
+    pub(crate) input_norm: Vec<f32>,
+    pub(crate) query: Dense,
+    pub(crate) key: Dense,
+    pub(crate) value: Dense,
+    pub(crate) output: Dense,
     /// Qwen3's per-head query and key normalization. Absent in Qwen2 and
     /// LLaMA, and its absence is read from the checkpoint rather than assumed.
-    query_norm: Option<Vec<f32>>,
-    key_norm: Option<Vec<f32>>,
-    post_norm: Vec<f32>,
-    gate: Dense,
-    up: Dense,
-    down: Dense,
+    pub(crate) query_norm: Option<Vec<f32>>,
+    pub(crate) key_norm: Option<Vec<f32>>,
+    pub(crate) post_norm: Vec<f32>,
+    pub(crate) gate: Dense,
+    pub(crate) up: Dense,
+    pub(crate) down: Dense,
 }
 
 /// A decoder language model run as a prompt encoder.
 pub struct TextEncoder {
     config: TextEncoderConfig,
     embeddings: Matrix,
-    layers: Vec<Layer>,
+    pub(crate) layers: Vec<Layer>,
     final_norm: Vec<f32>,
+    #[cfg(feature = "cuda")]
+    device: Option<crate::cuda_text_encoder::DeviceTextEncoder>,
 }
 
 impl TextEncoder {
@@ -198,11 +200,46 @@ impl TextEncoder {
             config,
             embeddings,
             layers,
+            #[cfg(feature = "cuda")]
+            device: None,
         })
+    }
+
+    /// Uploads every layer to a CUDA device and runs there from now on. The
+    /// embedding table stays on the host: it is read by lookup.
+    ///
+    /// Fails closed: an error leaves the encoder on the CPU, as it was.
+    #[cfg(feature = "cuda")]
+    pub fn attach_device(
+        &mut self,
+        context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
+    ) -> Result<(), NetworkError> {
+        self.device = Some(crate::cuda_text_encoder::DeviceTextEncoder::upload(
+            context, self,
+        )?);
+        Ok(())
+    }
+
+    /// Whether [`TextEncoder::attach_device`] moved this encoder.
+    #[cfg(feature = "cuda")]
+    pub fn on_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Drops the device copy, freeing its memory; the encoder runs on the
+    /// host again.
+    #[cfg(feature = "cuda")]
+    pub fn detach_device(&mut self) {
+        self.device = None;
     }
 
     /// The hidden states for a sequence of token ids, `[tokens, d_model]`.
     pub fn forward(&self, ids: &[u32]) -> Result<Matrix, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            let hidden = device.forward_layers(self, ids, ids.len(), &[self.layers.len()])?;
+            return Ok(rms_norm(&hidden, &self.final_norm, self.config.eps));
+        }
         let hidden = self.run(ids, ids.len(), self.layers.len(), |_, _| {})?;
         Ok(rms_norm(&hidden, &self.final_norm, self.config.eps))
     }
@@ -230,6 +267,10 @@ impl TextEncoder {
                 self.layers.len()
             )));
         }
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            return device.forward_layers(self, ids, real, layers);
+        }
         let width = self.config.d_model;
         let mut output = Matrix::new(ids.len(), layers.len() * width);
         self.run(ids, real, deepest, |done, hidden| {
@@ -253,23 +294,7 @@ impl TextEncoder {
         depth: usize,
         mut after: impl FnMut(usize, &Matrix),
     ) -> Result<Matrix, NetworkError> {
-        if ids.is_empty() {
-            return Err(NetworkError::InvalidConfig(
-                "an empty prompt has no hidden states".into(),
-            ));
-        }
-        let mut hidden = Matrix::new(ids.len(), self.config.d_model);
-        for (position, id) in ids.iter().enumerate() {
-            if *id as usize >= self.embeddings.rows {
-                return Err(NetworkError::InvalidTarget {
-                    expected: self.embeddings.rows,
-                    actual: *id as usize,
-                });
-            }
-            hidden
-                .row_mut(position)
-                .copy_from_slice(self.embeddings.row(*id as usize));
-        }
+        let mut hidden = self.embed(ids)?;
 
         let (heads, kv_heads, head_dim) = (
             self.config.num_heads,
@@ -323,6 +348,28 @@ impl TextEncoder {
         Ok(hidden)
     }
 
+    /// The embedding rows of `ids`, `[tokens, d_model]`.
+    pub(crate) fn embed(&self, ids: &[u32]) -> Result<Matrix, NetworkError> {
+        if ids.is_empty() {
+            return Err(NetworkError::InvalidConfig(
+                "an empty prompt has no hidden states".into(),
+            ));
+        }
+        let mut hidden = Matrix::new(ids.len(), self.config.d_model);
+        for (position, id) in ids.iter().enumerate() {
+            if *id as usize >= self.embeddings.rows {
+                return Err(NetworkError::InvalidTarget {
+                    expected: self.embeddings.rows,
+                    actual: *id as usize,
+                });
+            }
+            hidden
+                .row_mut(position)
+                .copy_from_slice(self.embeddings.row(*id as usize));
+        }
+        Ok(hidden)
+    }
+
     /// Tokenizes a prompt and returns its hidden states.
     pub fn encode(&self, tokenizer: &Bpe, prompt: &str) -> Result<Matrix, NetworkError> {
         self.forward(&tokenizer.encode(prompt)?)
@@ -339,14 +386,14 @@ impl TextEncoder {
 /// The rotary table, in the half-split arrangement Hugging Face checkpoints
 /// are trained with: dimension `i` pairs with `i + head_dim / 2`, rather than
 /// with its neighbour.
-struct Rotary {
-    cos: Vec<f32>,
-    sin: Vec<f32>,
+pub(crate) struct Rotary {
+    pub(crate) cos: Vec<f32>,
+    pub(crate) sin: Vec<f32>,
     half: usize,
 }
 
 impl Rotary {
-    fn new(tokens: usize, head_dim: usize, theta: f32) -> Self {
+    pub(crate) fn new(tokens: usize, head_dim: usize, theta: f32) -> Self {
         let half = head_dim / 2;
         let mut cos = vec![0.0; tokens * half];
         let mut sin = vec![0.0; tokens * half];

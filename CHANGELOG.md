@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `ImagePipeline::to_cuda` (and `try_cuda`) moves a sequence prompt encoder
+  such as FLUX.2-klein's Qwen3 to the device as well: 1024x1024 Q8 prompt
+  encode 12.4 s to 0.7 s on an RTX 3060, embeddings 0.0249 against diffusers
+  (host Q8 0.0251), peak VRAM 6754 to 10402 MiB (`docs/baseline.md`, P1).
+  New: `TextEncoder::attach_device`, `on_device`, `detach_device` and the
+  `cuda_text_encoder` module.
 - FLUX.2-klein loads and runs through `ImagePipeline`, checked stage by stage
   against diffusers (`docs/baseline.md`, K14). New public items:
   `ChatPrompt`, `ImagePipeline::sample_latent_from_noise`, `TextEncoder::forward_layers`,

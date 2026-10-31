@@ -164,6 +164,8 @@ pub mod cuda_mmdit;
 #[cfg(feature = "cuda")]
 pub mod cuda_t5;
 #[cfg(feature = "cuda")]
+pub mod cuda_text_encoder;
+#[cfg(feature = "cuda")]
 pub mod cuda_training;
 #[cfg(feature = "cuda")]
 pub(crate) mod gpu_cross;
