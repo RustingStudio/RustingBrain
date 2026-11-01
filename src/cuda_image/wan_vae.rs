@@ -11,6 +11,7 @@
 //! `DeviceConv` removes it if it ever shows in a profile.
 
 use super::*;
+use std::sync::atomic::Ordering;
 use crate::wan_vae::{CausalConv3d, Streams, WanAttention, WanResnet, WanVaeDecoder, unpatchify};
 
 const WAN_KERNELS: &str = r#"
@@ -94,6 +95,8 @@ struct DeviceWanUpBlock {
 /// The device and this module's kernels, with the layers that only need
 /// those.
 struct WanKernels {
+    /// Set while the clip's last latent frame goes through.
+    ending: std::sync::atomic::AtomicBool,
     gpu: Arc<ImageGpu>,
     rms: CudaFunction,
     dup_up_add: CudaFunction,
@@ -318,6 +321,9 @@ impl DeviceWanDecoder {
         let mut video = Vec::new();
         for (index, frame) in latent.iter().enumerate() {
             streams.rewind();
+            self.kernels
+                .ending
+                .store(index + 1 == latent.len(), Ordering::Relaxed);
             let chunk = vec![gpu.conv(&self.post_quant, &upload_map(gpu, frame)?)?];
             for frame in self.decode_chunk(&mut streams, chunk, index == 0)? {
                 let mut frame = unpatchify(&download_map(gpu, &frame)?, self.patch_size);
@@ -421,7 +427,11 @@ impl DeviceWanDecoder {
         }
         let mark = streams.position();
         let mut video = Vec::with_capacity(hidden.len());
-        for frame in hidden {
+        let ending = k.ending.load(Ordering::Relaxed);
+        let count = hidden.len();
+        for (index, frame) in hidden.into_iter().enumerate() {
+            // Only the clip's very last frame feeds no later output.
+            k.ending.store(ending && index + 1 == count, Ordering::Relaxed);
             streams.seek(mark);
             let mut frame = vec![frame];
             for block in &self.up_blocks[tail..] {
@@ -448,6 +458,7 @@ impl WanKernels {
                 .map_err(cuda_err("Wan VAE kernel lookup"))
         };
         Ok(Self {
+            ending: Default::default(),
             rms: get("wan_rms")?,
             dup_up_add: get("wan_dup_up_add")?,
             gpu: Arc::clone(gpu),
@@ -455,6 +466,12 @@ impl WanKernels {
     }
 
     /// A causal convolution over `chunk` after `history`, which it updates.
+    ///
+    /// A spatial one keeps in `history` not the frames it has seen but what
+    /// they have already contributed to the next outputs, so each frame is
+    /// gathered once and every tap's product goes straight into the output it
+    /// belongs to. The gather moves as many bytes as the GEMMs do, and the
+    /// old order, one output at a time, did it once a tap.
     fn causal(
         &self,
         conv: &DeviceCausal,
@@ -462,9 +479,73 @@ impl WanKernels {
         chunk: Vec<Map>,
         targets: Option<Vec<Map>>,
     ) -> Result<Vec<Map>, NetworkError> {
+        let newest = conv.taps.len() - 1;
+        if newest > 0 && conv.taps.iter().all(|tap| tap.kernel > 1 && tap.stride == 1) {
+            return self.causal_fan(conv, history, chunk, targets);
+        }
         let (stream, past) = extend(history, chunk);
         let outputs = self.causal_over(conv, &stream, past, targets)?;
         retire(history, stream);
+        Ok(outputs)
+    }
+
+    /// [`Self::causal`] for a spatial convolution: `history` holds the partial
+    /// sums of the next `taps - 1` outputs.
+    fn causal_fan(
+        &self,
+        conv: &DeviceCausal,
+        history: &mut Option<Vec<Map>>,
+        chunk: Vec<Map>,
+        targets: Option<Vec<Map>>,
+    ) -> Result<Vec<Map>, NetworkError> {
+        let gpu = &*self.gpu;
+        let newest = conv.taps.len() - 1;
+        let ending = self.ending.load(Ordering::Relaxed);
+        let mut partial = history.take().unwrap_or_default();
+        let mut targets = targets.map(Vec::into_iter);
+        let count = chunk.len();
+        let mut outputs = Vec::with_capacity(count);
+        for (index, frame) in chunk.iter().enumerate() {
+            let front = (!partial.is_empty()).then(|| partial.remove(0));
+            let (mut output, beta) = match (targets.as_mut().and_then(Iterator::next), front) {
+                (Some(mut target), Some(front)) => {
+                    gpu.add(&mut target.tensor, &front.tensor)?;
+                    (target, 1.0)
+                }
+                (Some(target), None) => (target, 1.0),
+                (None, Some(front)) => (front, 1.0),
+                (None, None) => {
+                    let out = &conv.taps[newest];
+                    let fresh = gpu.uninit(out.out_channels, frame.pixels())?;
+                    let map = Map {
+                        tensor: fresh,
+                        height: frame.height,
+                        width: frame.width,
+                    };
+                    (map, 0.0)
+                }
+            };
+            // The last frame of the clip feeds no later output.
+            let reach = if ending { newest.min(count - 1 - index) } else { newest };
+            let have = partial.len();
+            for back in have..reach {
+                let out = &conv.taps[newest - 1 - back];
+                partial.push(Map {
+                    tensor: gpu.uninit(out.out_channels, frame.pixels())?,
+                    height: frame.height,
+                    width: frame.width,
+                });
+            }
+            let mut jobs: Vec<(&DeviceConv, &mut Map, f32)> =
+                vec![(&conv.taps[newest], &mut output, beta)];
+            for (back, sum) in partial.iter_mut().enumerate().take(reach) {
+                let beta = if back < have { 1.0 } else { 0.0 };
+                jobs.push((&conv.taps[newest - 1 - back], sum, beta));
+            }
+            gpu.conv_fan(frame, &mut jobs, COLUMN_BUDGET)?;
+            outputs.push(output);
+        }
+        *history = Some(partial);
         Ok(outputs)
     }
 
