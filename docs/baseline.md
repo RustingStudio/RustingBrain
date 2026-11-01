@@ -2005,3 +2005,54 @@ The rest of the step is mostly the BF16 GEMMs (cutlass 14.4 ms a call at
 896, about 31% of kernel time after lever 2), which none of these levers
 touch. 1024x1024 needs the desktop at about 1.5 GB of VRAM or less; at 1.65
 GB both builds ran out of memory.
+
+## Wan 2.2 umT5-XXL prompt encoder (W1, 2026-11-01)
+
+Wan 2.2 TI2V-5B encodes its prompt with umT5-XXL (`text_encoder/` of the
+diffusers checkpoint: vocab 256384, d_model 4096, 64 heads of 64, 24 blocks,
+d_ff 10240, gated GELU, 32 buckets over distance 128). It is T5 with one
+change: every block has its own relative position table instead of block 0's
+shared one. `T5Encoder` now reads a table per block when the checkpoint has
+`encoder.block.1...relative_attention_bias.weight`, on the host (`t5.rs`) and
+the device (`cuda_t5.rs`); the tokenizer is the existing `Unigram` over
+`tokenizer/tokenizer.json`.
+
+Wan pads the prompt to 512 with `</s>` appended, masks the padding out of
+attention, and then cuts the output to the real tokens and zero-pads it back
+to 512. `T5Encoder::encode_real` runs only the real tokens and appends the
+zero rows. That gives the same states: a masked key adds nothing to a real
+query, and the position bias depends only on the distance between two tokens,
+so the real rows never see the padding either way.
+
+Parity against transformers' `UMT5EncoderModel` (the BF16 weights as stored,
+FP32 compute; RustingFrame `tools/wan_refs.py`), test
+`t5::tests::umt5_xxl_matches_transformers` (ignored;
+`RB_WAN_REF` is the directory with the reference dumps, `RB_WAN_MODEL`
+defaults to the Wan2.2-TI2V-5B download, `RB_WAN_CUDA=1` adds the device).
+Q8 weights; the F32 encoder (about 23 GB) does not fit beside the desktop.
+Layer 0 and the prompt embeddings are compared on the real rows; the pad rows
+of the reference come from running the padding and are not used by Wan.
+
+| Prompt | Ids | Embedding | Layer 0 position bias | Layer 0 | Prompt embeds, host | Prompt embeds, device |
+|---|---|---|---|---|---|---|
+| short, 9 tokens | exact | 0.0 | 0.0 | 9.33e-4 | 0.02029 | 0.02038 |
+| long, 39 tokens | exact | 0.0 | 0.0 | 9.79e-4 | 0.02454 | 0.02446 |
+
+Gates: 1e-6 for the embedding and bias, 5e-3 for layer 0, 3e-2 for the
+embeddings (P1's Qwen3 at Q8 is 0.025).
+
+Device activations into the GEMMs, RTX 3060, under the GPU lock, one call to
+warm up and then three timed (ms):
+
+| Activations | Device, short | Device, long | Encode, short | Encode, long | Peak VRAM | Load |
+|---|---|---|---|---|---|---|
+| BF16 (first try) | 0.02069 | 0.02709 | 29.2 / 29.0 / 27.6 | 157.7 / 107.9 / 105.3 | 5976 MiB | 2.4-3.3 |
+| FP32 (kept) | 0.02038 | 0.02446 | 102.1 / 96.0 / 94.8 | 194.2 / 194.3 / 194.5 | 6360 MiB | 1.4-2.4 |
+
+As in P1, BF16 on top of Q8's rounding moves the long prompt off the host's
+0.0245, so int8 weights keep FP32 activations; F32 weights still run BF16.
+The cost is about 70-90 ms a prompt, against a host encode of 0.4-1.9 s for
+the same prompts (short and long; the first run 0.62 / 1.47 s). Loading the
+Q8 encoder takes 17-36 s and the upload 12-14 s. Peak host RSS 6.2-7.9 GB
+(the F32 embedding table is 4.2 GB of it); the first host run was taken with
+25 GB of swap in use, so its RSS may read low.
