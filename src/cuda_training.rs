@@ -1155,6 +1155,40 @@ pub(crate) fn release_freed_memory(device: usize) -> Result<(), NetworkError> {
     }
 }
 
+/// The most device memory the default pool has held since the last call, in
+/// bytes; the call starts the next window. Measurement only.
+#[cfg(test)]
+pub(crate) fn reserved_high_water(device: usize) -> Result<u64, NetworkError> {
+    use cudarc::driver::sys;
+    let (ctx, _) = device_context(device)?;
+    ctx.synchronize()
+        .map_err(cuda_err("CUDA synchronize before a pool read"))?;
+    unsafe {
+        let mut pool = std::mem::MaybeUninit::uninit();
+        sys::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), ctx.cu_device())
+            .result()
+            .map_err(cuda_err("CUDA memory pool lookup"))?;
+        let pool = pool.assume_init();
+        let mut high = 0u64;
+        sys::cuMemPoolGetAttribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+            (&mut high as *mut u64).cast(),
+        )
+        .result()
+        .map_err(cuda_err("CUDA memory pool read"))?;
+        let mut zero = 0u64;
+        sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+            (&mut zero as *mut u64).cast(),
+        )
+        .result()
+        .map_err(cuda_err("CUDA memory pool reset"))?;
+        Ok(high)
+    }
+}
+
 /// Every kernel handle resolved once. `CudaModule::load_function` is a driver
 /// lookup; calling it inside the batch loop cost more than the kernels it found.
 struct Kernels {

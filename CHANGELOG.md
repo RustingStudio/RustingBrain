@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The Wan 2.2 device VAE decoder takes the blocks after the last one that adds
+  frames one frame at a time instead of four, output bit-identical: the
+  704x1280x17 decode peaks at 5856 MiB of device memory instead of 6784 MiB, in
+  the same 9.5 s. `make_room` uses the new fit (650 MiB + 5.0e-3 MiB a pixel);
+  the DiT still goes at 12 GB (3.5 GB free beside it against 5.7 GB needed)
+  and is estimated to stay on a 16 GB card (not measured).
 - Wan 2.2's video pipeline: `video_pipeline::VideoPipeline` turns a prompt,
   and optionally a first frame, into RGB video with umT5, the Wan DiT under
   classifier-free guidance and the Wan VAE, sampled with `UniPc`, diffusers'
