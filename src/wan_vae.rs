@@ -942,7 +942,12 @@ fn read_conv3d(
 
 /// An RMS norm's gamma times `sqrt(C)`.
 fn read_rms(file: &mut ShardedSafeTensors, name: &str) -> Result<Vec<f32>, NetworkError> {
-    let (gamma, _) = file.tensor(&format!("{name}.gamma"))?;
+    let (gamma, shape) = file.tensor(&format!("{name}.gamma"))?;
+    if shape.first() != Some(&gamma.len()) {
+        return Err(NetworkError::InvalidConfig(format!(
+            "{name}.gamma is {shape:?}, not one scale a channel"
+        )));
+    }
     let root = (gamma.len() as f32).sqrt();
     Ok(gamma.into_iter().map(|value| value * root).collect())
 }
@@ -968,7 +973,23 @@ fn read_mid(file: &mut ShardedSafeTensors, name: &str) -> Result<WanMid, Network
     let prefix = format!("{name}.attentions.0");
     let (qkv, shape) = file.tensor(&format!("{prefix}.to_qkv.weight"))?;
     let (qkv_bias, _) = file.tensor(&format!("{prefix}.to_qkv.bias"))?;
-    let width = shape[1];
+    let (proj, _) = file.tensor(&format!("{prefix}.proj.weight"))?;
+    let (proj_bias, _) = file.tensor(&format!("{prefix}.proj.bias"))?;
+    let width = shape.get(1).copied().unwrap_or(0);
+    if width == 0
+        || qkv.len() != 3 * width * width
+        || qkv_bias.len() != 3 * width
+        || proj.len() != width * width
+        || proj_bias.len() != width
+    {
+        return Err(NetworkError::InvalidConfig(format!(
+            "{prefix}: to_qkv {shape:?} with {} biases and proj {} + {} do not make a \
+             {width}-wide attention",
+            qkv_bias.len(),
+            proj.len(),
+            proj_bias.len()
+        )));
+    }
     let part = |index: usize| {
         Dense::new(
             Matrix::from_vec(
@@ -979,8 +1000,6 @@ fn read_mid(file: &mut ShardedSafeTensors, name: &str) -> Result<WanMid, Network
             Some(qkv_bias[index * width..(index + 1) * width].to_vec()),
         )
     };
-    let (proj, _) = file.tensor(&format!("{prefix}.proj.weight"))?;
-    let (proj_bias, _) = file.tensor(&format!("{prefix}.proj.bias"))?;
     let attention = WanAttention {
         norm: read_rms(file, &format!("{prefix}.norm"))?,
         query: part(0)?,

@@ -146,11 +146,59 @@ fn upload_tap(
     upload_conv(gpu, &tap)
 }
 
+/// The channels each tap of `conv` reads, once its weight is checked to
+/// split evenly into `taps` per-frame kernels.
+fn tap_channels(conv: &CausalConv3d) -> Result<usize, NetworkError> {
+    let host = &conv.conv;
+    let area = host.kernel * host.kernel;
+    if conv.taps == 0
+        || !host.in_channels.is_multiple_of(conv.taps)
+        || host.weight.cols != host.in_channels * area
+        || host
+            .bias
+            .as_ref()
+            .is_some_and(|bias| bias.len() != host.weight.rows)
+    {
+        return Err(NetworkError::InvalidConfig(format!(
+            "a {}-tap convolution over {} channels with a {}x{} weight and {:?} biases does \
+             not split into taps",
+            conv.taps,
+            host.in_channels,
+            host.weight.rows,
+            host.weight.cols,
+            host.bias.as_ref().map(Vec::len)
+        )));
+    }
+    Ok(host.in_channels / conv.taps)
+}
+
+/// An RMS norm's scales, refused unless there is one a channel.
+fn upload_gamma(
+    gpu: &ImageGpu,
+    gamma: &[f32],
+    channels: usize,
+) -> Result<CudaSlice<f32>, NetworkError> {
+    if gamma.len() != channels {
+        return Err(NetworkError::InvalidConfig(format!(
+            "an RMS norm over {channels} channels has {} scales",
+            gamma.len()
+        )));
+    }
+    gpu.upload_f32(gamma)
+}
+
 fn upload_causal(
     gpu: &ImageGpu,
     conv: &CausalConv3d,
     rows: std::ops::Range<usize>,
 ) -> Result<DeviceCausal, NetworkError> {
+    tap_channels(conv)?;
+    if rows.end > conv.conv.weight.rows {
+        return Err(NetworkError::InvalidConfig(format!(
+            "rows {rows:?} of a {}-row convolution",
+            conv.conv.weight.rows
+        )));
+    }
     Ok(DeviceCausal {
         taps: (0..conv.taps)
             .map(|tap| upload_tap(gpu, conv, tap, rows.clone()))
@@ -164,9 +212,9 @@ fn upload_all(gpu: &ImageGpu, conv: &CausalConv3d) -> Result<DeviceCausal, Netwo
 
 fn upload_wan_resnet(gpu: &ImageGpu, resnet: &WanResnet) -> Result<DeviceWanResnet, NetworkError> {
     Ok(DeviceWanResnet {
-        norm1: gpu.upload_f32(&resnet.norm1)?,
+        norm1: upload_gamma(gpu, &resnet.norm1, tap_channels(&resnet.conv1)?)?,
         conv1: upload_all(gpu, &resnet.conv1)?,
-        norm2: gpu.upload_f32(&resnet.norm2)?,
+        norm2: upload_gamma(gpu, &resnet.norm2, tap_channels(&resnet.conv2)?)?,
         conv2: upload_all(gpu, &resnet.conv2)?,
         shortcut: resnet
             .shortcut
@@ -181,7 +229,7 @@ fn upload_wan_attention(
     attention: &WanAttention,
 ) -> Result<DeviceWanAttention, NetworkError> {
     Ok(DeviceWanAttention {
-        norm: gpu.upload_f32(&attention.norm)?,
+        norm: upload_gamma(gpu, &attention.norm, attention.query.in_dim())?,
         query: upload_dense(gpu, &attention.query)?,
         key: upload_dense(gpu, &attention.key)?,
         value: upload_dense(gpu, &attention.value)?,
@@ -219,7 +267,14 @@ impl DeviceWanDecoder {
                             .time
                             .as_ref()
                             .map(|time| -> Result<[DeviceCausal; 2], NetworkError> {
-                                let half = time.conv.weight.rows / 2;
+                                let rows = time.conv.weight.rows;
+                                if !rows.is_multiple_of(2) {
+                                    return Err(NetworkError::InvalidConfig(format!(
+                                        "an upsampling time convolution makes two frames of \
+                                         {rows} channels"
+                                    )));
+                                }
+                                let half = rows / 2;
                                 Ok([
                                     upload_causal(gpu, time, 0..half)?,
                                     upload_causal(gpu, time, half..2 * half)?,
@@ -251,7 +306,7 @@ impl DeviceWanDecoder {
                 upload_wan_resnet(gpu, &decoder.mid.last)?,
             ),
             up_blocks,
-            norm_out: gpu.upload_f32(&decoder.norm_out)?,
+            norm_out: upload_gamma(gpu, &decoder.norm_out, tap_channels(&decoder.conv_out)?)?,
             conv_out: upload_all(gpu, &decoder.conv_out)?,
         })
     }
@@ -456,6 +511,13 @@ impl WanKernels {
     }
 
     fn rms(&self, map: &mut Map, gamma: &CudaSlice<f32>, silu: bool) -> Result<(), NetworkError> {
+        if gamma.len() != map.channels() {
+            return Err(NetworkError::InvalidConfig(format!(
+                "an RMS norm with {} scales over {} channels",
+                gamma.len(),
+                map.channels()
+            )));
+        }
         let (channels, pixels) = (map.channels() as i32, map.pixels() as i64);
         let launch = cfg(map.pixels());
         unsafe {
@@ -483,6 +545,11 @@ impl WanKernels {
         first: bool,
     ) -> Result<(), NetworkError> {
         let (fs, time) = (shortcut.side, shortcut.time);
+        if fs == 0 || time == 0 {
+            return Err(NetworkError::InvalidConfig(format!(
+                "a DupUp shortcut of {time} frames by {fs}x{fs}"
+            )));
+        }
         let factor = time * fs * fs;
         let offset = if first { time - 1 } else { 0 };
         if (input.len() * time).checked_sub(offset) != Some(output.len()) {
@@ -495,7 +562,27 @@ impl WanKernels {
         for (index, target) in output.iter_mut().enumerate() {
             let (frame, dt) = ((index + offset) / time, (index + offset) % time);
             let source = &input[frame];
-            let repeats = shortcut.out_channels * factor / source.channels();
+            let wanted = shortcut.out_channels * factor;
+            let repeats = wanted.checked_div(source.channels()).unwrap_or(0);
+            // The kernel reads input channel `j / repeats` for every `j` below
+            // `wanted` and writes every element of `target`, so both have to
+            // be exactly these sizes.
+            if repeats == 0
+                || source.channels() * repeats != wanted
+                || target.channels() != shortcut.out_channels
+                || target.height != source.height * fs
+                || target.width != source.width * fs
+            {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "a DupUp from {}x{}x{} to {}x{}x{} at {time} frames by {fs}x{fs}",
+                    source.channels(),
+                    source.height,
+                    source.width,
+                    target.channels(),
+                    target.height,
+                    target.width
+                )));
+            }
             let n = target.tensor.len();
             unsafe {
                 self.gpu
@@ -650,5 +737,62 @@ mod tests {
                 .unwrap();
             check(&gpu, &got, &want, 2e-3);
         }
+    }
+
+    /// Shapes a malformed checkpoint could bring are refused before any
+    /// upload or launch.
+    #[test]
+    fn malformed_wan_shapes_are_refused() {
+        let gpu = ImageGpu::new(0).unwrap();
+        let kernels = WanKernels::new(&gpu).unwrap();
+        let refused = |result: Result<(), NetworkError>| {
+            assert!(
+                matches!(result, Err(NetworkError::InvalidConfig(_))),
+                "{result:?}"
+            )
+        };
+
+        let mut frame = upload_map(&gpu, &map(8, 3, 4, 1)).unwrap();
+        let short = gpu.upload_f32(&[1.0; 7]).unwrap();
+        refused(kernels.rms(&mut frame, &short, true));
+
+        let shortcut = DupUp {
+            out_channels: 4,
+            time: 2,
+            side: 2,
+        };
+        let input = [upload_map(&gpu, &map(16, 3, 4, 2)).unwrap()];
+        for (channels, height, width) in [(5, 6, 8), (4, 6, 9), (4, 7, 8)] {
+            let mut output = [
+                upload_map(&gpu, &FeatureMap::new(channels, height, width)).unwrap(),
+                upload_map(&gpu, &FeatureMap::new(channels, height, width)).unwrap(),
+            ];
+            refused(kernels.dup_up_add(shortcut, &input, &mut output, false));
+        }
+        // 12 channels do not repeat into 4 x 8.
+        let input = [upload_map(&gpu, &map(12, 3, 4, 3)).unwrap()];
+        let mut output = [
+            upload_map(&gpu, &FeatureMap::new(4, 6, 8)).unwrap(),
+            upload_map(&gpu, &FeatureMap::new(4, 6, 8)).unwrap(),
+        ];
+        refused(kernels.dup_up_add(shortcut, &input, &mut output, false));
+
+        let conv = |in_channels: usize, taps: usize| CausalConv3d {
+            conv: Conv2d::new(Matrix::new(2, in_channels * 9), None, in_channels, 3, 1, 1).unwrap(),
+            taps,
+        };
+        refused(upload_all(&gpu, &conv(7, 3)).map(drop));
+        refused(upload_all(&gpu, &conv(6, 0)).map(drop));
+        // Three taps over 6 channels read 2 a frame, so each norm needs 2.
+        let mut resnet = WanResnet {
+            norm1: vec![1.0; 2],
+            conv1: conv(6, 3),
+            norm2: vec![1.0; 2],
+            conv2: conv(6, 3),
+            shortcut: None,
+        };
+        assert!(upload_wan_resnet(&gpu, &resnet).is_ok());
+        resnet.norm2.push(1.0);
+        refused(upload_wan_resnet(&gpu, &resnet).map(drop));
     }
 }
