@@ -49,10 +49,10 @@ pub(crate) const SHARED_BYTES: u32 = 2 * (TILE * (TILE + 8) * 2) as u32;
 const fn tiles(head_dim: usize) -> (usize, usize) {
     (TILE * (head_dim + 8) * 2, head_dim * (TILE + 8) * 2)
 }
-/// Keys key-major and values dimension-major.
+/// Keys and values, both key-major.
 pub(crate) const fn forward_shared_bytes(head_dim: usize) -> u32 {
-    let (rows, columns) = tiles(head_dim);
-    (rows + columns) as u32
+    let (rows, _) = tiles(head_dim);
+    (2 * rows) as u32
 }
 /// Keys and values, key-major; the query gradient reads the keys transposed.
 pub(crate) const fn dq_shared_bytes(head_dim: usize) -> u32 {
@@ -327,6 +327,28 @@ extern "C" __global__ __launch_bounds__(256) void image_attention_fwd(
 // both chosen so the eight rows of an mma fragment land in different banks.
 #define DROW (D+8)
 
+// A 16-byte copy from global to shared memory that skips the registers, so a
+// tile can stream in while the warps work on the one before it. With `ok`
+// false nothing is read and the 16 bytes are zeroed.
+__device__ __forceinline__ void cp16(unsigned short* dst, const unsigned short* src, bool ok){
+  unsigned a=(unsigned)__cvta_generic_to_shared(dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(a), "l"(src), "r"(ok?16:0));
+}
+__device__ __forceinline__ void cp_commit(){ asm volatile("cp.async.commit_group;\n" ::); }
+template<int N> __device__ __forceinline__ void cp_wait(){ asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+// Keys kt*64.. of the columns at `col` into a `[key][DROW]` tile, keys past
+// `kv_len` as zeros. Every width and column base is a multiple of the head
+// width, so each 16-byte chunk is aligned.
+template<int D> __device__ __forceinline__ void load_tile(unsigned short* dst,
+    const unsigned short* kvp, size_t kv_seq, int kv_width, int col, int kt, int kv_len){
+  for (int i = threadIdx.x; i < 64*D/8; i += 128) {
+    int r = (unsigned)i / (D/8), c = ((unsigned)i % (D/8))*8;
+    int key = kt*64 + r;
+    bool ok = key < kv_len;
+    cp16(dst + r*DROW + c, kvp + (ok ? (kv_seq + key)*(size_t)kv_width + col + c : 0), ok);
+  }
+}
+
 // One block per (query tile, head, sequence). Queries live in registers for
 // the whole block; keys and values stream through shared memory one tile at a
 // time. `lse` is written in the same layout the three-kernel path used, so the
@@ -342,7 +364,7 @@ template<int D> __device__ __forceinline__ void flash_fwd(
 {
   extern __shared__ unsigned short smem[];
   unsigned short* ks = smem;                      // [key][dim]
-  unsigned short* vt = smem + 64*DROW;            // [dim][key], transposed
+  unsigned short* vs = smem + 64*DROW;            // [key][dim]
 
   const int qt = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -391,24 +413,13 @@ template<int D> __device__ __forceinline__ void flash_fwd(
   const int shift = causal ? causal - 1 : 0;
   const int key_tiles = ((kv_len + 63) >> 6) - 1;
   const int last = causal ? min((qt*64 + 63 + shift) >> 6, key_tiles) : key_tiles;
+  // The value tile streams in under the score matmul and the softmax, the
+  // next key tile under the value matmul.
+  load_tile<D>(ks, kvp, kv_seq, kv_width, key_base + kv, 0, kv_len); cp_commit();
   for (int kt=0; kt<=last; ++kt) {
-    __syncthreads();
-    // One element a thread, not two: the value tile is stored transposed, and
-    // measured, the wider load does not pay for the extra shared-memory bank
-    // conflicts that come with it.
-    for (int i = threadIdx.x; i < 64*D; i += 128) {
-      int r = (unsigned)i / D, c = (unsigned)i % D;
-      int key = kt*64 + r;
-      unsigned short kb = 0, vb = 0;
-      if (key < kv_len) {
-        size_t p = (kv_seq + key)*(size_t)kv_width;
-        kb = kvp[p + key_base + kv + c];
-        vb = kvp[p + value_base + kv + c];
-      }
-      ks[r*DROW + c] = kb;
-      vt[c*FA_ROW + r] = vb;
-    }
-    __syncthreads();
+    __syncthreads();                // every warp is done with the last value tile
+    load_tile<D>(vs, kvp, kv_seq, kv_width, value_base + kv, kt, kv_len); cp_commit();
+    cp_wait<1>(); __syncthreads();  // key tile kt has landed
 
     float s[8][4];
     #pragma unroll
@@ -474,9 +485,19 @@ template<int D> __device__ __forceinline__ void flash_fwd(
       acc[n][0]*=corr_a; acc[n][1]*=corr_a; acc[n][2]*=corr_b; acc[n][3]*=corr_b;
     }
 
+    __syncthreads();                // every warp is done with key tile kt
+    if (kt < last) {
+      load_tile<D>(ks, kvp, kv_seq, kv_width, key_base + kv, kt + 1, kv_len); cp_commit();
+      cp_wait<1>();
+    } else {
+      cp_wait<0>();
+    }
+    __syncthreads();                // value tile kt has landed
+
     // output += probabilities * values. The accumulator fragment of the score
     // matmul is bit-for-bit the operand layout the value matmul wants, so the
-    // probabilities go straight from registers into the next mma.
+    // probabilities go straight from registers into the next mma; the values
+    // are key-major and `ldmatrix.trans` turns them on the way out.
     #pragma unroll
     for (int kk=0; kk<4; ++kk) {
       unsigned pf[4];
@@ -485,12 +506,11 @@ template<int D> __device__ __forceinline__ void flash_fwd(
       pf[2]=pack2(s[2*kk+1][0],s[2*kk+1][1]);
       pf[3]=pack2(s[2*kk+1][2],s[2*kk+1][3]);
       #pragma unroll
-      for (int n=0;n<D/8;++n) {
-        const unsigned short* p = vt + (n*8+g)*FA_ROW + kk*16 + t*2;
-        unsigned bf[2];
-        bf[0] = *(const unsigned*)p;
-        bf[1] = *(const unsigned*)(p+8);
-        MMA(acc[n], pf, bf);
+      for (int n=0;n<D/8;n+=2) {
+        unsigned bf[4];
+        ldsm_x4_trans(bf, vs + (kk*16 + ((lane>>3)&1)*8 + (lane&7))*DROW + (n + (lane>>4))*8);
+        MMA(acc[n],   pf, bf);
+        MMA(acc[n+1], pf, (bf+2));
       }
     }
   }
