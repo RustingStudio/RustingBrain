@@ -18,8 +18,9 @@
 //! umT5 and the DiT would cost a 40 s DiT read and upload per run. A
 //! caller short on host memory sets [`VideoPipeline::encoder`] to `None` once
 //! its prompts are encoded. The DiT and the VAE decoder share the device;
-//! before a decode that would not fit beside the DiT, the DiT is dropped and
-//! the next run reads it again from disk.
+//! before a decode that would not fit beside the DiT, only its device copy is
+//! dropped; the host int8 blocks (4.6 GB) stay, so the next run is an upload
+//! instead of a 40 s read from disk.
 
 use crate::conv::FeatureMap;
 use crate::matrix::Matrix;
@@ -456,7 +457,7 @@ impl VideoPipeline {
             Some(dit) => dit,
             None => WanDit::load_at(&self.dit_path, self.dit_config.clone(), self.precision)?,
         };
-        let uploaded = dit.attach_device(&context);
+        let uploaded = dit.attach_device_keeping_host(&context);
         self.denoiser = Some(dit);
         uploaded?;
         self.decoder.attach_device(&image)?;
@@ -515,13 +516,15 @@ impl VideoPipeline {
 
     fn denoiser(&mut self) -> Result<&WanDit, NetworkError> {
         if self.denoiser.is_none() {
-            #[allow(unused_mut)]
-            let mut dit = WanDit::load_at(&self.dit_path, self.dit_config.clone(), self.precision)?;
-            #[cfg(feature = "cuda")]
-            if let Some((_, context)) = &self.gpu {
-                dit.attach_device(context)?;
-            }
+            let dit = WanDit::load_at(&self.dit_path, self.dit_config.clone(), self.precision)?;
             self.denoiser = Some(dit);
+        }
+        // Loaded fresh or detached by `make_room`: only an upload is left.
+        #[cfg(feature = "cuda")]
+        if let (Some((_, context)), Some(dit)) = (&self.gpu, &mut self.denoiser)
+            && !dit.on_device()
+        {
+            dit.attach_device_keeping_host(context)?;
         }
         Ok(self.denoiser.as_ref().expect("loaded above"))
     }
@@ -604,13 +607,13 @@ impl VideoPipeline {
         self.decoder.decode(&latent)
     }
 
-    /// Drops the device DiT when a decode at this size would not fit beside
+    /// Drops the DiT's device copy when a decode at this size would not fit beside
     /// it. The decoder's need is W2's fit, `1163 MiB + 7.4e-3 MiB` per output
     /// pixel of one frame (the causal decode holds a frame at a time), plus a
     /// 512 MiB margin.
-    // NOTE: the next run reads the DiT from disk again (about 40 s with the upload); keep
-    // its host int8 copy instead if large clips come back to back and the
-    // 4.6 GB of host memory is there.
+    // NOTE: the host int8 copy stays (4.6 GB of host memory), so the next
+    // run is an upload, not a 40 s disk read and quantise; drop the whole DiT
+    // here instead if host memory is short.
     #[cfg(feature = "cuda")]
     fn make_room(&mut self, width: usize, height: usize) -> Result<(), NetworkError> {
         let Some((device, _)) = &self.gpu else {
@@ -624,7 +627,9 @@ impl VideoPipeline {
         crate::cuda_training::release_freed_memory(device)?;
         let free = crate::cuda_image::memory_info().map_or(0, |(free, _)| free);
         if (free as f64) < need {
-            self.denoiser = None;
+            if let Some(dit) = &mut self.denoiser {
+                dit.detach_device();
+            }
             crate::cuda_training::release_freed_memory(device)?;
         }
         Ok(())
@@ -1045,6 +1050,63 @@ mod tests {
     /// `RB_WAN_BENCH=WxHxF` times one more clip at that size. Host memory:
     /// umT5 and the VAE first, then the VAE and the int8 DiT until upload;
     /// peak RSS 8.6-9.4 GiB.
+    /// Two 1280x704x17 clips back to back on device 0: the second must pay
+    /// an upload, not a DiT read. Prompts are dummy states (timing only).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs Wan2.2-TI2V-5B and RB_WAN_CUDA=1"]
+    fn wan22_second_large_clip_reuses_the_host_dit() {
+        use std::time::Instant;
+        if std::env::var("RB_WAN_CUDA").as_deref() != Ok("1") {
+            return;
+        }
+        let model = PathBuf::from(
+            std::env::var("RB_WAN_MODEL")
+                .unwrap_or_else(|_| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+        );
+        let mut pipeline = VideoPipeline::load(&model).unwrap();
+        pipeline.encoder = None;
+        pipeline.config.steps = 2;
+        assert!(pipeline.try_cuda(0));
+        let request = VideoRequest {
+            width: 1280,
+            height: 704,
+            frames: 17,
+            seed: Some(0),
+            image: None,
+        };
+        let text = Matrix::new(16, pipeline.dit_config.text_dim);
+        for run in 0..2 {
+            let started = Instant::now();
+            let latent = pipeline
+                .sample_from_noise(
+                    &text,
+                    None,
+                    None,
+                    pipeline.noise(&request).unwrap(),
+                    |_, _| true,
+                )
+                .unwrap();
+            let sampled = started.elapsed();
+            pipeline.decode(&latent).unwrap();
+            eprintln!(
+                "wan clip {run}: sample {sampled:?}, total {:?}",
+                started.elapsed()
+            );
+            let on_device = pipeline.denoiser.as_ref().is_some_and(WanDit::on_device);
+            eprintln!("wan clip {run}: DiT on device after decode: {on_device}");
+            if run == 0 {
+                assert!(
+                    !on_device,
+                    "make_room did not fire; the test proves nothing"
+                );
+            }
+            let started = Instant::now();
+            pipeline.denoiser().unwrap();
+            eprintln!("wan clip {run}: reattach {:?}", started.elapsed());
+        }
+    }
+
     #[test]
     #[ignore = "needs Wan2.2-TI2V-5B and the output of RustingFrame's tools/wan_diffusers_bench.py w4"]
     fn wan22_video_pipeline_matches_diffusers() {
@@ -1378,9 +1440,9 @@ mod tests {
             let clip = pipeline.decode(&latent).unwrap();
             peak_mib = peak_mib.max(device_used_mib());
             eprintln!(
-                "wan video {size} decode: {:?}, DiT kept: {}",
+                "wan video {size} decode: {:?}, DiT on device: {}",
                 started.elapsed(),
-                pipeline.denoiser.is_some()
+                pipeline.denoiser.as_ref().is_some_and(WanDit::on_device)
             );
             save_clip(&clip, &dir, &format!("rb_w4_t2v_{size}"));
         }
