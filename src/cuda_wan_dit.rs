@@ -241,12 +241,25 @@ impl DeviceWanDit {
         // Several layers stacked into one GEMM, each with its bias.
         let stacked = |layers: &[&Dense]| {
             let (mut weights, mut biases) = (Vec::new(), Vec::new());
+            let (mut q, mut scales) = (Vec::new(), Vec::new());
+            let int8 = layers.iter().all(|layer| layer.int8_parts().is_some());
             for layer in layers {
-                weights.extend_from_slice(&layer.weight_f32().data);
+                match layer.int8_parts().filter(|_| int8) {
+                    Some((bytes, row_scales)) => {
+                        q.extend_from_slice(bytes);
+                        scales.extend_from_slice(row_scales);
+                    }
+                    None => weights.extend_from_slice(&layer.weight_f32().data),
+                }
                 biases.extend_from_slice(layer.bias.as_deref().expect("checked by validate"));
             }
             let (units, inner) = (biases.len(), layers[0].in_dim());
-            let wide = gpu.upload(&weights)?;
+            // int8 weights widen on the device: a quarter of the PCIe bytes
+            // and no single-threaded host dequantize of 4x the data.
+            let wide = match int8 {
+                true => gpu.dequantized(&q, &scales, units, inner)?,
+                false => gpu.upload(&weights)?,
+            };
             Ok::<_, NetworkError>(Linear {
                 weight: match layers[0].is_quantized() {
                     true => gpu.quantized(&wide.slice(..), units, inner)?,

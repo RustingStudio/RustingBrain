@@ -1563,6 +1563,38 @@ impl Gpu<'_> {
         self.memo_pack(parts, narrow, int8)
     }
 
+    /// Host int8 rows and their scales widened to FP32 on the device, the
+    /// same `q * scale` product `Quantized::dequantize` takes on the host,
+    /// without widening 4x on the host and over PCIe first.
+    pub(crate) fn dequantized(
+        &self,
+        q: &[i8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let q = self.context.stream.clone_htod(q).map_err(cuda_alloc_err(
+            "host to device copy",
+            q.len(),
+        ))?;
+        let scales = self.upload(scales)?;
+        let mut wide = self.uninit(rows * cols)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.dequantize_q8)
+                .arg(&q)
+                .arg(&scales)
+                .arg(&mut wide)
+                .arg(&(rows as i32))
+                .arg(&(cols as i32))
+                .arg(&0i32)
+                .launch(cfg(rows * cols))
+                .map_err(cuda_err("int8 dequantize kernel"))?;
+        }
+        Ok(wide)
+    }
+
     /// `rows x cols` FP32 weights on the device as int8 plus a scale per row.
     pub(crate) fn quantized(
         &self,
