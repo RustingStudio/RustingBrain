@@ -207,7 +207,7 @@ pub struct Conditioning {
 pub(crate) struct Positions {
     pub(crate) cos: Vec<f32>,
     pub(crate) sin: Vec<f32>,
-    pairs: usize,
+    pub(crate) pairs: usize,
 }
 
 impl Positions {
