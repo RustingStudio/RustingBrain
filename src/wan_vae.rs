@@ -24,7 +24,7 @@ use crate::safetensors::ShardedSafeTensors;
 use crate::vae::{attend, pad_right_bottom, read_conv};
 
 /// Frames of input a three-frame convolution keeps from one chunk to the next.
-const CACHE_FRAMES: usize = 2;
+pub(crate) const CACHE_FRAMES: usize = 2;
 
 /// The shape of a Wan autoencoder, from its `config.json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -243,7 +243,7 @@ impl CausalConv3d {
     /// The output for every frame of `chunk`, given the frames this layer saw
     /// before it in `history`, which is then replaced by the last two frames
     /// of the stream.
-    fn forward(
+    pub(crate) fn forward(
         &self,
         history: &mut Option<Vec<FeatureMap>>,
         chunk: Vec<FeatureMap>,
@@ -404,7 +404,7 @@ pub(crate) struct DupUp {
 
 impl DupUp {
     /// `first` drops the leading `time - 1` frames, as the first chunk does.
-    fn forward(&self, input: &[FeatureMap], first: bool) -> Vec<FeatureMap> {
+    pub(crate) fn forward(&self, input: &[FeatureMap], first: bool) -> Vec<FeatureMap> {
         let (fs, factor) = (self.side, self.time * self.side * self.side);
         let mut frames = Vec::with_capacity(input.len() * self.time);
         for frame in input {
@@ -594,9 +594,22 @@ pub struct WanVaeDecoder {
     pub(crate) up_blocks: Vec<WanUpBlock>,
     pub(crate) norm_out: Vec<f32>,
     pub(crate) conv_out: CausalConv3d,
+    #[cfg(feature = "cuda")]
+    pub(crate) device: Option<std::sync::Arc<crate::cuda_image::wan_vae::DeviceWanDecoder>>,
 }
 
 impl WanVaeDecoder {
+    /// Moves the decoder onto `gpu`; [`Self::decode`] runs there from then on.
+    #[cfg(feature = "cuda")]
+    pub fn attach_device(
+        &mut self,
+        gpu: &std::sync::Arc<crate::cuda_image::ImageGpu>,
+    ) -> Result<(), NetworkError> {
+        let device = crate::cuda_image::wan_vae::DeviceWanDecoder::upload(gpu, self)?;
+        self.device = Some(std::sync::Arc::new(device));
+        Ok(())
+    }
+
     /// Reads the decoder from `vae/diffusion_pytorch_model.safetensors`.
     pub fn load(
         path: impl AsRef<std::path::Path>,
@@ -658,6 +671,8 @@ impl WanVaeDecoder {
             norm_out: read_rms(&mut file, "decoder.norm_out")?,
             conv_out: read_conv3d(&mut file, "decoder.conv_out", 1, 1)?,
             config,
+            #[cfg(feature = "cuda")]
+            device: None,
         })
     }
 
@@ -674,6 +689,10 @@ impl WanVaeDecoder {
                 "a Wan latent is a non-empty list of {}-channel frames",
                 self.config.z_dim
             )));
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            return device.decode(latent);
         }
         let mut streams = Streams::new();
         let mut video = Vec::new();
@@ -1140,6 +1159,71 @@ pub(crate) mod tests {
         data
     }
 
+    /// Device decode time of random latents. `RB_WAN_BENCH` lists the latent
+    /// sizes as `frames x height x width`, comma separated (default
+    /// `5x30x52,5x44x80`, 480x832 and 704x1280 at 17 frames); each is decoded
+    /// `RB_WAN_RUNS` times (default 3) after one warm-up.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs Wan2.2-TI2V-5B and a GPU"]
+    fn wan22_vae_device_decode_timing() {
+        let env = |name: &str| std::env::var(name).ok();
+        let model = std::path::PathBuf::from(
+            env("RB_WAN_MODEL")
+                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+        )
+        .join("vae");
+        let config = WanVaeConfig::from_file(model.join("config.json")).unwrap();
+        let mut decoder =
+            WanVaeDecoder::load(model.join("diffusion_pytorch_model.safetensors"), config).unwrap();
+        decoder
+            .attach_device(&crate::cuda_image::ImageGpu::new(0).unwrap())
+            .unwrap();
+        let runs: usize = env("RB_WAN_RUNS").map_or(3, |runs| runs.parse().unwrap());
+        for size in env("RB_WAN_BENCH")
+            .unwrap_or_else(|| "5x30x52,5x44x80".into())
+            .split(',')
+        {
+            let dims: Vec<usize> = size.split('x').map(|dim| dim.parse().unwrap()).collect();
+            let latent: Vec<_> = (0..dims[0])
+                .map(|frame| {
+                    let count = decoder.config.z_dim * dims[1] * dims[2];
+                    let data = (0..count)
+                        .map(|index| {
+                            let bits =
+                                (index as u32 ^ (frame as u32) << 24).wrapping_mul(2654435761);
+                            // Roughly unit variance, then the latent scale.
+                            ((bits >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 3.46
+                        })
+                        .collect();
+                    FeatureMap::from_vec(decoder.config.z_dim, dims[1], dims[2], data).unwrap()
+                })
+                .collect();
+            let mut latent = latent;
+            decoder.config.denormalize(&mut latent);
+            let mut times = Vec::new();
+            for run in 0..=runs {
+                let started = std::time::Instant::now();
+                let video = decoder.decode(&latent).unwrap();
+                let elapsed = started.elapsed().as_secs_f64();
+                eprintln!(
+                    "wan vae device decode {size} run {run}: {elapsed:.3} s, {} frames of {}x{}",
+                    video.len(),
+                    video[0].height,
+                    video[0].width
+                );
+                if run > 0 {
+                    times.push(elapsed);
+                }
+            }
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            let (low, high) = times.iter().fold((f64::MAX, 0.0f64), |(low, high), time| {
+                (low.min(*time), high.max(*time))
+            });
+            eprintln!("wan vae device decode {size}: mean {mean:.3} s, {low:.3}-{high:.3} s");
+        }
+    }
+
     /// Wan 2.2's autoencoder against diffusers' `AutoencoderKLWan` in F32 on
     /// the output of RustingFrame's `tools/wan_refs.py w2`: a two-frame latent
     /// decoded to five 128x128 frames, a five-frame 64x64 clip and its first
@@ -1189,6 +1273,18 @@ pub(crate) mod tests {
             eprintln!("wan vae host decode: {:?}", started.elapsed());
             assert_eq!(decoded.len(), 5);
             gate("host decode", relative(&stack(&decoded), &video), 1e-5);
+            #[cfg(feature = "cuda")]
+            if env("RB_WAN_CUDA").as_deref() == Some("1") {
+                let mut decoder = decoder;
+                let gpu = crate::cuda_image::ImageGpu::new(0).unwrap();
+                decoder.attach_device(&gpu).unwrap();
+                for run in 0..2 {
+                    let started = std::time::Instant::now();
+                    let decoded = decoder.decode(&latent).unwrap();
+                    eprintln!("wan vae device decode {run}: {:?}", started.elapsed());
+                    gate("device decode", relative(&stack(&decoded), &video), 3e-3);
+                }
+            }
         }
 
         let encoder = WanVaeEncoder::load(&weights, config.clone()).unwrap();

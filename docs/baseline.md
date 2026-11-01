@@ -2056,3 +2056,60 @@ the same prompts (short and long; the first run 0.62 / 1.47 s). Loading the
 Q8 encoder takes 17-36 s and the upload 12-14 s. Peak host RSS 6.2-7.9 GB
 (the F32 embedding table is 4.2 GB of it); the first host run was taken with
 25 GB of swap in use, so its RSS may read low.
+
+## Wan 2.2 TI2V-5B video autoencoder (W2, 2026-11-01)
+
+`wan_vae::WanVaeDecoder` and `WanVaeEncoder` read `vae/` of the diffusers
+checkpoint (`AutoencoderKLWan`: z 48, base 160, decoder base 256, dim_mult
+1/2/4/4, two time halvings, patch 2) and run its chunked causal walk: one
+latent frame a chunk on the decode side (1 frame, then 4 each), the clip as
+`[0], [1..5], ...` on the encode side, every causal convolution keeping the
+last two frames it saw. `WanVaeDecoder::attach_device` moves the decoder to
+the GPU (`cuda_image::wan_vae`, FP16 like the image autoencoder): a
+three-frame convolution is one `DeviceConv` a tap, the older taps added onto
+the newest, and a tap before the clip skipped; two kernels of its own, the
+RMS norm (with SiLU) and the `DupUp3D` shortcut added in place. The encoder
+is host-only.
+
+Reference: RustingFrame `tools/wan_refs.py w2`, diffusers F32 on the CPU: a
+2-frame latent decoded to 5 frames of 128x128, a 5-frame 64x64 clip and its
+first frame encoded. Test `wan_vae::tests::wan22_vae_matches_diffusers`
+(ignored; `RB_WAN_REF`, `RB_WAN_MODEL` defaulting to the local
+Wan2.2-TI2V-5B, `RB_WAN_CUDA=1` adds the device decode). Relative L2:
+
+| Stage | Host F32 | Device FP16 (RTX 3060) | Gate |
+|---|---|---|---|
+| Latent denormalise | 0.0 | | 1e-6 |
+| Decode, 5 frames of 128x128 | 2.84e-7 | 1.285e-3 | 1e-5 / 3e-3 |
+| Encode mean, 5 frames of 64x64 | 5.18e-7 | (host only) | 1e-5 |
+| Encode normalised mean, 5 frames | 5.15e-7 | | 1e-5 |
+| Encode mean, first frame alone (TI2V) | 7.67e-7 | | 1e-5 |
+| Encode normalised mean, first frame | 7.56e-7 | | 1e-5 |
+
+The device decode is about 1.6x the image autoencoder's 7.9e-4 (K14), which
+is the same FP16 storage over a deeper stack. Host times at that size (load
+0.3-1.1): load 2.3-6.3 s, decode 6.0-6.2 s, encode 0.42-0.46 s (5 frames)
+and 0.13 s (1 frame). Unit test
+`cuda_image::wan_vae::tests::device_wan_layers_match_the_host` checks both
+kernels and the per-tap causal convolution (three chunks, a skip target on
+one) against the host layers.
+
+Device decode of random latents, RTX 3060, under the GPU lock, one warm-up
+then three timed runs, `wan_vae::tests::wan22_vae_device_decode_timing`
+(ignored), load 1.2-1.8:
+
+| Video | Latent | Decode, mean (spread) | Peak VRAM (process) | Peak host RSS |
+|---|---|---|---|---|
+| 480x832x17 | 48x5x30x52 | 4.328 s (4.322-4.334) | 4118 MiB | 2.76 GB |
+| 704x1280x17 | 48x5x44x80 | 9.496 s (9.485-9.505) | 7830 MiB | 2.93 GB |
+
+diffusers decoded 704x1280x17 in 27.3 s with VAE tiling (RustingFrame
+LOOP_LOG #18, W6); this is untiled. 7.8 GB does not sit beside a 9.4 GB DiT
+on the 12 GB card, so the denoiser has to leave the device before a
+704x1280 decode, as in diffusers. Host RSS includes the host copy of the
+decoder weights, which `attach_device` keeps.
+
+Rejected: running the image context without FP16 accumulation
+(`GpuContext::with_precision(device, false)` in `ImageGpu::new`) as an
+accuracy A/B gave relative L2 1.0, so the image path's GEMMs depend on that
+mode; not a usable comparison, reverted.
