@@ -201,6 +201,12 @@ impl Dense {
         }
     }
 
+    /// The int8 values and row scales, if the weight is stored as int8.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn int8_parts(&self) -> Option<(&[i8], &[f32])> {
+        self.quantized.as_ref().and_then(|q| q.parts())
+    }
+
     /// Whether the weight is stored quantized.
     pub fn is_quantized(&self) -> bool {
         self.quantized.is_some()
