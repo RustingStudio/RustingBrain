@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- FLUX.2-klein-4B denoises faster on the device: 1024x1024 Q8 on an RTX 3060
+  9.96 s to 6.61 s for 4 steps (2.49 to 1.65 s a step), parity against
+  diffusers unchanged (`docs/baseline.md`, P2). The per-head norm and
+  rotation runs one warp per head, flash attention streams K and V with
+  `cp.async` (also faster for the LM shapes: 0.557 to 0.398 ms at 4x1024,
+  head 64), and the MLP activation writes BF16 straight from the fused GEMM.
+  `examples/flash_probe` now compares kernel source files.
 - `vae::png_bytes` (`images` feature) encodes a decoded image to PNG in
   memory, the same bytes `save_png` writes.
 - `ImagePipeline::to_cuda` (and `try_cuda`) moves a sequence prompt encoder
