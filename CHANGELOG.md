@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `vae::png_bytes` (`images` feature) encodes a decoded image to PNG in
+  memory, the same bytes `save_png` writes.
 - `ImagePipeline::to_cuda` (and `try_cuda`) moves a sequence prompt encoder
   such as FLUX.2-klein's Qwen3 to the device as well: 1024x1024 Q8 prompt
   encode 12.4 s to 0.7 s on an RTX 3060, embeddings 0.0249 against diffusers

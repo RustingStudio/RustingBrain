@@ -810,25 +810,35 @@ pub fn to_rgb8(image: &FeatureMap) -> Vec<u8> {
 /// Writes a decoded image to a PNG.
 #[cfg(feature = "images")]
 pub fn save_png(image: &FeatureMap, path: impl AsRef<std::path::Path>) -> Result<(), NetworkError> {
+    let path = path.as_ref();
+    dynamic_image(image)?
+        .save(path)
+        .map_err(|error| NetworkError::InvalidDataset(format!("{}: {error}", path.display())))
+}
+
+/// A decoded image encoded as PNG in memory, the same bytes [`save_png`]
+/// writes to a `.png` file.
+#[cfg(feature = "images")]
+pub fn png_bytes(image: &FeatureMap) -> Result<Vec<u8>, NetworkError> {
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    dynamic_image(image)?
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .map_err(|error| NetworkError::InvalidDataset(format!("PNG encoding: {error}")))?;
+    Ok(bytes.into_inner())
+}
+
+#[cfg(feature = "images")]
+fn dynamic_image(image: &FeatureMap) -> Result<image::DynamicImage, NetworkError> {
     let bytes = to_rgb8(image);
     let (width, height) = (image.width as u32, image.height as u32);
-    let path = path.as_ref();
-    let write = |error: image::ImageError| {
-        NetworkError::InvalidDataset(format!("{}: {error}", path.display()))
-    };
+    let shape = || NetworkError::InvalidConfig("the image's shape and its bytes disagree".into());
     match image.channels {
         3 => image::RgbImage::from_raw(width, height, bytes)
-            .ok_or_else(|| {
-                NetworkError::InvalidConfig("the image's shape and its bytes disagree".into())
-            })?
-            .save(path)
-            .map_err(write),
+            .map(image::DynamicImage::ImageRgb8)
+            .ok_or_else(shape),
         1 => image::GrayImage::from_raw(width, height, bytes)
-            .ok_or_else(|| {
-                NetworkError::InvalidConfig("the image's shape and its bytes disagree".into())
-            })?
-            .save(path)
-            .map_err(write),
+            .map(image::DynamicImage::ImageLuma8)
+            .ok_or_else(shape),
         channels => Err(NetworkError::InvalidConfig(format!(
             "a {channels}-channel image is neither grey nor RGB"
         ))),
@@ -1314,5 +1324,25 @@ pub(crate) mod tests {
         assert_eq!(flux.latent_channels, 16);
         assert_eq!(flux.upscale(), 8);
         assert!(flux.shift_factor > 0.0);
+    }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn png_bytes_are_the_file_save_png_writes() {
+        for channels in [3, 1] {
+            let mut image = FeatureMap::new(channels, 5, 7);
+            for (index, value) in image.data.iter_mut().enumerate() {
+                *value = (index % 11) as f32 / 5.0 - 1.0;
+            }
+            let path = std::env::temp_dir().join(format!(
+                "rusting_brain_png_bytes_{}_{channels}.png",
+                std::process::id()
+            ));
+            save_png(&image, &path).unwrap();
+            let file = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(png_bytes(&image).unwrap(), file, "{channels} channels");
+        }
+        assert!(png_bytes(&FeatureMap::new(2, 1, 1)).is_err());
     }
 }
