@@ -833,6 +833,39 @@ pub fn png_bytes(image: &FeatureMap) -> Result<Vec<u8>, NetworkError> {
     Ok(bytes.into_inner())
 }
 
+/// An encoded image (PNG or JPEG) resized to exactly `width` x `height`, as a
+/// 3-channel FeatureMap in [-1, 1] (channel-planar, like `to_rgb8` reads).
+#[cfg(feature = "images")]
+pub fn from_image_bytes(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<FeatureMap, NetworkError> {
+    if width == 0 || height == 0 {
+        return Err(NetworkError::InvalidDataset(format!(
+            "cannot resize an image to {width}x{height}"
+        )));
+    }
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| NetworkError::InvalidDataset(format!("image decoding: {error}")))?;
+    let (w, h) = (width as u32, height as u32);
+    let rgb = if decoded.width() == w && decoded.height() == h {
+        decoded.to_rgb8()
+    } else {
+        decoded
+            .resize_exact(w, h, image::imageops::FilterType::Lanczos3)
+            .to_rgb8()
+    };
+    let pixels = width * height;
+    let mut map = FeatureMap::new(3, height, width);
+    for (pixel, rgb) in rgb.as_raw().chunks_exact(3).enumerate() {
+        for (channel, &byte) in rgb.iter().enumerate() {
+            map.data[channel * pixels + pixel] = byte as f32 / 255.0 * 2.0 - 1.0;
+        }
+    }
+    Ok(map)
+}
+
 #[cfg(feature = "images")]
 fn dynamic_image(image: &FeatureMap) -> Result<image::DynamicImage, NetworkError> {
     let bytes = to_rgb8(image);
@@ -1352,3 +1385,22 @@ pub(crate) mod tests {
         assert!(png_bytes(&FeatureMap::new(2, 1, 1)).is_err());
     }
 }
+
+    #[cfg(feature = "images")]
+    #[test]
+    fn from_image_bytes_round_trips_and_resizes() {
+        let mut image = FeatureMap::new(3, 5, 7);
+        for (index, value) in image.data.iter_mut().enumerate() {
+            *value = (index % 13) as f32 / 6.0 - 1.0;
+        }
+        let png = png_bytes(&image).unwrap();
+        let same = from_image_bytes(&png, 7, 5).unwrap();
+        assert_eq!(to_rgb8(&same), to_rgb8(&image));
+        let resized = from_image_bytes(&png, 16, 9).unwrap();
+        assert_eq!(
+            (resized.channels, resized.width, resized.height),
+            (3, 16, 9)
+        );
+        assert!(from_image_bytes(&png, 0, 9).is_err());
+        assert!(from_image_bytes(b"nope", 4, 4).is_err());
+    }
