@@ -54,7 +54,7 @@ struct DeviceLayer {
     input_norm: CudaSlice<f32>,
     /// Query, key and value stacked, `[(heads + 2 * kv_heads) * head_dim, d_model]`.
     qkv: Act,
-    /// The per-head norms, or a one-element stand-in where the model has none.
+    /// The per-head norms, or ones where the model has none.
     query_norm: CudaSlice<f32>,
     key_norm: CudaSlice<f32>,
     output: Act,
@@ -83,11 +83,60 @@ impl std::fmt::Debug for DeviceTextEncoder {
     }
 }
 
+/// Every weight's shape against the configuration the kernels are launched
+/// with, so a malformed checkpoint is refused instead of read past on the device.
+fn check_shapes(encoder: &TextEncoder) -> Result<(), NetworkError> {
+    let config = encoder.config();
+    let (d_model, mlp, head_dim) = (config.d_model, config.mlp_dim, config.head_dim);
+    let (query_width, kv_width) = (config.num_heads * head_dim, config.kv_heads * head_dim);
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(NetworkError::InvalidConfig(format!(
+            "rotary heads need an even width, not {head_dim}"
+        )));
+    }
+    for (index, layer) in encoder.layers.iter().enumerate() {
+        let dense = [
+            ("q_proj", &layer.query, query_width, d_model),
+            ("k_proj", &layer.key, kv_width, d_model),
+            ("v_proj", &layer.value, kv_width, d_model),
+            ("o_proj", &layer.output, d_model, query_width),
+            ("gate_proj", &layer.gate, mlp, d_model),
+            ("up_proj", &layer.up, mlp, d_model),
+            ("down_proj", &layer.down, d_model, mlp),
+        ];
+        for (name, weight, out_dim, in_dim) in dense {
+            if (weight.out_dim(), weight.in_dim()) != (out_dim, in_dim) {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "layer {index} {name} is {}x{}, the configuration wants {out_dim}x{in_dim}",
+                    weight.out_dim(),
+                    weight.in_dim()
+                )));
+            }
+        }
+        let norms = [
+            ("input_layernorm", Some(&layer.input_norm), d_model),
+            ("post_attention_layernorm", Some(&layer.post_norm), d_model),
+            ("q_norm", layer.query_norm.as_ref(), head_dim),
+            ("k_norm", layer.key_norm.as_ref(), head_dim),
+        ];
+        for (name, weight, width) in norms {
+            if let Some(weight) = weight.filter(|weight| weight.len() != width) {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "layer {index} {name} has {} values, the configuration wants {width}",
+                    weight.len()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl DeviceTextEncoder {
     /// Uploads `encoder`'s layers as BF16, or as int8 where it holds them at
     /// one byte. The host encoder stays the source of the embeddings, so it is
     /// borrowed again by [`DeviceTextEncoder::forward_layers`].
     pub fn upload(context: &Arc<GpuContext>, encoder: &TextEncoder) -> Result<Self, NetworkError> {
+        check_shapes(encoder)?;
         let config = encoder.config();
         if context.half_accumulate {
             return Err(NetworkError::InvalidConfig(
@@ -154,7 +203,8 @@ impl DeviceTextEncoder {
                 false => gpu.narrowed(&wide.slice(..), units * inner, true),
             }
         };
-        let norm = |weight: &Option<Vec<f32>>| gpu.upload(weight.as_deref().unwrap_or(&[0.0]));
+        let identity = vec![1.0; config.head_dim];
+        let norm = |weight: &Option<Vec<f32>>| gpu.upload(weight.as_deref().unwrap_or(&identity));
         let layers = encoder
             .layers
             .iter()
@@ -348,6 +398,7 @@ impl DeviceTextEncoder {
 
 #[cfg(test)]
 mod tests {
+    use super::check_shapes;
     use crate::cuda_training::cuda_doctor;
     use crate::gpu_transformer::GpuContext;
     use crate::network::NetworkError;
@@ -367,6 +418,50 @@ mod tests {
             }
             Err(error) => panic!("CUDA is present but the CUDA doctor failed: {error}"),
         }
+    }
+
+    #[test]
+    fn a_checkpoint_whose_shapes_disagree_with_its_configuration_is_refused() {
+        let config = TextEncoderConfig {
+            vocab_size: 16,
+            d_model: 64,
+            layers: 2,
+            num_heads: 4,
+            kv_heads: 2,
+            head_dim: 64,
+            mlp_dim: 96,
+            rope_theta: 10_000.0,
+            eps: 1e-6,
+            causal: true,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "rusting_brain_cuda_text_shapes_{}.safetensors",
+            std::process::id()
+        ));
+        checkpoint(&config, &path, true);
+        let load =
+            || TextEncoder::load_at(&path, "model.", config.clone(), Precision::F32).unwrap();
+        assert!(check_shapes(&load()).is_ok());
+        let breaks: [fn(&mut crate::text_encoder::Layer); 4] = [
+            |layer| std::mem::swap(&mut layer.gate, &mut layer.down),
+            |layer| std::mem::swap(&mut layer.query, &mut layer.key),
+            |layer| layer.post_norm.truncate(63),
+            |layer| layer.key_norm = Some(vec![1.0; 3]),
+        ];
+        let context = cuda_or_skip();
+        for (case, broken) in breaks.into_iter().enumerate() {
+            let mut encoder = load();
+            broken(&mut encoder.layers[1]);
+            assert!(
+                matches!(check_shapes(&encoder), Err(NetworkError::InvalidConfig(_))),
+                "case {case}"
+            );
+            if let Some(context) = &context {
+                assert!(encoder.attach_device(context).is_err(), "case {case}");
+                assert!(!encoder.on_device());
+            }
+        }
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
