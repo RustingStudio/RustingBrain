@@ -129,16 +129,17 @@ extern "C" __global__ void gelu_bwd(float*g,const float*pre,int n){
   g[i]*=0.5f*(1.f+th)+0.5f*x*(1.f-th*th)*0.7978846f*(1.f+3.f*0.044715f*x*x);
 }
 // `dst = act(src[:, off..off + cols] + bias[off..])`, where the activation is
-// the tanh GELU (`gelu` 1) or none (0). `dst` is `[rows, cols]`, `src` has row
-// stride `stride`. With `gelu` 2 it is SwiGLU instead, without a bias:
-// `silu(src[:, c]) * src[:, cols + c]`, so `src` is twice as wide as `dst`.
-extern "C" __global__ void bias_gelu(float*dst,const float*src,const float*bias,int rows,int cols,int stride,int off,int gelu,int has_bias){
+// the tanh GELU (`gelu` 1) or none (0). `dst` is `[rows, cols]`, BF16 if
+// `narrow`, `src` has row stride `stride`. With `gelu` 2 it is SwiGLU instead:
+// `silu(x[:, c]) * x[:, cols + c]` of the biased `x`, so `src` is twice as
+// wide as `dst`.
+extern "C" __global__ void bias_gelu(void*dst,const float*src,const float*bias,int rows,int cols,int stride,int off,int gelu,int has_bias,int narrow){
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*cols)return;int r=i/cols,c=i-r*cols;
-  float v=src[(size_t)r*stride+off+c];
-  if(gelu==2){dst[i]=v/(1.f+expf(-v))*src[(size_t)r*stride+off+cols+c];return;}
+  const float*x=src+(size_t)r*stride+off;float v=x[c];
   if(has_bias)v+=bias[off+c];
-  if(gelu)v=0.5f*v*(1.f+tanhf(0.7978846f*(v+0.044715f*v*v*v)));
-  dst[i]=v;
+  if(gelu==2){float u=x[cols+c];if(has_bias)u+=bias[off+cols+c];v=v/(1.f+expf(-v))*u;}
+  else if(gelu)v=0.5f*v*(1.f+tanhf(0.7978846f*(v+0.044715f*v*v*v)));
+  st(dst,i,v,narrow);
 }
 "#;
 
@@ -619,7 +620,8 @@ impl DeviceDit {
                     &normed_mlp.all(),
                     count,
                 )?;
-                let activated = self.gelu(&gpu, &pre, count, stream.mlp_in.units)?;
+                let units = stream.mlp_in.units;
+                let activated = self.gelu(&gpu, &pre, None, count, units, units, 0)?;
                 let output = self.apply(
                     &gpu,
                     &stream.mlp_out,
@@ -691,7 +693,6 @@ impl DeviceDit {
                 fused_width,
             )?;
             let mut qkv = gpu.uninit(rows * 3 * width)?;
-            let mut pre = gpu.uninit(rows * mlp_dim)?;
             let linear = &block.fused_in;
             self.bias(
                 &fused,
@@ -702,15 +703,27 @@ impl DeviceDit {
                 false,
                 &mut qkv.slice_mut(..),
             )?;
-            self.bias(
+            // The activation reads its half of `fused` in place; the biased
+            // copy is made only for the backward pass.
+            let activated = self.gelu(
+                &gpu,
                 &fused,
-                linear,
+                linear.bias.as_ref(),
                 rows,
-                3 * width,
                 mlp_dim,
-                false,
-                &mut pre.slice_mut(..),
+                fused_width,
+                3 * width,
             )?;
+            let pre = match keep {
+                true => {
+                    let mut pre = gpu.uninit(rows * mlp_dim)?;
+                    let cols = &mut pre.slice_mut(..);
+                    self.bias(&fused, linear, rows, 3 * width, mlp_dim, false, cols)?;
+                    Some(pre)
+                }
+                false => None,
+            };
+            drop(fused);
             let raw = match keep {
                 true => Some(stream.clone_dtod(&qkv).map_err(copy())?),
                 false => None,
@@ -721,7 +734,6 @@ impl DeviceDit {
                 )?;
             }
             let (merged, log_sum_exp, qkv) = self.attention(&gpu, &qkv, rows, heads, width)?;
-            let activated = self.gelu(&gpu, &pre, rows, mlp_dim)?;
             let mlp_width = block.mlp_out.inner;
             let mut output = gpu.uninit(rows * width)?;
             self.project(
@@ -748,17 +760,16 @@ impl DeviceDit {
                 &mut output.slice_mut(..),
                 width,
             )?;
-            let mut biased = gpu.uninit(rows * width)?;
             let attention_out = &block.attention_out;
-            self.bias(
-                &output,
-                attention_out,
-                rows,
-                0,
-                width,
-                false,
-                &mut biased.slice_mut(..),
-            )?;
+            let biased = match attention_out.bias {
+                Some(_) => {
+                    let mut biased = gpu.uninit(rows * width)?;
+                    let cols = &mut biased.slice_mut(..);
+                    self.bias(&output, attention_out, rows, 0, width, false, cols)?;
+                    biased
+                }
+                None => output,
+            };
             let gated = gpu.gate_residual(
                 &hidden.slice(..),
                 &biased.slice(..),
@@ -768,7 +779,7 @@ impl DeviceDit {
                 rows,
             )?;
             let input = std::mem::replace(&mut hidden, gated);
-            if let Some(raw) = raw {
+            if let (Some(raw), Some(pre)) = (raw, pre) {
                 single.push(SingleTape {
                     input,
                     normed,
@@ -1438,41 +1449,43 @@ impl DeviceDit {
         gpu.narrowed(&out.slice(..), rows * width, true)
     }
 
-    /// The tanh GELU of `pre`, narrow, or for a SwiGLU model SwiGLU, which
-    /// is half as wide as `pre`'s `cols`.
-    ///
-    /// NOTE: a pass of its own rather than fused into the bias add, so
-    /// that `pre` is there for the backward pass; one kernel writing both
-    /// would save it.
+    /// The tanh GELU, narrow, of the `cols` columns of `source` at `offset`
+    /// plus `bias`, or for a SwiGLU model SwiGLU, which is half as wide. The
+    /// kernel writes BF16 itself, so there is no FP32 copy to narrow.
+    #[allow(clippy::too_many_arguments)]
     fn gelu(
         &self,
         gpu: &Gpu<'_>,
-        pre: &CudaSlice<f32>,
+        source: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
         rows: usize,
         cols: usize,
+        stride: usize,
+        offset: usize,
     ) -> Result<Act, NetworkError> {
-        let (stride, cols, mode) = match self.swiglu {
-            true => (cols, cols / 2, 2i32),
-            false => (cols, cols, 1),
+        let (cols, mode) = match self.swiglu {
+            true => (cols / 2, 2i32),
+            false => (cols, 1),
         };
-        let mut out = gpu.uninit(rows * cols)?;
+        let mut out = gpu.act(rows * cols, true)?;
         unsafe {
             self.context
                 .stream
                 .launch_builder(&self.bias_gelu)
-                .arg(&mut out)
-                .arg(pre)
-                .arg(pre)
+                .arg(out.destination())
+                .arg(source)
+                .arg(bias.unwrap_or(source))
                 .arg(&(rows as i32))
                 .arg(&(cols as i32))
                 .arg(&(stride as i32))
-                .arg(&0i32)
+                .arg(&(offset as i32))
                 .arg(&mode)
-                .arg(&0i32)
+                .arg(&i32::from(bias.is_some()))
+                .arg(&1i32)
                 .launch(cfg(rows * cols))
                 .map_err(cuda_err("MMDiT GELU kernel"))?;
         }
-        gpu.narrowed(&out.slice(..), rows * cols, true)
+        Ok(out)
     }
 
     fn project(
@@ -1523,6 +1536,7 @@ impl DeviceDit {
                 .arg(&(offset as i32))
                 .arg(&i32::from(gelu))
                 .arg(&i32::from(linear.bias.is_some()))
+                .arg(&0i32)
                 .launch(cfg(rows * cols))
                 .map_err(cuda_err("MMDiT bias kernel"))?;
         }
