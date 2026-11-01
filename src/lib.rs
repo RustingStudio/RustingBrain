@@ -152,6 +152,7 @@ pub mod unet_lora;
 pub mod vae;
 pub mod vision;
 pub mod vit_encoder;
+pub mod wan_dit;
 pub mod wan_vae;
 pub mod webdataset;
 pub mod yolo;
@@ -297,3 +298,4 @@ pub use vision::{VisionTransformer, VitConfig};
 #[cfg(feature = "images")]
 pub use vit_encoder::read_image;
 pub use vit_encoder::{CLIP_MEAN, CLIP_STD, VitEncoder, VitEncoderConfig, composite_rgba};
+pub use wan_dit::{WanBlock, WanDit, WanDitConfig};
