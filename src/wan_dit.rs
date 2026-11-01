@@ -319,9 +319,36 @@ impl WanDit {
         &mut self,
         context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
     ) -> Result<(), NetworkError> {
-        self.device = Some(crate::cuda_wan_dit::DeviceWanDit::upload(context, self)?);
+        self.attach_device_keeping_host(context)?;
         self.blocks = Vec::new();
         Ok(())
+    }
+
+    /// [`WanDit::attach_device`], but the host keeps its blocks (4.6 GB at q8)
+    /// so [`WanDit::detach_device`] and a second attach is only an upload.
+    #[cfg(feature = "cuda")]
+    pub fn attach_device_keeping_host(
+        &mut self,
+        context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
+    ) -> Result<(), NetworkError> {
+        self.device = Some(crate::cuda_wan_dit::DeviceWanDit::upload(context, self)?);
+        Ok(())
+    }
+
+    /// Frees the device copy. Only for a model attached with
+    /// [`WanDit::attach_device_keeping_host`]: [`WanDit::forward`] then runs
+    /// on the kept host blocks until the next attach.
+    #[cfg(feature = "cuda")]
+    pub fn detach_device(&mut self) {
+        self.device = None;
+    }
+
+    /// Whether [`WanDit::forward`] runs on the device.
+    pub fn on_device(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        return self.device.is_some();
+        #[cfg(not(feature = "cuda"))]
+        false
     }
 
     /// The velocity for `latent`, one map of `[in_channels, height, width]`

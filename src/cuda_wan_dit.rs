@@ -744,6 +744,21 @@ mod tests {
             let error = crate::wan_vae::tests::relative(&flat(&got), &flat(&want));
             eprintln!("device wan transformer {precision:?}: relative L2 {error:.3e}");
             assert!(error < 2e-2, "{precision:?}: {error}");
+            // Detach and reattach from the kept host blocks.
+            let mut kept = WanDit::load_at(&path, config.clone(), precision).unwrap();
+            kept.attach_device_keeping_host(&gpu).unwrap();
+            kept.detach_device();
+            assert!(!kept.on_device());
+            let on_host = kept.forward(&latent, &timesteps, &context).unwrap();
+            assert_eq!(
+                flat(&on_host),
+                flat(&want),
+                "{precision:?}: host after detach"
+            );
+            kept.attach_device_keeping_host(&gpu).unwrap();
+            assert!(kept.on_device());
+            let again = kept.forward(&latent, &timesteps, &context).unwrap();
+            assert_eq!(flat(&again), flat(&got), "{precision:?}: reattached");
         }
     }
 
