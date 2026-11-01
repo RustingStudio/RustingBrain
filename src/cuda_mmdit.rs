@@ -51,16 +51,25 @@ extern "C" __global__ void layer_norm_modulate(float*out,const float*x,const flo
 }
 // The per-head RMS norm on a query or key, then the rotary position: pairs
 // are adjacent dimensions, FLUX's order, not the language model's halves.
-// One thread per (row, head); `first` is the row's index in the tables.
+// One warp per (row, head), a lane per pair, so a warp's loads are one
+// contiguous run (a thread per head read 128 strided floats and ran at a
+// twentieth of the bandwidth). `first` is the row's index in the tables.
 extern "C" __global__ void head_norm_rope(float*x,const float*scale,const float*cs,const float*sn,int rows,int heads,int head_dim,int stride,int off,int first){
-  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*heads)return;int r=i/heads,h=i-r*heads;
-  float*v=x+(size_t)r*stride+off+h*head_dim;
-  float s=0.f;for(int d=0;d<head_dim;d++)s+=v[d]*v[d];
-  float inv=rsqrtf(s/head_dim+1e-6f);int half=head_dim/2;
+  int w=(blockIdx.x*blockDim.x+threadIdx.x)>>5,lane=threadIdx.x&31;if(w>=rows*heads)return;
+  int r=w/heads,h=w-r*heads,half=head_dim/2;
+  float2*v=(float2*)(x+(size_t)r*stride+off+h*head_dim);const float2*k=(const float2*)scale;
+  // The sum of squares runs in dimension order through shuffles, the order
+  // the thread-per-head loop used, so the result is the same to the bit.
+  float s=0.f;
+  for(int b=0;b<half;b+=32){
+    float2 a=b+lane<half?v[b+lane]:make_float2(0.f,0.f);int n=min(32,half-b);
+    for(int j=0;j<n;j++){float x=__shfl_sync(0xffffffffu,a.x,j),y=__shfl_sync(0xffffffffu,a.y,j);s=fmaf(x,x,s);s=fmaf(y,y,s);}
+  }
+  float inv=rsqrtf(s/head_dim+1e-6f);
   const float*c=cs+(size_t)(first+r)*half;const float*n=sn+(size_t)(first+r)*half;
-  for(int p=0;p<half;p++){
-    float a=v[2*p]*inv*scale[2*p],b=v[2*p+1]*inv*scale[2*p+1];
-    v[2*p]=a*c[p]-b*n[p];v[2*p+1]=a*n[p]+b*c[p];
+  for(int p=lane;p<half;p+=32){
+    float2 e=v[p],g=k[p];float a=e.x*inv*g.x,b=e.y*inv*g.y;
+    v[p]=make_float2(a*c[p]-b*n[p],a*n[p]+b*c[p]);
   }
 }
 // The backward of `layer_norm_modulate`: adds `dL/dx` to `gx` given `dL/dout`
@@ -1595,7 +1604,7 @@ impl DeviceDit {
                 .arg(&(stride as i32))
                 .arg(&(offset as i32))
                 .arg(&(first as i32))
-                .launch(cfg(count * heads))
+                .launch(cfg(count * heads * 32))
                 .map_err(cuda_err("MMDiT head norm kernel"))?;
         }
         Ok(())
