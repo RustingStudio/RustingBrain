@@ -166,6 +166,8 @@ pub mod cuda_mmdit;
 #[cfg(feature = "cuda")]
 pub mod cuda_t5;
 #[cfg(feature = "cuda")]
+pub mod cuda_wan_dit;
+#[cfg(feature = "cuda")]
 pub mod cuda_text_encoder;
 #[cfg(feature = "cuda")]
 pub mod cuda_training;
