@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Wan 2.2's video pipeline: `video_pipeline::VideoPipeline` turns a prompt,
+  and optionally a first frame, into RGB video with umT5, the Wan DiT under
+  classifier-free guidance and the Wan VAE, sampled with `UniPc`, diffusers'
+  UniPC scheduler as Wan configures it (exact schedule, a bit-exact replay of
+  the reference trajectory). Requests are checked (frames 4k+1, sides a
+  multiple of 32). On an RTX 3060: a 256x256x5 clip in 6 steps takes 2.2 s,
+  a 704x1280x17 step 4.5-5.4 s; umT5 stays on the host and the DiT is
+  dropped before a decode that does not fit beside it (`docs/baseline.md`,
+  W4).
 - Wan 2.2's video transformer: `wan_dit::WanDit` runs one denoiser call of
   the TI2V-5B DiT (a timestep per frame, so the first frame of an
   image-conditioned clip can sit at t = 0), matching diffusers'

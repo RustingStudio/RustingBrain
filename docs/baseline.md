@@ -2184,3 +2184,127 @@ step took 7.7-8.7 s against 2.3 s and the upload 18.7 s against 12.3 s; BF16
 stays. Also not done: caching the cross-attention keys and values per prompt
 (a `NOTE:` note in `cuda_wan_dit`), a host Q8 product path (the test
 streams one only for the comparison), patches deeper than one frame.
+
+## Wan 2.2 TI2V-5B video pipeline (W4, 2026-11-01)
+
+`video_pipeline::VideoPipeline` runs Wan 2.2 TI2V-5B end to end, with the same
+shape as `ImagePipeline`: `load` / `load_at` read umT5 (Q8), the tokenizer and
+the VAE and check the configs (`expand_timesteps`, one transformer, the UniPC
+variant, the VAE's `z_dim` against the DiT's channels, umT5's `d_model`
+against the DiT's `text_dim`); `try_cuda` reads the DiT and moves it and the
+VAE decoder to the GPU; `generate` takes prompts and a `VideoRequest` (width,
+height, frames, seed, optional first-frame image) and returns RGB u8 frames,
+with a per-step callback that cancels by returning `false`. Text-to-video and
+text+image-to-video are one loop, as diffusers' `expand_timesteps` pipeline
+runs it: latent frame 0 is the encoded image at every DiT call with its
+timestep at 0, the scheduler steps the whole latent, and frame 0 is replaced
+by the image at the end. Every request is checked before any work
+(`InvalidConfig`): frames 4k+1, sides nonzero multiples of 32, the image
+three channels at the clip's size.
+
+`UniPc` is diffusers' `UniPCMultistepScheduler` as Wan configures it (order 2,
+bh2, predict x0, flow prediction, flow sigmas with shift 5, final sigma zero,
+lower order on the last step, corrector on every step), in F32. Its schedule
+matches the reference's timesteps and sigmas exactly
+(`unipc_matches_diffusers_schedule`). Replaying the reference's own DiT
+outputs through it (`wan22_unipc_replays_diffusers`, ignored, `RB_WAN_REF`
+only) gives 0.0 for steps 0-3 and at most 1.7e-8 after, once the
+reference's BF16 rounding of the guidance and of `sigma * v` is emulated;
+plain F32 drifts from 5e-5 to 1.6e-3, which is that rounding.
+
+Memory on the 12 GB card. umT5 stays on the host: its int8 copy is 6.4 GB on
+the device and does not fit beside the DiT, and a host encode is 1-5 s a
+prompt against 40 s to read and upload the DiT again. A caller sets
+`encoder = None` once its prompts are encoded (the test does, which is what
+keeps host RSS under 10 GB). The DiT and the decoder share the device; before
+a decode, `make_room` trims the pool (`cuda_training::release_freed_memory`,
+the pool keeps freed memory otherwise) and drops the DiT when W2's decode
+fit (1163 MiB + 7.4e-3 MiB per output pixel of a frame, plus 512 MiB) does
+not fit beside it. At 256x256 the DiT stays; at 704x1280 it goes and the
+next run reads it again (a `NOTE:` note: keep the host int8 copy if
+large clips come back to back and the 4.6 GB of host memory is there).
+
+Reference: RustingFrame `tools/wan_diffusers_bench.py w4`, diffusers 0.42.1
+with a BF16 DiT and VAE, the scheduler in F32; 256x256, 5 frames (latent
+48x2x16x16), 6 steps, guidance 5, seed 0, Wan's Chinese negative prompt; t2v
+and ti2v (`examples/i2v_input.JPG`). Test
+`video_pipeline::tests::wan22_video_pipeline_matches_diffusers` (ignored;
+`RB_WAN_REF`, `RB_WAN_MODEL`, `RB_WAN_CUDA=1`, `RB_WAN_BENCH=WxHxF`). Relative
+L2 on the RTX 3060 (device DiT Q8 and decoder, host umT5 Q8 and image
+encoder):
+
+| Check | t2v | ti2v | Gate |
+|---|---|---|---|
+| umT5 prompt states (token count exact) | 7.55e-2 | 9.82e-2 | 1.2e-1 |
+| umT5 negative prompt | 2.87e-2 | | 1.2e-1 |
+| First-frame latent (host encoder) | | 4.70e-3 | 5e-2 |
+| DiT call, teacher-forced, 12 per mode | 1.6e-2 to 6.8e-2 | 1.9e-2 to 3.5e-2 | 8e-2 |
+| Guided velocity (reported) | 6.2e-2 to 2.8e-1 | 6.6e-2 to 1.6e-1 | |
+| UniPC step from the reference's latent | 3.6e-3 to 7.3e-2 | 5.8e-3 to 7.0e-2 | 1e-1 |
+| Decode of the reference's final latent | 5.93e-3 | 4.41e-3 | 3e-2 |
+| Free-running final latent, reference states | 0.497 | 0.115 | 1.5 x floor: 0.689 / 0.158 |
+| Free-running video, reference states | 0.589 | 0.124 | 1.5 x floor: 0.769 / 0.176 |
+| Final latent, our states and first frame | 0.478 | 0.286 | 1.5 x floor: 0.832 / 0.479 |
+| Video, our states and first frame | 0.571 | 0.294 | 1.5 x floor: 0.973 / 0.487 |
+
+Why these gates. The per-call gate is W3's 4.4e-2 (against diffusers F32)
+widened to 8e-2 because this reference is BF16 compute: its own rounding adds
+to ours, and t2v's step-2 unconditional call reached 6.8e-2. Guidance 5
+multiplies the cond-uncond difference, so the guided velocity is 3-6 times
+the per-call error and is only reported; one UniPC step from the reference's
+latent stays under 7.3e-2 (gate 1e-1). The umT5 gate is 1.2e-1: W1 measured
+our Q8 encoder at 2.0-2.5e-2 against FP32 compute, the token ids match the
+HF tokenizer exactly (checked once by hand, the test asserts the count), and
+the rest is put down to the reference's BF16 encoder (not verified: no FP32
+encode of these prompts exists).
+
+A free-running 6-step trajectory cannot be held closer than its noise floor,
+so the test measures that floor and gates against it. It replays our sampler
+(jitter-free: 0.0 against `sample_from_noise`), then twice with Gaussian
+noise of the mean measured per-call error (3.06e-2 t2v, 2.33e-2 ti2v) added
+to every DiT output, and twice more with the prompt states also moved by the
+measured umT5 error. Our own run moves by 0.397-0.459 (t2v) and 0.104-0.105
+(ti2v) under the per-call noise alone, and 0.524-0.555 / 0.168-0.319 with the
+states moved too. The reference is one such perturbed run, so its distance
+from ours (0.497 / 0.115) is the floor itself; the gate is 1.5 times the
+larger of the two seeds. t2v is chaotic at 6 steps with guidance 5 (two
+unrelated latents would sit at about 1.4); the ti2v first frame anchors the
+trajectory. Side by side, the saved clips have the reference's layout and
+colours with different fine detail.
+
+Times on the RTX 3060 under the GPU lock (four runs; ranges):
+
+| Stage | Time |
+|---|---|
+| Load: umT5 Q8, tokenizer, VAE (host) | 18.3-43.5 s (disk cache) |
+| umT5 encode, host, per prompt | 1.1-5.1 s (28-126 tokens) |
+| First-frame encode, host, 256x256 | 1.09-1.28 s |
+| DiT read + Q8 + upload, decoder upload | 37.9-41.8 s (85.1 s once) |
+| DiT call, 256x256x5 (128 tokens) | 0.39-0.42 s first, then 0.165-0.167 s |
+| Step (two calls), 256x256x5 | 0.33-0.35 s |
+| Decode, 256x256x5 | 0.20-0.32 s |
+| Whole clip, t2v 256x256x5, 6 steps (noise, sample, decode) | 2.19-2.35 s |
+| Whole clip, ti2v 256x256x5, 6 steps (with the host image encode) | 3.71-4.36 s |
+| Step, 704x1280x17 (4400 tokens) | 4.5-5.4 s |
+| 6 steps, 704x1280x17 | 27.1-30.7 s |
+| Decode, 704x1280x17 (DiT dropped first) | 9.6-11.2 s |
+
+At 50 steps a 704x1280x17 clip is about 4 minutes of sampling and 10 s of
+decode, plus the 40 s DiT reload on the next run. Peak host RSS 8.38-9.43 GiB
+(umT5 and the VAE, then the int8 DiT until `attach_device` drops it); device
+memory in use at most 8606 MiB at 256x256 and 10202 MiB at 704x1280x17
+(1555-1833 MiB of it other processes), so the process peaks at about 8.4 GB.
+diffusers' own BF16 run of 704x1280x17 runs out of memory at the decode in
+the same 12 GB (RustingFrame `bench.json`).
+
+Clips (RustingFrame `tools/ref/wan/`): `rb_w4_t2v.mp4`, `rb_w4_ti2v.mp4` (our
+states and first frame from the reference noise, 256x256x5) and
+`rb_w4_t2v_1280x704x17.mp4` (our seed 0, 6 steps), each with
+`_frameNN.png`; 24 fps, libx264, yuv420p, crf 16, as the reference clips.
+
+Rejected: umT5 on the device beside the DiT (does not fit), swapping umT5
+and the DiT per run (40 s against 1-5 s of host encode), a fixed gate on the
+free-running clips (it would gate the trajectory's chaos, not our error).
+Not done: tiled or chunked decode that keeps the DiT resident at 704x1280,
+the image encoder on the device, cross-attention K/V cached per prompt,
+batching cond and uncond into one call, a 50-step comparison.
