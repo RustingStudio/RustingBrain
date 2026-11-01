@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Wan 2.2's video autoencoder: `wan_vae::WanVaeDecoder` decodes a latent
+  (one map per latent frame) into RGB frames and `WanVaeEncoder` encodes a
+  `1 + 4k`-frame clip, both matching diffusers' `AutoencoderKLWan` in F32
+  (relative L2 under 1e-6). `WanVaeDecoder::attach_device` decodes on the GPU
+  in FP16 (1.3e-3): 704x1280x17 in 9.5 s and 7.8 GB on an RTX 3060, untiled
+  (`docs/baseline.md`, W2).
 - umT5, Wan 2.2's prompt encoder, runs through `T5Encoder`: a checkpoint with
   a position table in every block is read that way (T5's single shared table
   is unchanged), on the host and the device. `T5Encoder::encode_real` gives

@@ -643,6 +643,7 @@ extern "C" __global__ void softmax_bwd(half_t*__restrict__ g,const half_t*__rest
 "#;
 
 mod lora;
+pub(crate) mod wan_vae;
 pub use lora::{DeviceAdapters, DeviceTape};
 
 /// NVRTC compilation costs a few hundred milliseconds and the source never
