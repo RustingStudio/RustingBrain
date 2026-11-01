@@ -2113,3 +2113,74 @@ Rejected: running the image context without FP16 accumulation
 (`GpuContext::with_precision(device, false)` in `ImageGpu::new`) as an
 accuracy A/B gave relative L2 1.0, so the image path's GEMMs depend on that
 mode; not a usable comparison, reverted.
+
+## Wan 2.2 TI2V-5B video transformer (W3, 2026-11-01)
+
+`wan_dit::WanDit` reads `transformer/` of the diffusers checkpoint
+(`WanTransformer3DModel`: 30 blocks of dim 3072, 24 heads of 128, FFN 14336,
+patch 1x2x2, text 4096) and runs one denoiser call as diffusers does: a
+timestep per frame (the TI2V first frame at 0), so the modulation, the gates
+and the output shift and scale are chosen per frame; RMS norm on q and k
+across all heads, rotation on interleaved pairs with the head split 44/42/42
+over frame, height and width; self-attention, then cross-attention on the
+prompt (norm2 with affine, added without a gate), then the tanh-GELU FFN.
+`WanDit::load_at` reads the whole model (about 5 GB at Q8); the parity test
+streams the F32 one through `WanDit::read_head` and `WanBlock::read`, one
+block at a time, so the host never holds the 20 GB F32 checkpoint.
+`WanDit::attach_device` moves the blocks to the GPU (`cuda_wan_dit`, like
+`cuda_mmdit`: FP32 residual and accumulators, BF16 GEMM operands, int8 or
+BF16 weights, the fused flash kernel for both attentions) and drops the
+host's copy of them; one kernel of its own, `rms_rope`, the RMS norm across
+heads with the rotation fused. Every checkpoint shape is checked before an
+upload or a launch (`InvalidConfig`, no panic).
+
+Reference: RustingFrame `tools/wan_refs.py w3`, diffusers F32 on the CPU,
+one forward at t = 952 (index 10 of 50) on a 2-frame 8x8 latent (32 tokens,
+the first frame at t = 0) with W1's short prompt padded to 512. Test
+`wan_dit::tests::wan22_transformer_matches_diffusers` (ignored;
+`RB_WAN_REF`, `RB_WAN_MODEL` defaulting to the local Wan2.2-TI2V-5B,
+`RB_WAN_CUDA=1` adds the device). Relative L2:
+
+| Stage | Host F32 | Host Q8 | Device Q8 (RTX 3060) | Gate |
+|---|---|---|---|---|
+| Rotary cos / sin | 0.0 | | | 1e-6 |
+| Patch embedding | 0.0 | | | 1e-5 |
+| Timestep embedding | 3.89e-7 | | | 1e-5 |
+| Timestep projection | 1.48e-7 | | | 1e-5 |
+| Prompt embedding | 4.74e-7 | | | 1e-5 |
+| Block 0 | 1.01e-6 | | | 1e-5 |
+| Output (30 blocks) | 2.34e-5 | 3.30e-2 | 4.39e-2 | 5e-5 / 5e-2 |
+| Device against host Q8 | | | 2.07e-2 | 5e-2 |
+
+The F32 output gate is 5e-5, not 1e-5: block 0 alone is 1.0e-6, which is
+F32 rounding of a 3072-wide sum, and 30 blocks of it compound to 2.3e-5. Q8
+is gated at 5e-2, the top of the task's band: per-row int8 over 30 blocks of
+14336-wide FFNs gives 3.3e-2 on the host before any device rounding; BF16
+operands add about 1e-2 more. Unit tests
+`cuda_wan_dit::tests::a_device_wan_transformer_matches_the_host_or_skips_without_device`
+(random 2-block model, 3 frames, one at t = 0: F32 3.2e-3, Q8 3.3e-3
+against the host) and
+`malformed_shapes_are_refused_before_upload_or_skip_without_device`; six
+host unit tests in `wan_dit::tests` (rotary table, timestep embedding,
+per-frame modulation, unpatchify, refused shapes, Q8 against F32).
+
+Times on the RTX 3060 under the GPU lock:
+
+| Step | Time | Peak VRAM (process) | Peak host RSS |
+|---|---|---|---|
+| Host F32, streamed per block, 32 tokens | 17.8-18.7 s (11.0-11.7 s reading blocks) | | 1.2 GB |
+| Q8 load + quantize, host | 19.9-20.2 s | | |
+| Upload to the device | 12.3-15.0 s | | |
+| Device Q8, 2x8x8 (32 tokens) | 0.31-0.54 s first, then 0.14-0.18 s | | |
+| Device Q8, 704x1280x17 (5x44x80, 4400 tokens) | 2.28-2.61 s (two sessions of three) | about 7750 MiB (9482 total, 1733 other) | 4.8 GB |
+
+Peak host RSS of the device run includes the host Q8 copy until
+`attach_device` drops the blocks, and the streamed host F32 and Q8 runs that
+the test makes first.
+
+Rejected: FP32 activations into the int8 GEMMs (as `cuda_t5` does). The
+output went from 4.39e-2 to 3.72e-2 against diffusers, but the 704x1280x17
+step took 7.7-8.7 s against 2.3 s and the upload 18.7 s against 12.3 s; BF16
+stays. Also not done: caching the cross-attention keys and values per prompt
+(a `NOTE:` note in `cuda_wan_dit`), a host Q8 product path (the test
+streams one only for the comparison), patches deeper than one frame.

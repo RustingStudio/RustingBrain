@@ -143,7 +143,7 @@ extern "C" __global__ void bias_gelu(void*dst,const float*src,const float*bias,i
 }
 "#;
 
-fn ptx() -> Result<&'static Ptx, NetworkError> {
+pub(crate) fn ptx() -> Result<&'static Ptx, NetworkError> {
     static PTX: OnceLock<Result<Ptx, String>> = OnceLock::new();
     PTX.get_or_init(|| compile_ptx(KERNELS).map_err(|error| error.to_string()))
         .as_ref()

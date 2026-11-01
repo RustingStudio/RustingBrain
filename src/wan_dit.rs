@@ -235,6 +235,8 @@ pub struct WanDit {
     pub(crate) out_table: Vec<f32>,
     pub(crate) proj_out: Dense,
     pub(crate) blocks: Vec<WanBlock>,
+    #[cfg(feature = "cuda")]
+    device: Option<crate::cuda_wan_dit::DeviceWanDit>,
 }
 
 impl WanDit {
@@ -303,8 +305,23 @@ impl WanDit {
             out_table: table(file, "scale_shift_table", 2, dim)?,
             blocks: Vec::new(),
             config,
+            #[cfg(feature = "cuda")]
+            device: None,
         };
         Ok(model)
+    }
+
+    /// Moves the blocks to the device; [`WanDit::forward`] runs there from
+    /// then on. The host keeps the embedders, the source of the timestep
+    /// embedding, and drops its copy of the blocks.
+    #[cfg(feature = "cuda")]
+    pub fn attach_device(
+        &mut self,
+        context: &std::sync::Arc<crate::gpu_transformer::GpuContext>,
+    ) -> Result<(), NetworkError> {
+        self.device = Some(crate::cuda_wan_dit::DeviceWanDit::upload(context, self)?);
+        self.blocks = Vec::new();
+        Ok(())
     }
 
     /// The velocity for `latent`, one map of `[in_channels, height, width]`
@@ -317,6 +334,10 @@ impl WanDit {
         timesteps: &[f32],
         context: &Matrix,
     ) -> Result<Vec<FeatureMap>, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device {
+            return device.forward(self, latent, timesteps, context);
+        }
         let mut step = self.prepare(latent, timesteps, context)?;
         for block in &self.blocks {
             block.forward(&self.config, &mut step)?;
@@ -1106,8 +1127,11 @@ pub(crate) mod tests {
     /// `tools/wan_refs.py w3`: a two-frame 16x16 latent at t = 952 under the
     /// short prompt of w1, every frame but the first at the step's timestep.
     /// `RB_WAN_REF` is the directory holding `w3.safetensors` and
-    /// `reference.json`, `RB_WAN_MODEL` the model (default the local copy).
-    /// The blocks are read one at a time, about 2 GB of host memory.
+    /// `reference.json`, `RB_WAN_MODEL` the model (default the local copy),
+    /// and `RB_WAN_CUDA=1` checks the int8 device model as well, with
+    /// `RB_WAN_BENCH` timing it at a larger latent. The host runs read the
+    /// blocks one at a time, about 1.2 GB of host memory; the device model
+    /// holds its int8 copy on the host until upload, about 4.6 GB.
     #[test]
     #[ignore = "needs Wan2.2-TI2V-5B and the output of RustingFrame's tools/wan_refs.py w3"]
     fn wan22_transformer_matches_diffusers() {
@@ -1207,6 +1231,68 @@ pub(crate) mod tests {
         // The F32 rounding of thirty blocks, each about 1e-6 (block0), adds up;
         // see docs/baseline.md.
         gate("output", relative(&stack(&output), &read("output").0), 5e-5);
+        drop((head, step));
+
+        // The same step with int8 weights on the host, which is what the
+        // device's error is to be read against.
+        let head = WanDit::read_head(&mut file, config.clone(), Precision::Q8).unwrap();
+        let mut step = head.prepare(&latent, &timesteps, &context).unwrap();
+        for index in 0..config.layers {
+            let block = WanBlock::read(&mut file, &config, index, Precision::Q8).unwrap();
+            block.forward(&config, &mut step).unwrap();
+        }
+        let host_q8 = stack(&head.finish(&step).unwrap());
+        gate(
+            "host Q8 output",
+            relative(&host_q8, &read("output").0),
+            5e-2,
+        );
+        drop((head, step, file));
+
+        #[cfg(feature = "cuda")]
+        if env("RB_WAN_CUDA").as_deref() == Some("1") {
+            let want = read("output").0;
+            let started = std::time::Instant::now();
+            let mut model = WanDit::load_at(&weights, config.clone(), Precision::Q8).unwrap();
+            eprintln!("wan dit Q8 host load: {:?}", started.elapsed());
+            let gpu = crate::gpu_transformer::GpuContext::new(0).unwrap();
+            let started = std::time::Instant::now();
+            model.attach_device(&gpu).unwrap();
+            eprintln!("wan dit upload: {:?}", started.elapsed());
+            for run in 0..3 {
+                let started = std::time::Instant::now();
+                let output = model.forward(&latent, &timesteps, &context).unwrap();
+                eprintln!("wan dit device step {run}: {:?}", started.elapsed());
+                gate("device Q8 output", relative(&stack(&output), &want), 5e-2);
+                gate(
+                    "device Q8 against host Q8",
+                    relative(&stack(&output), &host_q8),
+                    5e-2,
+                );
+            }
+            // `RB_WAN_BENCH=FxHxW`, a latent size, times a random latent of
+            // it: 5x44x80 is 704x1280 at 17 frames.
+            if let Some(size) = env("RB_WAN_BENCH") {
+                let [frames, height, width] = size
+                    .split('x')
+                    .map(|part| part.parse().unwrap())
+                    .collect::<Vec<usize>>()[..]
+                else {
+                    panic!("RB_WAN_BENCH is FxHxW")
+                };
+                let latent = self::latent(&config, frames, height, width);
+                let mut timesteps = vec![952.0; frames];
+                timesteps[0] = 0.0;
+                for run in 0..3 {
+                    let started = std::time::Instant::now();
+                    model.forward(&latent, &timesteps, &context).unwrap();
+                    eprintln!(
+                        "wan dit device step at {size} {run}: {:?}",
+                        started.elapsed()
+                    );
+                }
+            }
+        }
 
         let failures: Vec<_> = report
             .iter()

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Wan 2.2's video transformer: `wan_dit::WanDit` runs one denoiser call of
+  the TI2V-5B DiT (a timestep per frame, so the first frame of an
+  image-conditioned clip can sit at t = 0), matching diffusers'
+  `WanTransformer3DModel` in F32 (output relative L2 2.3e-5) and 3.3e-2 at
+  Q8. `WanDit::attach_device` runs it on the GPU (int8 weights, BF16
+  operands, FP32 residual): 4.4e-2 against diffusers, 704x1280x17 in
+  2.3-2.6 s a step and about 7.7 GB on an RTX 3060 (`docs/baseline.md`, W3).
+  A malformed checkpoint is refused with `InvalidConfig` before any upload.
 - Wan 2.2's video autoencoder: `wan_vae::WanVaeDecoder` decodes a latent
   (one map per latent frame) into RGB frames and `WanVaeEncoder` encodes a
   `1 + 4k`-frame clip, both matching diffusers' `AutoencoderKLWan` in F32
