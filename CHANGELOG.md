@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Wan 2.2 TI2V-5B gets FastWan's 3-step DMD sampler (`VideoConfig::dmd =
+  Some(Dmd { timesteps: vec![1000, 757, 522], seed })`, `dmd_sigmas`; no
+  guidance, one DiT call a step) and `VideoPipeline::set_dit_weights` for a
+  single-file DiT. 1280x704x49 samples in about 21 s, against a 450-500 s
+  30-step CFG run; default sampling unchanged.
 - The Wan 2.2 device VAE decoder takes the blocks after the last one that adds
   frames one frame at a time instead of four, output bit-identical: the
   704x1280x17 decode peaks at 5856 MiB of device memory instead of 6784 MiB, in

@@ -48,6 +48,42 @@ pub struct VideoConfig {
     pub guidance: f32,
     /// Tokens every prompt is padded to.
     pub prompt_length: usize,
+    /// FastWan's few-step DMD sampler instead of UniPC; `steps` and
+    /// `guidance` are then ignored (one DiT call a step, no guidance).
+    pub dmd: Option<Dmd>,
+}
+
+/// DMD sampling: the timesteps (FastWan 2.2 TI2V-5B uses 1000, 757, 522) and
+/// the seed of the fresh noise injected between steps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dmd {
+    pub timesteps: Vec<u32>,
+    pub seed: u64,
+}
+
+/// The sigma of each DMD timestep: that of the nearest timestep of a flow
+/// matching Euler schedule with `shift` (`timesteps = sigmas * train_steps`).
+pub fn dmd_sigmas(timesteps: &[u32], shift: f64, train_steps: usize) -> Vec<f64> {
+    let train = train_steps as f64;
+    let schedule: Vec<f64> = (0..train_steps)
+        .map(|i| {
+            let s = 1.0 - i as f64 * (1.0 - 1.0 / train) / (train - 1.0).max(1.0);
+            shift * s / (1.0 + (shift - 1.0) * s)
+        })
+        .collect();
+    timesteps
+        .iter()
+        .map(|&t| {
+            *schedule
+                .iter()
+                .min_by(|a, b| {
+                    (*a * train - t as f64)
+                        .abs()
+                        .total_cmp(&(*b * train - t as f64).abs())
+                })
+                .expect("train_steps > 0")
+        })
+        .collect()
 }
 
 impl Default for VideoConfig {
@@ -57,6 +93,7 @@ impl Default for VideoConfig {
             steps: 50,
             guidance: 5.0,
             prompt_length: 512,
+            dmd: None,
         }
     }
 }
@@ -442,6 +479,13 @@ impl VideoPipeline {
         })
     }
 
+    /// Reads the DiT from `path` (an index or a single `.safetensors` file)
+    /// instead of the model directory's, e.g. a distilled FastWan DiT.
+    pub fn set_dit_weights(&mut self, path: impl Into<PathBuf>) {
+        self.dit_path = path.into();
+        self.denoiser = None;
+    }
+
     /// Moves the VAE decoder and the DiT onto `device`; umT5 and the VAE
     /// encoder stay on the host (see the module docs).
     ///
@@ -565,6 +609,9 @@ impl VideoPipeline {
                 first.channels, first.height, first.width
             )));
         }
+        if let Some(dmd) = self.config.dmd.clone() {
+            return self.sample_dmd(&dmd, positive, first, noise, on_step);
+        }
         let guidance = self.config.guidance;
         let negative = negative.filter(|_| guidance > 1.0);
         let mut scheduler = UniPc::new(self.config.steps, self.flow_shift, self.train_steps)?;
@@ -592,6 +639,47 @@ impl VideoPipeline {
         }
         if let Some(first) = first {
             noise[0] = first.clone();
+        }
+        Ok(noise)
+    }
+
+    /// DMD: `x0 = x - sigma * v` each step, re-noised to the next sigma.
+    fn sample_dmd(
+        &mut self,
+        dmd: &Dmd,
+        positive: &Matrix,
+        first: Option<&FeatureMap>,
+        mut noise: Vec<FeatureMap>,
+        mut on_step: impl FnMut(usize, &[FeatureMap]) -> bool,
+    ) -> Result<Vec<FeatureMap>, NetworkError> {
+        let sigmas = dmd_sigmas(&dmd.timesteps, 8.0 /* FastWan's DMD shift */, self.train_steps);
+        eprintln!("dmd sigmas {sigmas:?}");
+        let mut rng = StdRng::seed_from_u64(dmd.seed);
+        for (step, (&t, &sigma)) in dmd.timesteps.iter().zip(&sigmas).enumerate() {
+            let mut input = noise.clone();
+            let mut times = vec![t as f32; noise.len()];
+            if let Some(first) = first {
+                input[0] = first.clone();
+                times[0] = 0.0;
+            }
+            let velocity = flatten(&self.denoiser()?.forward(&input, &times, positive)?);
+            let mut x0 = flatten(&noise);
+            for (x, v) in x0.iter_mut().zip(&velocity) {
+                *x = (*x as f64 - sigma * *v as f64) as f32;
+            }
+            if let Some(&next) = sigmas.get(step + 1) {
+                for x in &mut x0 {
+                    *x = ((1.0 - next) * *x as f64
+                        + next * crate::diffusion::gaussian(&mut rng) as f64) as f32;
+                }
+            }
+            refill(&mut noise, &x0);
+            if let Some(first) = first {
+                noise[0] = first.clone();
+            }
+            if !on_step(step, &noise) {
+                break;
+            }
         }
         Ok(noise)
     }
@@ -1108,6 +1196,79 @@ mod tests {
             if let Some((free, _)) = crate::cuda_image::memory_info() {
                 eprintln!("wan clip {run}: free with the DiT on device {} MiB", free >> 20);
             }
+        }
+    }
+
+    /// FastWan 2.2 TI2V-5B, 3-step DMD, text-to-video at 1280x704 with 49 and
+    /// 17 frames. `RB_FASTWAN` is the FastWan directory, `RB_WAN_MODEL` the
+    /// Wan 2.2 TI2V-5B one (text encoder, tokenizer, VAE); clips, frames and a
+    /// tile of five frames go to `/tmp/ws4`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs FastWan2.2-TI2V-5B, Wan2.2-TI2V-5B and RB_WAN_CUDA=1"]
+    fn fastwan_dmd_three_steps() {
+        use std::time::Instant;
+        if std::env::var("RB_WAN_CUDA").as_deref() != Ok("1") {
+            return;
+        }
+        let model = PathBuf::from(
+            std::env::var("RB_WAN_MODEL")
+                .unwrap_or_else(|_| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+        );
+        let fast = PathBuf::from(std::env::var("RB_FASTWAN").unwrap_or_else(|_| {
+            "/home/vasylt/Code/ai/ml/models/FastWan2.2-TI2V-5B-FullAttn-Diffusers".into()
+        }));
+        let dir = PathBuf::from("/tmp/ws4");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pipeline = VideoPipeline::load(&model).unwrap();
+        pipeline.set_dit_weights(fast.join("transformer/diffusion_pytorch_model.safetensors"));
+        pipeline.config.guidance = 1.0;
+        pipeline.config.dmd = Some(Dmd {
+            timesteps: vec![1000, 757, 522],
+            seed: 42,
+        });
+        let text = pipeline
+            .condition(
+                "A red fox trotting through fresh snow in a pine forest at golden hour, \
+                 cinematic, shallow depth of field",
+            )
+            .unwrap();
+        pipeline.encoder = None;
+        assert!(pipeline.try_cuda(0));
+        for frames in [49, 17] {
+            let request = VideoRequest {
+                width: 1280,
+                height: 704,
+                frames,
+                seed: Some(42),
+                image: None,
+            };
+            let started = Instant::now();
+            let latent = pipeline
+                .sample_from_noise(&text, None, None, pipeline.noise(&request).unwrap(), |_, _| true)
+                .unwrap();
+            let sampled = started.elapsed();
+            let decoding = Instant::now();
+            let clip = pipeline.decode(&latent).unwrap();
+            eprintln!(
+                "fastwan 1280x704x{frames}: sample {sampled:?}, decode {:?}, total {:?}",
+                decoding.elapsed(),
+                started.elapsed()
+            );
+            let name = format!("fastwan_{frames}");
+            save_clip(&clip, &dir, &name);
+            let picks: Vec<usize> = (0..5).map(|k| k * (frames - 1) / 4).collect();
+            let mut command = std::process::Command::new("ffmpeg");
+            command.args(["-y", "-loglevel", "error"]).current_dir(&dir);
+            for pick in &picks {
+                command.arg("-i").arg(format!("{name}_frame{:02}.png", pick + 1));
+            }
+            let scaled: String = (0..5).map(|k| format!("[{k}]scale=640:-1[s{k}];")).collect();
+            let stacked: String = (0..5).map(|k| format!("[s{k}]")).collect();
+            command
+                .args(["-filter_complex", &format!("{scaled}{stacked}hstack=inputs=5")])
+                .arg(if frames == 49 { "tiles.png".to_string() } else { format!("tiles{frames}.png") });
+            assert!(command.status().unwrap().success(), "tile failed");
         }
     }
 
