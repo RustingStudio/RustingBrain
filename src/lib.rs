@@ -150,6 +150,7 @@ pub mod transformer_block;
 pub mod unet;
 pub mod unet_lora;
 pub mod vae;
+pub mod video_pipeline;
 pub mod vision;
 pub mod vit_encoder;
 pub mod wan_dit;
@@ -300,4 +301,5 @@ pub use vision::{VisionTransformer, VitConfig};
 #[cfg(feature = "images")]
 pub use vit_encoder::read_image;
 pub use vit_encoder::{CLIP_MEAN, CLIP_STD, VitEncoder, VitEncoderConfig, composite_rgba};
+pub use video_pipeline::{UniPc, Video, VideoConfig, VideoPipeline, VideoRequest};
 pub use wan_dit::{WanBlock, WanDit, WanDitConfig};
