@@ -152,6 +152,7 @@ pub mod unet_lora;
 pub mod vae;
 pub mod vision;
 pub mod vit_encoder;
+pub mod wan_vae;
 pub mod webdataset;
 pub mod yolo;
 
