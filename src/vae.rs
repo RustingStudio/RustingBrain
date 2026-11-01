@@ -197,36 +197,7 @@ impl AttentionBlock {
         let queries = self.query.forward(&tokens)?;
         let keys = self.key.forward(&tokens)?;
         let values = self.value.forward(&tokens)?;
-
-        let scale = (queries.cols as f32).sqrt().recip();
-        let mut attended = Matrix::new(tokens.rows, values.cols);
-        let mut weights = vec![0.0; tokens.rows];
-        for pixel in 0..tokens.rows {
-            let query = queries.row(pixel);
-            let mut largest = f32::NEG_INFINITY;
-            for (weight, other) in weights.iter_mut().zip(0..tokens.rows) {
-                let score = query
-                    .iter()
-                    .zip(keys.row(other))
-                    .map(|(query, key)| query * key)
-                    .sum::<f32>()
-                    * scale;
-                *weight = score;
-                largest = largest.max(score);
-            }
-            let mut total = 0.0;
-            for weight in &mut weights {
-                *weight = (*weight - largest).exp();
-                total += *weight;
-            }
-            let row = attended.row_mut(pixel);
-            for (other, weight) in weights.iter().enumerate() {
-                let weight = weight / total;
-                for (value, source) in row.iter_mut().zip(values.row(other)) {
-                    *value += weight * source;
-                }
-            }
-        }
+        let attended = attend(&queries, &keys, &values);
 
         let projected = self.output.forward(&attended)?;
         let mut output = FeatureMap::from_tokens(&projected, input.height, input.width)?;
@@ -235,6 +206,41 @@ impl AttentionBlock {
         }
         Ok(output)
     }
+}
+
+/// Single-head softmax attention of every query row over every key row, the
+/// scores scaled by one over the square root of the width.
+pub(crate) fn attend(queries: &Matrix, keys: &Matrix, values: &Matrix) -> Matrix {
+    let scale = (queries.cols as f32).sqrt().recip();
+    let mut attended = Matrix::new(queries.rows, values.cols);
+    let mut weights = vec![0.0; queries.rows];
+    for pixel in 0..queries.rows {
+        let query = queries.row(pixel);
+        let mut largest = f32::NEG_INFINITY;
+        for (weight, other) in weights.iter_mut().zip(0..queries.rows) {
+            let score = query
+                .iter()
+                .zip(keys.row(other))
+                .map(|(query, key)| query * key)
+                .sum::<f32>()
+                * scale;
+            *weight = score;
+            largest = largest.max(score);
+        }
+        let mut total = 0.0;
+        for weight in &mut weights {
+            *weight = (*weight - largest).exp();
+            total += *weight;
+        }
+        let row = attended.row_mut(pixel);
+        for (other, weight) in weights.iter().enumerate() {
+            let weight = weight / total;
+            for (value, source) in row.iter_mut().zip(values.row(other)) {
+                *value += weight * source;
+            }
+        }
+    }
+    attended
 }
 
 /// One rung of the ladder: several residual blocks, then a doubling.
@@ -781,7 +787,7 @@ impl VaeEncoder {
 
 /// Adds one row at the bottom and one column at the right, which is the
 /// padding `diffusers` applies before an encoder's halving convolution.
-fn pad_right_bottom(map: &FeatureMap) -> FeatureMap {
+pub(crate) fn pad_right_bottom(map: &FeatureMap) -> FeatureMap {
     let (height, width) = (map.height + 1, map.width + 1);
     let mut padded = FeatureMap::new(map.channels, height, width);
     for channel in 0..map.channels {
