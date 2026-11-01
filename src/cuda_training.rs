@@ -1136,6 +1136,25 @@ fn keep_freed_memory(ctx: &CudaContext) -> Result<(), NetworkError> {
     }
 }
 
+/// Waits for the device, then hands the memory [`keep_freed_memory`] kept
+/// back to the driver, so that `memory_info` reports it free again. A model
+/// that drops one network to make room for another calls it in between.
+pub(crate) fn release_freed_memory(device: usize) -> Result<(), NetworkError> {
+    use cudarc::driver::sys;
+    let (ctx, _) = device_context(device)?;
+    ctx.synchronize()
+        .map_err(cuda_err("CUDA synchronize before a pool trim"))?;
+    unsafe {
+        let mut pool = std::mem::MaybeUninit::uninit();
+        sys::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), ctx.cu_device())
+            .result()
+            .map_err(cuda_err("CUDA memory pool lookup"))?;
+        sys::cuMemPoolTrimTo(pool.assume_init(), 0)
+            .result()
+            .map_err(cuda_err("CUDA memory pool trim"))
+    }
+}
+
 /// Every kernel handle resolved once. `CudaModule::load_function` is a driver
 /// lookup; calling it inside the batch loop cost more than the kernels it found.
 struct Kernels {
