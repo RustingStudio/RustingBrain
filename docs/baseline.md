@@ -1944,3 +1944,64 @@ follows the load (another loop was reading from disk); run 3 at load 4.8 took
 row: 22.9 to 11.0 s. 10402 MiB leaves about 1.9 GB on the 12 GB card at
 1024x1024, so the encoder stays resident; there is no encode-then-free step.
 The three PNGs are byte for byte the same and show the lighthouse in fog.
+
+## FLUX.2-klein-4B denoiser step on the RTX 3060 (P2, 2026-11-01)
+
+Goal: bring the Q8 1024x1024 step from 2.49 s (F3; diffusers BF16 1.54 s)
+to 1.8 s or less. nsys over the F3 run put the time in the BF16 GEMMs
+(cutlass 18.3 ms a call), `flash_attention_fwd_128` (24.4 ms a call, 25
+calls a step) and `head_norm_rope` (7.25 ms a call, 60 calls a step, about
+0.44 s a step for a per-head RMS norm and rotation). One lever at a time;
+each must keep `pipeline::tests::flux2_klein_matches_diffusers`
+(`RB_FLUX2_CUDA=1`) at final latent 0.0441 and image 0.0263 or better, and
+win an interleaved A/B (`examples/text_to_image.rs`, the F3 command, under
+the GPU lock, one hold per run).
+
+| Lever | Kernel, ms a call (before / after) | Denoise, 4 steps (s) | Parity (latent / image) | Kept |
+|---|---|---|---|---|
+| 1. `head_norm_rope` one warp per head (5cef28c) | 6.18 / 0.38 (nsys, 896x896) | 1024: 9.77 / 9.75 / 9.80 to 7.87 / 7.89 / 7.88 (tree-sum version, load 1.5-3.4) | 0.04411 / 0.02626, bit-identical to before | yes |
+| 2. flash attention K/V by `cp.async`, double-buffered, V by `ldmatrix.trans` (dade0bc) | 29.8 / 13.2 (`examples/flash_probe`, FLUX shape); 12.48 / 5.46 (nsys, 896x896) | 896: nsys 6.13 to 5.20 | 0.04411 / 0.02626, unchanged | yes |
+| 3. SwiGLU/GELU writes BF16 straight from the fused GEMM's columns (ee42587) | not profiled (one copy and one cast pass per MLP removed) | 1024: 7.04 / 7.00 / 7.00 / 7.49 to 6.63 / 6.71 / 6.85 / 6.24 (load 3-5); 896: 5.72 / 5.68 to 5.43 / 4.97 / 5.32 | 0.04411 / 0.02626, unchanged | yes |
+
+Lever 1: the old kernel ran one thread per (row, head) over 128 values, so
+4608 x 24 threads each walked a 512-byte stride. One warp per head reads the
+head as float2 coalesced. The first version summed the squares with a
+shuffle tree; that moved the image to 0.02733 (worse than 0.0263), so the
+kept version broadcasts each lane's pair with shuffles and sums in dimension
+order, the order the thread-per-head loop used, which gives the same bits.
+The 1024 A/B was run on the tree-sum build (its commit message quotes it);
+the kept build matches it in nsys at 896 (base 7.49 s, kept 6.13 s denoise).
+
+Lever 2: K and V tiles (64 keys) are now copied with `cp.async` into
+key-major shared tiles padded to D+8; V for the current tile streams in
+under QK and the softmax, K for the next tile under PV. LM shape (4 x 1024,
+head 64, causal) 0.557 to 0.398 ms. `examples/flash_probe` now takes kernel
+source files and times them interleaved, best of 5.
+
+Rejected: `ldmatrix` for the K fragments at head 128, 13.35 against 13.21 ms
+(it lost at head 64 as well, A2); the shuffle-tree sum in lever 1 (parity,
+above).
+
+Lever 3: the activation kernel takes an offset and a stride into the GEMM
+output and writes the next GEMM's BF16 input itself. The single blocks read
+the SwiGLU half of the fused q/k/v + MLP projection in place instead of
+copying it out, the separate FP32-to-BF16 pass after each activation is
+gone, and the fused buffer is freed before attention. Every lever 3 run beat
+every lever 2 run at 1024 (one round of each ran out of memory at decode
+with 1.65 GB of desktop on the card and is left out; an 896 lever 2 run that
+CS2 started under fell back to the host encoder and is left out too).
+
+1024x1024 with all three levers, the four runs above (`examples/text_to_image.rs`,
+`QUANTIZE=1 CUDA=0`, encoder on the device):
+
+| | F3 / P1 | P2 |
+|---|---|---|
+| Denoise, 4 steps | 9.96 s (2.49 s a step) | 6.63 / 6.71 / 6.85 / 6.24, mean 6.61 s (1.65 s a step) |
+| Encode + denoise + decode | 11.0 s (P1) | 8.0 / 8.6 / 8.3 / 7.4, mean 8.1 s |
+| Peak VRAM (nvidia-smi) | 10402 MiB (P1) | 10434 MiB |
+
+diffusers BF16 is 1.54 s a step (F3). The 1.8 s goal holds; 1.6 does not.
+The rest of the step is mostly the BF16 GEMMs (cutlass 14.4 ms a call at
+896, about 31% of kernel time after lever 2), which none of these levers
+touch. 1024x1024 needs the desktop at about 1.5 GB of VRAM or less; at 1.65
+GB both builds ran out of memory.
