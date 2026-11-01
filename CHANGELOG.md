@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `ImagePipeline::encoder_on_device` says whether `to_cuda` (or `try_cuda`)
+  moved a sequence prompt encoder such as FLUX.2-klein's Qwen3. That upload
+  may fail when VRAM is short and the encoder then stays on the host (prompt
+  encode about 12 s instead of 0.7 s on an RTX 3060); before, nothing said so.
 - FLUX.2-klein-4B denoises faster on the device: 1024x1024 Q8 on an RTX 3060
   9.96 s to 6.61 s for 4 steps (2.49 to 1.65 s a step), parity against
   diffusers unchanged (`docs/baseline.md`, P2). The per-head norm and
