@@ -35,6 +35,10 @@ pub struct DeviceT5 {
     context: Arc<GpuContext>,
     blocks: Vec<DeviceBlock>,
     final_norm: CudaSlice<f32>,
+    /// Whether the GEMMs read BF16 activations. Int8 weights read FP32 ones,
+    /// as in [`crate::cuda_text_encoder`]: BF16 on top of Q8's rounding put
+    /// umT5-XXL's embeddings at 0.0271 against the host's 0.0245.
+    narrow: bool,
 }
 
 impl std::fmt::Debug for DeviceT5 {
@@ -88,6 +92,7 @@ impl DeviceT5 {
             })
             .collect::<Result<_, NetworkError>>()?;
         Ok(Self {
+            narrow: !encoder.blocks.iter().any(|block| block.query.is_quantized()),
             final_norm: gpu.upload(&encoder.final_norm)?,
             context: context.clone(),
             blocks,
@@ -107,18 +112,30 @@ impl DeviceT5 {
         let width = config.mlp_dim;
 
         let mut hidden = gpu.upload(&encoder.embed(ids)?.data)?;
-        let bias: Vec<f32> = encoder.bias(tokens).concat();
-        let bias = gpu.upload(&bias)?;
+        let upload_bias = |layer: usize| gpu.upload(&encoder.bias(layer, tokens).concat());
+        // umT5 has a table per block, T5 one for all of them.
+        let shared = match encoder.position_bias.len() {
+            1 => Some(upload_bias(0)?),
+            _ => None,
+        };
         let square = tokens * tokens;
 
-        for block in &self.blocks {
+        for (index, block) in self.blocks.iter().enumerate() {
+            let own;
+            let bias = match &shared {
+                Some(bias) => bias,
+                None => {
+                    own = upload_bias(index)?;
+                    &own
+                }
+            };
             let (normed, _, _) = gpu.rmsnorm(
                 &hidden,
                 &block.attention_norm.as_view(),
                 tokens,
                 d_model,
                 config.eps,
-                true,
+                self.narrow,
                 false,
             )?;
             let mut qkv = gpu.uninit(tokens * 3 * inner)?;
@@ -127,7 +144,7 @@ impl DeviceT5 {
                 3 * inner,
                 d_model,
                 &normed.all(),
-                true,
+                self.narrow,
                 &mut qkv.slice_mut(..),
                 tokens,
                 0.0,
@@ -153,7 +170,7 @@ impl DeviceT5 {
                 head_dim,
                 square,
             )?;
-            gpu.add(&mut scores, &bias, 0, heads * square, true)?;
+            gpu.add(&mut scores, bias, 0, heads * square, true)?;
             let mut log_sum_exp = gpu.uninit(heads * tokens)?;
             gpu.attention_softmax(
                 &mut scores,
@@ -201,7 +218,7 @@ impl DeviceT5 {
                 tokens,
                 d_model,
                 config.eps,
-                true,
+                self.narrow,
                 false,
             )?;
             let mut gate_up = gpu.uninit(tokens * 2 * width)?;
@@ -210,18 +227,18 @@ impl DeviceT5 {
                 2 * width,
                 d_model,
                 &normed.all(),
-                true,
+                self.narrow,
                 &mut gate_up.slice_mut(..),
                 tokens,
                 0.0,
             )?;
-            let wide = gpu.gated(&gate_up, tokens, width, true, true)?;
+            let wide = gpu.gated(&gate_up, tokens, width, self.narrow, true)?;
             gpu.project(
                 &block.mlp_out,
                 d_model,
                 width,
                 &wide.all(),
-                true,
+                self.narrow,
                 &mut hidden.slice_mut(..),
                 tokens,
                 1.0,
@@ -250,7 +267,7 @@ impl DeviceT5 {
 mod tests {
     use super::*;
     use crate::cuda_training::cuda_doctor;
-    use crate::t5::tests::{checkpoint, tiny};
+    use crate::t5::tests::{checkpoint, checkpoint_with, tiny};
     use crate::transformer::Precision;
 
     fn cuda_or_skip() -> Option<Arc<GpuContext>> {
@@ -273,9 +290,15 @@ mod tests {
         };
         let config = tiny();
         let path = std::env::temp_dir().join("rusting_brain_cuda_t5.safetensors");
-        checkpoint(&config, &path);
-        for precision in [Precision::F32, Precision::Q8] {
+        // T5's shared position table, then umT5's one per block.
+        for (per_block, precision) in [
+            (false, Precision::F32),
+            (false, Precision::Q8),
+            (true, Precision::F32),
+        ] {
+            checkpoint_with(&config, &path, per_block);
             let encoder = T5Encoder::load_at(&path, config.clone(), precision).unwrap();
+            assert_eq!(encoder.position_bias.len() > 1, per_block);
             let device = DeviceT5::upload(&context, &encoder).unwrap();
             let ids = [5, 9, 3, 17, 2, 30, 1];
             let expected = encoder.forward(&ids).unwrap();
@@ -294,7 +317,7 @@ mod tests {
                 .fold(0.0f32, f32::max);
             assert!(
                 worst < 2e-2 * scale,
-                "{precision:?}: worst difference {worst} of {scale}"
+                "{precision:?}, per block {per_block}: worst difference {worst} of {scale}"
             );
         }
         std::fs::remove_file(path).ok();

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- umT5, Wan 2.2's prompt encoder, runs through `T5Encoder`: a checkpoint with
+  a position table in every block is read that way (T5's single shared table
+  is unchanged), on the host and the device. `T5Encoder::encode_real` gives
+  the states Wan hands its denoiser: the real tokens only, zero rows after
+  them. umT5-XXL at Q8 against transformers: token ids exact, prompt
+  embeddings 0.0203 / 0.0245 on the host, 0.0204 / 0.0245 on an RTX 3060
+  (95 / 194 ms for 9 / 39 tokens; `docs/baseline.md`, W1).
 - `ImagePipeline::encoder_on_device` says whether `to_cuda` (or `try_cuda`)
   moved a sequence prompt encoder such as FLUX.2-klein's Qwen3. That upload
   may fail when VRAM is short and the encoder then stays on the host (prompt

@@ -7,12 +7,15 @@
 //! scaled — T5 folds that scale into its initialization instead, so dividing by
 //! the square root of the head width here would quietly change every logit.
 //!
-//! The position bias is shared: the first block owns the table, and every block
-//! after it adds the same numbers.
+//! In T5 the position bias is shared: the first block owns the table, and every
+//! block after it adds the same numbers. umT5 (Wan's prompt encoder) is the
+//! same network with a table in every block, and a checkpoint that carries
+//! them is read that way.
 //!
-//! NOTE: inference only, encoder only, no attention mask. The published
-//! image pipelines pad a prompt and let the padding be attended, so a mask
-//! would produce different numbers from the reference rather than better ones.
+//! NOTE: inference only, encoder only, no attention mask. FLUX.1 and SD3
+//! pad a prompt and let the padding be attended, so a mask would produce
+//! different numbers from the reference rather than better ones. Wan masks the
+//! padding, which [`T5Encoder::encode_real`] gets by not running it at all.
 
 use crate::conv::Dense;
 use crate::matrix::Matrix;
@@ -127,8 +130,9 @@ pub(crate) struct Block {
 pub struct T5Encoder {
     pub(crate) config: T5Config,
     pub(crate) tokens: Matrix,
-    /// The shared position bias, `[buckets, heads]`.
-    pub(crate) position_bias: Matrix,
+    /// The position bias tables, `[buckets, heads]` each: one shared by every
+    /// block (T5), or one per block (umT5).
+    pub(crate) position_bias: Vec<Matrix>,
     pub(crate) blocks: Vec<Block>,
     pub(crate) final_norm: Vec<f32>,
     #[cfg(feature = "cuda")]
@@ -173,8 +177,13 @@ impl T5Encoder {
                 tokens.cols, config.d_model
             )));
         }
-        let position_bias =
-            file.matrix("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight")?;
+        let table = |index: usize| {
+            format!("encoder.block.{index}.layer.0.SelfAttention.relative_attention_bias.weight")
+        };
+        let per_block = config.layers > 1 && file.names().any(|name| name == table(1));
+        let position_bias = (0..if per_block { config.layers } else { 1 })
+            .map(|index| file.matrix(&table(index)))
+            .collect::<Result<Vec<_>, NetworkError>>()?;
 
         let blocks = (0..config.layers)
             .map(|index| {
@@ -231,6 +240,19 @@ impl T5Encoder {
         prompt: &str,
         length: usize,
     ) -> Result<Vec<u32>, NetworkError> {
+        let mut ids = self.real_ids(tokenizer, prompt, length)?;
+        ids.resize(length, self.config.pad_token);
+        Ok(ids)
+    }
+
+    /// The same without the padding: the prompt cut to leave room for the end
+    /// token, and the end token.
+    fn real_ids(
+        &self,
+        tokenizer: &Unigram,
+        prompt: &str,
+        length: usize,
+    ) -> Result<Vec<u32>, NetworkError> {
         if length == 0 {
             return Err(NetworkError::InvalidConfig(
                 "a prompt padded to nothing has no states".into(),
@@ -239,7 +261,6 @@ impl T5Encoder {
         let mut ids = tokenizer.encode(prompt)?;
         ids.truncate(length - 1);
         ids.push(self.config.eos_token);
-        ids.resize(length, self.config.pad_token);
         Ok(ids)
     }
 
@@ -262,37 +283,52 @@ impl T5Encoder {
             return device.forward(self, ids);
         }
         let mut hidden = self.embed(ids)?;
-        let bias = self.bias(ids.len());
-        for block in &self.blocks {
-            let normed = rms_norm(&hidden, &block.attention_norm, self.config.eps);
-            let attended = attention(
-                &block.query.forward(&normed)?,
-                &block.key.forward(&normed)?,
-                &block.value.forward(&normed)?,
-                self.config.num_heads,
-                &bias,
-            );
-            add(&mut hidden, &block.output.forward(&attended)?);
-
-            let normed = rms_norm(&hidden, &block.mlp_norm, self.config.eps);
-            let mut wide = block.mlp_in.forward(&normed)?;
-            match &block.gate {
-                Some(gate) => {
-                    let gate = gate.forward(&normed)?;
-                    wide.data
-                        .par_iter_mut()
-                        .zip(gate.data.par_iter())
-                        .for_each(|(value, gate)| *value = crate::ffn::gelu(*value) * gate);
-                }
-                None => wide
-                    .data
-                    .par_iter_mut()
-                    .for_each(|value| *value = value.max(0.0)),
+        let shared = (self.position_bias.len() == 1).then(|| self.bias(0, ids.len()));
+        for index in 0..self.blocks.len() {
+            match &shared {
+                Some(bias) => self.layer(index, &mut hidden, bias)?,
+                None => self.layer(index, &mut hidden, &self.bias(index, ids.len()))?,
             }
-            add(&mut hidden, &block.mlp_out.forward(&wide)?);
         }
 
         Ok(rms_norm(&hidden, &self.final_norm, self.config.eps))
+    }
+
+    /// Block `index` on the host, in place, with the bias it reads.
+    pub(crate) fn layer(
+        &self,
+        index: usize,
+        hidden: &mut Matrix,
+        bias: &[Vec<f32>],
+    ) -> Result<(), NetworkError> {
+        let block = &self.blocks[index];
+        let normed = rms_norm(hidden, &block.attention_norm, self.config.eps);
+        let attended = attention(
+            &block.query.forward(&normed)?,
+            &block.key.forward(&normed)?,
+            &block.value.forward(&normed)?,
+            self.config.num_heads,
+            bias,
+        );
+        add(hidden, &block.output.forward(&attended)?);
+
+        let normed = rms_norm(hidden, &block.mlp_norm, self.config.eps);
+        let mut wide = block.mlp_in.forward(&normed)?;
+        match &block.gate {
+            Some(gate) => {
+                let gate = gate.forward(&normed)?;
+                wide.data
+                    .par_iter_mut()
+                    .zip(gate.data.par_iter())
+                    .for_each(|(value, gate)| *value = crate::ffn::gelu(*value) * gate);
+            }
+            None => wide
+                .data
+                .par_iter_mut()
+                .for_each(|value| *value = value.max(0.0)),
+        }
+        add(hidden, &block.mlp_out.forward(&wide)?);
+        Ok(())
     }
 
     /// The embedding rows of `ids`, `[tokens, d_model]`.
@@ -328,9 +364,29 @@ impl T5Encoder {
         self.forward(&self.tokenize(tokenizer, prompt, length)?)
     }
 
-    /// The learned position bias for a sequence of this length, one
-    /// `[tokens, tokens]` block per head.
-    pub(crate) fn bias(&self, tokens: usize) -> Vec<Vec<f32>> {
+    /// The states Wan hands its denoiser: `[length, d_model]`, the prompt's
+    /// real tokens (the end token among them) and zero rows after them.
+    ///
+    /// Wan runs umT5 over the padded ids with the padding masked out of
+    /// attention, then zeroes the padding's states. Running only the real
+    /// tokens gives the same rows: a masked key adds nothing, and the bias
+    /// depends on the distance between two tokens, not on the length.
+    pub fn encode_real(
+        &self,
+        tokenizer: &Unigram,
+        prompt: &str,
+        length: usize,
+    ) -> Result<Matrix, NetworkError> {
+        let mut states = self.forward(&self.real_ids(tokenizer, prompt, length)?)?;
+        states.data.resize(length * self.config.d_model, 0.0);
+        states.rows = length;
+        Ok(states)
+    }
+
+    /// The learned position bias block `layer` adds for a sequence of this
+    /// length, one `[tokens, tokens]` block per head.
+    pub(crate) fn bias(&self, layer: usize, tokens: usize) -> Vec<Vec<f32>> {
+        let table = &self.position_bias[layer.min(self.position_bias.len() - 1)];
         (0..self.config.num_heads)
             .map(|head| {
                 let mut head_bias = vec![0.0; tokens * tokens];
@@ -344,9 +400,7 @@ impl T5Encoder {
                             self.config.buckets,
                             self.config.max_distance,
                         );
-                        *slot = self
-                            .position_bias
-                            .row(bucket.min(self.position_bias.rows - 1))[head];
+                        *slot = table.row(bucket.min(table.rows - 1))[head];
                     }
                 }
                 head_bias
@@ -485,6 +539,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn checkpoint(config: &T5Config, path: &std::path::Path) {
+        checkpoint_with(config, path, false);
+    }
+
+    /// The same, with a position table in every block, as umT5 writes it.
+    /// Each block's table differs from the one before it.
+    pub(crate) fn checkpoint_with(config: &T5Config, path: &std::path::Path, per_block: bool) {
         let mut tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
         let mut add = |name: String, shape: Vec<usize>| {
             let count = shape.iter().product::<usize>();
@@ -545,6 +605,18 @@ pub(crate) mod tests {
             vec![config.d_model],
         );
 
+        for index in (1..config.layers).filter(|_| per_block) {
+            let count = config.buckets * config.num_heads;
+            let values = (0..count)
+                .map(|at| ((at * (index + 2) % 13) as f32 - 6.0) * 0.1)
+                .collect();
+            tensors.insert(
+                format!(
+                    "encoder.block.{index}.layer.0.SelfAttention.relative_attention_bias.weight"
+                ),
+                (vec![config.buckets, config.num_heads], values),
+            );
+        }
         crate::safetensors::write_checkpoint(path, &tensors);
     }
 
@@ -625,6 +697,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_umt5_block_reads_its_own_position_table() {
+        let config = tiny();
+        let path = std::env::temp_dir().join("rusting_brain_umt5_tables.safetensors");
+        checkpoint_with(&config, &path, true);
+        let umt5 = T5Encoder::load(&path, config.clone()).unwrap();
+        std::fs::remove_file(path).ok();
+        let t5 = encoder(
+            &config,
+            "rusting_brain_umt5_shared.safetensors",
+            Precision::F32,
+        );
+
+        assert_eq!((umt5.position_bias.len(), t5.position_bias.len()), (2, 1));
+        assert_eq!(umt5.bias(0, 5), t5.bias(0, 5));
+        assert_ne!(umt5.bias(1, 5), umt5.bias(0, 5));
+        // T5 adds block 0's table everywhere.
+        assert_eq!(t5.bias(1, 5), t5.bias(0, 5));
+        let ids = [5, 9, 3, 1];
+        assert_ne!(umt5.forward(&ids).unwrap(), t5.forward(&ids).unwrap());
+
+        // Block by block, the host steps are the forward.
+        let mut hidden = umt5.embed(&ids).unwrap();
+        for index in 0..config.layers {
+            umt5.layer(index, &mut hidden, &umt5.bias(index, ids.len()))
+                .unwrap();
+        }
+        let hidden = rms_norm(&hidden, &umt5.final_norm, config.eps);
+        assert_eq!(hidden, umt5.forward(&ids).unwrap());
+    }
+
+    #[test]
+    fn the_real_tokens_run_alone_and_the_padding_is_zero() {
+        let config = tiny();
+        let encoder = encoder(&config, "rusting_brain_t5_real.safetensors", Precision::F32);
+        let tokenizer = Unigram::from_json(&crate::tokenizer::tests::unigram_json()).unwrap();
+
+        let states = encoder.encode_real(&tokenizer, "abc", 6).unwrap();
+        let ids = encoder.tokenize(&tokenizer, "abc", 6).unwrap();
+        let real = ids.iter().position(|&id| id == config.eos_token).unwrap() + 1;
+        let alone = encoder.forward(&ids[..real]).unwrap();
+
+        assert_eq!((states.rows, states.cols), (6, config.d_model));
+        assert_eq!(&states.data[..alone.data.len()], &alone.data[..]);
+        assert!(
+            states.data[alone.data.len()..]
+                .iter()
+                .all(|&value| value == 0.0)
+        );
+    }
+
+    #[test]
     fn the_original_feed_forward_is_read_where_a_checkpoint_has_one() {
         let config = T5Config {
             gated: false,
@@ -653,6 +776,166 @@ pub(crate) mod tests {
                 "{float} against {quantized}"
             );
         }
+    }
+
+    /// Relative L2 distance of `got` from `want`.
+    fn relative(got: &[f32], want: &[f32]) -> f32 {
+        assert_eq!(got.len(), want.len());
+        let (gap, norm) = got
+            .iter()
+            .zip(want)
+            .fold((0.0f64, 0.0f64), |(g, n), (a, b)| {
+                (g + ((a - b) as f64).powi(2), n + (*b as f64).powi(2))
+            });
+        (gap / norm).sqrt() as f32
+    }
+
+    /// Wan 2.2's umT5-XXL at Q8 against transformers, stage by stage, for both
+    /// prompts of RustingFrame's `tools/wan_refs.py w1`. `RB_WAN_REF` is the
+    /// directory holding `w1.safetensors` and `reference.json`, `RB_WAN_MODEL`
+    /// the model (default the local copy), and `RB_WAN_CUDA=1` checks the
+    /// device encoder as well. About 9 GB of host memory: the embedding table
+    /// is F32 (4.2 GB), the projections int8.
+    #[test]
+    #[ignore = "needs Wan2.2-TI2V-5B and the output of RustingFrame's tools/wan_refs.py w1"]
+    fn umt5_xxl_matches_transformers() {
+        let env = |name: &str| std::env::var(name).ok();
+        let dir = std::path::PathBuf::from(env("RB_WAN_REF").expect("RB_WAN_REF"));
+        let model = std::path::PathBuf::from(
+            env("RB_WAN_MODEL")
+                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
+                .unwrap();
+        let mut reference =
+            crate::safetensors::SafeTensors::open(dir.join("w1.safetensors")).unwrap();
+        let mut read = |name: &str| reference.tensor(name).unwrap().0;
+        let mut report = Vec::new();
+        let mut gate = |stage: &str, error: f32, limit: f32| {
+            eprintln!("umt5 {stage}: relative L2 {error:.3e} (gate {limit:.0e})");
+            report.push((stage.to_string(), error, limit));
+        };
+
+        let tokenizer = Unigram::from_file(model.join("tokenizer/tokenizer.json")).unwrap();
+        let config = T5Config::from_file(model.join("text_encoder/config.json")).unwrap();
+        let started = std::time::Instant::now();
+        let encoder = T5Encoder::load_at(
+            model.join("text_encoder/model.safetensors.index.json"),
+            config,
+            Precision::Q8,
+        )
+        .unwrap();
+        eprintln!("umt5 load Q8: {:?}", started.elapsed());
+        assert_eq!(
+            encoder.position_bias.len(),
+            24,
+            "umT5 has a table per block"
+        );
+        let length = settings["w1"]["max_sequence_length"].as_u64().unwrap() as usize;
+        let d_model = encoder.config.d_model;
+
+        // The table block 0 adds at the full length; the others differ only in
+        // which table they read.
+        let bias = encoder.bias(0, length).concat();
+        gate(
+            "layer 0 position bias",
+            relative(&bias, &read("layer0.position_bias")),
+            1e-6,
+        );
+        drop(bias);
+
+        #[cfg(feature = "cuda")]
+        let device = (env("RB_WAN_CUDA").as_deref() == Some("1")).then(|| {
+            let context = crate::gpu_transformer::GpuContext::new(0).unwrap();
+            let started = std::time::Instant::now();
+            let device = crate::cuda_t5::DeviceT5::upload(&context, &encoder).unwrap();
+            eprintln!("umt5 upload Q8: {:?}", started.elapsed());
+            device
+        });
+
+        for name in ["short", "long"] {
+            let ids = encoder
+                .tokenize(
+                    &tokenizer,
+                    settings["w1"]["prompts"][name].as_str().unwrap(),
+                    length,
+                )
+                .unwrap();
+            let want: Vec<u32> = read(&format!("{name}.input_ids"))
+                .iter()
+                .map(|&id| id as u32)
+                .collect();
+            let real = read(&format!("{name}.attention_mask"))
+                .iter()
+                .filter(|&&m| m > 0.0)
+                .count();
+            assert_eq!(ids, want, "{name}: token ids");
+            assert_eq!(
+                real,
+                settings["w1"][format!("{name}_tokens")].as_u64().unwrap() as usize
+            );
+
+            let embed = encoder.embed(&ids).unwrap();
+            gate(
+                &format!("{name} embed"),
+                relative(&embed.data, &read(&format!("{name}.embed"))),
+                1e-6,
+            );
+
+            // Past the real tokens transformers' rows are masked queries, which
+            // Wan zeroes; only the real rows are compared.
+            let mut hidden = encoder.embed(&ids[..real]).unwrap();
+            encoder
+                .layer(0, &mut hidden, &encoder.bias(0, real))
+                .unwrap();
+            let layer0 = read(&format!("{name}.layer0"));
+            gate(
+                &format!("{name} layer 0, Q8"),
+                relative(&hidden.data, &layer0[..real * d_model]),
+                5e-3,
+            );
+
+            let prompt = settings["w1"]["prompts"][name].as_str().unwrap();
+            let started = std::time::Instant::now();
+            let states = encoder.encode_real(&tokenizer, prompt, length).unwrap();
+            eprintln!(
+                "umt5 {name} host encode Q8 ({real} tokens): {:?}",
+                started.elapsed()
+            );
+            let embeds = read(&format!("{name}.prompt_embeds"));
+            gate(
+                &format!("{name} prompt embeds, host Q8"),
+                relative(&states.data, &embeds),
+                3e-2,
+            );
+
+            #[cfg(feature = "cuda")]
+            if let Some(device) = &device {
+                device.forward(&encoder, &ids[..real]).unwrap();
+                let mut times = Vec::new();
+                let mut got = None;
+                for _ in 0..3 {
+                    let started = std::time::Instant::now();
+                    got = Some(device.forward(&encoder, &ids[..real]).unwrap());
+                    times.push(started.elapsed());
+                }
+                eprintln!("umt5 {name} device encode Q8 ({real} tokens): {times:?}");
+                let mut got = got.unwrap();
+                got.data.resize(length * d_model, 0.0);
+                gate(
+                    &format!("{name} prompt embeds, device Q8"),
+                    relative(&got.data, &embeds),
+                    3e-2,
+                );
+            }
+        }
+
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, error, limit)| error > limit)
+            .collect();
+        assert!(failed.is_empty(), "over the gate: {failed:?}");
     }
 
     #[test]
