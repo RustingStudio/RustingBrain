@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Wan VAE device decode gathers each frame's convolution columns once for all
+  three temporal taps (the layers keep partial sums of the next outputs
+  instead of the last two input frames) and skips the zero-bias epilogue on
+  the older taps: 1280x704x17 decodes 7.4 % faster (11.04 s to 10.22 s in a
+  debug test build) with a lower peak (5.4 against 5.9 GB). Relative L2 to
+  diffusers 1.13e-3 (was 1.29e-3), to the previous decode 1.6e-3.
 - Wan 2.2 TI2V-5B gets FastWan's 3-step DMD sampler (`VideoConfig::dmd =
   Some(Dmd { timesteps: vec![1000, 757, 522], seed })`, `dmd_sigmas`; no
   guidance, one DiT call a step) and `VideoPipeline::set_dit_weights` for a

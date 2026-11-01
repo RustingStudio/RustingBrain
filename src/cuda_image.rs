@@ -967,6 +967,8 @@ struct DeviceConv {
     /// Always present. A convolution without one gets zeros, which keeps the
     /// epilogue kernel branchless.
     bias: CudaSlice<f32>,
+    /// Whether `bias` holds anything but zeros, so the epilogue can be skipped.
+    biased: bool,
     in_channels: usize,
     out_channels: usize,
     kernel: usize,
@@ -1039,6 +1041,7 @@ fn upload_conv(gpu: &ImageGpu, conv: &Conv2d) -> Result<DeviceConv, NetworkError
             Some(bias) => bias.clone(),
             None => vec![0.0; conv.weight.rows],
         })?,
+        biased: conv.bias.is_some(),
         in_channels: conv.in_channels,
         out_channels: conv.out_channels(),
         kernel: conv.kernel,
@@ -1335,12 +1338,111 @@ impl ImageGpu {
                 )?;
             }
         }
-        self.add_channel_f32(output, &conv.bias, pixels)?;
+        if conv.biased {
+            self.add_channel_f32(output, &conv.bias, pixels)?;
+        }
         Ok(fresh.map(|tensor| Map {
             tensor,
             height,
             width,
         }))
+    }
+
+    /// Several [`rowwise`] convolutions of one input, each added onto
+    /// (`beta` of one) or written over (zero) its own same-sized output. The input is
+    /// gathered once for all of them, which is what a causal convolution's
+    /// taps want: every frame meets each tap, and the gather is the part
+    /// that does not depend on the weights.
+    fn conv_fan(
+        &self,
+        input: &Map,
+        jobs: &mut [(&DeviceConv, &mut Map, f32)],
+        budget: usize,
+    ) -> Result<(), NetworkError> {
+        let Some(first) = jobs.first().map(|job| job.0) else {
+            return Ok(());
+        };
+        let (k, padding) = (first.kernel, first.padding);
+        let pixels = input.pixels();
+        for (conv, target, _) in jobs.iter() {
+            if !rowwise(conv.kernel, conv.stride)
+                || conv.kernel != k
+                || conv.padding != padding
+                || conv.pad_end != 0
+                || k != 2 * padding + 1
+                || conv.in_channels != input.channels()
+                || target.channels() != conv.out_channels
+                || target.height != input.height
+                || target.width != input.width
+            {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "a fanned {k}x{k} convolution over {} channels does not fit a {}x{} input",
+                    conv.in_channels, input.height, input.width
+                )));
+            }
+        }
+        let (height, width) = (input.height, input.width);
+        let patch = input.channels() * k;
+        let group = if width % 8 == 0 { 1 } else { 8 };
+        let stack = (budget / (patch * width).max(1))
+            .saturating_sub(k - 1)
+            .max(group)
+            .next_multiple_of(group)
+            .min(height);
+        let pitch = (stack + k - 1) * width;
+        let mut columns = self.uninit(patch, pitch)?;
+        for row in (0..height).step_by(stack) {
+            let rows = stack.min(height - row);
+            let span = rows * width;
+            let lines = (rows + k - 1) * width;
+            unsafe {
+                self.context
+                    .stream
+                    .launch_builder(&self.im2row)
+                    .arg(&mut columns.data)
+                    .arg(&input.tensor.data)
+                    .arg(&(input.height as i32))
+                    .arg(&(input.width as i32))
+                    .arg(&(k as i32))
+                    .arg(&(padding as i32))
+                    .arg(&(width as i32))
+                    .arg(&(row as i32))
+                    .arg(&(lines as i32))
+                    .arg(&(pitch as i64))
+                    .launch(plane(lines, input.channels()))
+                    .map_err(cuda_err("im2row kernel"))?;
+            }
+            let bytes = columns.bytes();
+            for (conv, output, beta) in jobs.iter_mut() {
+                let taps = conv.weight.bytes();
+                let tap = conv.out_channels * patch * 2;
+                let mut target = output.tensor.data.slice_mut(row * width..);
+                for ky in 0..k {
+                    act_plain::<f16, _>(
+                        &self.context,
+                        &taps.slice(ky * tap..(ky + 1) * tap),
+                        patch,
+                        &bytes.slice(ky * width * 2..),
+                        pitch,
+                        true,
+                        true,
+                        &mut target,
+                        pixels,
+                        conv.out_channels,
+                        span,
+                        patch,
+                        1.0,
+                        if ky == 0 { *beta } else { 1.0 },
+                    )?;
+                }
+            }
+        }
+        for (conv, output, _) in jobs.iter_mut() {
+            if conv.biased {
+                self.add_channel_f32(&mut output.tensor, &conv.bias, pixels)?;
+            }
+        }
+        Ok(())
     }
 
     /// `out[rows, out_dim] = tokens . weight^T + bias`.

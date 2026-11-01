@@ -1202,7 +1202,7 @@ mod tests {
     /// FastWan 2.2 TI2V-5B, 3-step DMD, text-to-video at 1280x704 with 49 and
     /// 17 frames. `RB_FASTWAN` is the FastWan directory, `RB_WAN_MODEL` the
     /// Wan 2.2 TI2V-5B one (text encoder, tokenizer, VAE); clips, frames and a
-    /// tile of five frames go to `/tmp/ws4`.
+    /// tile of five frames go to `/tmp/ws5`.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs FastWan2.2-TI2V-5B, Wan2.2-TI2V-5B and RB_WAN_CUDA=1"]
@@ -1218,7 +1218,7 @@ mod tests {
         let fast = PathBuf::from(std::env::var("RB_FASTWAN").unwrap_or_else(|_| {
             "/home/vasylt/Code/ai/ml/models/FastWan2.2-TI2V-5B-FullAttn-Diffusers".into()
         }));
-        let dir = PathBuf::from("/tmp/ws4");
+        let dir = PathBuf::from("/tmp/ws5");
         std::fs::create_dir_all(&dir).unwrap();
         let mut pipeline = VideoPipeline::load(&model).unwrap();
         pipeline.set_dit_weights(fast.join("transformer/diffusion_pytorch_model.safetensors"));
