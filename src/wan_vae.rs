@@ -218,6 +218,16 @@ impl<T> Streams<T> {
         self.cursor = 0;
     }
 
+    /// Where the next layer's history is.
+    pub(crate) fn position(&self) -> usize {
+        self.cursor
+    }
+
+    /// Goes back to a [`Self::position`], to run another chunk through the layers after it.
+    pub(crate) fn seek(&mut self, position: usize) {
+        self.cursor = position;
+    }
+
     /// The history of the next layer.
     pub(crate) fn next(&mut self) -> &mut Option<Vec<T>> {
         if self.cursor == self.slots.len() {
@@ -1222,6 +1232,13 @@ pub(crate) mod tests {
             decoder.config.denormalize(&mut latent);
             let mut times = Vec::new();
             for run in 0..=runs {
+                crate::cuda_training::release_freed_memory(0).unwrap();
+                crate::cuda_training::reserved_high_water(0).unwrap();
+                let (free, total) = crate::cuda_image::memory_info().unwrap_or_default();
+                eprintln!(
+                    "wan vae device decode {size} run {run}: resident {} MiB",
+                    (total - free) >> 20
+                );
                 let started = std::time::Instant::now();
                 let video = decoder.decode(&latent).unwrap();
                 let elapsed = started.elapsed().as_secs_f64();
@@ -1231,6 +1248,15 @@ pub(crate) mod tests {
                     video[0].height,
                     video[0].width
                 );
+                let peak = crate::cuda_training::reserved_high_water(0).unwrap();
+                eprintln!("wan vae device decode {size} run {run}: peak {} MiB", peak >> 20);
+                if let (0, Some(path)) = (run, env("RB_WAN_DUMP")) {
+                    let bytes: Vec<u8> = video
+                        .iter()
+                        .flat_map(|frame| frame.data.iter().flat_map(|value| value.to_le_bytes()))
+                        .collect();
+                    std::fs::write(format!("{path}.{size}"), bytes).unwrap();
+                }
                 if run > 0 {
                     times.push(elapsed);
                 }

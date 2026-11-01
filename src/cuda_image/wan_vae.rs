@@ -337,13 +337,67 @@ impl DeviceWanDecoder {
         Ok(video)
     }
 
+    /// One up block over `hidden`.
+    fn up_block(
+        &self,
+        block: &DeviceWanUpBlock,
+        streams: &mut Streams<Map>,
+        mut hidden: Vec<Map>,
+        first: bool,
+    ) -> Result<Vec<Map>, NetworkError> {
+        let (k, gpu) = (&self.kernels, &*self.kernels.gpu);
+        let copy = match block.shortcut {
+            Some(_) => Some(
+                hidden
+                    .iter()
+                    .map(|frame| clone_map(gpu, frame))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
+        for resnet in &block.resnets {
+            hidden = k.resnet(resnet, streams, hidden)?;
+        }
+        if let Some((time, conv)) = &block.upsample {
+            if let Some([early, late]) = time {
+                let history = streams.next();
+                if history.is_none() {
+                    // As on the host: the first chunk keeps its frames.
+                    *history = Some(Vec::new());
+                } else {
+                    let (stream, past) = extend(history, hidden);
+                    let early = k.causal_over(early, &stream, past, None)?;
+                    let late = k.causal_over(late, &stream, past, None)?;
+                    retire(history, stream);
+                    hidden = early
+                        .into_iter()
+                        .zip(late)
+                        .flat_map(|(early, late)| [early, late])
+                        .collect();
+                }
+            }
+            hidden = hidden
+                .into_iter()
+                .map(|frame| {
+                    let large = gpu.upsample_nearest(&frame, 2)?;
+                    drop(frame);
+                    gpu.conv(conv, &large)
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        if let (Some(shortcut), Some(copy)) = (block.shortcut, copy) {
+            k.dup_up_add(shortcut, &copy, &mut hidden, first)?;
+        }
+        Ok(hidden)
+    }
+
     fn decode_chunk(
         &self,
         streams: &mut Streams<Map>,
         chunk: Vec<Map>,
         first: bool,
     ) -> Result<Vec<Map>, NetworkError> {
-        let (k, gpu) = (&self.kernels, &*self.kernels.gpu);
+        let k = &self.kernels;
         let mut hidden = k.causal(&self.conv_in, streams.next(), chunk, None)?;
         hidden = k.resnet(&self.mid.0, streams, hidden)?;
         hidden = hidden
@@ -351,54 +405,32 @@ impl DeviceWanDecoder {
             .map(|frame| k.attention(&self.mid.1, frame))
             .collect::<Result<_, _>>()?;
         hidden = k.resnet(&self.mid.2, streams, hidden)?;
-        for block in &self.up_blocks {
-            let copy = match block.shortcut {
-                Some(_) => Some(
-                    hidden
-                        .iter()
-                        .map(|frame| clone_map(gpu, frame))
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-                None => None,
-            };
-            for resnet in &block.resnets {
-                hidden = k.resnet(resnet, streams, hidden)?;
-            }
-            if let Some((time, conv)) = &block.upsample {
-                if let Some([early, late]) = time {
-                    let history = streams.next();
-                    if history.is_none() {
-                        // As on the host: the first chunk keeps its frames.
-                        *history = Some(Vec::new());
-                    } else {
-                        let (stream, past) = extend(history, hidden);
-                        let early = k.causal_over(early, &stream, past, None)?;
-                        let late = k.causal_over(late, &stream, past, None)?;
-                        retire(history, stream);
-                        hidden = early
-                            .into_iter()
-                            .zip(late)
-                            .flat_map(|(early, late)| [early, late])
-                            .collect();
-                    }
-                }
-                hidden = hidden
-                    .into_iter()
-                    .map(|frame| {
-                        let large = gpu.upsample_nearest(&frame, 2)?;
-                        drop(frame);
-                        gpu.conv(conv, &large)
-                    })
-                    .collect::<Result<_, _>>()?;
-            }
-            if let (Some(shortcut), Some(copy)) = (block.shortcut, copy) {
-                k.dup_up_add(shortcut, &copy, &mut hidden, first)?;
-            }
+        // The blocks after the last one that adds frames take them one at a
+        // time. The causal caches make that the same computation, and the
+        // full-size frames, where the memory goes, are never held together.
+        let tail = self
+            .up_blocks
+            .iter()
+            .rposition(|block| {
+                let time = block.upsample.as_ref().is_some_and(|up| up.0.is_some());
+                time || block.shortcut.is_some_and(|shortcut| shortcut.time > 1)
+            })
+            .map_or(0, |last| last + 1);
+        for block in &self.up_blocks[..tail] {
+            hidden = self.up_block(block, streams, hidden, first)?;
         }
-        for frame in &mut hidden {
-            k.rms(frame, &self.norm_out, true)?;
+        let mark = streams.position();
+        let mut video = Vec::with_capacity(hidden.len());
+        for frame in hidden {
+            streams.seek(mark);
+            let mut frame = vec![frame];
+            for block in &self.up_blocks[tail..] {
+                frame = self.up_block(block, streams, frame, first)?;
+            }
+            k.rms(&mut frame[0], &self.norm_out, true)?;
+            video.extend(k.causal(&self.conv_out, streams.next(), frame, None)?);
         }
-        k.causal(&self.conv_out, streams.next(), hidden, None)
+        Ok(video)
     }
 }
 

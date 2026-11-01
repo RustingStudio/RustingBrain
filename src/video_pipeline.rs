@@ -608,9 +608,10 @@ impl VideoPipeline {
     }
 
     /// Drops the DiT's device copy when a decode at this size would not fit beside
-    /// it. The decoder's need is W2's fit, `1163 MiB + 7.4e-3 MiB` per output
-    /// pixel of one frame (the causal decode holds a frame at a time), plus a
-    /// 512 MiB margin.
+    /// it. The decoder's need is `650 MiB + 5.0e-3 MiB` per output pixel of one
+    /// frame, plus a 512 MiB margin: the pool's peak over a decode, fitted to
+    /// 2.3, 3.4 and 5.9 GB at 352x640, 480x832 and 704x1280 (17 frames) less
+    /// the decoder's weights, which are on the device by then.
     // NOTE: the host int8 copy stays (4.6 GB of host memory), so the next
     // run is an upload, not a 40 s disk read and quantise; drop the whole DiT
     // here instead if host memory is short.
@@ -623,7 +624,7 @@ impl VideoPipeline {
         if self.decoder.device.is_none() || self.denoiser.is_none() {
             return Ok(());
         }
-        let need = (1163.0 + 7.4e-3 * (width * height) as f64 + 512.0) * 1048576.0;
+        let need = (650.0 + 5.0e-3 * (width * height) as f64 + 512.0) * 1048576.0;
         crate::cuda_training::release_freed_memory(device)?;
         let free = crate::cuda_image::memory_info().map_or(0, |(free, _)| free);
         if (free as f64) < need {
@@ -1104,6 +1105,9 @@ mod tests {
             let started = Instant::now();
             pipeline.denoiser().unwrap();
             eprintln!("wan clip {run}: reattach {:?}", started.elapsed());
+            if let Some((free, _)) = crate::cuda_image::memory_info() {
+                eprintln!("wan clip {run}: free with the DiT on device {} MiB", free >> 20);
+            }
         }
     }
 
