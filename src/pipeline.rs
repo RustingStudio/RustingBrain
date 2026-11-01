@@ -1094,6 +1094,21 @@ impl ImagePipeline {
         false
     }
 
+    /// Whether a sequence prompt encoder runs on the device.
+    ///
+    /// [`ImagePipeline::to_cuda`] succeeds even when this encoder does not fit
+    /// beside the denoiser and stays on the host, where FLUX.2-klein's prompt
+    /// encode takes about 12 s instead of 0.7 s on an RTX 3060. This is how a
+    /// caller finds out. `false` for every other encoder and without the
+    /// `cuda` feature.
+    pub fn encoder_on_device(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if let PromptEncoder::Sequence { encoder, .. } = &self.encoder {
+            return encoder.on_device();
+        }
+        false
+    }
+
     /// How many pixels one latent pixel becomes: the decoder's ladder.
     pub fn upscale(&self) -> usize {
         self.decoder.config().upscale()
@@ -2484,6 +2499,13 @@ mod tests {
         assert_eq!(conditioning.pooled.len(), clip.d_model);
         assert_eq!(conditioning.text.data, alone.text.data);
         assert_ne!(conditioning.pooled, alone.pooled);
+    }
+
+    #[test]
+    fn a_host_pipeline_says_its_encoder_is_not_on_the_device() {
+        let (pipeline, _) = pipeline("encoder_host");
+        assert!(matches!(pipeline.encoder, PromptEncoder::Sequence { .. }));
+        assert!(!pipeline.encoder_on_device());
     }
 
     #[test]
