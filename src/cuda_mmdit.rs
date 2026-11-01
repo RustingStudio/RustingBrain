@@ -141,6 +141,22 @@ extern "C" __global__ void bias_gelu(void*dst,const float*src,const float*bias,i
   else if(gelu)v=0.5f*v*(1.f+tanhf(0.7978846f*(v+0.044715f*v*v*v)));
   st(dst,i,v,narrow);
 }
+// Debug-only (`RB_FAKE_W8A8`): each BF16 row of `src` through int8 with its own
+// absmax scale and back, into `dst`. One block per row.
+extern "C" __global__ void fake_w8a8(void*dst,const void*src,int rows,int cols){
+  __shared__ float red[ROW_THREADS];int tid=threadIdx.x;
+  for(int r=blockIdx.x;r<rows;r+=gridDim.x){
+    size_t at=(size_t)r*cols;float m=0.f;
+    for(int c=tid;c<cols;c+=ROW_THREADS)m=fmaxf(m,fabsf(ld(src,at+c,1)));
+    red[tid]=m;__syncthreads();
+    for(int s=ROW_THREADS/2;s>0;s>>=1){if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]);__syncthreads();}
+    float scale=red[0]/127.f;__syncthreads();
+    for(int c=tid;c<cols;c+=ROW_THREADS){
+      float v=ld(src,at+c,1);
+      st(dst,at+c,scale>0.f?rintf(v/scale)*scale:0.f,1);
+    }
+  }
+}
 "#;
 
 pub(crate) fn ptx() -> Result<&'static Ptx, NetworkError> {
@@ -271,6 +287,7 @@ pub struct DeviceDit {
     head_norm_rope_bwd: CudaFunction,
     gelu_bwd: CudaFunction,
     gate_rows: CudaFunction,
+    fake_w8a8: CudaFunction,
     /// Whether any weight is int8, which the backward pass cannot read.
     quantized: bool,
     image_in: Linear,
@@ -435,6 +452,7 @@ impl DeviceDit {
             head_norm_rope_bwd: get("head_norm_rope_bwd")?,
             gelu_bwd: get("gelu_bwd")?,
             gate_rows: get("gate_rows")?,
+            fake_w8a8: get("fake_w8a8")?,
             quantized: quantized.get(),
             slots,
             swiglu: dit.swiglu,
@@ -1488,6 +1506,43 @@ impl DeviceDit {
         Ok(out)
     }
 
+    /// Debug gate for W8A8 quality: `x` through per-row int8 and back when
+    /// `RB_FAKE_W8A8` is 1 (every block linear) or 2 (all but the ones whose
+    /// input is wider than the model, the down projections). `None`, the
+    /// default, leaves `x` alone.
+    fn fake_quantized(
+        &self,
+        gpu: &Gpu<'_>,
+        linear: &Linear,
+        x: &Act,
+        rows: usize,
+    ) -> Result<Option<Act>, NetworkError> {
+        static MODE: OnceLock<u8> = OnceLock::new();
+        let mode = *MODE.get_or_init(|| {
+            std::env::var("RB_FAKE_W8A8").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        if mode == 0 || (mode == 2 && linear.inner != self.image_in.units) {
+            return Ok(None);
+        }
+        let mut out = gpu.act(rows * linear.inner, true)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.fake_w8a8)
+                .arg(out.destination())
+                .arg(&x.all())
+                .arg(&(rows as i32))
+                .arg(&(linear.inner as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (rows.max(1) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(cuda_err("fake W8A8 kernel"))?;
+        }
+        Ok(Some(out))
+    }
+
     fn project(
         &self,
         gpu: &Gpu<'_>,
@@ -1497,11 +1552,12 @@ impl DeviceDit {
         out: &mut CudaViewMut<'_, f32>,
         beta: f32,
     ) -> Result<(), NetworkError> {
+        let fake = self.fake_quantized(gpu, linear, x, rows)?;
         gpu.project(
             &linear.weight,
             linear.units,
             linear.inner,
-            &x.all(),
+            &fake.as_ref().unwrap_or(x).all(),
             true,
             out,
             rows,
