@@ -31,6 +31,17 @@ pred = transformer(hidden_states=P._pack_latents(noise), timestep=torch.ones(1),
                    guidance=None, encoder_hidden_states=embeds,
                    txt_ids=P._prepare_text_ids(embeds), img_ids=P._prepare_latent_ids(noise),
                    return_dict=False)[0]
-save_file({"step0_pred_blocks": pred[0].contiguous()}, f"{out}/flux2_blocks.safetensors")
+dumps = {"step0_pred_blocks": pred[0].contiguous()}
+if "ref_latents" in ref:
+    # An edit run (scripts/flux2_reference.py with REF_IMAGE): the same cut-down
+    # model with the reference's tokens and ids after the image's.
+    tokens, ids = ref["ref_latents"][None], ref["ref_ids"][None]
+    pred = transformer(hidden_states=torch.cat([P._pack_latents(noise), tokens], dim=1),
+                       timestep=torch.ones(1), guidance=None, encoder_hidden_states=embeds,
+                       txt_ids=P._prepare_text_ids(embeds),
+                       img_ids=torch.cat([P._prepare_latent_ids(noise), ids], dim=1),
+                       return_dict=False)[0][:, :1024]
+    dumps["step0_pred_blocks_ref"] = pred[0].contiguous()
+save_file(dumps, f"{out}/flux2_blocks.safetensors")
 print("wrote", out, flush=True)
 os._exit(0)

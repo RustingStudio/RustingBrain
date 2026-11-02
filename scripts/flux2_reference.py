@@ -8,6 +8,16 @@ The stages run one model at a time with the pipeline's own helpers, which
 is what `Flux2KleinPipeline.__call__` does, minus the dtype casts to the
 models' storage type.
 
+With `REF_IMAGE=<png>` the run is an edit: the image is a reference, as in
+`Flux2KleinPipeline(image=...)`. It is resized to at most a megapixel and
+cropped to a multiple of 32, encoded by the VAE (distribution mode),
+patchified and batch-normalised, packed, and given time offset 10 in its ids;
+its tokens follow the image's own through every step and their output is
+dropped. Extra dumps: `ref_pixels` (the preprocessed reference, 3x512x512 in
+[-1, 1]), `ref_latents` (its packed tokens), `ref_ids`, and `ids` (the ids of
+text, image and reference tokens in the transformer's order). The output size is the reference's, and the prompt defaults to a watercolor
+edit.
+
 Run with an environment that has torch, diffusers and transformers:
 `python scripts/flux2_reference.py <model dir> <out dir>`, then
 `RB_FLUX2_REF=<out dir> cargo test --release --lib flux2_klein -- --ignored`.
@@ -27,7 +37,9 @@ from transformers import AutoTokenizer, Qwen3ForCausalLM
 
 model = sys.argv[1]
 out = sys.argv[2] if len(sys.argv) > 2 else "."
-prompt = os.environ.get("PROMPT", "a lighthouse on a rocky coast in fog")
+ref_path = os.environ.get("REF_IMAGE")
+prompt = os.environ.get("PROMPT", "turn this into a watercolor painting" if ref_path
+                        else "a lighthouse on a rocky coast in fog")
 size, seed, steps = 512, 0, 4
 os.makedirs(out, exist_ok=True)
 torch.set_grad_enabled(False)
@@ -73,6 +85,29 @@ noise = torch.randn((1, 128, size // 16, size // 16), generator=generator, dtype
 latent_ids = P._prepare_latent_ids(noise)
 latents = P._pack_latents(noise)
 text_ids = P._prepare_text_ids(embeds)
+model_ids = [text_ids[0], latent_ids[0]]
+if ref_path:
+    from PIL import Image
+    from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
+    processor = Flux2ImageProcessor(vae_scale_factor=16)
+    img = Image.open(ref_path).convert("RGB")
+    if img.size[0] * img.size[1] > 1024 * 1024:
+        img = processor._resize_to_target_area(img, 1024 * 1024)
+    w, h = (img.size[0] // 32) * 32, (img.size[1] // 32) * 32
+    assert (w, h) == (size, size), f"the dumps assume a {size}x{size} reference, got {w}x{h}"
+    pixels = processor.preprocess(img, height=h, width=w, resize_mode="crop")
+    ref_vae = AutoencoderKLFlux2.from_pretrained(f"{model}/vae", torch_dtype=torch.float32).eval()
+    ref_latent = P._encode_vae_image(type("S", (), {"vae": ref_vae, "_patchify_latents": staticmethod(P._patchify_latents)})(),
+                                     pixels, generator)
+    ref_ids = P._prepare_image_ids([ref_latent])
+    ref_tokens = P._pack_latents(ref_latent)
+    del ref_vae
+    dumps["ref_pixels"] = pixels[0]
+    dumps["ref_latents"] = ref_tokens[0]
+    dumps["ref_ids"] = ref_ids[0].to(torch.int32)
+    model_ids.append(ref_ids[0])
+    img_ids = torch.cat([latent_ids, ref_ids], dim=1)
+dumps["ids"] = torch.cat(model_ids, dim=0).to(torch.int32)
 sigmas = np.linspace(1.0, 1 / steps, steps)
 mu = compute_empirical_mu(image_seq_len=latents.shape[1], num_steps=steps)
 timesteps, _ = retrieve_timesteps(scheduler, steps, "cpu", sigmas=sigmas, mu=mu)
@@ -81,9 +116,12 @@ dumps["noise"] = noise[0]
 dumps["timesteps"] = timesteps.float()
 dumps["sigmas"] = scheduler.sigmas.float()
 for i, t in enumerate(timesteps):
-    pred = transformer(hidden_states=latents, timestep=t.expand(1) / 1000, guidance=None,
-                       encoder_hidden_states=embeds, txt_ids=text_ids, img_ids=latent_ids,
-                       return_dict=False)[0]
+    inputs, input_ids = latents, latent_ids
+    if ref_path:
+        inputs, input_ids = torch.cat([latents, ref_tokens], dim=1), img_ids
+    pred = transformer(hidden_states=inputs, timestep=t.expand(1) / 1000, guidance=None,
+                       encoder_hidden_states=embeds, txt_ids=text_ids, img_ids=input_ids,
+                       return_dict=False)[0][:, :latents.size(1)]
     if i == 0:
         dumps["step0_pred"] = pred[0]
     latents = scheduler.step(pred, t, latents, return_dict=False)[0]
