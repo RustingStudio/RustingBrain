@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Wan 2.2 TI2V-5B image-to-video at 1280x704x49 now fits on a 12 GB card.
+  The device DiT's per-block temporaries were shadowed, not dropped, so they
+  all sat under the feed-forward's two FP32 `[tokens, 14336]` buffers (626 MiB
+  each at 49 frames; one of them was the failed allocation). They now drop when
+  their stage ends, the attention scratch is allocated once per call, and the
+  feed-forward's bias and GELU run in one kernel. Activation peak at 49 frames
+  goes from about 2.7 GB to 1.1 GB. Output is unchanged: the parity tests print
+  the same numbers. 3060, 1280x704x33, UniPC 20 steps, CFG 5, release test
+  build without LTO, 2 interleaved runs each, load 1.2-2.4: whole-process peak
+  (desktop included) 11061/10877 to 9885/9723 MiB, sampling 227.1/226.5 s to
+  221.0/215.1 s. 1280x704x49 went from out of memory before step 0 to 335.7 s
+  of sampling plus a working decode, peak 10086 MiB.
 - Wan 2.2 TI2V-5B image-to-video on the UniPC + CFG path can skip steps:
   `VideoConfig::skip = Some(StepSkip { full: 4, every: 2 })` runs the first 4
   steps in full, then skips both DiT passes on every second step but the last

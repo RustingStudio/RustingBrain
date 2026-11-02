@@ -370,48 +370,63 @@ impl DeviceWanDit {
         let patches = model.patches(latent, grid);
         let mut hidden = self.input(&gpu, &self.patch, &patches)?;
         let text = self.input(&gpu, &self.text_in, context)?;
-        let text = self.gelu(&gpu, &text, context.rows, dim)?;
+        let text = self.gelu(&gpu, &text, None, context.rows, dim)?;
         let text = self.apply(&gpu, &self.text_out, &text, context.rows)?;
         let text = gpu.narrowed(&text.slice(..), context.rows * dim, true)?;
         let scale = (config.head_dim as f32).sqrt().recip();
         let flash = self.context.flash.as_ref().expect("checked at upload");
+        // Both attentions write all of these, so one set serves every block.
+        let mut merged = gpu.act(rows * dim, true)?;
+        let mut log_sum_exp = gpu.uninit(heads * rows)?;
+        let shape = FlashShape {
+            rows,
+            seq_len: rows,
+            kv_len: rows,
+            sequences: 1,
+            heads,
+            group: 1,
+            qkv_width: 3 * dim,
+            kv_width: 3 * dim,
+            query_width: dim,
+            key_base: dim,
+            value_base: 2 * dim,
+            causal: false,
+        };
+        let cross = FlashShape {
+            kv_len: context.rows,
+            qkv_width: dim,
+            kv_width: 2 * dim,
+            key_base: 0,
+            value_base: dim,
+            ..shape
+        };
 
+        // Each stage's temporaries end with its scope. Shadowed, they all
+        // lived to the end of the block, under the feed-forward's two FP32
+        // `[rows, ffn_dim]` buffers: 2.7 GB at 1280x704x49, now 1.1 GB.
         for (index, block) in self.blocks.iter().enumerate() {
             let at = index * 6 * frames * dim;
             let attention = modulation.slice(at..at + 3 * frames * dim);
             let feed_forward = modulation.slice(at + 3 * frames * dim..at + 6 * frames * dim);
 
-            let normed =
-                self.frame_norm(&gpu, &hidden, &attention, frames, per_frame, 3, dim, eps)?;
-            let mut qkv = self.apply(&gpu, &block.qkv, &normed, rows)?;
-            for (weight, offset) in [(&block.query_norm, 0), (&block.key_norm, dim)] {
-                self.rms_rope(
-                    &mut qkv,
-                    weight,
-                    Some((&cos, &sin)),
-                    rows,
-                    3 * dim,
-                    offset,
-                    config.head_dim,
-                    eps,
-                )?;
-            }
-            let qkv = gpu.narrowed(&qkv.slice(..), rows * 3 * dim, true)?;
-            let mut merged = gpu.act(rows * dim, true)?;
-            let mut log_sum_exp = gpu.uninit(heads * rows)?;
-            let shape = FlashShape {
-                rows,
-                seq_len: rows,
-                kv_len: rows,
-                sequences: 1,
-                heads,
-                group: 1,
-                qkv_width: 3 * dim,
-                kv_width: 3 * dim,
-                query_width: dim,
-                key_base: dim,
-                value_base: 2 * dim,
-                causal: false,
+            let qkv = {
+                let normed =
+                    self.frame_norm(&gpu, &hidden, &attention, frames, per_frame, 3, dim, eps)?;
+                let mut qkv = self.apply(&gpu, &block.qkv, &normed, rows)?;
+                drop(normed);
+                for (weight, offset) in [(&block.query_norm, 0), (&block.key_norm, dim)] {
+                    self.rms_rope(
+                        &mut qkv,
+                        weight,
+                        Some((&cos, &sin)),
+                        rows,
+                        3 * dim,
+                        offset,
+                        config.head_dim,
+                        eps,
+                    )?;
+                }
+                gpu.narrowed(&qkv.slice(..), rows * 3 * dim, true)?
             };
             gpu.flash_attention(
                 flash,
@@ -422,6 +437,7 @@ impl DeviceWanDit {
                 shape,
                 scale,
             )?;
+            drop(qkv);
             let out = self.apply(&gpu, &block.output, &merged, rows)?;
             hidden = gpu.gate_residual(
                 &hidden.slice(..),
@@ -431,46 +447,44 @@ impl DeviceWanDit {
                 dim,
                 per_frame,
             )?;
+            drop(out);
 
-            let normed = self.norm(
-                &gpu,
-                &hidden.slice(..),
-                &block.norm2.slice(..),
-                rows,
-                dim,
-                eps,
-            )?;
-            let mut query = self.apply(&gpu, &block.cross_query, &normed, rows)?;
-            self.rms_rope(
-                &mut query,
-                &block.cross_query_norm,
-                None,
-                rows,
-                dim,
-                0,
-                config.head_dim,
-                eps,
-            )?;
-            let mut kv = self.apply(&gpu, &block.cross_kv, &text, context.rows)?;
-            self.rms_rope(
-                &mut kv,
-                &block.cross_key_norm,
-                None,
-                context.rows,
-                2 * dim,
-                0,
-                config.head_dim,
-                eps,
-            )?;
-            let query = gpu.narrowed(&query.slice(..), rows * dim, true)?;
-            let kv = gpu.narrowed(&kv.slice(..), context.rows * 2 * dim, true)?;
-            let shape = FlashShape {
-                kv_len: context.rows,
-                qkv_width: dim,
-                kv_width: 2 * dim,
-                key_base: 0,
-                value_base: dim,
-                ..shape
+            let query = {
+                let normed = self.norm(
+                    &gpu,
+                    &hidden.slice(..),
+                    &block.norm2.slice(..),
+                    rows,
+                    dim,
+                    eps,
+                )?;
+                let mut query = self.apply(&gpu, &block.cross_query, &normed, rows)?;
+                drop(normed);
+                self.rms_rope(
+                    &mut query,
+                    &block.cross_query_norm,
+                    None,
+                    rows,
+                    dim,
+                    0,
+                    config.head_dim,
+                    eps,
+                )?;
+                gpu.narrowed(&query.slice(..), rows * dim, true)?
+            };
+            let kv = {
+                let mut kv = self.apply(&gpu, &block.cross_kv, &text, context.rows)?;
+                self.rms_rope(
+                    &mut kv,
+                    &block.cross_key_norm,
+                    None,
+                    context.rows,
+                    2 * dim,
+                    0,
+                    config.head_dim,
+                    eps,
+                )?;
+                gpu.narrowed(&kv.slice(..), context.rows * 2 * dim, true)?
             };
             gpu.flash_attention(
                 flash,
@@ -478,17 +492,25 @@ impl DeviceWanDit {
                 &kv,
                 &mut merged,
                 &mut log_sum_exp,
-                shape,
+                cross,
                 scale,
             )?;
+            drop((query, kv));
             let out = self.apply(&gpu, &block.cross_output, &merged, rows)?;
             gpu.add(&mut hidden, &out, 0, rows * dim, true)?;
+            drop(out);
 
-            let normed =
-                self.frame_norm(&gpu, &hidden, &feed_forward, frames, per_frame, 3, dim, eps)?;
-            let pre = self.apply(&gpu, &block.ffn_in, &normed, rows)?;
-            let activated = self.gelu(&gpu, &pre, rows, block.ffn_in.units)?;
+            let activated = {
+                let normed =
+                    self.frame_norm(&gpu, &hidden, &feed_forward, frames, per_frame, 3, dim, eps)?;
+                let units = block.ffn_in.units;
+                let pre = self.gemm(&gpu, &block.ffn_in, &normed, rows)?;
+                drop(normed);
+                // The bias and the GELU in one pass: no FP32 copy of `pre`.
+                self.gelu(&gpu, &pre, Some(&block.ffn_in.bias), rows, units)?
+            };
             let out = self.apply(&gpu, &block.ffn_out, &activated, rows)?;
+            drop(activated);
             hidden = gpu.gate_residual(
                 &hidden.slice(..),
                 &out.slice(..),
@@ -518,6 +540,28 @@ impl DeviceWanDit {
         self.apply(gpu, linear, &narrow, tokens.rows)
     }
 
+    /// `linear` over `rows` narrow rows, without its bias, FP32 out.
+    fn gemm(
+        &self,
+        gpu: &Gpu<'_>,
+        linear: &Linear,
+        x: &Act,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, NetworkError> {
+        let mut raw = gpu.uninit(rows * linear.units)?;
+        gpu.project(
+            &linear.weight,
+            linear.units,
+            linear.inner,
+            &x.all(),
+            true,
+            &mut raw.slice_mut(..),
+            rows,
+            0.0,
+        )?;
+        Ok(raw)
+    }
+
     /// `linear` over `rows` narrow rows, its bias added, FP32 out.
     fn apply(
         &self,
@@ -527,17 +571,7 @@ impl DeviceWanDit {
         rows: usize,
     ) -> Result<CudaSlice<f32>, NetworkError> {
         let units = linear.units;
-        let mut raw = gpu.uninit(rows * units)?;
-        gpu.project(
-            &linear.weight,
-            units,
-            linear.inner,
-            &x.all(),
-            true,
-            &mut raw.slice_mut(..),
-            rows,
-            0.0,
-        )?;
+        let raw = self.gemm(gpu, linear, x, rows)?;
         let mut out = gpu.uninit(rows * units)?;
         unsafe {
             self.context
@@ -559,11 +593,12 @@ impl DeviceWanDit {
         Ok(out)
     }
 
-    /// The tanh GELU of `[rows, cols]`, narrow.
+    /// The tanh GELU of `[rows, cols]`, `bias` added first if given, narrow.
     fn gelu(
         &self,
         gpu: &Gpu<'_>,
         source: &CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
         rows: usize,
         cols: usize,
     ) -> Result<Act, NetworkError> {
@@ -574,13 +609,13 @@ impl DeviceWanDit {
                 .launch_builder(&self.bias_gelu)
                 .arg(out.destination())
                 .arg(source)
-                .arg(source)
+                .arg(bias.unwrap_or(source))
                 .arg(&(rows as i32))
                 .arg(&(cols as i32))
                 .arg(&(cols as i32))
                 .arg(&0i32)
                 .arg(&1i32)
-                .arg(&0i32)
+                .arg(&i32::from(bias.is_some()))
                 .arg(&1i32)
                 .launch(cfg(rows * cols))
                 .map_err(cuda_err("Wan GELU kernel"))?;
