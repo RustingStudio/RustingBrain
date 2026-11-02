@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Wan 2.2 TI2V-5B image-to-video on the UniPC + CFG path can skip steps:
+  `VideoConfig::skip = Some(StepSkip { full: 4, every: 2 })` runs the first 4
+  steps in full, then skips both DiT passes on every second step but the last
+  and gives UniPC the previous guided velocity; default `None`, bit-identical.
+  1280x704x17, 20 steps, seed 7, guidance 5, 3060: 40 to 26 DiT calls, 111.6 s
+  (3 runs, spread 0.2 s) to 74.7 s (3 runs, spread 4.6 s), 33 % less; latent
+  relative L2 to the 20-step run 0.224, against 0.426 for 13 plain steps (26
+  calls, 73.3 s). At 49 frames 329.5 s to 215.8 s, 0.176. Test
+  `wan22_image_to_video_step_skip_sweep` (ignored, `RB_WAN_CUDA=1`,
+  `RB_WS3_IMAGE`).
 - Q8 denoiser projections carry one int8 scale per 64 columns instead of one
   per row (`RB_Q8_GROUP`, 0 restores the old layout; the modulations stay per
   row), and the input/time embeddings and output projection stay F32. FLUX.2-klein
