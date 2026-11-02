@@ -71,7 +71,8 @@ impl Codebook {
     }
 }
 
-/// A `[rows, cols]` weight matrix as `i8` values with one `f32` scale per row,
+/// A `[rows, cols]` weight matrix as `i8` values with one `f32` scale per row
+/// (or per `group` columns of a row, see [`Quantized::from_matrix_grouped`]),
 /// or as 4-bit codebook indices with one `f32` scale per [`BLOCK`] of a row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Quantized {
@@ -79,6 +80,9 @@ pub struct Quantized {
     cols: usize,
     values: Values,
     scales: Vec<f32>,
+    /// Columns one int8 scale covers; `cols` for a scale per row. Unused by
+    /// 4-bit weights, whose block is [`BLOCK`].
+    group: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,17 +102,27 @@ impl Quantized {
     /// Quantizes row by row. A row of zeros gets a scale of zero, which
     /// dequantizes back to zeros rather than to `NaN`.
     pub(crate) fn from_matrix(value: &Matrix) -> Self {
-        let cols = value.cols.max(1);
-        let mut data = Vec::with_capacity(value.data.len());
-        let mut scales = Vec::with_capacity(value.rows);
+        Self::from_matrix_grouped(value, value.cols)
+    }
 
-        for row in value.data.chunks(cols) {
-            let absmax = row.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    /// [`Quantized::from_matrix`] with one scale per `group` columns of a row
+    /// rather than per row: an outlier then costs the precision of `group`
+    /// weights instead of the whole row. `group >= cols` is the per-row
+    /// scheme; the last group of a row may be shorter.
+    pub(crate) fn from_matrix_grouped(value: &Matrix, group: usize) -> Self {
+        let cols = value.cols.max(1);
+        let group = group.clamp(1, cols);
+        let mut data = Vec::with_capacity(value.data.len());
+        let mut scales = Vec::with_capacity(value.rows * cols.div_ceil(group));
+
+        for chunk in value.data.chunks(cols).flat_map(|row| row.chunks(group)) {
+            let absmax = chunk.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
             let scale = absmax / 127.0;
             scales.push(scale);
             let inverse = if scale > 0.0 { 1.0 / scale } else { 0.0 };
             data.extend(
-                row.iter()
+                chunk
+                    .iter()
                     .map(|v| (v * inverse).round().clamp(-127.0, 127.0) as i8),
             );
         }
@@ -118,6 +132,7 @@ impl Quantized {
             cols: value.cols,
             values: Values::Int8(data),
             scales,
+            group,
         }
     }
 
@@ -147,6 +162,7 @@ impl Quantized {
             cols: value.cols,
             values: Values::Four { codebook, packed },
             scales,
+            group: BLOCK,
         }
     }
 
@@ -162,9 +178,16 @@ impl Quantized {
         };
         let blocks = cols.div_ceil(BLOCK);
         let row_bytes = blocks * BLOCK / 2;
+        let int8_groups = cols.div_ceil(self.group);
         let unit_dot = |activations: &[f32], unit: usize| match &self.values {
             Values::Int8(data) => {
-                dot(activations, &data[unit * cols..(unit + 1) * cols]) * self.scales[unit]
+                let row = &data[unit * cols..(unit + 1) * cols];
+                let scales = &self.scales[unit * int8_groups..];
+                row.chunks(self.group)
+                    .zip(activations.chunks(self.group))
+                    .zip(scales)
+                    .map(|((w, x), scale)| dot(x, w) * scale)
+                    .sum()
             }
             Values::Four { packed, .. } => dot4(
                 activations,
@@ -214,10 +237,11 @@ impl Quantized {
         let cols = self.cols.max(1);
         match &self.values {
             Values::Int8(data) => {
-                let scale = self.scales[index];
+                let groups = cols.div_ceil(self.group);
+                let scales = &self.scales[index * groups..(index + 1) * groups];
                 let row = &data[index * cols..index * cols + cols];
-                for (slot, &value) in target.iter_mut().zip(row) {
-                    *slot = value as f32 * scale;
+                for (k, (slot, &value)) in target.iter_mut().zip(row).enumerate() {
+                    *slot = value as f32 * scales[k / self.group];
                 }
             }
             Values::Four { codebook, packed } => {
@@ -277,8 +301,18 @@ impl Quantized {
     #[cfg(feature = "cuda")]
     pub(crate) fn parts(&self) -> Option<(&[i8], &[f32])> {
         match &self.values {
-            Values::Int8(data) => Some((data, &self.scales)),
-            Values::Four { .. } => None,
+            Values::Int8(data) if self.group >= self.cols => Some((data, &self.scales)),
+            _ => None,
+        }
+    }
+
+    /// Columns one int8 scale covers, `None` for a scale per row or for
+    /// 4-bit weights.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn int8_group(&self) -> Option<usize> {
+        match &self.values {
+            Values::Int8(_) if self.group < self.cols => Some(self.group),
+            _ => None,
         }
     }
 
@@ -469,6 +503,41 @@ mod tests {
             // row's absmax and the number of terms, not by the result.
             assert!((got - want).abs() < 0.05, "{got} vs {want}");
         }
+    }
+
+    #[test]
+    fn a_scale_per_group_beats_a_scale_per_row_on_an_outlier() {
+        // One large weight in the first group; the second group is small and
+        // keeps its own scale. A ragged last group (cols = 10, group 4).
+        let mut data: Vec<f32> = (0..20).map(|v| (v as f32 * 0.37).sin() * 0.01).collect();
+        data[0] = 5.0;
+        let weights = Matrix::from_vec(2, 10, data);
+        let input = Matrix::from_vec(1, 10, (0..10).map(|v| 1.0 - v as f32 * 0.2).collect());
+        let mut expected = Matrix::new(1, 2);
+        input.dot_rhs_transposed(&weights, &mut expected);
+
+        let row = Quantized::from_matrix(&weights);
+        let grouped = Quantized::from_matrix_grouped(&weights, 4);
+        assert_eq!(grouped.scales.len(), 2 * 3);
+        let error = |q: &Quantized| {
+            let got = q.matmul_rhs_transposed(&input);
+            let wide = q.dequantize();
+            // The product must be the dequantized matrix's product.
+            let mut again = Matrix::new(1, 2);
+            input.dot_rhs_transposed(&wide, &mut again);
+            for (a, b) in got.data.iter().zip(&again.data) {
+                assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+            }
+            wide.data
+                .iter()
+                .zip(&weights.data)
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>()
+        };
+        assert!(error(&grouped) < error(&row) / 2.0);
+        assert!((grouped.matmul_rhs_transposed(&input).data[1] - expected.data[1]).abs() < 1e-3);
+        // `group >= cols` is the per-row scheme, bit for bit.
+        assert_eq!(Quantized::from_matrix_grouped(&weights, 10), row);
     }
 
     #[test]

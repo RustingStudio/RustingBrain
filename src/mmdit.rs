@@ -872,7 +872,7 @@ impl Dit {
             swap_halves(&mut final_modulation);
         }
         if precision == Precision::Q8 {
-            final_modulation.quantize();
+            quantize_dense(&mut final_modulation, false);
         }
 
         Ok(Self {
@@ -915,7 +915,6 @@ impl Dit {
             &mut self.text_in,
             &mut self.time_in.input,
             &mut self.time_in.output,
-            &mut self.final_modulation,
             &mut self.final_out,
         ];
         for embedder in [self.vector_in.as_mut(), self.guidance_in.as_mut()]
@@ -941,7 +940,8 @@ impl Dit {
             modulations.push(&mut block.modulation);
             layers.extend([&mut block.fused_in, &mut block.fused_out]);
         }
-        layers.into_par_iter().for_each(Dense::quantize);
+        layers.into_par_iter().for_each(|layer| quantize_dense(layer, true));
+        quantize_dense(&mut self.final_modulation, false);
 
         // A modulation several blocks share is quantized once, and every
         // block is pointed at the one quantized copy.
@@ -951,7 +951,7 @@ impl Dit {
                 Some((_, to)) => to.clone(),
                 None => {
                     let mut copy = (**modulation).clone();
-                    copy.projection.quantize();
+                    quantize_dense(&mut copy.projection, false);
                     let copy = Arc::new(copy);
                     done.push((modulation.clone(), copy.clone()));
                     copy
@@ -1215,6 +1215,53 @@ pub(crate) fn split(tokens: &Matrix, first: usize) -> (Matrix, Matrix) {
     )
 }
 
+/// Columns one int8 scale covers in a quantized denoiser projection. A scale
+/// per row lets one outlier weight set the step for 3072 to 12288 others;
+/// 64 columns cut the rounding error of a FLUX.2 weight by about 40% at 6%
+/// more scale bytes. `RB_Q8_GROUP=0` is the scale per row of before.
+pub(crate) fn q8_group() -> usize {
+    static GROUP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GROUP.get_or_init(|| {
+        std::env::var("RB_Q8_GROUP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+    })
+}
+
+/// Quantizes `layer` per [`q8_group`], or per row when `grouped` is false: a
+/// modulation reads one vector, which the device multiplies by the int8 bytes
+/// directly; grouped scales would make it widen the 320 MB stacked weight
+/// first, and the modulations carry little of the error.
+fn quantize_dense(layer: &mut Dense, grouped: bool) {
+    match q8_group() {
+        0 => layer.quantize(),
+        _ if !grouped => layer.quantize(),
+        group => layer.quantize_grouped(group),
+    }
+}
+
+/// Linears that stay in `f32` under Q8: the two input embeddings, the time
+/// embedding and the output projection carry more rounding error per byte than
+/// any block (step-0 1.0e-2 to 0.92e-2 at group 128) and weigh about 100 MB.
+/// `RB_Q8_GROUP=0` keeps them quantized, as before.
+fn keep_float(name: &str) -> bool {
+    q8_group() != 0
+        && !name.contains("blocks")
+        && [
+            "x_embedder",
+            "context_embedder",
+            "timestep_embedder",
+            "proj_out",
+            "img_in",
+            "txt_in",
+            "time_in",
+            "final_layer.linear",
+        ]
+        .iter()
+        .any(|part| name.contains(part))
+}
+
 fn dense(
     file: &mut ShardedSafeTensors,
     name: &str,
@@ -1231,10 +1278,13 @@ fn dense(
         .ok()
         .map(|(bias, _)| bias);
     let mut layer = Dense::new(Matrix::from_vec(shape[0], shape[1], values), bias)?;
-    if precision == Precision::Q8 {
+    if precision == Precision::Q8 && !keep_float(name) {
         // Quantizing as each tensor arrives is what keeps the peak at one
         // `f32` tensor rather than the whole model.
-        layer.quantize();
+        let modulation = ["modulation", "norm.linear", "norm_out", "_mod.", "norm1"]
+            .iter()
+            .any(|part| name.contains(part));
+        quantize_dense(&mut layer, !modulation);
     }
     Ok(layer)
 }
@@ -1558,7 +1608,7 @@ fn stacked(
     let bias = parts.iter().any(|part| part.bias.is_some()).then_some(bias);
     let mut layer = Dense::new(weight, bias)?;
     if precision == Precision::Q8 {
-        layer.quantize();
+        quantize_dense(&mut layer, true);
     }
     Ok(layer)
 }
