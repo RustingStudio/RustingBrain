@@ -191,6 +191,25 @@ impl Dense {
         }
     }
 
+    /// [`Dense::quantize`] with one scale per `group` columns, for a weight
+    /// whose rows have outliers (see `Quantized::from_matrix_grouped`).
+    pub fn quantize_grouped(&mut self, group: usize) {
+        if self.quantized.is_none() {
+            self.quantized = Some(crate::quantized::Quantized::from_matrix_grouped(
+                &self.weight,
+                group,
+            ));
+            self.weight.data = Vec::new();
+        }
+    }
+
+    /// Columns one int8 scale covers, `None` for a scale per row or a float
+    /// weight.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn int8_group(&self) -> Option<usize> {
+        self.quantized.as_ref().and_then(|q| q.int8_group())
+    }
+
     /// The weight as `f32`, widening it first if it is stored quantized.
     ///
     /// Borrowed in the common case, so a float layer costs nothing to ask.

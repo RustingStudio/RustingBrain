@@ -58,6 +58,8 @@ pub(crate) struct ModelKernels {
     decode_attention_merge: CudaFunction,
     store_rows: CudaFunction,
     quantize_q8: CudaFunction,
+    quantize_groups_q8: CudaFunction,
+    dequantize_groups_q8: CudaFunction,
     dequantize_q8: CudaFunction,
     dequantize_q4: CudaFunction,
     gemv_q8: CudaFunction,
@@ -109,6 +111,8 @@ impl ModelKernels {
             decode_attention_merge: get("decode_attention_merge")?,
             store_rows: get("store_rows")?,
             quantize_q8: get("quantize_rows_q8")?,
+            quantize_groups_q8: get("quantize_groups_q8")?,
+            dequantize_groups_q8: get("dequantize_groups_q8")?,
             dequantize_q8: get("dequantize_q8")?,
             dequantize_q4: get("dequantize_q4")?,
             gemv_q8: get("gemv_q8")?,
@@ -270,6 +274,10 @@ pub(crate) struct Act {
     /// Set on an int8 weight from [`Gpu::decode_pack`]: `bytes` then holds one
     /// `i8` per weight and this one scale per row.
     scales: Option<CudaSlice<f32>>,
+    /// Columns one scale covers when `scales` holds several a row (a weight
+    /// from [`Gpu::quantized_grouped`]); 0 for one scale a row. Only the
+    /// dequantizing path reads a grouped weight.
+    group: usize,
 }
 
 impl Act {
@@ -439,6 +447,7 @@ impl Gpu<'_> {
             narrow,
             len,
             scales: None,
+            group: 0,
         })
     }
 
@@ -1621,6 +1630,37 @@ impl Gpu<'_> {
         Ok(act)
     }
 
+    /// [`Gpu::quantized`] with a scale per `group` columns of a row.
+    pub(crate) fn quantized_grouped(
+        &self,
+        weights: &CudaView<'_, f32>,
+        rows: usize,
+        cols: usize,
+        group: usize,
+    ) -> Result<Act, NetworkError> {
+        let group = group.clamp(1, cols.max(1));
+        let groups = cols.div_ceil(group);
+        let mut act = self.act(rows * cols / 4 + 1, false)?;
+        act.len = rows * cols;
+        let mut scales = self.uninit(rows * groups)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.quantize_groups_q8)
+                .arg(weights)
+                .arg(&mut act.bytes)
+                .arg(&mut scales)
+                .arg(&(rows as i32))
+                .arg(&(cols as i32))
+                .arg(&(group as i32))
+                .launch(warp_each(rows * groups))
+                .map_err(cuda_err("int8 grouped quantize kernel"))?;
+        }
+        act.scales = Some(scales);
+        act.group = group;
+        Ok(act)
+    }
+
     /// [`Gpu::linear_packed`] for a weight that may be int8. A few rows, a
     /// decode step, read the int8 bytes directly, from [`Q8_MMA_ROWS`] on the
     /// tensor cores; more, a prompt, dequantize
@@ -1661,6 +1701,28 @@ impl Gpu<'_> {
             return self.linear_packed(&rows_of, units, inner, x, narrow, out, rows, beta);
         };
         let bytes = weights.bytes.slice(first * inner..);
+        if weights.group > 0 {
+            // Grouped scales: no int8 GEMV reads them, so every height takes
+            // the dequantize-then-cuBLAS path.
+            let groups = inner.div_ceil(weights.group);
+            let scales = scales.slice(first * groups..);
+            let mut wide = self.act(units * inner, narrow)?;
+            unsafe {
+                self.context
+                    .stream
+                    .launch_builder(&self.context.model.dequantize_groups_q8)
+                    .arg(&bytes)
+                    .arg(&scales)
+                    .arg(&mut wide.bytes)
+                    .arg(&(units as i32))
+                    .arg(&(inner as i32))
+                    .arg(&i32::from(narrow))
+                    .arg(&(weights.group as i32))
+                    .launch(cfg(units * inner))
+                    .map_err(cuda_err("int8 grouped dequantize kernel"))?;
+            }
+            return self.linear_packed(&wide.all(), units, inner, x, narrow, out, rows, beta);
+        }
         let scales = scales.slice(first..);
         if rows > Q8_GEMV_ROWS || inner % 16 != 0 {
             let mut wide = self.act(units * inner, narrow)?;

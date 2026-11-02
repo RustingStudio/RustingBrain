@@ -342,14 +342,19 @@ impl DeviceDit {
                 .map_err(cuda_err("MMDiT kernel lookup"))
         };
         let quantized = std::cell::Cell::new(false);
-        let linear = |weight: Matrix, bias: Option<&[f32]>, int8: bool| {
+        // The host's weight is already on its int8 grid, so quantizing the
+        // widened copy again lands on the same values and scales.
+        let linear = |weight: Matrix, bias: Option<&[f32]>, int8: bool, group: Option<usize>| {
             quantized.set(quantized.get() || int8);
             let (units, inner) = (weight.rows, weight.cols);
             let wide = gpu.upload(&weight.data)?;
             Ok::<_, NetworkError>(Linear {
-                weight: match int8 {
-                    true => gpu.quantized(&wide.slice(..), units, inner)?,
-                    false => gpu.narrowed(&wide.slice(..), units * inner, true)?,
+                weight: match (int8, group) {
+                    (true, Some(group)) => {
+                        gpu.quantized_grouped(&wide.slice(..), units, inner, group)?
+                    }
+                    (true, None) => gpu.quantized(&wide.slice(..), units, inner)?,
+                    (false, _) => gpu.narrowed(&wide.slice(..), units * inner, true)?,
                 },
                 bias: bias.map(|bias| gpu.upload(bias)).transpose()?,
                 units,
@@ -361,6 +366,7 @@ impl DeviceDit {
                 layer.weight_f32().into_owned(),
                 layer.bias.as_deref(),
                 layer.is_quantized(),
+                layer.int8_group(),
             )
         };
         let stream = |stream: &crate::mmdit::Stream| {
@@ -412,6 +418,7 @@ impl DeviceDit {
             Matrix::from_vec(weights.len() / inner, inner, weights),
             Some(&biases),
             modulations.iter().any(|layer| layer.is_quantized()),
+            modulations.iter().find_map(|layer| layer.int8_group()),
         )?;
 
         let width = dit.config().d_model;
@@ -430,14 +437,16 @@ impl DeviceDit {
                     part
                 };
                 let quantized = block.fused_out.is_quantized();
+                let group = block.fused_out.int8_group();
                 Ok(DeviceSingle {
                     fused_in: dense(&block.fused_in)?,
                     attention_out: linear(
                         columns(0, width),
                         block.fused_out.bias.as_deref(),
                         quantized,
+                        group,
                     )?,
-                    mlp_out: linear(columns(width, mlp_dim), None, quantized)?,
+                    mlp_out: linear(columns(width, mlp_dim), None, quantized, group)?,
                     query_norm: gpu.upload(&block.query_norm.scale)?,
                     key_norm: gpu.upload(&block.key_norm.scale)?,
                 })

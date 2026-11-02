@@ -643,6 +643,25 @@ extern "C" __global__ void quantize_rows_q8(const float*w,signed char*q,float*sc
   for(int k=lane;k<cols;k+=WARP)q[(size_t)row*cols+k]=(signed char)fminf(fmaxf(rintf(in[k]*inv),-127.f),127.f);
   if(lane==0)scales[row]=scale;
 }
+// The same with one scale per `group` columns of a row, `groups = ceil(cols /
+// group)` scales a row. One warp per group.
+extern "C" __global__ void quantize_groups_q8(const float*w,signed char*q,float*scales,int rows,int cols,int group){
+  int groups=(cols+group-1)/group;
+  long g=((long)blockIdx.x*blockDim.x+threadIdx.x)/WARP;int lane=threadIdx.x%WARP;
+  if(g>=(long)rows*groups)return;
+  int row=g/groups,start=(g%groups)*group,end=min(start+group,cols);
+  const float*in=w+(size_t)row*cols;
+  float m=0.f;for(int k=start+lane;k<end;k+=WARP)m=fmaxf(m,fabsf(in[k]));
+  for(int o=WARP/2;o>0;o>>=1)m=fmaxf(m,__shfl_xor_sync(0xffffffff,m,o));
+  float scale=m/127.f,inv=scale>0.f?1.f/scale:0.f;
+  for(int k=start+lane;k<end;k+=WARP)q[(size_t)row*cols+k]=(signed char)fminf(fmaxf(rintf(in[k]*inv),-127.f),127.f);
+  if(lane==0)scales[g]=scale;
+}
+extern "C" __global__ void dequantize_groups_q8(const signed char*q,const float*scales,void*out,int units,int inner,int narrow,int group){
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)units*inner)return;
+  int groups=(inner+group-1)/group;
+  store_act(out,i,(float)q[i]*scales[i/inner*groups+(i%inner)/group],narrow);
+}
 // `out = w * scale` per element, for a prompt, which takes the cuBLAS path.
 extern "C" __global__ void dequantize_q8(const signed char*q,const float*scales,void*out,int units,int inner,int narrow){
   size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)units*inner)return;

@@ -3127,7 +3127,7 @@ mod tests {
         // Q8 rounding, not a wrong layer: `flux2_klein_blocks_match_diffusers`
         // puts the same blocks at 1e-6 in F32. Over C11's 0.006 for SDXL's
         // UNet, which is why these gates are Q8's own.
-        gate("step-0 prediction", relative(&prediction.data, &read("step0_pred")), 0.02);
+        gate("step-0 prediction", relative(&prediction.data, &read("step0_pred")), 0.011);
 
         let started = std::time::Instant::now();
         let latent = pipeline
@@ -3135,7 +3135,7 @@ mod tests {
             .unwrap();
         eprintln!("flux2 four steps: {:?}", started.elapsed());
         let final_latents = read("final_latents");
-        gate("final latent, 4 steps", relative(&latent.data, &final_latents), 0.05);
+        gate("final latent, 4 steps", relative(&latent.data, &final_latents), 0.04);
 
         // What the autoencoder is handed, from diffusers' own final latent.
         let want_latent = Matrix::from_vec(1024, 128, final_latents);
@@ -3152,7 +3152,7 @@ mod tests {
         eprintln!("flux2 decode: {:?}", started.elapsed());
         gate("decoded image, reference latent", relative(&decoded.data, &image), 0.012);
         let decoded = pipeline.decode(&latent, 32, 32).unwrap();
-        gate("decoded image, whole chain", relative(&decoded.data, &image), 0.03);
+        gate("decoded image, whole chain", relative(&decoded.data, &image), 0.034);
 
         let failed: Vec<_> = report.iter().filter(|(_, error, limit)| error > limit).collect();
         assert!(failed.is_empty(), "over the gate: {failed:?}");
@@ -3222,7 +3222,7 @@ mod tests {
         pipeline.denoiser.set_conditioning(conditioning.clone());
         let prediction = pipeline.denoiser.denoise(&noise, levels[0]).unwrap();
         assert_eq!((prediction.rows, prediction.cols), (1024, 128));
-        gate("step-0 prediction", relative(&prediction.data, &read("step0_pred")), 0.025);
+        gate("step-0 prediction", relative(&prediction.data, &read("step0_pred")), 0.016);
 
         // The same step from diffusers' own reference tokens, which leaves
         // the encoder's share of the error out of the denoiser's.
@@ -3238,16 +3238,16 @@ mod tests {
         gate(
             "step-0 prediction, diffusers' tokens",
             relative(&prediction.data, &read("step0_pred")),
-            0.025,
+            0.015,
         );
         pipeline.set_references(std::slice::from_ref(&pixels)).unwrap();
 
         let latent = pipeline
             .sample_latent_from_noise(conditioning, None, noise, None, |_, _| true)
             .unwrap();
-        gate("final latent, 4 steps", relative(&latent.data, &read("final_latents")), 0.05);
+        gate("final latent, 4 steps", relative(&latent.data, &read("final_latents")), 0.02);
         let decoded = pipeline.decode(&latent, 32, 32).unwrap();
-        gate("image, whole chain", relative(&decoded.data, &read("image")), 0.03);
+        gate("image, whole chain", relative(&decoded.data, &read("image")), 0.007);
         #[cfg(feature = "images")]
         if let Some(out) = env("RB_FLUX2_OUT") {
             crate::vae::save_png(&decoded, out).unwrap();

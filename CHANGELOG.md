@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Q8 denoiser projections carry one int8 scale per 64 columns instead of one
+  per row (`RB_Q8_GROUP`, 0 restores the old layout; the modulations stay per
+  row), and the input/time embeddings and output projection stay F32. FLUX.2-klein
+  step-0 against diffusers: 0.0127 to 0.0068 host, 0.0141 to 0.0087 device
+  (0.0226 to 0.0139 with a reference image); 1024x1024 denoise 6.24 s to 6.37 s,
+  peak VRAM 10434 to 10626 MiB.
 - FLUX.2-klein reference-image conditioning (image editing):
   `ImagePipeline::set_references(&[FeatureMap])` and
   `generate_with_references(prompt, width, height, seed, &references, on_step)`
