@@ -51,6 +51,28 @@ pub struct VideoConfig {
     /// FastWan's few-step DMD sampler instead of UniPC; `steps` and
     /// `guidance` are then ignored (one DiT call a step, no guidance).
     pub dmd: Option<Dmd>,
+    /// Skips some UniPC steps; `None` runs every step.
+    pub skip: Option<StepSkip>,
+}
+
+/// Step skipping on the UniPC path: after the first `full` steps, every
+/// `every`-th step except the last skips both DiT passes and hands UniPC the
+/// previous step's guided velocity. Image-to-video 1280x704x17, 20 steps,
+/// `full: 4, every: 2`: 26 of 40 DiT calls, 34 % less sampling time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepSkip {
+    pub full: usize,
+    pub every: usize,
+}
+
+impl StepSkip {
+    /// Whether `step` of `steps` is skipped.
+    pub fn skips(&self, step: usize, steps: usize) -> bool {
+        self.every > 0
+            && step >= self.full
+            && step + 1 < steps
+            && (step - self.full) % self.every == self.every - 1
+    }
 }
 
 /// DMD sampling: the timesteps (FastWan 2.2 TI2V-5B uses 1000, 757, 522) and
@@ -94,6 +116,7 @@ impl Default for VideoConfig {
             guidance: 5.0,
             prompt_length: 512,
             dmd: None,
+            skip: None,
         }
     }
 }
@@ -615,8 +638,19 @@ impl VideoPipeline {
         let guidance = self.config.guidance;
         let negative = negative.filter(|_| guidance > 1.0);
         let mut scheduler = UniPc::new(self.config.steps, self.flow_shift, self.train_steps)?;
-        for step in 0..self.config.steps {
+        let skip = self.config.skip;
+        let mut guided = Vec::new();
+        let steps = self.config.steps;
+        for step in 0..steps {
             let t = scheduler.timesteps()[step];
+            if !guided.is_empty() && skip.is_some_and(|skip| skip.skips(step, steps)) {
+                let next = scheduler.step(&guided, &flatten(&noise))?;
+                refill(&mut noise, &next);
+                if !on_step(step, &noise) {
+                    break;
+                }
+                continue;
+            }
             let mut input = noise.clone();
             let mut times = vec![t; noise.len()];
             if let Some(first) = first {
@@ -631,7 +665,8 @@ impl VideoPipeline {
                     *v = u + guidance * (*v - u);
                 }
             }
-            let next = scheduler.step(&velocity, &flatten(&noise))?;
+            guided = velocity;
+            let next = scheduler.step(&guided, &flatten(&noise))?;
             refill(&mut noise, &next);
             if !on_step(step, &noise) {
                 break;
@@ -1269,6 +1304,151 @@ mod tests {
                 .args(["-filter_complex", &format!("{scaled}{stacked}hstack=inputs=5")])
                 .arg(if frames == 49 { "tiles.png".to_string() } else { format!("tiles{frames}.png") });
             assert!(command.status().unwrap().success(), "tile failed");
+        }
+    }
+
+    #[test]
+    fn step_skip_keeps_the_head_and_the_last_step() {
+        let skip = StepSkip { full: 4, every: 2 };
+        let skipped: Vec<usize> = (0..20).filter(|&s| skip.skips(s, 20)).collect();
+        assert_eq!(skipped, [5, 7, 9, 11, 13, 15, 17]);
+        assert!(!StepSkip { full: 0, every: 0 }.skips(3, 20));
+    }
+
+    /// Wan 2.2 TI2V-5B image-to-video on the UniPC + CFG path, cheaper step
+    /// variants against the full run of the same seed. `RB_WAN_CUDA=1`;
+    /// `RB_WAN_MODEL`; `RB_WS3_IMAGE` (a PNG at the clip size); `RB_WS3_FRAMES`
+    /// (default 17); `RB_WS3_RUNS` (default 1); `RB_WS3_DECODE=1` decodes each
+    /// variant and tiles five frames into `/tmp/ws3/<name>_tiles.png`;
+    /// `RB_WS3_VARIANTS` is `name:steps[:full:every[:runs]]`
+    /// words (default `base:20`); `base:20` always runs first and is the reference.
+    #[cfg(all(feature = "cuda", feature = "images"))]
+    #[test]
+    #[ignore = "needs Wan2.2-TI2V-5B, a 1280x704 image and RB_WAN_CUDA=1"]
+    fn wan22_image_to_video_step_skip_sweep() {
+        use std::time::Instant;
+        let env = |name: &str| std::env::var(name).ok();
+        let Some(image_path) = env("RB_WS3_IMAGE").filter(|_| env("RB_WAN_CUDA").as_deref() == Some("1"))
+        else {
+            eprintln!("skipped: needs RB_WAN_CUDA=1 and RB_WS3_IMAGE");
+            return;
+        };
+        let model = PathBuf::from(
+            env("RB_WAN_MODEL")
+                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+        );
+        let frames: usize = env("RB_WS3_FRAMES").map_or(17, |v| v.parse().unwrap());
+        let runs: usize = env("RB_WS3_RUNS").map_or(1, |v| v.parse().unwrap());
+        let dir = PathBuf::from("/tmp/ws3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let picture = image::open(image_path)
+            .unwrap()
+            .to_rgb8();
+        let (width, height) = (picture.width() as usize, picture.height() as usize);
+        let mut planes = vec![0f32; 3 * width * height];
+        for (i, pixel) in picture.pixels().enumerate() {
+            for c in 0..3 {
+                planes[c * width * height + i] = pixel[c] as f32 / 127.5 - 1.0;
+            }
+        }
+        let image = FeatureMap::from_vec(3, height, width, planes).unwrap();
+        let mut pipeline = VideoPipeline::load(&model).unwrap();
+        let text = pipeline
+            .condition("A cinematic shot of the scene coming to life, gentle camera push in, natural motion")
+            .unwrap();
+        let negative = pipeline.condition("").unwrap();
+        pipeline.encoder = None;
+        assert!(pipeline.try_cuda(0));
+        let request = VideoRequest {
+            width,
+            height,
+            frames,
+            seed: Some(7),
+            image: Some(&image),
+        };
+        let first = pipeline.encode_image(&image).unwrap();
+        let spec = env("RB_WS3_VARIANTS").unwrap_or_else(|| "base:20".into());
+        let mut variants: Vec<&str> = spec.split_whitespace().collect();
+        let base = variants.iter().position(|v| v.starts_with("base:20")).map_or("base:20", |i| variants.remove(i));
+        variants.insert(0, base);
+        // Warm-up: the DiT upload and the kernel build are not sampling time.
+        pipeline.config.steps = 2;
+        pipeline
+            .sample_from_noise(&text, Some(&negative), Some(&first), pipeline.noise(&request).unwrap(), |_, _| true)
+            .unwrap();
+        let mut reference: Vec<f32> = Vec::new();
+        let mut pending = Vec::new();
+        for variant in variants {
+            let parts: Vec<&str> = variant.split(':').collect();
+            let number = |i: usize| parts.get(i).map_or(0, |v| v.parse::<usize>().unwrap());
+            pipeline.config.steps = number(1);
+            pipeline.config.skip = (number(3) > 0).then(|| StepSkip {
+                full: number(2),
+                every: number(3),
+            });
+            let steps = pipeline.config.steps;
+            let calls: usize = (0..steps)
+                .map(|step| match pipeline.config.skip {
+                    Some(skip) if skip.skips(step, steps) => 0,
+                    _ => 2,
+                })
+                .sum();
+            let mut times = Vec::new();
+            let mut latent = Vec::new();
+            let runs = parts.get(4).map_or(runs, |v| v.parse().unwrap());
+            for _ in 0..runs {
+                let started = Instant::now();
+                latent = pipeline
+                    .sample_from_noise(&text, Some(&negative), Some(&first), pipeline.noise(&request).unwrap(), |_, _| true)
+                    .unwrap();
+                times.push(started.elapsed().as_secs_f64());
+            }
+            let flat: Vec<f32> = latent[1..].iter().flat_map(|m| m.data.clone()).collect();
+            if reference.is_empty() {
+                reference = flat.clone();
+            }
+            let (mut diff, mut norm) = (0f64, 0f64);
+            for (a, b) in flat.iter().zip(&reference) {
+                diff += ((a - b) as f64).powi(2);
+                norm += (*b as f64).powi(2);
+            }
+            let mean = times.iter().sum::<f64>() / runs as f64;
+            let spread = times.iter().cloned().fold(f64::MIN, f64::max)
+                - times.iter().cloned().fold(f64::MAX, f64::min);
+            let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+            eprintln!(
+                "WS3 {variant} dit_calls {calls} sample_mean {mean:.1}s spread {spread:.1}s rel_l2 {:.4} load {}",
+                (diff / norm).sqrt(),
+                load.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+            );
+            // NOTE: decode after the last sample; a 49-frame decode leaves
+            // too little device memory for the next sample's DiT.
+            if env("RB_WS3_DECODE").as_deref() == Some("1") {
+                pending.push((variant.replace(':', "_"), latent));
+            }
+        }
+        for (name, latent) in pending {
+            {
+                let clip = pipeline.decode(&latent).unwrap();
+                // Five frames piped straight into one tile PNG; no frame files.
+                use std::io::Write;
+                let mut command = std::process::Command::new("ffmpeg");
+                command
+                    .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+                    .args(["-s", &format!("{width}x{height}"), "-i", "-"])
+                    .args(["-vf", "scale=640:-1,tile=5x1", "-frames:v", "1"])
+                    .arg(dir.join(format!("{name}_tiles.png")))
+                    .stdin(std::process::Stdio::piped());
+                let mut child = command.spawn().expect("ffmpeg");
+                let mut stdin = child.stdin.take().unwrap();
+                for k in 0..5 {
+                    stdin
+                        .write_all(&crate::vae::to_rgb8(&clip[k * (frames - 1) / 4]))
+                        .unwrap();
+                }
+                drop(stdin);
+                assert!(child.wait().unwrap().success(), "tile failed");
+            }
         }
     }
 
