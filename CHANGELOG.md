@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Wan 2.2 TI2V-5B image-to-video at 1280x704x121 now fits on a 12 GB card.
+  Above 12288 tokens the device DiT runs the QKV projection and the
+  feed-forward 4096 tokens at a time, so their FP32 `[tokens, 3 * dim]` and
+  `[tokens, 14336]` buffers no longer scale with the clip (121 frames failed
+  allocating 746 MiB with 94 MiB free). 1280x704x49 and below run the same
+  code as before and print the same parity numbers. 3060, UniPC 20 steps,
+  CFG 5, release test build without LTO: 121 frames sample in 1146.7 s, peak
+  10748 MiB (desktop included); 81 frames peak 10994 to 10164 MiB with the
+  same decoded frames.
 - Wan 2.2 TI2V-5B image-to-video at 1280x704x49 now fits on a 12 GB card.
   The device DiT's per-block temporaries were shadowed, not dropped, so they
   all sat under the feed-forward's two FP32 `[tokens, 14336]` buffers (626 MiB
