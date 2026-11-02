@@ -3029,8 +3029,8 @@ mod tests {
     /// `RB_FLUX2_REF` is the script's output, `RB_FLUX2_MODEL` the model
     /// (default the local copy), `RB_FLUX2_ENCODER=f32` adds a run of the
     /// prompt encoder in F32 on its own (about 12 GB) and `RB_FLUX2_CUDA=1`
-    /// moves the pipeline to the device. The denoiser is Q8: in F32 it alone
-    /// needs about 16 GB.
+    /// moves the pipeline to the device. `RB_FLUX2_OUT=<png>` saves the
+    /// whole-chain image. The denoiser is Q8: in F32 it alone needs about 16 GB.
     #[test]
     #[ignore = "needs FLUX.2-klein-4B and the output of scripts/flux2_reference.py"]
     fn flux2_klein_matches_diffusers() {
@@ -3153,6 +3153,10 @@ mod tests {
         gate("decoded image, reference latent", relative(&decoded.data, &image), 0.012);
         let decoded = pipeline.decode(&latent, 32, 32).unwrap();
         gate("decoded image, whole chain", relative(&decoded.data, &image), 0.034);
+        #[cfg(feature = "images")]
+        if let Some(out) = env("RB_FLUX2_OUT") {
+            crate::vae::save_png(&decoded, out).unwrap();
+        }
 
         let failed: Vec<_> = report.iter().filter(|(_, error, limit)| error > limit).collect();
         assert!(failed.is_empty(), "over the gate: {failed:?}");
