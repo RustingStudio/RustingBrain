@@ -908,6 +908,85 @@ mod tests {
         }
     }
 
+    /// The real int8 Wan 2.2 TI2V-5B, one forward at 1280x704 run whole and
+    /// in the shipped 4096-token parts. `RB_WAN_CUDA=1`; `RB_WAN_MODEL`;
+    /// `RB_WAN_CHUNK_FRAMES` is a comma list of video frames (default 49,
+    /// 11440 tokens: two full parts and a ragged one).
+    #[test]
+    #[ignore = "needs Wan2.2-TI2V-5B and RB_WAN_CUDA=1"]
+    fn real_chunked_tokens_match_the_whole_pass() {
+        if std::env::var("RB_WAN_CUDA").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = std::path::PathBuf::from(
+            std::env::var("RB_WAN_MODEL")
+                .unwrap_or_else(|_| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+        );
+        let config =
+            crate::wan_dit::WanDitConfig::from_file(dir.join("transformer/config.json")).unwrap();
+        let weights = dir.join("transformer/diffusion_pytorch_model.safetensors.index.json");
+        let model = WanDit::load_at(&weights, config.clone(), Precision::Q8).unwrap();
+        let gpu = cuda_or_skip().expect("RB_WAN_CUDA=1 needs a device");
+        let mut device = DeviceWanDit::upload(&gpu, &model).unwrap();
+        let context = context(&config, 512);
+        let flat = |frames: &[FeatureMap]| {
+            frames
+                .iter()
+                .flat_map(|f| f.data.clone())
+                .collect::<Vec<_>>()
+        };
+        let list = std::env::var("RB_WAN_CHUNK_FRAMES").unwrap_or_else(|_| "49".into());
+        for video in list.split(',').map(|f| f.trim().parse::<usize>().unwrap()) {
+            let frames = (video - 1) / 4 + 1;
+            // 1280x704 is a 44x80 latent; the first frame is the image.
+            let latent = latent(&config, frames, 44, 80);
+            let mut timesteps = vec![700.0; frames];
+            timesteps[0] = 0.0;
+            let mut run = |above, rows| {
+                (device.chunk_above, device.chunk_rows) = (above, rows);
+                flat(
+                    &device
+                        .forward(&model, &latent, &timesteps, &context)
+                        .unwrap(),
+                )
+            };
+            // The whole pass does not fit above 49 frames on 12 GB; there the
+            // reference is the same model in 1000-token parts, which no
+            // offset bug would leave equal to the 4096-token ones.
+            let tokens = frames * 880;
+            let (reference, name) = match tokens <= CHUNK_ABOVE {
+                true => (run(usize::MAX, CHUNK_ROWS), "whole"),
+                false => (run(0, 1000), "1000-token parts"),
+            };
+            let parts = run(0, CHUNK_ROWS);
+            if tokens <= CHUNK_ABOVE {
+                // What a different GEMM height alone moves: the noise floor
+                // of the 1000-token reference used above.
+                let floor = crate::wan_vae::tests::relative(&run(0, 1000), &reference);
+                eprintln!("real wan 1280x704x{video}: 1000-token parts vs whole {floor:.3e}");
+            }
+            let error = crate::wan_vae::tests::relative(&parts, &reference);
+            let per_frame = parts.len() / frames;
+            let frame = |f: usize| f * per_frame..(f + 1) * per_frame;
+            let worst = (0..frames)
+                .map(|f| crate::wan_vae::tests::relative(&parts[frame(f)], &reference[frame(f)]))
+                .fold(0.0f32, f32::max);
+            let rms = |f: usize| {
+                let values = &parts[frame(f)];
+                (values.iter().map(|v| v * v).sum::<f32>() / values.len() as f32).sqrt()
+            };
+            eprintln!(
+                "real wan 1280x704x{video} ({tokens} tokens): 4096-token parts vs {name} \
+                 {error:.3e}, worst latent frame {worst:.3e}; output rms frame 1 {:.3}, \
+                 middle {:.3}, last {:.3}",
+                rms(1),
+                rms(frames / 2),
+                rms(frames - 1)
+            );
+            assert!(error < 1e-2, "{video} frames: {error}");
+        }
+    }
+
     #[test]
     fn malformed_shapes_are_refused_before_upload_or_skip_without_device() {
         let Some(gpu) = cuda_or_skip() else { return };
