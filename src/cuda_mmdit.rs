@@ -532,12 +532,29 @@ impl DeviceDit {
             });
         }
         lora.check(dit)?;
+        if keep && dit.references().is_some() {
+            return Err(NetworkError::InvalidConfig(
+                "training does not take reference images".into(),
+            ));
+        }
         let gpu = Gpu {
             context: &self.context,
         };
         let config = dit.config();
         let (width, heads, eps) = (config.d_model, config.num_heads, config.eps);
         let head_dim = config.head_dim();
+        // Reference tokens ride after the image's own and come back out
+        // unread, so only the first `own_rows` reach the final layer.
+        let references = dit.references();
+        let own_rows = patches.rows;
+        let joined;
+        let patches = match references {
+            Some(references) => {
+                joined = crate::mmdit::concatenate(patches, &references.tokens);
+                &joined
+            }
+            None => patches,
+        };
         let (text_rows, image_rows) = (conditioning.text.rows, patches.rows);
         let rows = text_rows + image_rows;
         let copy = || cuda_err("device to device copy");
@@ -549,7 +566,13 @@ impl DeviceDit {
             .collect();
         let vector = gpu.narrowed(&gpu.upload(&vector)?.slice(..), width, true)?;
         let modulation = self.apply(&gpu, &self.modulation, &[], &vector.all(), 1)?;
-        let positions = Positions::new(config, text_rows, conditioning.height, conditioning.width);
+        let positions = Positions::with_references(
+            config,
+            text_rows,
+            conditioning.height,
+            conditioning.width,
+            references.map_or(&[][..], |references| &references.grids[..]),
+        );
         let (cos, sin) = (gpu.upload(&positions.cos)?, gpu.upload(&positions.sin)?);
 
         let mut text = self.input(&gpu, &self.text_in, &conditioning.text)?;
@@ -816,11 +839,11 @@ impl DeviceDit {
         // The final layer's modulation is a shift then a scale, which is the
         // layout the norm kernel reads.
         let image = hidden.slice(text_rows * width..);
-        let mut normed = gpu.uninit(image_rows * width)?;
-        self.launch_norm(&image, &triple(2), &mut normed, image_rows, width, eps)?;
-        let normed = gpu.narrowed(&normed.slice(..), image_rows * width, true)?;
-        let output = self.apply(&gpu, &self.final_out, &[], &normed.all(), image_rows)?;
-        let output = Matrix::from_vec(image_rows, self.final_out.units, gpu.download(&output)?);
+        let mut normed = gpu.uninit(own_rows * width)?;
+        self.launch_norm(&image, &triple(2), &mut normed, own_rows, width, eps)?;
+        let normed = gpu.narrowed(&normed.slice(..), own_rows * width, true)?;
+        let output = self.apply(&gpu, &self.final_out, &[], &normed.all(), own_rows)?;
+        let output = Matrix::from_vec(own_rows, self.final_out.units, gpu.download(&output)?);
         let tape = DeviceTape {
             modulation,
             cos,

@@ -202,12 +202,64 @@ pub struct Conditioning {
     pub guidance: f32,
 }
 
+/// Reference images for a FLUX.2 edit: their packed latent tokens, which ride
+/// through the transformer beside the image's own and are dropped from what
+/// comes out.
+#[derive(Clone, Debug)]
+pub struct References {
+    /// `[sum of rows * columns, in_channels]`, the grids one after another.
+    pub tokens: Matrix,
+    /// Each reference's patch grid, `(rows, columns)`.
+    pub grids: Vec<(usize, usize)>,
+}
+
 /// The rotation table for one sequence: a cosine and a sine per head dimension
 /// pair per token.
 pub(crate) struct Positions {
     pub(crate) cos: Vec<f32>,
     pub(crate) sin: Vec<f32>,
     pub(crate) pairs: usize,
+}
+
+/// The position of every token on the four axes a rotary table counts, text
+/// first, then the image's patches, then each reference's.
+///
+/// A patch's row and column go on the second and third axes when there are
+/// three or more, and on the only two when there are two; the first of three
+/// stays at zero. A fourth axis, which only FLUX.2 has, counts the text
+/// tokens, which otherwise all sit at the origin. A reference's patches go on
+/// the first axis at ten times its index plus ten, so a reference never
+/// shares a position with the image or with another reference.
+pub(crate) fn token_ids(
+    config: &DitConfig,
+    text_len: usize,
+    height: usize,
+    width: usize,
+    references: &[(usize, usize)],
+) -> Vec<[usize; 4]> {
+    let axes = config.axes_dim.len();
+    let (row_axis, column_axis) = (axes.min(3).saturating_sub(2), axes.min(3) - 1);
+    let mut ids = Vec::new();
+    for token in 0..text_len {
+        ids.push([0, 0, 0, token]);
+    }
+    let mut grids = vec![(0, height, width)];
+    grids.extend(
+        references
+            .iter()
+            .enumerate()
+            .map(|(index, (rows, columns))| (10 * (index + 1), *rows, *columns)),
+    );
+    for (time, rows, columns) in grids {
+        for patch in 0..rows * columns {
+            let mut id = [0; 4];
+            id[0] = time;
+            id[row_axis] = patch / columns;
+            id[column_axis] = patch % columns;
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 impl Positions {
@@ -221,23 +273,28 @@ impl Positions {
     /// five hundred at the fastest frequency is an angle no `f32` holds to
     /// the last bit.
     pub(crate) fn new(config: &DitConfig, text_len: usize, height: usize, width: usize) -> Self {
+        Self::with_references(config, text_len, height, width, &[])
+    }
+
+    /// The same, with reference images' patches after the image's own, each
+    /// grid `(rows, columns)` on the first axis at ten times its index plus
+    /// ten, which is what FLUX.2 does so a reference never shares a position
+    /// with the image or with another reference.
+    pub(crate) fn with_references(
+        config: &DitConfig,
+        text_len: usize,
+        height: usize,
+        width: usize,
+        references: &[(usize, usize)],
+    ) -> Self {
         let pairs = config.head_dim() / 2;
-        let tokens = text_len + height * width;
+        let ids = token_ids(config, text_len, height, width, references);
+        let tokens = ids.len();
         let mut cos = vec![0.0; tokens * pairs];
         let mut sin = vec![0.0; tokens * pairs];
-        let axes = config.axes_dim.len();
-        let (row_axis, column_axis) = (axes.min(3).saturating_sub(2), axes.min(3) - 1);
 
-        for token in 0..tokens {
-            let mut position = [0.0f64; 4];
-            if token < text_len {
-                position[3] = token as f64;
-            } else {
-                let patch = token - text_len;
-                position[row_axis] = (patch / width) as f64;
-                position[column_axis] = (patch % width) as f64;
-            }
-
+        for (token, position) in ids.iter().enumerate() {
+            let position = position.map(|id| id as f64);
             let mut pair = 0;
             for (axis, dim) in config.axes_dim.iter().enumerate() {
                 let position = position.get(axis).copied().unwrap_or(0.0);
@@ -631,6 +688,7 @@ pub struct Dit {
     pub(crate) swiglu: bool,
     conditioning: Option<Conditioning>,
     unconditional: Option<Conditioning>,
+    references: Option<References>,
     #[cfg(feature = "cuda")]
     device: Option<crate::cuda_mmdit::DeviceDit>,
 }
@@ -656,6 +714,33 @@ impl Dit {
     /// sampling run and again for every new prompt.
     pub fn set_conditioning(&mut self, conditioning: Conditioning) {
         self.conditioning = Some(conditioning);
+    }
+
+    /// Hands it reference images to edit from, or takes them away with `None`.
+    ///
+    /// Every forward pass then attends over the references' tokens as well
+    /// and drops their outputs; only a model with four rotary axes (FLUX.2)
+    /// has positions to tell them apart.
+    pub fn set_references(&mut self, references: Option<References>) -> Result<(), NetworkError> {
+        if let Some(references) = &references
+            && (self.config.axes_dim.len() != 4
+                || references.tokens.cols != self.config.in_channels
+                || references.tokens.rows
+                    != references.grids.iter().map(|(rows, columns)| rows * columns).sum::<usize>())
+        {
+            return Err(NetworkError::InvalidConfig(
+                "reference tokens need a four-axis model and one in_channels-wide row per patch \
+                 of each grid"
+                    .into(),
+            ));
+        }
+        self.references = references;
+        Ok(())
+    }
+
+    /// The reference images being edited from, if any.
+    pub(crate) fn references(&self) -> Option<&References> {
+        self.references.as_ref()
     }
 
     /// Hands it the prompt to push away from, which is the empty one for
@@ -812,6 +897,7 @@ impl Dit {
             config,
             conditioning: None,
             unconditional: None,
+            references: None,
             #[cfg(feature = "cuda")]
             device: None,
         })
@@ -961,13 +1047,21 @@ impl Dit {
         }
 
         let vector = self.vector(timestep, conditioning)?;
-        let mut image = self.image_in.forward(patches)?;
+        let own_rows = patches.rows;
+        let grids = self.references.as_ref().map_or(&[][..], |r| &r.grids[..]);
+        let mut image = match &self.references {
+            Some(references) => self
+                .image_in
+                .forward(&concatenate(patches, &references.tokens))?,
+            None => self.image_in.forward(patches)?,
+        };
         let mut text = self.text_in.forward(&conditioning.text)?;
-        let positions = Positions::new(
+        let positions = Positions::with_references(
             &self.config,
             text.rows,
             conditioning.height,
             conditioning.width,
+            grids,
         );
         let heads = self.config.num_heads;
         let eps = self.config.eps;
@@ -1055,6 +1149,8 @@ impl Dit {
         }
 
         let (_, image) = split(&hidden, text.rows);
+        // The references only lent their tokens to the attention.
+        let (image, _) = split(&image, own_rows);
         let modulation = self
             .final_modulation
             .apply(&vector.iter().map(|value| silu(*value)).collect::<Vec<_>>())?;

@@ -1422,6 +1422,82 @@ impl ImagePipeline {
         self.decode(&latent, columns, rows)
     }
 
+    /// Hands a FLUX.2 denoiser reference images to edit from, or takes them
+    /// away when `images` is empty.
+    ///
+    /// Each image is in `[-1, 1]`, three channels, at a size
+    /// [`ImagePipeline::patch_grid`] accepts (diffusers resizes a reference
+    /// above a megapixel and crops it to a multiple of 16 first; that is the
+    /// caller's to do). It goes through the image encoder and the same
+    /// patch packing and batch-norm statistics as the image's own latent,
+    /// and rides through every denoiser step as extra tokens at its own
+    /// position in time. The image itself can be any size, not the
+    /// references'. Needs [`ImagePipeline::image_encoder`].
+    pub fn set_references(&mut self, images: &[FeatureMap]) -> Result<(), NetworkError> {
+        let ImageDenoiser::Transformer(dit) = &mut self.denoiser else {
+            return Err(NetworkError::InvalidConfig(
+                "only a transformer denoiser takes reference images".into(),
+            ));
+        };
+        if images.is_empty() {
+            return dit.set_references(None);
+        }
+        let encoder = self.image_encoder.as_ref().ok_or_else(|| {
+            NetworkError::InvalidConfig(
+                "this checkpoint's autoencoder holds no encoder, so it cannot read a reference"
+                    .into(),
+            )
+        })?;
+        let block = self.decoder.config().upscale() * self.config.patch;
+        let mut tokens: Option<Matrix> = None;
+        let mut grids = Vec::new();
+        for image in images {
+            if image.width == 0
+                || image.height == 0
+                || !image.width.is_multiple_of(block)
+                || !image.height.is_multiple_of(block)
+            {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "a {}x{} reference does not divide into {block}-pixel patches",
+                    image.width, image.height
+                )));
+            }
+            let mut packed = pixel_unshuffle(&encoder.encode(image)?, self.config.patch)?.to_tokens();
+            if let Some((mean, std)) = self.decoder.patch_norm() {
+                normalise_patches(&mut packed, mean, std, true)?;
+            }
+            grids.push((image.height / block, image.width / block));
+            tokens = Some(match tokens {
+                Some(before) => crate::mmdit::concatenate(&before, &packed),
+                None => packed,
+            });
+        }
+        let tokens = tokens.expect("images is not empty");
+        let ImageDenoiser::Transformer(dit) = &mut self.denoiser else {
+            unreachable!("checked above")
+        };
+        dit.set_references(Some(crate::mmdit::References { tokens, grids }))
+    }
+
+    /// [`ImagePipeline::generate`] editing from reference images: the
+    /// prompt says what to make of them. See
+    /// [`ImagePipeline::set_references`]. The references are taken away again
+    /// afterwards, whether the run worked or not.
+    pub fn generate_with_references(
+        &mut self,
+        prompt: &str,
+        width: usize,
+        height: usize,
+        seed: Option<u64>,
+        references: &[FeatureMap],
+        on_step: impl FnMut(usize, &Matrix) -> bool,
+    ) -> Result<FeatureMap, NetworkError> {
+        self.set_references(references)?;
+        let result = self.generate(prompt, width, height, seed, on_step);
+        self.set_references(&[])?;
+        result
+    }
+
     /// The same run started from a picture instead of from noise.
     ///
     /// `image` is in `[-1, 1]`, three channels, at a size
@@ -3082,6 +3158,105 @@ mod tests {
         assert!(failed.is_empty(), "over the gate: {failed:?}");
     }
 
+    /// FLUX.2-klein-4B editing from a reference image against
+    /// `REF_IMAGE=<512x512 png> python scripts/flux2_reference.py`, stage by
+    /// stage: ids (exact), the reference's latent tokens, the first step's
+    /// prediction, the final latent and the image. Variables as in
+    /// [`flux2_klein_matches_diffusers`]; the prompt embeddings are diffusers'
+    /// own, so only the reference path is under test. With `RB_FLUX2_CUDA=1`
+    /// the VAE encoder, the denoiser and the decoder run on the device.
+    #[test]
+    #[ignore = "needs FLUX.2-klein-4B and the output of scripts/flux2_reference.py with REF_IMAGE"]
+    fn flux2_klein_reference_matches_diffusers() {
+        let env = |name: &str| std::env::var(name).ok();
+        let dir = std::path::PathBuf::from(env("RB_FLUX2_REF").expect("RB_FLUX2_REF"));
+        let model = std::path::PathBuf::from(
+            env("RB_FLUX2_MODEL")
+                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
+        );
+        let mut reference =
+            crate::safetensors::SafeTensors::open(dir.join("flux2.safetensors")).unwrap();
+        let mut read = |name: &str| reference.tensor(name).unwrap().0;
+        let mut report = Vec::new();
+        let mut gate = |stage: &str, error: f32, limit: f32| {
+            eprintln!("flux2 reference {stage}: relative L2 {error:.3e} (gate {limit:.0e})");
+            report.push((stage.to_string(), error, limit));
+        };
+
+        #[allow(unused_mut)]
+        let mut pipeline = ImagePipeline::load_at(&model, Precision::Q8).unwrap();
+        #[cfg(feature = "cuda")]
+        if env("RB_FLUX2_CUDA").as_deref() == Some("1") {
+            pipeline.to_cuda(0).unwrap();
+        }
+        let pixels = FeatureMap::from_vec(3, 512, 512, read("ref_pixels")).unwrap();
+        pipeline.set_references(std::slice::from_ref(&pixels)).unwrap();
+        let ImageDenoiser::Transformer(dit) = &pipeline.denoiser else {
+            panic!("FLUX.2 has a transformer")
+        };
+
+        // Ids: text, the image's 32x32, the reference's 32x32 at time 10.
+        let ids = crate::mmdit::token_ids(dit.config(), 512, 32, 32, &[(32, 32)]);
+        let want: Vec<usize> = read("ids").iter().map(|&id| id as usize).collect();
+        assert_eq!(ids.concat(), want);
+
+        let tokens = &dit.references().unwrap().tokens;
+        assert_eq!((tokens.rows, tokens.cols), (1024, 128));
+        gate("latent tokens", relative(&tokens.data, &read("ref_latents")), 0.03);
+
+        let levels = pipeline.scheduler(1024).sigmas(4).unwrap();
+        let grid = read("noise");
+        let mut noise = Matrix::new(1024, 128);
+        for channel in 0..128 {
+            for token in 0..1024 {
+                noise.data[token * 128 + channel] = grid[channel * 1024 + token];
+            }
+        }
+        let conditioning = Conditioning {
+            text: Matrix::from_vec(512, 7680, read("prompt_embeds")),
+            pooled: Vec::new(),
+            height: 32,
+            width: 32,
+            guidance: pipeline.config.embedded_guidance,
+        };
+        pipeline.denoiser.set_conditioning(conditioning.clone());
+        let prediction = pipeline.denoiser.denoise(&noise, levels[0]).unwrap();
+        assert_eq!((prediction.rows, prediction.cols), (1024, 128));
+        gate("step-0 prediction", relative(&prediction.data, &read("step0_pred")), 0.025);
+
+        // The same step from diffusers' own reference tokens, which leaves
+        // the encoder's share of the error out of the denoiser's.
+        let ImageDenoiser::Transformer(dit) = &mut pipeline.denoiser else {
+            unreachable!()
+        };
+        dit.set_references(Some(crate::mmdit::References {
+            tokens: Matrix::from_vec(1024, 128, read("ref_latents")),
+            grids: vec![(32, 32)],
+        }))
+        .unwrap();
+        let prediction = pipeline.denoiser.denoise(&noise, levels[0]).unwrap();
+        gate(
+            "step-0 prediction, diffusers' tokens",
+            relative(&prediction.data, &read("step0_pred")),
+            0.025,
+        );
+        pipeline.set_references(std::slice::from_ref(&pixels)).unwrap();
+
+        let latent = pipeline
+            .sample_latent_from_noise(conditioning, None, noise, None, |_, _| true)
+            .unwrap();
+        gate("final latent, 4 steps", relative(&latent.data, &read("final_latents")), 0.05);
+        let decoded = pipeline.decode(&latent, 32, 32).unwrap();
+        gate("image, whole chain", relative(&decoded.data, &read("image")), 0.03);
+        #[cfg(feature = "images")]
+        if let Some(out) = env("RB_FLUX2_OUT") {
+            crate::vae::save_png(&decoded, out).unwrap();
+        }
+
+        let failed: Vec<_> = report.iter().filter(|(_, error, limit)| error > limit).collect();
+        assert!(failed.is_empty(), "over the gate: {failed:?}");
+    }
+
     /// FLUX.2-klein's Qwen3 prompt encoder on the device against diffusers'
     /// prompt embeddings, all 512 positions of the three stacked layers, at
     /// Q8 (int8 weights) and, with `RB_FLUX2_ENCODER=f32`, from the F32 host
@@ -3229,6 +3404,25 @@ mod tests {
             let error = relative(&got.data, &want);
             eprintln!("flux2 2+2 blocks {precision:?}: relative L2 {error:.3e} (gate {limit:.0e})");
             assert!(error <= limit, "{precision:?}: {error}");
+
+            // An edit run's dump also holds the same model with a reference.
+            let mut blocks = crate::safetensors::SafeTensors::open(dir.join("flux2_blocks.safetensors")).unwrap();
+            if let (Ok((tokens, _)), Ok((want, _))) =
+                (reference.tensor("ref_latents"), blocks.tensor("step0_pred_blocks_ref"))
+            {
+                dit.set_references(Some(crate::mmdit::References {
+                    tokens: Matrix::from_vec(1024, 128, tokens),
+                    grids: vec![(32, 32)],
+                }))
+                .unwrap();
+                let got = dit.denoise(&noise, 1.0).unwrap();
+                let error = relative(&got.data, &want);
+                eprintln!(
+                    "flux2 2+2 blocks {precision:?} with a reference: relative L2 {error:.3e} \
+                     (gate {limit:.0e})"
+                );
+                assert!(error <= limit, "{precision:?} with a reference: {error}");
+            }
         }
     }
 }

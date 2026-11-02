@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- FLUX.2-klein reference-image conditioning (image editing):
+  `ImagePipeline::set_references(&[FeatureMap])` and
+  `generate_with_references(prompt, width, height, seed, &references, on_step)`
+  encode each reference with the pipeline's VAE encoder and append its tokens
+  (ids `10 + 10 i` on the time axis) to the image tokens, host and device;
+  without references nothing changes. 512x512 edit, 4 steps, Q8 on the 3060:
+  3.92 s warm; image 0.0112 against diffusers. Example `image_edit`.
 - Wan VAE device decode gathers each frame's convolution columns once for all
   three temporal taps (the layers keep partial sums of the next outputs
   instead of the last two input frames) and skips the zero-bias epilogue on
