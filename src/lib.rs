@@ -161,6 +161,8 @@ pub mod yolo;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_flash;
 #[cfg(feature = "cuda")]
+pub(crate) mod cuda_fp8;
+#[cfg(feature = "cuda")]
 pub mod cuda_image;
 #[cfg(feature = "cuda")]
 pub mod cuda_mmdit;

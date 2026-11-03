@@ -62,6 +62,7 @@ pub(crate) struct ModelKernels {
     dequantize_groups_q8: CudaFunction,
     dequantize_q8: CudaFunction,
     dequantize_fp8: CudaFunction,
+    quantize_e4m3: CudaFunction,
     dequantize_q4: CudaFunction,
     gemv_q8: CudaFunction,
     swiglu_forward: CudaFunction,
@@ -116,6 +117,7 @@ impl ModelKernels {
             dequantize_groups_q8: get("dequantize_groups_q8")?,
             dequantize_q8: get("dequantize_q8")?,
             dequantize_fp8: get("dequantize_fp8")?,
+            quantize_e4m3: get("quantize_rows_e4m3")?,
             dequantize_q4: get("dequantize_q4")?,
             gemv_q8: get("gemv_q8")?,
             swiglu_forward: get("swiglu_fwd")?,
@@ -1722,6 +1724,85 @@ impl Gpu<'_> {
         Ok(wide)
     }
 
+    /// `rows` rows of `x` (BF16 when `narrow`) as E4M3 bytes and one scale a
+    /// row, the way `Quantized::from_matrix_fp8` stores a weight.
+    pub(crate) fn quantized_e4m3_rows(
+        &self,
+        x: &CudaView<'_, u8>,
+        narrow: bool,
+        rows: usize,
+        inner: usize,
+    ) -> Result<(CudaSlice<u8>, CudaSlice<f32>), NetworkError> {
+        let mut q = unsafe { self.context.stream.alloc::<u8>((rows * inner).max(1)) }
+            .map_err(cuda_alloc_err("device allocation", rows * inner))?;
+        let mut scales = self.uninit(rows)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.quantize_e4m3)
+                .arg(x)
+                .arg(&i32::from(narrow))
+                .arg(&(inner as i32))
+                .arg(&mut q)
+                .arg(&mut scales)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(cuda_err("E4M3 row quantize kernel"))?;
+        }
+        Ok((q, scales))
+    }
+
+    /// [`Gpu::project_at`] for an FP8 weight on the sm_89+ FP8 GEMM `gemm`
+    /// (`cuda_fp8::load`): `x` quantized to E4M3 per row, then
+    /// `out = x . W^T + beta * out` in FP32. UNVERIFIED: no sm_89 or sm_120
+    /// card has run it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn project_fp8_mma(
+        &self,
+        gemm: &CudaFunction,
+        weights: &Act,
+        first: usize,
+        units: usize,
+        inner: usize,
+        x: &CudaView<'_, u8>,
+        narrow: bool,
+        out: &mut CudaViewMut<'_, f32>,
+        rows: usize,
+        beta: f32,
+    ) -> Result<(), NetworkError> {
+        debug_assert!(weights.fp8);
+        if rows == 0 || units == 0 {
+            return Ok(());
+        }
+        let scales = weights.scales.as_ref().expect("an FP8 weight has scales");
+        let (xq, xs) = self.quantized_e4m3_rows(x, narrow, rows, inner)?;
+        let tile = crate::cuda_fp8::TILE;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(gemm)
+                .arg(&xq)
+                .arg(&xs)
+                .arg(&weights.bytes.slice(first * inner..))
+                .arg(&scales.slice(first..))
+                .arg(out)
+                .arg(&(rows as i32))
+                .arg(&(units as i32))
+                .arg(&(inner as i32))
+                .arg(&beta)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (units.div_ceil(tile) as u32, rows.div_ceil(tile) as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(cuda_err("FP8 tensor-core GEMM kernel"))?;
+        }
+        Ok(())
+    }
+
     /// [`Gpu::linear_packed`] for a weight that may be int8. A few rows, a
     /// decode step, read the int8 bytes directly, from [`Q8_MMA_ROWS`] on the
     /// tensor cores; more, a prompt, dequantize
@@ -1762,9 +1843,40 @@ impl Gpu<'_> {
             return self.linear_packed(&rows_of, units, inner, x, narrow, out, rows, beta);
         };
         if weights.fp8 {
+            if let Some(gemm) = &self.context.fp8_gemm {
+                // Opt-in, sm_89+ only, UNVERIFIED: no such card has run it.
+                return self.project_fp8_mma(
+                    gemm, weights, first, units, inner, x, narrow, out, rows, beta,
+                );
+            }
+            // Tests only: the FP8 GEMM's quality estimated on sm_86, by taking
+            // `x` through E4M3 and back before the widened product.
+            #[cfg(test)]
+            if std::env::var_os("RB_TEST_FP8_ACTIVATIONS").is_some() {
+                let (bytes, scales) = self.quantized_e4m3_rows(x, narrow, rows, inner)?;
+                let codes = Act {
+                    bytes,
+                    narrow: false,
+                    len: rows * inner,
+                    scales: Some(scales),
+                    group: 0,
+                    fp8: true,
+                };
+                let x8 = self.widened_fp8(&codes, 0, rows, inner, narrow)?;
+                let wide = self.widened_fp8(weights, first, units, inner, narrow)?;
+                return self.linear_packed(
+                    &wide.all(),
+                    units,
+                    inner,
+                    &x8.all(),
+                    narrow,
+                    out,
+                    rows,
+                    beta,
+                );
+            }
             // NOTE: sm_86 has no FP8 tensor cores, so every height widens
             // into a scratch copy and takes cuBLAS, as grouped int8 does.
-            // sm_89+ can read the bytes in an FP8 mma kernel (X3).
             let wide = self.widened_fp8(weights, first, units, inner, narrow)?;
             return self.linear_packed(&wide.all(), units, inner, x, narrow, out, rows, beta);
         }
@@ -5882,6 +5994,155 @@ mod tests {
                     (g - w).abs() <= bound + 1e-30,
                     "row {row} unit {unit}: {g:e} vs {w:e}"
                 );
+            }
+        }
+    }
+
+    /// `rows x inner` values whose rows span 2^-20 to 2^20 with a heavy tail
+    /// inside each (subnormal E4M3 codes), row 2 zero when there is one.
+    fn fp8_values(rows: usize, inner: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        let mut values: Vec<f32> = (0..rows * inner)
+            .map(|i| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1442695040888963407);
+                let u = (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                u * u * u * 8.0 * 2.0f32.powi(((i / inner) % 41) as i32 - 20)
+            })
+            .collect();
+        if rows > 2 {
+            values[2 * inner..3 * inner].fill(0.0);
+        }
+        values
+    }
+
+    /// `values` as a device operand, BF16 when `narrow`, and the host copy of
+    /// what the device holds.
+    fn fp8_operand(gpu: &Gpu<'_>, values: &[f32], rows: usize, narrow: bool) -> (Act, Matrix) {
+        let mut x = gpu.act(values.len(), narrow).unwrap();
+        gpu.cast_into(
+            &mut x.bytes.slice_mut(..),
+            &gpu.upload(values).unwrap().slice(..),
+            values.len(),
+            narrow,
+        )
+        .unwrap();
+        let host = Matrix::from_vec(rows, values.len() / rows, gpu.download_act(&x).unwrap());
+        (x, host)
+    }
+
+    /// The FP8 GEMM's activation quantizer against the host encoder, bit for
+    /// bit, from FP32 and BF16 input. No FP8 instruction, so the 3060 runs it.
+    #[test]
+    fn e4m3_row_quantization_matches_the_host_or_skips_without_device() {
+        let Some(context) = cuda_or_skip() else {
+            return;
+        };
+        let gpu = Gpu { context: &context };
+        for (rows, inner) in [(43, 300), (1, 1), (5, 4097)] {
+            for narrow in [false, true] {
+                let values = fp8_values(rows, inner, 0x9e37_79b9_7f4a_7c15);
+                let (x, host) = fp8_operand(&gpu, &values, rows, narrow);
+                let (q, scales) = gpu
+                    .quantized_e4m3_rows(&x.all(), narrow, rows, inner)
+                    .unwrap();
+                let want = crate::quantized::Quantized::from_matrix_fp8(&host);
+                let (want_q, want_scales) = want.parts_fp8().unwrap();
+                let got_q = context.stream.clone_dtoh(&q).unwrap();
+                let got_scales = gpu.download(&scales).unwrap();
+                assert_eq!(
+                    &got_q[..rows * inner],
+                    want_q,
+                    "{rows}x{inner} narrow {narrow}"
+                );
+                let bits = |v: &[f32]| v.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got_scales), bits(want_scales));
+            }
+        }
+    }
+
+    /// The sm_89+ FP8 GEMM against its host math
+    /// (`Quantized::matmul_fp8_activations`, gate rel_l2 < 1e-3) and the FP32
+    /// product of the unquantized operands (reported, loose gate), on ragged
+    /// shapes, FP32 and BF16 input and `beta` 0 and 1. UNVERIFIED: it skips on
+    /// the 3060 (sm_86) and no sm_89 or sm_120 card has run it yet.
+    #[test]
+    #[ignore = "needs sm_89+"]
+    fn the_fp8_gemm_matches_the_host_reference_on_sm_89_or_skips() {
+        let Some(context) = cuda_or_skip() else {
+            return;
+        };
+        let device = context.stream.context();
+        let (major, minor) = device.compute_capability().unwrap();
+        let Some(gemm) = crate::cuda_fp8::load(device) else {
+            eprintln!("skipped: needs sm_89+, device 0 is {major}.{minor}");
+            return;
+        };
+        let gpu = Gpu { context: &context };
+        let rel_l2 = |got: &[f32], want: &[f32]| {
+            let (mut diff, mut norm) = (0.0f64, 0.0f64);
+            for (g, w) in got.iter().zip(want) {
+                diff += f64::from(g - w).powi(2);
+                norm += f64::from(*w).powi(2);
+            }
+            (diff / norm.max(1e-300)).sqrt()
+        };
+        // (rows, units, inner, first): whole tiles, ragged edges on all three
+        // axes, an inner that is not a multiple of 16 or 32, a weight row
+        // offset, and one row.
+        for (rows, units, inner, first) in [
+            (64, 64, 64, 0),
+            (130, 77, 300, 0),
+            (1, 200, 3072, 0),
+            (257, 129, 33, 3),
+            (7, 3072, 96, 0),
+            (100, 70, 4097, 0),
+        ] {
+            let w = fp8_values(first + units, inner, 0x2545_f491_4f6c_dd1d);
+            let w = Matrix::from_vec(first + units, inner, w);
+            let host_w = crate::quantized::Quantized::from_matrix_fp8(&w);
+            let (bytes, scales) = host_w.parts_fp8().unwrap();
+            let weights = gpu.fp8(bytes, scales, first + units, inner).unwrap();
+            let unit_rows = Matrix::from_vec(units, inner, w.data[first * inner..].to_vec());
+            let host_w = crate::quantized::Quantized::from_matrix_fp8(&unit_rows);
+            for (narrow, beta) in [(true, 0.0), (false, 1.0)] {
+                let values: Vec<f32> = ramp_from(rows * inner, 7)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v * (1.0 + (i / inner) as f32))
+                    .collect();
+                let (x, x_host) = fp8_operand(&gpu, &values, rows, narrow);
+                let start = ramp_from(rows * units, 2);
+                let mut out = gpu.upload(&start).unwrap();
+                gpu.project_fp8_mma(
+                    &gemm,
+                    &weights,
+                    first,
+                    units,
+                    inner,
+                    &x.all(),
+                    narrow,
+                    &mut out.slice_mut(..),
+                    rows,
+                    beta,
+                )
+                .unwrap();
+                let got = gpu.download(&out).unwrap();
+                let mut reference = host_w.matmul_fp8_activations(&x_host);
+                let mut exact = Matrix::new(rows, units);
+                x_host.dot_rhs_transposed(&unit_rows, &mut exact);
+                for (i, s) in start.iter().enumerate() {
+                    reference.data[i] += beta * s;
+                    exact.data[i] += beta * s;
+                }
+                let (to_host, to_f32) = (rel_l2(&got, &reference.data), rel_l2(&got, &exact.data));
+                eprintln!(
+                    "{rows}x{units}x{inner} first {first} narrow {narrow} beta {beta}: \
+                     rel_l2 {to_host:.3e} to the host FP8 math, {to_f32:.3e} to FP32"
+                );
+                assert!(to_host < 1e-3, "against the host FP8 math: {to_host:e}");
+                assert!(to_f32 < 0.1, "against FP32: {to_f32:e}");
             }
         }
     }

@@ -294,6 +294,42 @@ impl Quantized {
         output
     }
 
+    /// `input . self^T` for an FP8 weight with `input` quantized to E4M3 too,
+    /// one scale per row as [`Quantized::from_matrix_fp8`] stores a weight:
+    /// the decoded codes multiplied and summed in `f32`, then both scales.
+    /// The host reference of the sm_89+ FP8 GEMM (`cuda_fp8`); the device sums
+    /// in another order, so the two agree to rounding, not bit for bit.
+    #[cfg(test)]
+    pub(crate) fn matmul_fp8_activations(&self, input: &Matrix) -> Matrix {
+        let Values::Fp8(weights) = &self.values else {
+            panic!("matmul_fp8_activations needs an FP8 weight");
+        };
+        debug_assert_eq!(input.cols, self.cols);
+        let cols = self.cols.max(1);
+        let x = Self::from_matrix_fp8(input);
+        let Values::Fp8(codes) = &x.values else {
+            unreachable!()
+        };
+        let table = e4m3_table();
+        let mut output = Matrix::new(input.rows, self.rows);
+        output
+            .data
+            .par_chunks_mut(self.rows.max(1))
+            .zip(codes.par_chunks(cols).zip(&x.scales))
+            .for_each(|(target, (row, x_scale))| {
+                for (unit, slot) in target.iter_mut().enumerate() {
+                    let w = &weights[unit * cols..(unit + 1) * cols];
+                    let dot: f32 = row
+                        .iter()
+                        .zip(w)
+                        .map(|(&a, &b)| table[usize::from(a)] * table[usize::from(b)])
+                        .sum();
+                    *slot = dot * x_scale * self.scales[unit];
+                }
+            });
+        output
+    }
+
     /// Writes row `index` back as `f32`, for the embedding lookup.
     pub(crate) fn dequantize_row(&self, index: usize, target: &mut [f32]) {
         let cols = self.cols.max(1);
@@ -697,6 +733,51 @@ mod tests {
             assert!((got - want).abs() < 1e-4, "{got} vs {want}");
         }
         assert_eq!(quantized.bytes(), rows * cols + rows * 4);
+    }
+
+    /// The host reference of the FP8 GEMM: exact on integers E4M3 holds
+    /// (absmax 448 makes both scales 1), and within E4M3's rounding of the
+    /// float product on random data, with a zero row giving zeros.
+    #[test]
+    fn fp8_activations_times_an_fp8_weight_is_the_e4m3_product() {
+        let (rows, units, cols) = (5, 6, 33);
+        // Integers up to 16 and 448 are E4M3 codes; one 448 a row.
+        let ints = |n: usize, seed: usize| -> Matrix {
+            let mut data: Vec<f32> = (0..n * cols)
+                .map(|i| ((i * 7 + seed) % 33) as f32 - 16.0)
+                .collect();
+            for row in data.chunks_mut(cols) {
+                row[seed % cols] = 448.0;
+            }
+            Matrix::from_vec(n, cols, data)
+        };
+        let (x, w) = (ints(rows, 3), ints(units, 11));
+        let got = Quantized::from_matrix_fp8(&w).matmul_fp8_activations(&x);
+        let mut want = Matrix::new(rows, units);
+        x.dot_rhs_transposed(&w, &mut want);
+        assert_eq!(got.data, want.data);
+
+        let (rows, units, cols) = (9, 13, 300);
+        let mut x = Matrix::from_vec(rows, cols, normal(rows * cols));
+        x.row_mut(4).fill(0.0);
+        // `normal` restarts its sequence, so the weight takes values after x's.
+        let w = normal((rows + units) * cols)[rows * cols..].to_vec();
+        let w = Matrix::from_vec(units, cols, w);
+        let got = Quantized::from_matrix_fp8(&w).matmul_fp8_activations(&x);
+        let mut want = Matrix::new(rows, units);
+        x.dot_rhs_transposed(&w, &mut want);
+        assert!(got.row(4).iter().all(|&v| v == 0.0));
+        let l2 = |v: &[f32]| v.iter().map(|a| a * a).sum::<f32>().sqrt();
+        let diff: Vec<f32> = got
+            .data
+            .iter()
+            .zip(&want.data)
+            .map(|(a, b)| a - b)
+            .collect();
+        let rel = l2(&diff) / l2(&want.data);
+        eprintln!("FP8 x FP8 against the f32 product: rel_l2 {rel:.3e}");
+        // Two operands each within 2^-4 relative.
+        assert!(rel < 0.08, "rel_l2 {rel}");
     }
 
     #[test]
