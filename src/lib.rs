@@ -173,6 +173,8 @@ pub mod cuda_t5;
 #[cfg(feature = "cuda")]
 pub mod cuda_wan_dit;
 #[cfg(feature = "cuda")]
+pub mod cuda_sana;
+#[cfg(feature = "cuda")]
 pub(crate) mod cuda_w8a8;
 #[cfg(feature = "cuda")]
 pub mod cuda_text_encoder;
