@@ -15,6 +15,7 @@
 //! kernels saves one pass per GEMM if a profile ever shows it.
 
 use crate::conv::Dense;
+use crate::cuda_flash::compile_ptx;
 use crate::cuda_training::{cfg, cuda_err};
 use crate::dit_lora::{Adapter, DitLora};
 use crate::gpu_model::{Act, FlashShape, Gpu};
@@ -26,7 +27,7 @@ use crate::mmdit::{Conditioning, Dit, Positions};
 use crate::network::NetworkError;
 use crate::param::Param;
 use cudarc::driver::{CudaFunction, CudaSlice, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::{Ptx, compile_ptx};
+use cudarc::nvrtc::Ptx;
 use std::sync::{Arc, OnceLock};
 
 const KERNELS: &str = r#"

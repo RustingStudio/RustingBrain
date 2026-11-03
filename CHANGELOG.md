@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Every NVRTC kernel now compiles for the device's own virtual architecture:
+  the newest one the loaded NVRTC reports that is not above the oldest
+  visible device (compute_86 on a 3060, compute_89 on an sm_89 card,
+  compute_120 on an RTX 50; with NVRTC 13.4 an unknown newer card gets
+  compute_121, which the driver JIT-compiles forward). Before,
+  only the fused attention kernels named a target (compute_80, still their
+  floor); the rest used NVRTC's default. A device older than NVRTC's list or
+  a failed query keeps the default. 3060: lib suite 700 passed with the
+  known detection failure, and FLUX.2-klein (step-0 8.73e-3, image 3.03e-2)
+  and Wan DiT/VAE device parity are unchanged. The sm_89 and sm_120 targets
+  are UNVERIFIED: no such card has run them.
 - FLUX.2-klein's transformer can store its block linears as FP8 E4M3, with one
   scale per row: `Precision::Fp8` (opt-in; Q8 stays the default). This adds a
   variant to `Precision`, so an exhaustive `match` on it outside the crate

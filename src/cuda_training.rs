@@ -1,5 +1,6 @@
 //! Fail-closed FP32 CUDA fitting.  All state below is owned by `CudaSlice`s;
 //! host pointers are only used by cudarc's checked copy operations.
+use crate::cuda_flash::compile_ptx;
 use crate::{
     Activation, CudaTrainingCheckpoint, Dataset, Loss, Network, NetworkError, Optimizer,
     TrainConfig, TrainingHistory,
@@ -8,7 +9,7 @@ use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys::cublasOperation_t};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{Ptx, compile_ptx};
+use cudarc::nvrtc::Ptx;
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::{
     collections::HashMap,

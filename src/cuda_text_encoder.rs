@@ -13,6 +13,7 @@
 //! The embedding table stays on the host. It is read by lookup, and for
 //! Qwen3-4B it is 1.5 GB that no GEMM reads.
 
+use crate::cuda_flash::compile_ptx;
 use crate::cuda_training::{cfg, cuda_err};
 use crate::gpu_model::{Act, FlashShape, Gpu};
 use crate::gpu_transformer::GpuContext;
@@ -20,7 +21,7 @@ use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::text_encoder::{Rotary, TextEncoder};
 use cudarc::driver::{CudaFunction, CudaSlice, PushKernelArg};
-use cudarc::nvrtc::{Ptx, compile_ptx};
+use cudarc::nvrtc::Ptx;
 use std::sync::{Arc, OnceLock};
 
 // The per-head RMS norm on a query or key (skipped when `norm` is 0), then the
