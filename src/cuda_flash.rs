@@ -24,7 +24,7 @@
 use crate::cuda_training::cuda_err;
 use cudarc::driver::sys::CUfunction_attribute;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
-use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
+use cudarc::nvrtc::{CompileError, CompileOptions, Ptx, compile_ptx_with_opts};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1053,8 +1053,15 @@ pub(crate) fn flash_kernels(device: usize, context: &Arc<CudaContext>) -> Option
     let module = modules
         .entry(device)
         .or_insert_with(|| {
+            // `mma.sync` with BF16 needs at least compute_80. Above that the
+            // process target is used, so an sm_89 or sm_120 box gets its own
+            // PTX (UNVERIFIED: no such card has run this).
+            let arch = match nvrtc_arch() {
+                Some((number, name)) if number >= 80 => name,
+                _ => "compute_80",
+            };
             let options = CompileOptions {
-                arch: Some("compute_80"),
+                arch: Some(arch),
                 ..Default::default()
             };
             let ptx = compile_ptx_with_opts(KERNELS, options).ok()?;
@@ -1107,6 +1114,89 @@ pub(crate) fn eligible(mixed_precision: bool, head_dim: usize) -> bool {
     mixed_precision && matches!(head_dim, 64 | 128) && !disabled()
 }
 
+/// Compiles `src` for [`nvrtc_arch`], or for NVRTC's default target when the
+/// device or NVRTC cannot be asked. Every kernel source in the crate goes
+/// through here, so the sm_89 and sm_120 kernels of RustingFrame X3 can use
+/// their own instructions.
+pub(crate) fn compile_ptx(src: &str) -> Result<Ptx, CompileError> {
+    let options = CompileOptions {
+        arch: nvrtc_arch().map(|(_, name)| name),
+        ..Default::default()
+    };
+    compile_ptx_with_opts(src, options)
+}
+
+/// The NVRTC `--gpu-architecture` for this process: the virtual architecture
+/// NVRTC knows that is closest to, and not above, the oldest visible device,
+/// as its number (86 for compute_86) and name. `None` keeps NVRTC's default.
+///
+/// The compiled PTX is cached process-wide and loaded on every device, so the
+/// oldest device decides. PTX JIT-compiles forward, so it runs on newer cards.
+/// The sm_89 and sm_120 targets are UNVERIFIED: only sm_86 has run this.
+pub(crate) fn nvrtc_arch() -> Option<(i32, &'static str)> {
+    static ARCH: OnceLock<Option<(i32, String)>> = OnceLock::new();
+    ARCH.get_or_init(|| {
+        let oldest = oldest_device_capability()?;
+        let number = pick_arch(oldest, &nvrtc_supported_archs()?)?;
+        Some((number, format!("compute_{number}")))
+    })
+    .as_ref()
+    .map(|(number, name)| (*number, name.as_str()))
+}
+
+/// The highest of `supported` (NVRTC's list, 86 for 8.6) not above
+/// `capability`. `None` when the device is older than all of them.
+fn pick_arch((major, minor): (i32, i32), supported: &[i32]) -> Option<i32> {
+    let device = major * 10 + minor;
+    supported
+        .iter()
+        .copied()
+        .filter(|&arch| arch <= device)
+        .max()
+}
+
+/// The lowest compute capability among the visible devices. Read through the
+/// driver rather than a [`CudaContext`], which would create a primary context
+/// (and take memory) on every device.
+fn oldest_device_capability() -> Option<(i32, i32)> {
+    use cudarc::driver::result::{device, init};
+    use cudarc::driver::sys::CUdevice_attribute::{
+        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR as MAJOR,
+        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR as MINOR,
+    };
+    init().ok()?;
+    (0..device::get_count().ok()?)
+        .map(|ordinal| {
+            let handle = device::get(ordinal).ok()?;
+            // SAFETY: `handle` came from `device::get`.
+            unsafe {
+                Some((
+                    device::get_attribute(handle, MAJOR).ok()?,
+                    device::get_attribute(handle, MINOR).ok()?,
+                ))
+            }
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()
+}
+
+/// The virtual architectures the loaded NVRTC accepts, such as 75, 86, 89 and
+/// 120 for NVRTC 13. Asked at runtime because the library is loaded
+/// dynamically and may be older or newer than the one this was built against.
+fn nvrtc_supported_archs() -> Option<Vec<i32>> {
+    use cudarc::nvrtc::sys::{nvrtcGetNumSupportedArchs, nvrtcGetSupportedArchs, nvrtcResult};
+    let mut count = 0;
+    // SAFETY: NVRTC writes one int, then `count` ints into a buffer that long.
+    unsafe {
+        if nvrtcGetNumSupportedArchs(&mut count) != nvrtcResult::NVRTC_SUCCESS || count <= 0 {
+            return None;
+        }
+        let mut archs = vec![0; count as usize];
+        (nvrtcGetSupportedArchs(archs.as_mut_ptr()) == nvrtcResult::NVRTC_SUCCESS).then_some(archs)
+    }
+}
+
 /// Set by `RUSTING_BRAIN_NO_FLASH`. An escape hatch worth keeping: a fused
 /// attention kernel is the kind of thing that is wrong on exactly one shape,
 /// and a run that can fall back without a rebuild is a run that can be
@@ -1131,6 +1221,26 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    /// What NVRTC 13.4 reports from `nvrtcGetSupportedArchs` (no `a`/`f` variants).
+    const NVRTC_13: [i32; 13] = [75, 80, 86, 87, 88, 89, 90, 100, 103, 107, 110, 120, 121];
+
+    #[test]
+    fn the_nvrtc_arch_is_the_highest_known_one_not_above_the_device() {
+        let pick = |capability| super::pick_arch(capability, &NVRTC_13);
+        assert_eq!(pick((8, 6)), Some(86));
+        assert_eq!(pick((8, 9)), Some(89));
+        assert_eq!(pick((12, 0)), Some(120));
+        // A future card NVRTC does not know gets the newest target below it,
+        // whose PTX the driver JIT-compiles forward.
+        assert_eq!(pick((13, 5)), Some(121));
+        // 8.5 does not exist; it falls to 8.0, not up to 8.6.
+        assert_eq!(pick((8, 5)), Some(80));
+        // Older than anything NVRTC 13 builds for: its default, which fails
+        // to load there as it does today.
+        assert_eq!(pick((6, 1)), None);
+        assert_eq!(super::pick_arch((8, 6), &[]), None);
+    }
+
     /// NVRTC only sees this source at runtime, so nothing in a `cargo build`
     /// catches a typo in the PTX. Without this test a kernel that fails to
     /// compile is silently `None` and every parity test still passes, having
@@ -1141,9 +1251,12 @@ mod tests {
             crate::cuda_training::skip_without_cuda();
             return;
         };
-        match context.compute_capability() {
-            Ok((major, _)) if major >= 8 => {}
-            _ => return,
+        let (major, minor) = context.compute_capability().unwrap();
+        let arch = super::nvrtc_arch();
+        eprintln!("device 0 is {major}.{minor}, NVRTC target {arch:?}");
+        assert!(arch.is_some_and(|(number, _)| number <= major * 10 + minor));
+        if major < 8 {
+            return;
         }
         assert!(
             super::flash_kernels(0, &context).is_some(),

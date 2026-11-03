@@ -51,6 +51,7 @@
 
 use crate::clip::{ClipTextEncoder, Layer, Norm};
 use crate::conv::{Conv2d, Dense, FeatureMap, GroupNorm};
+use crate::cuda_flash::compile_ptx;
 use crate::cuda_training::{cfg, cuda_alloc_err, cuda_err, device_context};
 use crate::gpu_transformer::{GpuContext, act_lhs_transposed, act_plain, act_rhs_transposed};
 use crate::matrix::Matrix;
@@ -63,7 +64,7 @@ use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaView, DevicePtr, DevicePtrMut, LaunchConfig,
     PushKernelArg,
 };
-use cudarc::nvrtc::{Ptx, compile_ptx};
+use cudarc::nvrtc::Ptx;
 use half::f16;
 use lora::{AttentionRecord, BlockRecord, DeviceLora, Recorder};
 use std::sync::{Arc, OnceLock};

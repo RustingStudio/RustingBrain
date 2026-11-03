@@ -16,6 +16,7 @@
 //! of a whole sampling run shows them (512 rows against 4400 at 704x1280).
 
 use crate::conv::{Dense, FeatureMap};
+use crate::cuda_flash::compile_ptx;
 use crate::cuda_training::{cfg, cuda_err};
 use crate::gpu_model::{Act, FlashShape, Gpu};
 use crate::gpu_transformer::GpuContext;
@@ -23,7 +24,7 @@ use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::wan_dit::{WanBlock, WanDit, rope};
 use cudarc::driver::{CudaFunction, CudaSlice, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::{Ptx, compile_ptx};
+use cudarc::nvrtc::Ptx;
 use std::sync::{Arc, OnceLock};
 
 const KERNELS: &str = r#"
