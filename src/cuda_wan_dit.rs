@@ -987,6 +987,86 @@ mod tests {
         }
     }
 
+    /// The real int8 Wan 2.2 TI2V-5B on the device against one diffusers
+    /// BF16 forward per size (RustingFrame's `tools/wan_diffusers_bench.py
+    /// dit1`): the same seeded latent, frame 0 at t = 0 and the rest at t,
+    /// the "ti2v" prompt embeds. `RB_WAN_CUDA=1`; `RB_WS9D_REF` holds
+    /// `dit1_<HxWxF>.safetensors`; `RB_WS9D_SIZES` (default
+    /// `352x640x17,352x640x121`); `RB_WAN_EMBEDS`; `RB_WAN_MODEL`.
+    #[test]
+    #[ignore = "needs Wan2.2-TI2V-5B, RB_WAN_CUDA=1 and RB_WS9D_REF"]
+    fn real_forward_matches_diffusers_per_latent_frame() {
+        use crate::wan_vae::tests::{frames, relative};
+        let env = |name: &str| std::env::var(name).ok();
+        let Some(dir) = env("RB_WS9D_REF").filter(|_| env("RB_WAN_CUDA").as_deref() == Some("1"))
+        else {
+            eprintln!("skipped: needs RB_WAN_CUDA=1 and RB_WS9D_REF");
+            return;
+        };
+        let model_dir = std::path::PathBuf::from(
+            env("RB_WAN_MODEL")
+                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+        );
+        let embeds = env("RB_WAN_EMBEDS").unwrap_or_else(|| {
+            "/home/vasylt/Code/rusting/RustingFrame/tools/ref/wan/embeds.safetensors".into()
+        });
+        let (data, shape) = crate::safetensors::SafeTensors::open(embeds)
+            .unwrap()
+            .tensor("ti2v")
+            .unwrap();
+        let context = Matrix::from_vec(shape[0], shape[1], data);
+        let config =
+            crate::wan_dit::WanDitConfig::from_file(model_dir.join("transformer/config.json"))
+                .unwrap();
+        let weights = model_dir.join("transformer/diffusion_pytorch_model.safetensors.index.json");
+        let model = WanDit::load_at(&weights, config.clone(), Precision::Q8).unwrap();
+        let gpu = cuda_or_skip().expect("RB_WAN_CUDA=1 needs a device");
+        let device = DeviceWanDit::upload(&gpu, &model).unwrap();
+        let sizes = env("RB_WS9D_SIZES").unwrap_or_else(|| "352x640x17,352x640x121".into());
+        let mut worst = 0.0f32;
+        for size in sizes.split(',').map(str::trim) {
+            let path = std::path::Path::new(&dir).join(format!("dit1_{size}.safetensors"));
+            let mut reference = crate::safetensors::SafeTensors::open(path).unwrap();
+            let (data, shape) = reference.tensor("latent").unwrap();
+            let latent = frames(&data, &shape);
+            // One timestep per token, even over each frame.
+            let (per_token, _) = reference.tensor("timestep").unwrap();
+            let per_frame = per_token.len() / latent.len();
+            let timesteps: Vec<f32> = per_token.iter().step_by(per_frame).copied().collect();
+            for (frame, t) in per_token.chunks(per_frame).zip(&timesteps) {
+                assert!(frame.iter().all(|value| value == t));
+            }
+            assert_eq!(timesteps[0], 0.0);
+            let (data, shape) = reference.tensor("output").unwrap();
+            let want = frames(&data, &shape);
+            let started = std::time::Instant::now();
+            let got = device
+                .forward(&model, &latent, &timesteps, &context)
+                .unwrap();
+            let seconds = started.elapsed().as_secs_f32();
+            let per: Vec<f32> = got
+                .iter()
+                .zip(&want)
+                .map(|(got, want)| relative(&got.data, &want.data))
+                .collect();
+            let flat =
+                |maps: &[FeatureMap]| maps.iter().flat_map(|m| m.data.clone()).collect::<Vec<_>>();
+            let all = relative(&flat(&got), &flat(&want));
+            worst = per.iter().copied().fold(worst, f32::max);
+            eprintln!(
+                "ws9d {size} ({} latent frames, t={}, {seconds:.1} s): rel_l2 {all:.3e}; per frame {}",
+                latent.len(),
+                timesteps[timesteps.len() - 1],
+                per.iter()
+                    .map(|e| format!("{e:.3e}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        // W3 gated the device Q8 forward at 5e-2 against FP32.
+        assert!(worst < 5e-2, "worst latent frame {worst}");
+    }
+
     #[test]
     fn malformed_shapes_are_refused_before_upload_or_skip_without_device() {
         let Some(gpu) = cuda_or_skip() else { return };
