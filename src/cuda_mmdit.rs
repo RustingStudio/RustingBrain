@@ -273,7 +273,7 @@ pub struct DeviceDit {
     head_norm_rope_bwd: CudaFunction,
     gelu_bwd: CudaFunction,
     gate_rows: CudaFunction,
-    /// The int8 tensor-core path (`RB_FLUX2_W8A8=1`), loaded only when asked.
+    /// The int8 tensor-core path: FLUX.2 on sm_80+ unless `RB_FLUX2_W8A8=0`.
     w8a8: Option<W8a8>,
     /// Whether any weight is int8, which the backward pass cannot read.
     quantized: bool,
@@ -495,7 +495,7 @@ impl DeviceDit {
             head_norm_rope_bwd: get("head_norm_rope_bwd")?,
             gelu_bwd: get("gelu_bwd")?,
             gate_rows: get("gate_rows")?,
-            w8a8: match crate::cuda_w8a8::enabled() {
+            w8a8: match crate::cuda_w8a8::enabled() && dit.swiglu {
                 true => W8a8::load(&gpu)?,
                 false => None,
             },
@@ -1566,7 +1566,7 @@ impl DeviceDit {
         Ok(out)
     }
 
-    /// `out = x . W^T + beta * out`; with `RB_FLUX2_W8A8=1` an int8 weight
+    /// `out = x . W^T + beta * out`; with the W8A8 path loaded an int8 weight
     /// takes the int8 tensor cores, `x` quantized per row on the way.
     fn project(
         &self,

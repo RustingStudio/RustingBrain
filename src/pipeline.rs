@@ -3076,7 +3076,7 @@ mod tests {
         let mut read = |name: &str| reference.tensor(name).unwrap().0;
         let mut report = Vec::new();
         let mut gate = |stage: &str, error: f32, limit: f32| {
-            eprintln!("flux2 {stage}: relative L2 {error:.3e} (gate {limit:.0e})");
+            eprintln!("flux2 {stage}: relative L2 {error:.3e} (gate {limit})");
             report.push((stage.to_string(), error, limit));
         };
 
@@ -3131,6 +3131,17 @@ mod tests {
         }
         eprintln!("flux2 load: {:?}", started.elapsed());
         assert_eq!(pipeline.config.steps, 4);
+        // W8A8, the device default on sm_80+, rounds the block linears'
+        // activations to int8 too. The owner waived the gates for it
+        // (2026-11-03), so a W8A8 run is held to its measured 1.114e-2 /
+        // 4.935e-2 / 4.154e-2 plus about 12 %, which still catches a broken
+        // kernel; `RB_FLUX2_W8A8=0` runs the strict gates below.
+        #[cfg(feature = "cuda")]
+        let w8a8 = crate::cuda_w8a8::enabled() && crate::cuda_w8a8::loaded();
+        #[cfg(not(feature = "cuda"))]
+        let w8a8 = false;
+        let limit = |strict: f32, int8: f32| if w8a8 { int8 } else { strict };
+        eprintln!("flux2 W8A8: {w8a8}");
 
         let (got, _) = pipeline.encoder.encode(prompt).unwrap();
         gate(
@@ -3169,7 +3180,7 @@ mod tests {
         gate(
             "step-0 prediction",
             relative(&prediction.data, &read("step0_pred")),
-            0.011,
+            limit(0.011, 0.0125),
         );
 
         let started = std::time::Instant::now();
@@ -3181,7 +3192,7 @@ mod tests {
         gate(
             "final latent, 4 steps",
             relative(&latent.data, &final_latents),
-            0.04,
+            limit(0.04, 0.055),
         );
 
         // What the autoencoder is handed, from diffusers' own final latent.
@@ -3210,7 +3221,7 @@ mod tests {
         gate(
             "decoded image, whole chain",
             relative(&decoded.data, &image),
-            0.034,
+            limit(0.034, 0.046),
         );
         #[cfg(feature = "images")]
         if let Some(out) = env("RB_FLUX2_OUT") {
