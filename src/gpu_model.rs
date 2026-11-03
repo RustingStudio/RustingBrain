@@ -310,6 +310,14 @@ impl Act {
         self.bytes.slice(..)
     }
 
+    /// An int8 weight's bytes, scales and columns a scale (0: one a row).
+    pub(crate) fn int8(&self) -> Option<(&CudaSlice<u8>, &CudaSlice<f32>, usize)> {
+        match &self.scales {
+            Some(scales) if !self.fp8 => Some((&self.bytes, scales, self.group)),
+            _ => None,
+        }
+    }
+
     /// The same bytes as FP32, for the kernels that never learned to narrow.
     ///
     /// Only sound on a wide buffer, which is why every caller is on the routed

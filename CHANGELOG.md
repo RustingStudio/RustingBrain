@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- W8A8 for FLUX.2-klein's block linears (RustingFrame P5), opt-in with
+  `RB_FLUX2_W8A8=1` on compute capability 8.0+: `cuda_w8a8` quantizes BF16
+  activations to int8 per token per 64 columns and multiplies them with the
+  Q8 weights on the int8 tensor cores (`mma.sync` m16n8k32 s8), FP32 out.
+  The default path is unchanged. On the 3060, 1024x1024 denoise 6.91 s to
+  4.98 s (28 % less), 512x512 2.35 s to 1.53 s; klein against diffusers
+  with the switch: step-0 1.11e-2, final latent 4.94e-2, image 4.15e-2, over
+  the image gate (0.034), which the owner waived for this path.
 - An FP8 GEMM for sm_89 and later (RustingFrame X3a), off by default:
   `cuda_fp8` runs `y = x . W^T + beta * y` for an X1 FP8 weight with `x`
   quantized to E4M3 per row on the fly (`quantize_rows_e4m3`, bit for bit the
