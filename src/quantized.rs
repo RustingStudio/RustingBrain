@@ -96,6 +96,41 @@ enum Values {
         codebook: Codebook,
         packed: Vec<u8>,
     },
+    /// FP8 E4M3 (`e4m3fn`) bytes, one scale per row: `scale = absmax / 448`
+    /// and the nearest E4M3 value of `w / scale`. A storage format here: the
+    /// host and an sm_86 device widen it before they multiply.
+    Fp8(Vec<u8>),
+}
+
+/// The largest finite E4M3 (`e4m3fn`) value.
+pub(crate) const E4M3_MAX: f32 = 448.0;
+
+/// `x` as E4M3 (`e4m3fn`) bits, rounded to nearest even and saturated at
+/// [`E4M3_MAX`]; `NaN` is `0x7f`.
+///
+/// The positive codes count up in value order, and the step inside an octave
+/// `[2^e, 2^(e+1))` is `2^(e-3)` (`2^-9` for the subnormals, `e = -6`), so the
+/// code is the octave's first code plus the value in steps. Rounding up out of
+/// an octave lands on the next octave's first code by the same sum.
+pub(crate) fn f32_to_e4m3(x: f32) -> u8 {
+    if x.is_nan() {
+        return 0x7f;
+    }
+    let sign = if x.is_sign_negative() { 0x80 } else { 0 };
+    let a = x.abs();
+    if a >= E4M3_MAX {
+        return sign | 0x7e;
+    }
+    let octave = ((a.to_bits() >> 23) as i32 - 127).max(-6);
+    // A power of two, so the product is exact and only the rounding rounds.
+    let steps = (a * f32::from_bits(((130 - octave) as u32) << 23)).round_ties_even() as i32;
+    sign | (((octave + 7) << 3) + steps - 8).min(0x7e) as u8
+}
+
+/// The 256 E4M3 values, from the decoder the safetensors reader uses.
+fn e4m3_table() -> &'static [f32; 256] {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|b| crate::safetensors::f8_to_f32(b as u8, 4, 3)))
 }
 
 impl Quantized {
@@ -133,6 +168,30 @@ impl Quantized {
             values: Values::Int8(data),
             scales,
             group,
+        }
+    }
+
+    /// Stores `value` as FP8 E4M3 with one scale per row (see
+    /// [`Values::Fp8`]). A row of zeros gets a scale of zero.
+    pub(crate) fn from_matrix_fp8(value: &Matrix) -> Self {
+        let cols = value.cols.max(1);
+        let mut data = Vec::with_capacity(value.data.len());
+        let mut scales = Vec::with_capacity(value.rows);
+        for row in value.data.chunks(cols) {
+            let absmax = row.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+            let scale = absmax / E4M3_MAX;
+            scales.push(scale);
+            data.extend(row.iter().map(|v| match scale > 0.0 {
+                true => f32_to_e4m3(v / scale),
+                false => 0,
+            }));
+        }
+        Self {
+            rows: value.rows,
+            cols: value.cols,
+            values: Values::Fp8(data),
+            scales,
+            group: cols,
         }
     }
 
@@ -174,7 +233,7 @@ impl Quantized {
         let mut output = Matrix::new(input.rows, self.rows);
         let levels = match &self.values {
             Values::Four { codebook, .. } => codebook.levels(),
-            Values::Int8(_) => [0.0; 16],
+            _ => [0.0; 16],
         };
         let blocks = cols.div_ceil(BLOCK);
         let row_bytes = blocks * BLOCK / 2;
@@ -195,6 +254,9 @@ impl Quantized {
                 &self.scales[unit * blocks..(unit + 1) * blocks],
                 &levels,
             ),
+            Values::Fp8(data) => {
+                dot_fp8(activations, &data[unit * cols..(unit + 1) * cols]) * self.scales[unit]
+            }
         };
 
         // A sequence of tokens is the cheapest thing to fork on: the rows are
@@ -254,6 +316,16 @@ impl Quantized {
                     *slot = levels[usize::from(nibble)] * scales[k / BLOCK];
                 }
             }
+            Values::Fp8(data) => {
+                let table = e4m3_table();
+                let scale = self.scales[index];
+                for (slot, &byte) in target
+                    .iter_mut()
+                    .zip(&data[index * cols..(index + 1) * cols])
+                {
+                    *slot = table[usize::from(byte)] * scale;
+                }
+            }
         }
     }
 
@@ -292,6 +364,7 @@ impl Quantized {
         let values = match &self.values {
             Values::Int8(data) => data.len(),
             Values::Four { packed, .. } => packed.len(),
+            Values::Fp8(data) => data.len(),
         };
         values + self.scales.len() * 4
     }
@@ -321,8 +394,18 @@ impl Quantized {
     #[cfg(feature = "cuda")]
     pub(crate) fn parts_4bit(&self) -> Option<(&[u8], &[f32], Codebook)> {
         match &self.values {
-            Values::Int8(_) => None,
             Values::Four { codebook, packed } => Some((packed, &self.scales, *codebook)),
+            _ => None,
+        }
+    }
+
+    /// The E4M3 bytes, row-major, and one scale per row; `None` unless the
+    /// weight is FP8.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn parts_fp8(&self) -> Option<(&[u8], &[f32])> {
+        match &self.values {
+            Values::Fp8(data) => Some((data, &self.scales)),
+            _ => None,
         }
     }
 }
@@ -375,6 +458,29 @@ fn dot(activations: &[f32], weights: &[i8]) -> f32 {
         return unsafe { dot_avx2(activations, weights) };
     }
     dot_lanes::<8>(activations, weights)
+}
+
+/// `f32` activations against one E4M3 row, widened through the table eight
+/// at a time into the lane-wise product of [`dot_lanes`].
+fn dot_fp8(activations: &[f32], weights: &[u8]) -> f32 {
+    const LANES: usize = 8;
+    let table = e4m3_table();
+    let mut lanes = [0.0f32; LANES];
+    let tail = activations.len() - activations.len() % LANES;
+    for (x, w) in activations[..tail]
+        .chunks_exact(LANES)
+        .zip(weights[..tail].chunks_exact(LANES))
+    {
+        for lane in 0..LANES {
+            lanes[lane] += x[lane] * table[usize::from(w[lane])];
+        }
+    }
+    let rest: f32 = activations[tail..]
+        .iter()
+        .zip(&weights[tail..])
+        .map(|(x, &w)| x * table[usize::from(w)])
+        .sum();
+    lanes.iter().sum::<f32>() + rest
 }
 
 /// Where weight `k` of a 4-bit row sits: see [`Values::Four`].
@@ -503,6 +609,94 @@ mod tests {
             // row's absmax and the number of terms, not by the result.
             assert!((got - want).abs() < 0.05, "{got} vs {want}");
         }
+    }
+
+    /// The E4M3 encoder against the safetensors decoder: every finite code
+    /// round-trips, rounding is to nearest with ties to the even code (the
+    /// even mantissa) on a brute-force search over all 254 finite codes,
+    /// magnitudes from 448 up saturate, `NaN` stays `NaN`, and the subnormals
+    /// round on their 2^-9 grid.
+    #[test]
+    fn e4m3_encoding_round_trips_rounds_to_even_and_saturates() {
+        use crate::safetensors::f8_to_f32;
+        let decode = |b: u8| f8_to_f32(b, 4, 3);
+        for b in 0..=255u8 {
+            if b & 0x7f == 0x7f {
+                assert!(decode(b).is_nan(), "{b:#04x} is the NaN");
+                continue;
+            }
+            assert_eq!(f32_to_e4m3(decode(b)), b, "{b:#04x} -> {}", decode(b));
+        }
+        // The nearest of the 127 non-negative finite codes to `|x|`; of two
+        // equally near, which are neighbours, the even one.
+        let nearest = |x: f32| -> u8 {
+            let a = x.abs();
+            let mut best = 0u8;
+            for b in 1..=0x7eu8 {
+                let (gap, held) = ((decode(b) - a).abs(), (decode(best) - a).abs());
+                if gap < held || (gap == held && b % 2 == 0) {
+                    best = b;
+                }
+            }
+            best | if x.is_sign_negative() { 0x80 } else { 0 }
+        };
+        let mut values: Vec<f32> = normal(4000).iter().map(|v| v * 40.0).collect();
+        values.extend(normal(2000).iter().map(|v| v * 0.02));
+        // Every midpoint between neighbouring codes, which is where the ties
+        // are, and a hair either side of it.
+        for b in 0..0x7eu8 {
+            let mid = (decode(b) + decode(b + 1)) / 2.0;
+            for x in [mid, mid.next_up(), mid.next_down()] {
+                values.extend([x, -x]);
+            }
+        }
+        for x in values.into_iter().filter(|x| x.abs() < E4M3_MAX) {
+            assert_eq!(f32_to_e4m3(x), nearest(x), "{x:e}");
+        }
+        for (x, want) in [
+            (448.0, 0x7e),
+            (464.0, 0x7e),
+            (1e9, 0x7e),
+            (f32::INFINITY, 0x7e),
+            (-500.0, 0xfe),
+            (f32::NEG_INFINITY, 0xfe),
+            (2.0f32.powi(-9), 0x01),
+            (2.0f32.powi(-10), 0x00),
+            (3.0 * 2.0f32.powi(-10), 0x02),
+            (-(2.0f32.powi(-11)), 0x80),
+            (2.0f32.powi(-6) - 2.0f32.powi(-10), 0x08),
+            (f32::MIN_POSITIVE / 4.0, 0x00),
+        ] {
+            assert_eq!(f32_to_e4m3(x), want, "{x:e}");
+        }
+        assert_eq!(f32_to_e4m3(f32::NAN), 0x7f);
+        assert!(decode(f32_to_e4m3(f32::NAN)).is_nan());
+    }
+
+    /// An FP8 weight multiplies like the float matrix it dequantizes to,
+    /// and lands within E4M3's half step (2^-4 relative) of the original.
+    #[test]
+    fn an_fp8_weight_multiplies_like_its_own_dequantized_matrix() {
+        let (rows, cols) = (7, 37);
+        let mut weights = Matrix::from_vec(rows, cols, normal(rows * cols));
+        weights.row_mut(3).fill(0.0);
+        let quantized = Quantized::from_matrix_fp8(&weights);
+        let widened = quantized.dequantize();
+        assert!(widened.row(3).iter().all(|&v| v == 0.0));
+        for (got, want) in widened.data.iter().zip(&weights.data) {
+            assert!(
+                (got - want).abs() <= want.abs() / 16.0 + 2e-3,
+                "{got} vs {want}"
+            );
+        }
+        let input = Matrix::from_vec(3, cols, normal(3 * cols));
+        let mut expected = Matrix::new(3, rows);
+        input.dot_rhs_transposed(&widened, &mut expected);
+        let actual = quantized.matmul_rhs_transposed(&input);
+        for (got, want) in actual.data.iter().zip(&expected.data) {
+            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        }
+        assert_eq!(quantized.bytes(), rows * cols + rows * 4);
     }
 
     #[test]

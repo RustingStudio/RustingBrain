@@ -61,6 +61,7 @@ pub(crate) struct ModelKernels {
     quantize_groups_q8: CudaFunction,
     dequantize_groups_q8: CudaFunction,
     dequantize_q8: CudaFunction,
+    dequantize_fp8: CudaFunction,
     dequantize_q4: CudaFunction,
     gemv_q8: CudaFunction,
     swiglu_forward: CudaFunction,
@@ -114,6 +115,7 @@ impl ModelKernels {
             quantize_groups_q8: get("quantize_groups_q8")?,
             dequantize_groups_q8: get("dequantize_groups_q8")?,
             dequantize_q8: get("dequantize_q8")?,
+            dequantize_fp8: get("dequantize_fp8")?,
             dequantize_q4: get("dequantize_q4")?,
             gemv_q8: get("gemv_q8")?,
             swiglu_forward: get("swiglu_fwd")?,
@@ -278,6 +280,9 @@ pub(crate) struct Act {
     /// from [`Gpu::quantized_grouped`]); 0 for one scale a row. Only the
     /// dequantizing path reads a grouped weight.
     group: usize,
+    /// Set on a weight from [`Gpu::fp8`]: `bytes` holds one E4M3 value per
+    /// weight and `scales` one scale per row.
+    fp8: bool,
 }
 
 impl Act {
@@ -448,6 +453,7 @@ impl Gpu<'_> {
             len,
             scales: None,
             group: 0,
+            fp8: false,
         })
     }
 
@@ -1582,10 +1588,11 @@ impl Gpu<'_> {
         rows: usize,
         cols: usize,
     ) -> Result<CudaSlice<f32>, NetworkError> {
-        let q = self.context.stream.clone_htod(q).map_err(cuda_alloc_err(
-            "host to device copy",
-            q.len(),
-        ))?;
+        let q = self
+            .context
+            .stream
+            .clone_htod(q)
+            .map_err(cuda_alloc_err("host to device copy", q.len()))?;
         let scales = self.upload(scales)?;
         let mut wide = self.uninit(rows * cols)?;
         unsafe {
@@ -1661,6 +1668,60 @@ impl Gpu<'_> {
         Ok(act)
     }
 
+    /// Host FP8 E4M3 rows and their row scales on the device as they are, one
+    /// byte a weight (see `Quantized::from_matrix_fp8`).
+    pub(crate) fn fp8(
+        &self,
+        bytes: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Act, NetworkError> {
+        debug_assert_eq!(bytes.len(), rows * cols);
+        debug_assert_eq!(scales.len(), rows);
+        Ok(Act {
+            bytes: self
+                .context
+                .stream
+                .clone_htod(bytes)
+                .map_err(cuda_alloc_err("host to device copy", bytes.len()))?,
+            narrow: false,
+            len: rows * cols,
+            scales: Some(self.upload(scales)?),
+            group: 0,
+            fp8: true,
+        })
+    }
+
+    /// Rows `first..first + units` of an FP8 weight widened to an operand,
+    /// BF16 when `narrow`.
+    pub(crate) fn widened_fp8(
+        &self,
+        weights: &Act,
+        first: usize,
+        units: usize,
+        inner: usize,
+        narrow: bool,
+    ) -> Result<Act, NetworkError> {
+        debug_assert!(weights.fp8);
+        let scales = weights.scales.as_ref().expect("an FP8 weight has scales");
+        let mut wide = self.act(units * inner, narrow)?;
+        unsafe {
+            self.context
+                .stream
+                .launch_builder(&self.context.model.dequantize_fp8)
+                .arg(&weights.bytes.slice(first * inner..))
+                .arg(&scales.slice(first..))
+                .arg(&mut wide.bytes)
+                .arg(&(units as i32))
+                .arg(&(inner as i32))
+                .arg(&i32::from(narrow))
+                .launch(cfg(units * inner))
+                .map_err(cuda_err("FP8 dequantize kernel"))?;
+        }
+        Ok(wide)
+    }
+
     /// [`Gpu::linear_packed`] for a weight that may be int8. A few rows, a
     /// decode step, read the int8 bytes directly, from [`Q8_MMA_ROWS`] on the
     /// tensor cores; more, a prompt, dequantize
@@ -1700,6 +1761,13 @@ impl Gpu<'_> {
             let rows_of = weights.at(first * inner);
             return self.linear_packed(&rows_of, units, inner, x, narrow, out, rows, beta);
         };
+        if weights.fp8 {
+            // NOTE: sm_86 has no FP8 tensor cores, so every height widens
+            // into a scratch copy and takes cuBLAS, as grouped int8 does.
+            // sm_89+ can read the bytes in an FP8 mma kernel (X3).
+            let wide = self.widened_fp8(weights, first, units, inner, narrow)?;
+            return self.linear_packed(&wide.all(), units, inner, x, narrow, out, rows, beta);
+        }
         let bytes = weights.bytes.slice(first * inner..);
         if weights.group > 0 {
             // Grouped scales: no int8 GEMV reads them, so every height takes
@@ -5729,6 +5797,93 @@ mod tests {
             &host_probabilities,
             2e-6,
         );
+    }
+
+    /// The device's FP8 widening against the host's, bit for bit in FP32,
+    /// on a random matrix with rows of very different size (so the scales
+    /// spread and some weights land on subnormal codes), a zero row and a
+    /// row offset, then one projection through it against the host product.
+    #[test]
+    fn an_fp8_weight_widens_to_the_host_bits_or_skips_without_device() {
+        let Some(context) = cuda_or_skip() else {
+            return;
+        };
+        let gpu = Gpu { context: &context };
+        let (units, inner) = (41, 300);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut values: Vec<f32> = (0..units * inner)
+            .map(|i| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1442695040888963407);
+                let u = (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                // Row r spans 2^(r - 20), and a heavy tail inside every row.
+                u * u * u * 8.0 * 2.0f32.powi((i / inner) as i32 - 20)
+            })
+            .collect();
+        values[7 * inner..8 * inner].fill(0.0);
+        let host =
+            crate::quantized::Quantized::from_matrix_fp8(&Matrix::from_vec(units, inner, values));
+        let (bytes, scales) = host.parts_fp8().unwrap();
+        assert!(
+            bytes.iter().any(|b| b & 0x78 == 0 && b & 7 != 0),
+            "no subnormal codes"
+        );
+        let weights = gpu.fp8(bytes, scales, units, inner).unwrap();
+        let want = host.dequantize();
+        for first in [0, 5] {
+            let wide = gpu
+                .widened_fp8(&weights, first, units - first, inner, false)
+                .unwrap();
+            let got = gpu.download_act(&wide).unwrap();
+            let want = &want.data[first * inner..];
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "weight {i} from row {first}: {g:e} vs {w:e}"
+                );
+            }
+        }
+
+        let rows = 6;
+        let input = ramp_from(rows * inner, 3);
+        let mut x = gpu.act(rows * inner, true).unwrap();
+        gpu.cast_into(
+            &mut x.bytes.slice_mut(..),
+            &gpu.upload(&input).unwrap().slice(..),
+            rows * inner,
+            true,
+        )
+        .unwrap();
+        let x_host = Matrix::from_vec(rows, inner, gpu.download_act(&x).unwrap());
+        let mut out = gpu.upload(&vec![0.0; rows * units]).unwrap();
+        gpu.project(
+            &weights,
+            units,
+            inner,
+            &x.all(),
+            true,
+            &mut out.slice_mut(..),
+            rows,
+            0.0,
+        )
+        .unwrap();
+        let got = gpu.download(&out).unwrap();
+        let expected = host.matmul_rhs_transposed(&x_host);
+        for (unit, scale) in scales.iter().enumerate() {
+            for row in 0..rows {
+                let (g, w) = (got[row * units + unit], expected.data[row * units + unit]);
+                // BF16 rounding of the widened weight, 2^-9 of each term.
+                let bound =
+                    scale * 448.0 * x_host.row(row).iter().map(|v| v.abs()).sum::<f32>() / 256.0;
+                assert!(
+                    (g - w).abs() <= bound + 1e-30,
+                    "row {row} unit {unit}: {g:e} vs {w:e}"
+                );
+            }
+        }
     }
 
     /// Every int8 GEMV the decode step can pick - one row, the four-row

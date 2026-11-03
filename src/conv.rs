@@ -203,6 +203,22 @@ impl Dense {
         }
     }
 
+    /// [`Dense::quantize`] as FP8 E4M3 with one scale per row
+    /// (`Quantized::from_matrix_fp8`): the same byte a weight, on the grid
+    /// Blackwell's FP8 tensor cores read.
+    pub fn quantize_fp8(&mut self) {
+        if self.quantized.is_none() {
+            self.quantized = Some(crate::quantized::Quantized::from_matrix_fp8(&self.weight));
+            self.weight.data = Vec::new();
+        }
+    }
+
+    /// The E4M3 bytes and row scales, if the weight is stored as FP8.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fp8_parts(&self) -> Option<(&[u8], &[f32])> {
+        self.quantized.as_ref().and_then(|q| q.parts_fp8())
+    }
+
     /// Columns one int8 scale covers, `None` for a scale per row or a float
     /// weight.
     #[cfg(feature = "cuda")]

@@ -122,7 +122,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 ///
 /// `E4M3` here is the `e4m3fn` variant the machine-learning world uses: no
 /// infinities, and the all-ones exponent with a full mantissa is the only NaN.
-fn f8_to_f32(bits: u8, exponent_bits: u32, mantissa_bits: u32) -> f32 {
+pub(crate) fn f8_to_f32(bits: u8, exponent_bits: u32, mantissa_bits: u32) -> f32 {
     let sign = ((bits as u32) & 0x80) << 24;
     let exponent = ((bits as u32) >> mantissa_bits) & ((1 << exponent_bits) - 1);
     let mantissa = (bits as u32) & ((1 << mantissa_bits) - 1);

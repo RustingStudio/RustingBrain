@@ -11,7 +11,8 @@
 //! the files.
 //!
 //! Set `QUANTIZE=1` to hold the denoiser and the encoder at one byte per
-//! weight, which is a quarter of the memory.
+//! weight, which is a quarter of the memory. `QUANTIZE=fp8` stores the
+//! denoiser's block linears as FP8 E4M3 instead.
 //!
 //! `STEPS` and `GUIDANCE` override what the model asked for, which is what
 //! lets a run be lined up against another implementation's. `NEGATIVE` is the
@@ -57,9 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A 4B model is 16 GB in f32 and 4 GB a byte per weight, so the switch is
     // what decides whether it fits at all.
-    let precision = match std::env::var("QUANTIZE").is_ok() {
-        true => Precision::Q8,
-        false => Precision::F32,
+    let precision = match std::env::var("QUANTIZE").as_deref() {
+        Ok("fp8") => Precision::Fp8,
+        Ok(_) => Precision::Q8,
+        Err(_) => Precision::F32,
     };
 
     println!("loading {directory}");

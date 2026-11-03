@@ -569,6 +569,13 @@ pub enum Precision {
     /// Symmetric int8 with one `f32` scale per row: 1 byte per weight plus 4
     /// bytes per row. Lossy, for inference and for shipping a model.
     Q8,
+    /// FP8 E4M3 with one `f32` scale per row, for the block linears of the
+    /// FLUX-family transformer (`mmdit::Dit`) only: its modulations stay int8,
+    /// its embeddings `f32`, and [`crate::pipeline::ImagePipeline`] loads the
+    /// prompt encoder at [`Precision::Q8`]. Other loaders read it as `F32`
+    /// and [`TransformerLm::save_bin`] refuses it. On a device without FP8
+    /// tensor cores the bytes are widened to BF16 before each GEMM.
+    Fp8,
 }
 
 /// The JSON preamble of a binary snapshot. Small: it holds no weights.
@@ -2419,6 +2426,11 @@ impl TransformerLm {
         precision: Precision,
     ) -> Result<(), NetworkError> {
         self.check_full_precision("be saved")?;
+        if precision == Precision::Fp8 {
+            return Err(NetworkError::InvalidConfig(
+                "a language model saves as F32 or Q8, not FP8".into(),
+            ));
+        }
         #[cfg(feature = "cuda")]
         self.sync_from_device()?;
         let header = serde_json::to_vec(&BinHeader {
@@ -2452,6 +2464,7 @@ impl TransformerLm {
                         writer.write_all(&quantized)?;
                     }
                 }
+                Precision::Fp8 => unreachable!("refused above"),
             }
         }
         writer.flush()?;
@@ -2564,6 +2577,11 @@ impl TransformerLm {
                             *slot = *byte as i8 as f32 * scale;
                         }
                     }
+                }
+                Precision::Fp8 => {
+                    return Err(NetworkError::InvalidConfig(
+                        "this file says FP8, which save_bin never writes".into(),
+                    ));
                 }
             }
         }

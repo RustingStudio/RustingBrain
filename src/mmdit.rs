@@ -386,7 +386,9 @@ pub(crate) fn attention(
     kv_heads: usize,
     causal: bool,
 ) -> Matrix {
-    attention_over(queries, keys, values, num_heads, kv_heads, causal, keys.rows)
+    attention_over(
+        queries, keys, values, num_heads, kv_heads, causal, keys.rows,
+    )
 }
 
 /// [`attention`] over only the first `limit` keys, which is how a padded
@@ -726,7 +728,11 @@ impl Dit {
             && (self.config.axes_dim.len() != 4
                 || references.tokens.cols != self.config.in_channels
                 || references.tokens.rows
-                    != references.grids.iter().map(|(rows, columns)| rows * columns).sum::<usize>())
+                    != references
+                        .grids
+                        .iter()
+                        .map(|(rows, columns)| rows * columns)
+                        .sum::<usize>())
         {
             return Err(NetworkError::InvalidConfig(
                 "reference tokens need a four-axis model and one in_channels-wide row per patch \
@@ -871,9 +877,7 @@ impl Dit {
         if layout.final_scale_first() {
             swap_halves(&mut final_modulation);
         }
-        if precision == Precision::Q8 {
-            quantize_dense(&mut final_modulation, false);
-        }
+        store(&mut final_modulation, precision, false);
 
         Ok(Self {
             image_in,
@@ -940,7 +944,9 @@ impl Dit {
             modulations.push(&mut block.modulation);
             layers.extend([&mut block.fused_in, &mut block.fused_out]);
         }
-        layers.into_par_iter().for_each(|layer| quantize_dense(layer, true));
+        layers
+            .into_par_iter()
+            .for_each(|layer| quantize_dense(layer, true));
         quantize_dense(&mut self.final_modulation, false);
 
         // A modulation several blocks share is quantized once, and every
@@ -1098,10 +1104,13 @@ impl Dit {
                 &text_mod[0][2],
             );
             let swiglu = self.swiglu;
-            let image_mlp =
-                block
-                    .image
-                    .feed_forward(&image, &image_mod[1][0], &image_mod[1][1], eps, swiglu)?;
+            let image_mlp = block.image.feed_forward(
+                &image,
+                &image_mod[1][0],
+                &image_mod[1][1],
+                eps,
+                swiglu,
+            )?;
             gated_add(&mut image, &image_mlp, &image_mod[1][2]);
             let text_mlp =
                 block
@@ -1241,6 +1250,19 @@ fn quantize_dense(layer: &mut Dense, grouped: bool) {
     }
 }
 
+/// Quantizes `layer` at `precision`. `grouped` is false for a modulation,
+/// which stays int8 per row under FP8 too: the device multiplies its one
+/// vector by the int8 bytes directly, and an FP8 one would widen the 320 MB
+/// stacked weight first, as a grouped one would.
+fn store(layer: &mut Dense, precision: Precision, grouped: bool) {
+    match precision {
+        Precision::F32 => {}
+        Precision::Q8 => quantize_dense(layer, grouped),
+        Precision::Fp8 if grouped => layer.quantize_fp8(),
+        Precision::Fp8 => layer.quantize(),
+    }
+}
+
 /// Linears that stay in `f32` under Q8: the two input embeddings, the time
 /// embedding and the output projection carry more rounding error per byte than
 /// any block (step-0 1.0e-2 to 0.92e-2 at group 128) and weigh about 100 MB.
@@ -1278,13 +1300,13 @@ fn dense(
         .ok()
         .map(|(bias, _)| bias);
     let mut layer = Dense::new(Matrix::from_vec(shape[0], shape[1], values), bias)?;
-    if precision == Precision::Q8 && !keep_float(name) {
+    if precision != Precision::F32 && !keep_float(name) {
         // Quantizing as each tensor arrives is what keeps the peak at one
         // `f32` tensor rather than the whole model.
         let modulation = ["modulation", "norm.linear", "norm_out", "_mod.", "norm1"]
             .iter()
             .any(|part| name.contains(part));
-        quantize_dense(&mut layer, !modulation);
+        store(&mut layer, precision, !modulation);
     }
     Ok(layer)
 }
@@ -1607,9 +1629,7 @@ fn stacked(
     }
     let bias = parts.iter().any(|part| part.bias.is_some()).then_some(bias);
     let mut layer = Dense::new(weight, bias)?;
-    if precision == Precision::Q8 {
-        quantize_dense(&mut layer, true);
-    }
+    store(&mut layer, precision, true);
     Ok(layer)
 }
 
@@ -1940,7 +1960,14 @@ pub(crate) mod tests {
         linear("single_stream_modulation.linear", dim, 3 * dim);
         for index in 0..config.double_blocks {
             let base = format!("transformer_blocks.{index}");
-            for name in ["to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj"] {
+            for name in [
+                "to_q",
+                "to_k",
+                "to_v",
+                "add_q_proj",
+                "add_k_proj",
+                "add_v_proj",
+            ] {
                 linear(&format!("{base}.attn.{name}"), dim, dim);
             }
             linear(&format!("{base}.attn.to_out.0"), dim, dim);
@@ -1952,19 +1979,29 @@ pub(crate) mod tests {
         }
         for index in 0..config.single_blocks {
             let base = format!("single_transformer_blocks.{index}");
-            linear(&format!("{base}.attn.to_qkv_mlp_proj"), dim, 3 * dim + 2 * mlp);
+            linear(
+                &format!("{base}.attn.to_qkv_mlp_proj"),
+                dim,
+                3 * dim + 2 * mlp,
+            );
             linear(&format!("{base}.attn.to_out"), dim + mlp, dim);
         }
         linear("norm_out.linear", dim, 2 * dim);
         linear("proj_out", dim, config.out_channels);
         for index in 0..config.double_blocks {
             for name in ["norm_q", "norm_k", "norm_added_q", "norm_added_k"] {
-                add(format!("transformer_blocks.{index}.attn.{name}.weight"), vec![head]);
+                add(
+                    format!("transformer_blocks.{index}.attn.{name}.weight"),
+                    vec![head],
+                );
             }
         }
         for index in 0..config.single_blocks {
             for name in ["norm_q", "norm_k"] {
-                add(format!("single_transformer_blocks.{index}.attn.{name}.weight"), vec![head]);
+                add(
+                    format!("single_transformer_blocks.{index}.attn.{name}.weight"),
+                    vec![head],
+                );
             }
         }
         crate::safetensors::write_checkpoint(path, &tensors);
@@ -2310,7 +2347,10 @@ pub(crate) mod tests {
         assert_eq!((out.rows, out.cols), (2, 2));
         let expected = [silu(1.0) * 3.0, silu(-2.0) * 4.0, 0.0, silu(0.5) * 2.0];
         for (actual, expected) in out.data.iter().zip(expected) {
-            assert!((actual - expected).abs() < 1e-6, "{actual} is not {expected}");
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "{actual} is not {expected}"
+            );
         }
         let plain = activate(Matrix::from_vec(1, 2, vec![1.0, -1.0]), false);
         assert_eq!(plain.data, vec![gelu(1.0), gelu(-1.0)]);
@@ -2327,10 +2367,17 @@ pub(crate) mod tests {
         assert!(dit.swiglu);
         assert_eq!(dit.pooled_dim(), None);
         let shared = |dit: &Dit| {
-            Arc::ptr_eq(&dit.double[0].image.modulation, &dit.double[1].image.modulation)
-                && Arc::ptr_eq(&dit.double[0].text.modulation, &dit.double[1].text.modulation)
-                && Arc::ptr_eq(&dit.single[0].modulation, &dit.single[1].modulation)
-                && !Arc::ptr_eq(&dit.double[0].image.modulation, &dit.double[0].text.modulation)
+            Arc::ptr_eq(
+                &dit.double[0].image.modulation,
+                &dit.double[1].image.modulation,
+            ) && Arc::ptr_eq(
+                &dit.double[0].text.modulation,
+                &dit.double[1].text.modulation,
+            ) && Arc::ptr_eq(&dit.single[0].modulation, &dit.single[1].modulation)
+                && !Arc::ptr_eq(
+                    &dit.double[0].image.modulation,
+                    &dit.double[0].text.modulation,
+                )
         };
         assert!(shared(&dit));
 
@@ -2357,7 +2404,10 @@ pub(crate) mod tests {
             .zip(&float.data)
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0f32, f32::max);
-        let scale = float.data.iter().fold(0.0f32, |most, value| most.max(value.abs()));
+        let scale = float
+            .data
+            .iter()
+            .fold(0.0f32, |most, value| most.max(value.abs()));
         assert!(error < 0.05 * scale.max(1e-3), "{error} against {scale}");
     }
 
