@@ -168,22 +168,22 @@ pub(crate) fn linear(file: &mut ShardedSafeTensors, name: &str, bias: bool) -> R
     Dense::new(Matrix::from_vec(rows, cols, values), bias)
 }
 
-struct GemmaLayer {
-    input_norm: Vec<f32>,
-    post_attention_norm: Vec<f32>,
-    pre_feedforward_norm: Vec<f32>,
-    post_feedforward_norm: Vec<f32>,
-    query: Dense,
-    key: Dense,
-    value: Dense,
-    output: Dense,
-    gate: Dense,
-    up: Dense,
-    down: Dense,
+pub(crate) struct GemmaLayer {
+    pub(crate) input_norm: Vec<f32>,
+    pub(crate) post_attention_norm: Vec<f32>,
+    pub(crate) pre_feedforward_norm: Vec<f32>,
+    pub(crate) post_feedforward_norm: Vec<f32>,
+    pub(crate) query: Dense,
+    pub(crate) key: Dense,
+    pub(crate) value: Dense,
+    pub(crate) output: Dense,
+    pub(crate) gate: Dense,
+    pub(crate) up: Dense,
+    pub(crate) down: Dense,
 }
 
 impl GemmaLayer {
-    fn read(file: &mut ShardedSafeTensors, layer: usize) -> Result<Self, NetworkError> {
+    pub(crate) fn read(file: &mut ShardedSafeTensors, layer: usize) -> Result<Self, NetworkError> {
         let name = |part: &str| format!("layers.{layer}.{part}");
         Ok(Self {
             input_norm: gemma_norm(file, &name("input_layernorm.weight"))?,
