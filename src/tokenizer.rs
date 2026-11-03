@@ -199,6 +199,11 @@ impl Bpe {
                 },
             ),
             None if normalizer.contains("\"Prepend\"") => Some(Metaspace::Prepend),
+            // Gemma: a `Replace` normalizer turns spaces into `▁`, with no
+            // prefix, and the whole text is one piece.
+            None if normalizer.contains("\"Replace\"") && normalizer.contains('\u{2581}') => {
+                Some(Metaspace::Never)
+            }
             None => None,
         };
         let byte_fallback = model

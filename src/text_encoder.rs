@@ -408,7 +408,7 @@ impl Rotary {
         Self { cos, sin, half }
     }
 
-    fn apply(&self, values: &mut Matrix, heads: usize) {
+    pub(crate) fn apply(&self, values: &mut Matrix, heads: usize) {
         let head_dim = self.half * 2;
         let half = self.half;
         values
