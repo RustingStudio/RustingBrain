@@ -361,13 +361,31 @@ impl DeviceDit {
                 inner,
             })
         };
-        let dense = |layer: &Dense| {
-            linear(
+        // An FP8 weight goes up as its bytes; there is no device quantizer to
+        // land a widened copy back on the host's grid.
+        let fp8 = |bytes: &[u8], scales: &[f32], bias: Option<&[f32]>, units, inner| {
+            quantized.set(true);
+            Ok::<_, NetworkError>(Linear {
+                weight: gpu.fp8(bytes, scales, units, inner)?,
+                bias: bias.map(|bias| gpu.upload(bias)).transpose()?,
+                units,
+                inner,
+            })
+        };
+        let dense = |layer: &Dense| match layer.fp8_parts() {
+            Some((bytes, scales)) => fp8(
+                bytes,
+                scales,
+                layer.bias.as_deref(),
+                layer.out_dim(),
+                layer.in_dim(),
+            ),
+            None => linear(
                 layer.weight_f32().into_owned(),
                 layer.bias.as_deref(),
                 layer.is_quantized(),
                 layer.int8_group(),
-            )
+            ),
         };
         let stream = |stream: &crate::mmdit::Stream| {
             Ok::<_, NetworkError>(DeviceStream {
@@ -396,7 +414,10 @@ impl DeviceDit {
         let mut modulations: Vec<&Dense> = Vec::new();
         let mut slots = Vec::new();
         for &layer in &readers {
-            let index = match modulations.iter().position(|seen| std::ptr::eq(*seen, layer)) {
+            let index = match modulations
+                .iter()
+                .position(|seen| std::ptr::eq(*seen, layer))
+            {
                 Some(index) => index,
                 None => {
                     modulations.push(layer);
@@ -426,6 +447,32 @@ impl DeviceDit {
             .single
             .iter()
             .map(|block| {
+                if let Some((bytes, scales)) = block.fused_out.fp8_parts() {
+                    // A scale per row covers both halves of the row.
+                    let cols = block.fused_out.in_dim();
+                    let units = block.fused_out.out_dim();
+                    let columns = |from: usize, count: usize| -> Vec<u8> {
+                        bytes
+                            .chunks(cols)
+                            .flat_map(|row| &row[from..from + count])
+                            .copied()
+                            .collect()
+                    };
+                    let bias = block.fused_out.bias.as_deref();
+                    return Ok(DeviceSingle {
+                        fused_in: dense(&block.fused_in)?,
+                        attention_out: fp8(&columns(0, width), scales, bias, units, width)?,
+                        mlp_out: fp8(
+                            &columns(width, cols - width),
+                            scales,
+                            None,
+                            units,
+                            cols - width,
+                        )?,
+                        query_norm: gpu.upload(&block.query_norm.scale)?,
+                        key_norm: gpu.upload(&block.key_norm.scale)?,
+                    });
+                }
                 let fused_out = block.fused_out.weight_f32();
                 let mlp_dim = fused_out.cols - width;
                 let columns = |from: usize, count: usize| {
@@ -1551,7 +1598,10 @@ impl DeviceDit {
     ) -> Result<Option<Act>, NetworkError> {
         static MODE: OnceLock<u8> = OnceLock::new();
         let mode = *MODE.get_or_init(|| {
-            std::env::var("RB_FAKE_W8A8").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("RB_FAKE_W8A8")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
         });
         if mode == 0 || (mode == 2 && linear.inner != self.image_in.units) {
             return Ok(None);

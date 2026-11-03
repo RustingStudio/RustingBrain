@@ -352,7 +352,11 @@ impl ChatPrompt {
     }
 
     /// The token ids for `prompt`, padded, and how many of them are real.
-    pub fn tokenize(&self, tokenizer: &Bpe, prompt: &str) -> Result<(Vec<u32>, usize), NetworkError> {
+    pub fn tokenize(
+        &self,
+        tokenizer: &Bpe,
+        prompt: &str,
+    ) -> Result<(Vec<u32>, usize), NetworkError> {
         let mut ids = tokenizer.encode(&format!("{}{prompt}{}", self.prefix, self.suffix))?;
         ids.truncate(self.length);
         let real = ids.len();
@@ -641,7 +645,9 @@ impl ImagePipeline {
     /// [`Precision::Q8`] is a quarter of the memory those two need, measured
     /// here at about a tenth slower per step. It is the difference between a
     /// model that does not fit and one that does; the decoder stays in `f32`,
-    /// because it is small and it is what the eye sees.
+    /// because it is small and it is what the eye sees. [`Precision::Fp8`]
+    /// stores a FLUX-family transformer's block linears as FP8 and loads
+    /// everything else as [`Precision::Q8`].
     pub fn load_at(
         directory: impl AsRef<std::path::Path>,
         precision: Precision,
@@ -660,6 +666,12 @@ impl ImagePipeline {
     ) -> Result<Self, NetworkError> {
         let directory = directory.as_ref();
         let part = |name: &str| directory.join(name);
+        // FP8 is the transformer's alone; everything else takes Q8 for it.
+        let transformer_precision = precision;
+        let precision = match precision {
+            Precision::Fp8 => Precision::Q8,
+            other => other,
+        };
 
         let decoder_config = crate::vae::VaeConfig::from_file(part("vae/config.json"))?;
         let scheduler = read_json(&part("scheduler/scheduler_config.json"));
@@ -734,12 +746,13 @@ impl ImagePipeline {
                 .as_ref()
                 .and_then(|scheduler| number(scheduler, "shift"))
                 .unwrap_or(defaults.shift),
-            dynamic_shift: scheduler.as_ref().and_then(dynamic_shift).map(|dynamic| {
-                DynamicShift {
+            dynamic_shift: scheduler
+                .as_ref()
+                .and_then(dynamic_shift)
+                .map(|dynamic| DynamicShift {
                     empirical: flux2,
                     ..dynamic
-                }
-            }),
+                }),
             // The Stable Diffusion line predicts noise along a beta schedule
             // and was trained with the prompt dropped part of the time, so it
             // is sampled with guidance over more steps than a distilled model
@@ -935,7 +948,7 @@ impl ImagePipeline {
                 &mut denoiser_file("transformer")?,
                 "",
                 denoiser_config,
-                precision,
+                transformer_precision,
             )?
             .into(),
             None => {
@@ -1462,7 +1475,8 @@ impl ImagePipeline {
                     image.width, image.height
                 )));
             }
-            let mut packed = pixel_unshuffle(&encoder.encode(image)?, self.config.patch)?.to_tokens();
+            let mut packed =
+                pixel_unshuffle(&encoder.encode(image)?, self.config.patch)?.to_tokens();
             if let Some((mean, std)) = self.decoder.patch_norm() {
                 normalise_patches(&mut packed, mean, std, true)?;
             }
@@ -3019,10 +3033,22 @@ mod tests {
     /// Relative L2 distance of `got` from `want`.
     fn relative(got: &[f32], want: &[f32]) -> f32 {
         assert_eq!(got.len(), want.len());
-        let (gap, norm) = got.iter().zip(want).fold((0.0f64, 0.0f64), |(g, n), (a, b)| {
-            (g + ((a - b) as f64).powi(2), n + (*b as f64).powi(2))
-        });
+        let (gap, norm) = got
+            .iter()
+            .zip(want)
+            .fold((0.0f64, 0.0f64), |(g, n), (a, b)| {
+                (g + ((a - b) as f64).powi(2), n + (*b as f64).powi(2))
+            });
         (gap / norm).sqrt() as f32
+    }
+
+    /// The klein tests' denoiser precision: Q8, or FP8 with
+    /// `RB_FLUX2_PRECISION=fp8`.
+    fn flux2_precision() -> Precision {
+        match std::env::var("RB_FLUX2_PRECISION").as_deref() {
+            Ok("fp8") => Precision::Fp8,
+            _ => Precision::Q8,
+        }
     }
 
     /// FLUX.2-klein-4B against `scripts/flux2_reference.py`, stage by stage.
@@ -3030,7 +3056,8 @@ mod tests {
     /// (default the local copy), `RB_FLUX2_ENCODER=f32` adds a run of the
     /// prompt encoder in F32 on its own (about 12 GB) and `RB_FLUX2_CUDA=1`
     /// moves the pipeline to the device. `RB_FLUX2_OUT=<png>` saves the
-    /// whole-chain image. The denoiser is Q8: in F32 it alone needs about 16 GB.
+    /// whole-chain image. The denoiser is Q8: in F32 it alone needs about 16 GB;
+    /// `RB_FLUX2_PRECISION=fp8` makes its block linears FP8 instead.
     #[test]
     #[ignore = "needs FLUX.2-klein-4B and the output of scripts/flux2_reference.py"]
     fn flux2_klein_matches_diffusers() {
@@ -3064,9 +3091,10 @@ mod tests {
         let embeds = read("prompt_embeds");
 
         if env("RB_FLUX2_ENCODER").as_deref() == Some("f32") {
-            let mut file =
-                crate::safetensors::ShardedSafeTensors::open(weights(&model.join("text_encoder")).unwrap())
-                    .unwrap();
+            let mut file = crate::safetensors::ShardedSafeTensors::open(
+                weights(&model.join("text_encoder")).unwrap(),
+            )
+            .unwrap();
             let mut config =
                 TextEncoderConfig::from_file(model.join("text_encoder/config.json")).unwrap();
             config.layers = 27;
@@ -3080,25 +3108,36 @@ mod tests {
             let (got, pooled) = encoder.encode(prompt).unwrap();
             eprintln!("flux2 encoder f32: {:?}", started.elapsed());
             assert!(pooled.is_none());
-            gate("prompt embeds, encoder F32", relative(&got.data, &embeds), 1e-3);
+            gate(
+                "prompt embeds, encoder F32",
+                relative(&got.data, &embeds),
+                1e-3,
+            );
         }
 
         let started = std::time::Instant::now();
         #[allow(unused_mut)]
-        let mut pipeline = ImagePipeline::load_at(&model, Precision::Q8).unwrap();
+        let mut pipeline = ImagePipeline::load_at(&model, flux2_precision()).unwrap();
         #[cfg(feature = "cuda")]
         if env("RB_FLUX2_CUDA").as_deref() == Some("1") {
             pipeline.to_cuda(0).unwrap();
             let PromptEncoder::Sequence { encoder, .. } = &pipeline.encoder else {
                 panic!("FLUX.2 takes a sequence encoder")
             };
-            assert!(encoder.on_device(), "to_cuda left the Q8 encoder on the host");
+            assert!(
+                encoder.on_device(),
+                "to_cuda left the Q8 encoder on the host"
+            );
         }
         eprintln!("flux2 load: {:?}", started.elapsed());
         assert_eq!(pipeline.config.steps, 4);
 
         let (got, _) = pipeline.encoder.encode(prompt).unwrap();
-        gate("prompt embeds, encoder Q8", relative(&got.data, &embeds), 0.03);
+        gate(
+            "prompt embeds, encoder Q8",
+            relative(&got.data, &embeds),
+            0.03,
+        );
 
         let levels = pipeline.scheduler(1024).sigmas(4).unwrap();
         gate("sigmas", relative(&levels, &read("sigmas")), 1e-5);
@@ -3127,7 +3166,11 @@ mod tests {
         // Q8 rounding, not a wrong layer: `flux2_klein_blocks_match_diffusers`
         // puts the same blocks at 1e-6 in F32. Over C11's 0.006 for SDXL's
         // UNet, which is why these gates are Q8's own.
-        gate("step-0 prediction", relative(&prediction.data, &read("step0_pred")), 0.011);
+        gate(
+            "step-0 prediction",
+            relative(&prediction.data, &read("step0_pred")),
+            0.011,
+        );
 
         let started = std::time::Instant::now();
         let latent = pipeline
@@ -3135,7 +3178,11 @@ mod tests {
             .unwrap();
         eprintln!("flux2 four steps: {:?}", started.elapsed());
         let final_latents = read("final_latents");
-        gate("final latent, 4 steps", relative(&latent.data, &final_latents), 0.04);
+        gate(
+            "final latent, 4 steps",
+            relative(&latent.data, &final_latents),
+            0.04,
+        );
 
         // What the autoencoder is handed, from diffusers' own final latent.
         let want_latent = Matrix::from_vec(1024, 128, final_latents);
@@ -3144,21 +3191,36 @@ mod tests {
         normalise_patches(&mut unnormalised, mean, std, false).unwrap();
         let unpacked =
             pixel_shuffle(&FeatureMap::from_tokens(&unnormalised, 32, 32).unwrap(), 2).unwrap();
-        gate("autoencoder input", relative(&unpacked.data, &read("vae_latent")), 1e-5);
+        gate(
+            "autoencoder input",
+            relative(&unpacked.data, &read("vae_latent")),
+            1e-5,
+        );
 
         let image = read("image");
         let started = std::time::Instant::now();
         let decoded = pipeline.decode(&want_latent, 32, 32).unwrap();
         eprintln!("flux2 decode: {:?}", started.elapsed());
-        gate("decoded image, reference latent", relative(&decoded.data, &image), 0.012);
+        gate(
+            "decoded image, reference latent",
+            relative(&decoded.data, &image),
+            0.012,
+        );
         let decoded = pipeline.decode(&latent, 32, 32).unwrap();
-        gate("decoded image, whole chain", relative(&decoded.data, &image), 0.034);
+        gate(
+            "decoded image, whole chain",
+            relative(&decoded.data, &image),
+            0.034,
+        );
         #[cfg(feature = "images")]
         if let Some(out) = env("RB_FLUX2_OUT") {
             crate::vae::save_png(&decoded, out).unwrap();
         }
 
-        let failed: Vec<_> = report.iter().filter(|(_, error, limit)| error > limit).collect();
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, error, limit)| error > limit)
+            .collect();
         assert!(failed.is_empty(), "over the gate: {failed:?}");
     }
 
@@ -3188,13 +3250,15 @@ mod tests {
         };
 
         #[allow(unused_mut)]
-        let mut pipeline = ImagePipeline::load_at(&model, Precision::Q8).unwrap();
+        let mut pipeline = ImagePipeline::load_at(&model, flux2_precision()).unwrap();
         #[cfg(feature = "cuda")]
         if env("RB_FLUX2_CUDA").as_deref() == Some("1") {
             pipeline.to_cuda(0).unwrap();
         }
         let pixels = FeatureMap::from_vec(3, 512, 512, read("ref_pixels")).unwrap();
-        pipeline.set_references(std::slice::from_ref(&pixels)).unwrap();
+        pipeline
+            .set_references(std::slice::from_ref(&pixels))
+            .unwrap();
         let ImageDenoiser::Transformer(dit) = &pipeline.denoiser else {
             panic!("FLUX.2 has a transformer")
         };
@@ -3206,7 +3270,11 @@ mod tests {
 
         let tokens = &dit.references().unwrap().tokens;
         assert_eq!((tokens.rows, tokens.cols), (1024, 128));
-        gate("latent tokens", relative(&tokens.data, &read("ref_latents")), 0.03);
+        gate(
+            "latent tokens",
+            relative(&tokens.data, &read("ref_latents")),
+            0.03,
+        );
 
         let levels = pipeline.scheduler(1024).sigmas(4).unwrap();
         let grid = read("noise");
@@ -3226,7 +3294,11 @@ mod tests {
         pipeline.denoiser.set_conditioning(conditioning.clone());
         let prediction = pipeline.denoiser.denoise(&noise, levels[0]).unwrap();
         assert_eq!((prediction.rows, prediction.cols), (1024, 128));
-        gate("step-0 prediction", relative(&prediction.data, &read("step0_pred")), 0.016);
+        gate(
+            "step-0 prediction",
+            relative(&prediction.data, &read("step0_pred")),
+            0.016,
+        );
 
         // The same step from diffusers' own reference tokens, which leaves
         // the encoder's share of the error out of the denoiser's.
@@ -3244,20 +3316,33 @@ mod tests {
             relative(&prediction.data, &read("step0_pred")),
             0.015,
         );
-        pipeline.set_references(std::slice::from_ref(&pixels)).unwrap();
+        pipeline
+            .set_references(std::slice::from_ref(&pixels))
+            .unwrap();
 
         let latent = pipeline
             .sample_latent_from_noise(conditioning, None, noise, None, |_, _| true)
             .unwrap();
-        gate("final latent, 4 steps", relative(&latent.data, &read("final_latents")), 0.02);
+        gate(
+            "final latent, 4 steps",
+            relative(&latent.data, &read("final_latents")),
+            0.02,
+        );
         let decoded = pipeline.decode(&latent, 32, 32).unwrap();
-        gate("image, whole chain", relative(&decoded.data, &read("image")), 0.007);
+        gate(
+            "image, whole chain",
+            relative(&decoded.data, &read("image")),
+            0.007,
+        );
         #[cfg(feature = "images")]
         if let Some(out) = env("RB_FLUX2_OUT") {
             crate::vae::save_png(&decoded, out).unwrap();
         }
 
-        let failed: Vec<_> = report.iter().filter(|(_, error, limit)| error > limit).collect();
+        let failed: Vec<_> = report
+            .iter()
+            .filter(|(_, error, limit)| error > limit)
+            .collect();
         assert!(failed.is_empty(), "over the gate: {failed:?}");
     }
 
@@ -3288,10 +3373,9 @@ mod tests {
                 env("RB_FLUX2_MODEL")
                     .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
             );
-            let settings: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(dir.join("reference.json")).unwrap(),
-            )
-            .unwrap();
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
+                    .unwrap();
             let prompt = settings["prompt"].as_str().unwrap();
             let embeds = crate::safetensors::SafeTensors::open(dir.join("flux2.safetensors"))
                 .unwrap()
@@ -3329,7 +3413,10 @@ mod tests {
                 };
                 let started = std::time::Instant::now();
                 inner.attach_device(&context).unwrap();
-                eprintln!("flux2 device encoder {precision:?}: upload {:?}", started.elapsed());
+                eprintln!(
+                    "flux2 device encoder {precision:?}: upload {:?}",
+                    started.elapsed()
+                );
                 let mut times = Vec::new();
                 let mut got = None;
                 for _ in 0..4 {
@@ -3389,7 +3476,11 @@ mod tests {
         // model, so its F32 gate is BF16's.
         let device = cfg!(feature = "cuda") && env("RB_FLUX2_CUDA").as_deref() == Some("1");
         let f32_limit = if device { 0.01 } else { 1e-4 };
-        for (precision, limit) in [(Precision::F32, f32_limit), (Precision::Q8, 0.02)] {
+        for (precision, limit) in [
+            (Precision::F32, f32_limit),
+            (Precision::Q8, 0.02),
+            (Precision::Fp8, 0.02),
+        ] {
             #[allow(unused_mut)]
             let mut dit = Dit::load_at(&path, "", config.clone(), precision).unwrap();
             #[cfg(feature = "cuda")]
@@ -3410,10 +3501,13 @@ mod tests {
             assert!(error <= limit, "{precision:?}: {error}");
 
             // An edit run's dump also holds the same model with a reference.
-            let mut blocks = crate::safetensors::SafeTensors::open(dir.join("flux2_blocks.safetensors")).unwrap();
-            if let (Ok((tokens, _)), Ok((want, _))) =
-                (reference.tensor("ref_latents"), blocks.tensor("step0_pred_blocks_ref"))
-            {
+            let mut blocks =
+                crate::safetensors::SafeTensors::open(dir.join("flux2_blocks.safetensors"))
+                    .unwrap();
+            if let (Ok((tokens, _)), Ok((want, _))) = (
+                reference.tensor("ref_latents"),
+                blocks.tensor("step0_pred_blocks_ref"),
+            ) {
                 dit.set_references(Some(crate::mmdit::References {
                     tokens: Matrix::from_vec(1024, 128, tokens),
                     grids: vec![(32, 32)],

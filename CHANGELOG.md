@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- FLUX.2-klein's transformer can store its block linears as FP8 E4M3, with one
+  scale per row: `Precision::Fp8` (opt-in; Q8 stays the default). This adds a
+  variant to `Precision`, so an exhaustive `match` on it outside the crate
+  breaks, and RustingFrame needs its own "fp8" value to reach it. Only the
+  FLUX-family `Dit` uses it. Modulations stay int8 per row, embedders and
+  proj_out stay F32, other models load it as Q8 or F32, and `save_bin`
+  refuses it. On the device a `dequantize_fp8` kernel widens the bytes to
+  BF16 for the existing GEMM (sm_86; the native FP8 GEMM on sm_89+ is
+  UNVERIFIED and not used). Parity is worse than Q8 and misses the image gate:
+  lighthouse seed 0 on the device, step-0 3.10e-2 against 8.73e-3, whole-chain
+  image 6.93e-2 against 3.03e-2 (gate 0.034). The host gives the same numbers.
+  3060, 1024x1024, 4 steps, 3 interleaved runs, load 1.7-5.8: denoise 6.77 s
+  against 6.82 s, upload 7.0 s against 12.5 s, process peak 9186 against
+  10626 MiB.
 - Wan 2.2 TI2V-5B image-to-video at 1280x704x121 now fits on a 12 GB card.
   Above 12288 tokens the device DiT runs the QKV projection and the
   feed-forward 4096 tokens at a time, so their FP32 `[tokens, 3 * dim]` and

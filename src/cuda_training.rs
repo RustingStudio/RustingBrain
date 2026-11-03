@@ -667,6 +667,20 @@ extern "C" __global__ void dequantize_q8(const signed char*q,const float*scales,
   size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)units*inner)return;
   store_act(out,i,(float)q[i]*scales[i/inner],narrow);
 }
+// FP8 E4M3 (`e4m3fn`: no infinities, 0x7f and 0xff the only NaN) by its bits,
+// the value `safetensors::f8_to_f32` decodes on the host, times a scale per
+// row. sm_86 has no FP8 arithmetic, so a prompt widens the weight first.
+__device__ __forceinline__ float e4m3_to_f32(unsigned char b){
+  unsigned e=(b>>3)&15u,m=b&7u;float v;
+  if(e==0u)v=(float)m*0.001953125f;
+  else if(e==15u&&m==7u)return __int_as_float(0x7fc00000);
+  else v=__uint_as_float(((e+120u)<<23)|(m<<20));
+  return (b&0x80)?-v:v;
+}
+extern "C" __global__ void dequantize_fp8(const unsigned char*q,const float*scales,void*out,int units,int inner,int narrow){
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)units*inner)return;
+  store_act(out,i,e4m3_to_f32(q[i])*scales[i/inner],narrow);
+}
 // The 4-bit layout of `quantized.rs`: rows padded to blocks of 64, byte j of a
 // block holding weight j low and weight j+32 high, one scale a block, and the
 // codebook's 16 levels in `levels`.
