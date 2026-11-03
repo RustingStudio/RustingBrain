@@ -687,7 +687,11 @@ impl VideoPipeline {
         mut noise: Vec<FeatureMap>,
         mut on_step: impl FnMut(usize, &[FeatureMap]) -> bool,
     ) -> Result<Vec<FeatureMap>, NetworkError> {
-        let sigmas = dmd_sigmas(&dmd.timesteps, 8.0 /* FastWan's DMD shift */, self.train_steps);
+        let sigmas = dmd_sigmas(
+            &dmd.timesteps,
+            8.0, /* FastWan's DMD shift */
+            self.train_steps,
+        );
         eprintln!("dmd sigmas {sigmas:?}");
         let mut rng = StdRng::seed_from_u64(dmd.seed);
         for (step, (&t, &sigma)) in dmd.timesteps.iter().zip(&sigmas).enumerate() {
@@ -705,7 +709,8 @@ impl VideoPipeline {
             if let Some(&next) = sigmas.get(step + 1) {
                 for x in &mut x0 {
                     *x = ((1.0 - next) * *x as f64
-                        + next * crate::diffusion::gaussian(&mut rng) as f64) as f32;
+                        + next * crate::diffusion::gaussian(&mut rng) as f64)
+                        as f32;
                 }
             }
             refill(&mut noise, &x0);
@@ -1229,7 +1234,10 @@ mod tests {
             pipeline.denoiser().unwrap();
             eprintln!("wan clip {run}: reattach {:?}", started.elapsed());
             if let Some((free, _)) = crate::cuda_image::memory_info() {
-                eprintln!("wan clip {run}: free with the DiT on device {} MiB", free >> 20);
+                eprintln!(
+                    "wan clip {run}: free with the DiT on device {} MiB",
+                    free >> 20
+                );
             }
         }
     }
@@ -1280,7 +1288,13 @@ mod tests {
             };
             let started = Instant::now();
             let latent = pipeline
-                .sample_from_noise(&text, None, None, pipeline.noise(&request).unwrap(), |_, _| true)
+                .sample_from_noise(
+                    &text,
+                    None,
+                    None,
+                    pipeline.noise(&request).unwrap(),
+                    |_, _| true,
+                )
                 .unwrap();
             let sampled = started.elapsed();
             let decoding = Instant::now();
@@ -1296,13 +1310,24 @@ mod tests {
             let mut command = std::process::Command::new("ffmpeg");
             command.args(["-y", "-loglevel", "error"]).current_dir(&dir);
             for pick in &picks {
-                command.arg("-i").arg(format!("{name}_frame{:02}.png", pick + 1));
+                command
+                    .arg("-i")
+                    .arg(format!("{name}_frame{:02}.png", pick + 1));
             }
-            let scaled: String = (0..5).map(|k| format!("[{k}]scale=640:-1[s{k}];")).collect();
+            let scaled: String = (0..5)
+                .map(|k| format!("[{k}]scale=640:-1[s{k}];"))
+                .collect();
             let stacked: String = (0..5).map(|k| format!("[s{k}]")).collect();
             command
-                .args(["-filter_complex", &format!("{scaled}{stacked}hstack=inputs=5")])
-                .arg(if frames == 49 { "tiles.png".to_string() } else { format!("tiles{frames}.png") });
+                .args([
+                    "-filter_complex",
+                    &format!("{scaled}{stacked}hstack=inputs=5"),
+                ])
+                .arg(if frames == 49 {
+                    "tiles.png".to_string()
+                } else {
+                    format!("tiles{frames}.png")
+                });
             assert!(command.status().unwrap().success(), "tile failed");
         }
     }
@@ -1328,7 +1353,8 @@ mod tests {
     fn wan22_image_to_video_step_skip_sweep() {
         use std::time::Instant;
         let env = |name: &str| std::env::var(name).ok();
-        let Some(image_path) = env("RB_WS3_IMAGE").filter(|_| env("RB_WAN_CUDA").as_deref() == Some("1"))
+        let Some(image_path) =
+            env("RB_WS3_IMAGE").filter(|_| env("RB_WAN_CUDA").as_deref() == Some("1"))
         else {
             eprintln!("skipped: needs RB_WAN_CUDA=1 and RB_WS3_IMAGE");
             return;
@@ -1341,9 +1367,7 @@ mod tests {
         let runs: usize = env("RB_WS3_RUNS").map_or(1, |v| v.parse().unwrap());
         let dir = PathBuf::from("/tmp/ws3");
         std::fs::create_dir_all(&dir).unwrap();
-        let picture = image::open(image_path)
-            .unwrap()
-            .to_rgb8();
+        let picture = image::open(image_path).unwrap().to_rgb8();
         let (width, height) = (picture.width() as usize, picture.height() as usize);
         let mut planes = vec![0f32; 3 * width * height];
         for (i, pixel) in picture.pixels().enumerate() {
@@ -1369,12 +1393,21 @@ mod tests {
         let first = pipeline.encode_image(&image).unwrap();
         let spec = env("RB_WS3_VARIANTS").unwrap_or_else(|| "base:20".into());
         let mut variants: Vec<&str> = spec.split_whitespace().collect();
-        let base = variants.iter().position(|v| v.starts_with("base:20")).map_or("base:20", |i| variants.remove(i));
+        let base = variants
+            .iter()
+            .position(|v| v.starts_with("base:20"))
+            .map_or("base:20", |i| variants.remove(i));
         variants.insert(0, base);
         // Warm-up: the DiT upload and the kernel build are not sampling time.
         pipeline.config.steps = 2;
         pipeline
-            .sample_from_noise(&text, Some(&negative), Some(&first), pipeline.noise(&request).unwrap(), |_, _| true)
+            .sample_from_noise(
+                &text,
+                Some(&negative),
+                Some(&first),
+                pipeline.noise(&request).unwrap(),
+                |_, _| true,
+            )
             .unwrap();
         let mut reference: Vec<f32> = Vec::new();
         let mut pending = Vec::new();
@@ -1399,7 +1432,13 @@ mod tests {
             for _ in 0..runs {
                 let started = Instant::now();
                 latent = pipeline
-                    .sample_from_noise(&text, Some(&negative), Some(&first), pipeline.noise(&request).unwrap(), |_, _| true)
+                    .sample_from_noise(
+                        &text,
+                        Some(&negative),
+                        Some(&first),
+                        pipeline.noise(&request).unwrap(),
+                        |_, _| true,
+                    )
                     .unwrap();
                 times.push(started.elapsed().as_secs_f64());
             }
@@ -1419,7 +1458,10 @@ mod tests {
             eprintln!(
                 "WS3 {variant} dit_calls {calls} sample_mean {mean:.1}s spread {spread:.1}s rel_l2 {:.4} load {}",
                 (diff / norm).sqrt(),
-                load.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+                load.split_whitespace()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
             // NOTE: decode after the last sample; a 49-frame decode leaves
             // too little device memory for the next sample's DiT.
@@ -1428,28 +1470,169 @@ mod tests {
             }
         }
         for (name, latent) in pending {
-            {
-                let clip = pipeline.decode(&latent).unwrap();
-                // Five frames piped straight into one tile PNG; no frame files.
-                use std::io::Write;
-                let mut command = std::process::Command::new("ffmpeg");
-                command
-                    .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"])
-                    .args(["-s", &format!("{width}x{height}"), "-i", "-"])
-                    .args(["-vf", "scale=640:-1,tile=5x1", "-frames:v", "1"])
-                    .arg(dir.join(format!("{name}_tiles.png")))
-                    .stdin(std::process::Stdio::piped());
-                let mut child = command.spawn().expect("ffmpeg");
-                let mut stdin = child.stdin.take().unwrap();
-                for k in 0..5 {
-                    stdin
-                        .write_all(&crate::vae::to_rgb8(&clip[k * (frames - 1) / 4]))
-                        .unwrap();
-                }
-                drop(stdin);
-                assert!(child.wait().unwrap().success(), "tile failed");
-            }
+            let clip = pipeline.decode(&latent).unwrap();
+            save_tiles(&clip, &dir.join(format!("{name}_tiles.png")));
         }
+    }
+
+    /// Frames 0, F/4, F/2, 3F/4 and F-1 of `clip`, each scaled to 640 wide,
+    /// side by side in one PNG; no frame files.
+    fn save_tiles(clip: &[FeatureMap], path: &Path) {
+        use std::io::Write;
+        let (width, height, frames) = (clip[0].width, clip[0].height, clip.len());
+        let mut child = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+            ])
+            .args(["-s", &format!("{width}x{height}"), "-i", "-"])
+            .args(["-vf", "scale=640:-1,tile=5x1", "-frames:v", "1"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("ffmpeg");
+        let mut stdin = child.stdin.take().unwrap();
+        for k in 0..5 {
+            stdin
+                .write_all(&crate::vae::to_rgb8(&clip[k * (frames - 1) / 4]))
+                .unwrap();
+        }
+        drop(stdin);
+        assert!(child.wait().unwrap().success(), "tile failed");
+    }
+
+    /// Image-to-video against diffusers on a long clip (WS9d): RustingFrame's
+    /// `tools/wan_diffusers_bench.py ti2v` output `ti2v_<RB_WS9D_SIZE>.safetensors`
+    /// (default `352x640x121`) in `RB_WS9D_REF`. Teacher-forced: each step's
+    /// two DiT calls on the reference's input and one UniPC step from the
+    /// reference's latent, rel_l2 per latent frame. Then free-running from
+    /// the reference noise, first frame and prompt states, and our decode of
+    /// both final latents, tiled into `RB_WS9D_REF/rb_ti2v_<size>_tiles.png`
+    /// and `rb_decode_of_diffusers_<size>_tiles.png`. `RB_WAN_CUDA=1`;
+    /// `RB_WS9D_FORCED` caps the teacher-forced steps (default all).
+    #[cfg(all(feature = "cuda", feature = "images"))]
+    #[test]
+    #[ignore = "needs Wan2.2-TI2V-5B, RB_WAN_CUDA=1 and RB_WS9D_REF"]
+    fn wan22_ti2v_long_clip_replays_diffusers() {
+        use crate::wan_vae::tests::{frames, relative};
+        let env = |name: &str| std::env::var(name).ok();
+        let Some(dir) = env("RB_WS9D_REF").filter(|_| env("RB_WAN_CUDA").as_deref() == Some("1"))
+        else {
+            eprintln!("skipped: needs RB_WAN_CUDA=1 and RB_WS9D_REF");
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let model = PathBuf::from(
+            env("RB_WAN_MODEL")
+                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+        );
+        let size = env("RB_WS9D_SIZE").unwrap_or_else(|| "352x640x121".into());
+        let mut reference =
+            crate::safetensors::SafeTensors::open(dir.join(format!("ti2v_{size}.safetensors")))
+                .unwrap();
+        let mut read = |name: &str| reference.tensor(name).unwrap();
+        let matrix =
+            |(data, shape): (Vec<f32>, Vec<usize>)| Matrix::from_vec(shape[0], shape[1], data);
+        let positive = matrix(read("prompt_embeds"));
+        let negative = matrix(read("negative_prompt_embeds"));
+        let (noise, noise_shape) = read("noise");
+        let steps = read("timesteps").0.len();
+        let (input, shape) = read("step0.dit_in");
+        let first = frames(&input, &shape).remove(0);
+        let per_frame = |got: &[FeatureMap], want: &[FeatureMap]| -> Vec<f32> {
+            got.iter()
+                .zip(want)
+                .map(|(g, w)| relative(&g.data, &w.data))
+                .collect()
+        };
+        let show = |errors: &[f32]| {
+            errors
+                .iter()
+                .map(|e| format!("{e:.2e}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        let mut pipeline = VideoPipeline::load(&model).unwrap();
+        pipeline.encoder = None;
+        pipeline.config.steps = steps;
+        pipeline.config.guidance = 5.0;
+        pipeline.config.skip = None;
+        assert!(pipeline.try_cuda(0));
+        let sigmas = UniPc::new(steps, pipeline.flow_shift, pipeline.train_steps).unwrap();
+        for (a, b) in sigmas.sigmas().iter().zip(&read("sigmas").0) {
+            assert!((a - b).abs() < 1e-6, "sigma {a} vs {b}");
+        }
+
+        let mut unipc = UniPc::new(steps, pipeline.flow_shift, pipeline.train_steps).unwrap();
+        let mut sample = flatten(&frames(&noise, &noise_shape));
+        let forced: usize = env("RB_WS9D_FORCED").map_or(steps, |v| v.parse().unwrap());
+        for step in 0..forced.min(steps) {
+            let (input, shape) = read(&format!("step{step}.dit_in"));
+            let input = frames(&input, &shape);
+            let per_token = read(&format!("step{step}.dit_t")).0;
+            let times: Vec<f32> = per_token
+                .iter()
+                .step_by(per_token.len() / input.len())
+                .copied()
+                .collect();
+            let dit = pipeline.denoiser().unwrap();
+            let cond = dit.forward(&input, &times, &positive).unwrap();
+            let uncond = dit.forward(&input, &times, &negative).unwrap();
+            let (data, shape) = read(&format!("step{step}.cond"));
+            let want_cond = frames(&data, &shape);
+            let (data, shape) = read(&format!("step{step}.uncond"));
+            let want_uncond = frames(&data, &shape);
+            let guided: Vec<f32> = flatten(&cond)
+                .iter()
+                .zip(flatten(&uncond))
+                .map(|(c, u)| u + 5.0 * (c - u))
+                .collect();
+            let next = unipc.step(&guided, &sample).unwrap();
+            let mut ours = frames(&noise, &noise_shape);
+            refill(&mut ours, &next);
+            let (data, shape) = read(&format!("step{step}.latent"));
+            let want = frames(&data, &shape);
+            eprintln!(
+                "ws9d step {step} t={}: cond {:.3e} uncond {:.3e} latent {:.3e}\n  cond per frame {}\n  latent per frame {}",
+                times[times.len() - 1],
+                relative(&flatten(&cond), &flatten(&want_cond)),
+                relative(&flatten(&uncond), &flatten(&want_uncond)),
+                relative(&next, &flatten(&want)),
+                show(&per_frame(&cond, &want_cond)),
+                show(&per_frame(&ours, &want)),
+            );
+            sample = flatten(&want);
+        }
+
+        let latent = pipeline
+            .sample_from_noise(
+                &positive,
+                Some(&negative),
+                Some(&first),
+                frames(&noise, &noise_shape),
+                |_, _| true,
+            )
+            .unwrap();
+        let (data, shape) = read("final_latent");
+        let want = frames(&data, &shape);
+        eprintln!(
+            "ws9d free-running final latent {:.3e}; per frame {}",
+            relative(&flatten(&latent), &flatten(&want)),
+            show(&per_frame(&latent, &want))
+        );
+        let clip = pipeline.decode(&latent).unwrap();
+        save_tiles(&clip, &dir.join(format!("rb_ti2v_{size}_tiles.png")));
+        let clip = pipeline.decode(&want).unwrap();
+        save_tiles(
+            &clip,
+            &dir.join(format!("rb_decode_of_diffusers_{size}_tiles.png")),
+        );
     }
 
     #[test]
