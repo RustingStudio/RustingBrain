@@ -159,6 +159,7 @@ pub mod wan_dit;
 pub mod wan_vae;
 pub mod webdataset;
 pub mod yolo;
+pub mod zimage;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_flash;

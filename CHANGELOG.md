@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Z-Image-Turbo text-to-image (RustingFrame Z1). `zimage::ZImage` is the
+  single-stream DiT: noise and caption refiners, 3D RoPE 32/48/48, qk norm.
+  It runs Q8 on the host and on the device. `ImagePipeline::load_at` picks
+  it when `model_index.json` names `ZImagePipeline`. The sampler is
+  flow-match Euler at shift 3, 8 steps, no CFG. The Qwen3-4B encoder is
+  klein's code with `ChatPrompt::z_image`: the state after 35 layers, real
+  tokens only. Its weights equal klein's in every layer that runs. Only the
+  MLP of layer 35 (the 36th) differs, and the loader never reads it.
+  The FLUX.1 decoder's mid attention scores reach 2e7, which FP16 cannot
+  hold. On the first FP16 overflow, the device decoder switches for good to
+  F32 scores and a softmax with FP16 output (`softmax_wide`). klein never
+  overflows, so its path stays bit for bit the same
+  (`flux2_klein_matches_diffusers` with `RB_FLUX2_W8A8=0`: 8.727e-3 /
+  3.313e-2 / 3.028e-2, unchanged).
+  `zimage::tests::z_image_turbo_matches_diffusers` runs the lighthouse at
+  1024², 8 steps, seed 7, on the device. The reference is diffusers 0.42.1
+  in F32 on the CPU (RustingFrame `tools/zimage_refs.py`). Results:
+  encoder F32 2.96e-6, encoder Q8 1.07e-2, sigmas exact, step-0 1.51e-2,
+  final latent 9.08e-2, image 8.63e-2. The decoder alone on the reference
+  latent gives 1.02e-3. Q8 weight error misses the plan gates (1e-2 / 1e-2
+  / 3e-2 / 3e-2); it is not a bug. F32 activations change nothing
+  (1.78e-2 / 8.96e-2). Q8 group 16 gives 1.15e-2 / 6.61e-2. The picture
+  matches diffusers by eye.
+  Through RustingFrame on the 3060, a warm 1024² job takes 21.95 s
+  (21.92-21.97, 3 runs under the lock). Peak VRAM is 11866 MiB on the
+  whole GPU, desktop included. The encoder does not fit beside the DiT on
+  12 GB, so it runs on the host: about 1.8 s for each new prompt.
+
 - W8A8 is now the default for FLUX.2-klein on compute capability 8.0+
   (owner, 2026-11-03); `RB_FLUX2_W8A8=0` turns it off. Other DiT layouts
   (FLUX.1) keep the dequantize-then-cuBLAS path. `flux2_klein_matches_diffusers`

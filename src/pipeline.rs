@@ -43,6 +43,7 @@ use crate::tokenizer::{Bpe, Unigram};
 use crate::transformer::Precision;
 use crate::unet::{Unet, UnetConfig};
 use crate::vae::{VaeDecoder, VaeEncoder};
+use crate::zimage::ZImage;
 
 /// How a run is put together: the sampler's settings and the latent's packing.
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +179,8 @@ pub enum ImageDenoiser {
     Transformer(Dit),
     /// A convolutional UNet: Stable Diffusion 1.x, 2.x and XL.
     Unet(Unet),
+    /// Z-Image's single-stream transformer.
+    ZImage(ZImage),
 }
 
 impl From<Dit> for ImageDenoiser {
@@ -200,6 +203,7 @@ impl ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.config().in_channels,
             Self::Unet(denoiser) => denoiser.config().out_channels,
+            Self::ZImage(denoiser) => denoiser.config().token_width(),
         }
     }
 
@@ -208,6 +212,7 @@ impl ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.config().text_dim,
             Self::Unet(denoiser) => denoiser.config().cross_dim,
+            Self::ZImage(denoiser) => denoiser.config().caption_dim,
         }
     }
 
@@ -216,6 +221,7 @@ impl ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.pooled_dim(),
             Self::Unet(denoiser) => denoiser.pooled_dim(),
+            Self::ZImage(_) => None,
         }
     }
 
@@ -224,6 +230,7 @@ impl ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.set_conditioning(conditioning),
             Self::Unet(denoiser) => denoiser.set_conditioning(conditioning),
+            Self::ZImage(denoiser) => denoiser.set_conditioning(conditioning),
         }
     }
 
@@ -232,6 +239,8 @@ impl ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.set_unconditional(conditioning),
             Self::Unet(denoiser) => denoiser.set_unconditional(conditioning),
+            // Z-Image-Turbo is distilled to run without guidance.
+            Self::ZImage(_) => {}
         }
     }
 }
@@ -241,6 +250,7 @@ impl Denoiser for ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.denoise(latents, sigma),
             Self::Unet(denoiser) => denoiser.denoise(latents, sigma),
+            Self::ZImage(denoiser) => denoiser.denoise(latents, sigma),
         }
     }
 
@@ -252,6 +262,7 @@ impl Denoiser for ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.denoise_unconditional(latents, sigma),
             Self::Unet(denoiser) => denoiser.denoise_unconditional(latents, sigma),
+            Self::ZImage(denoiser) => denoiser.denoise_unconditional(latents, sigma),
         }
     }
 }
@@ -336,6 +347,8 @@ pub struct ChatPrompt {
     /// Which states are read, as how many layers have run: 9 is the state
     /// after the ninth layer. No final norm is applied.
     pub layers: Vec<usize>,
+    /// Whether only the real tokens are encoded, with no padding.
+    pub trim: bool,
 }
 
 impl ChatPrompt {
@@ -348,6 +361,20 @@ impl ChatPrompt {
             length: 512,
             pad,
             layers: vec![9, 18, 27],
+            trim: false,
+        }
+    }
+
+    /// `ZImagePipeline`'s: the same turn with thinking left on, so no empty
+    /// thought, the state after layer 35 of 36, and only the real tokens.
+    pub fn z_image(pad: u32) -> Self {
+        Self {
+            prefix: "<|im_start|>user\n".into(),
+            suffix: "<|im_end|>\n<|im_start|>assistant\n".into(),
+            length: 512,
+            pad,
+            layers: vec![35],
+            trim: true,
         }
     }
 
@@ -360,7 +387,9 @@ impl ChatPrompt {
         let mut ids = tokenizer.encode(&format!("{}{prompt}{}", self.prefix, self.suffix))?;
         ids.truncate(self.length);
         let real = ids.len();
-        ids.resize(self.length, self.pad);
+        if !self.trim {
+            ids.resize(self.length, self.pad);
+        }
         Ok((ids, real))
     }
 }
@@ -678,11 +707,15 @@ impl ImagePipeline {
         // FLUX.2 is told apart by its pipeline's name: its prompt, schedule
         // and latent all differ from FLUX.1's in ways no part's own
         // configuration records.
-        let flux2 = read_json(&part("model_index.json")).is_some_and(|json| {
+        let pipeline_name = read_json(&part("model_index.json")).and_then(|json| {
             json.get("_class_name")
                 .and_then(|name| name.as_str())
-                .is_some_and(|name| name.starts_with("Flux2"))
+                .map(str::to_owned)
         });
+        let flux2 = pipeline_name
+            .as_ref()
+            .is_some_and(|name| name.starts_with("Flux2"));
+        let zimage = pipeline_name.as_deref() == Some("ZImagePipeline");
         // Which denoiser a model has is which directory it published it in.
         let unet = part("unet/config.json").exists();
 
@@ -711,7 +744,10 @@ impl ImagePipeline {
                 || architecture(json, "CLIP")
         });
 
-        let denoiser_config = match unet {
+        let zimage_config = zimage
+            .then(|| crate::zimage::ZImageConfig::from_file(part("transformer/config.json")))
+            .transpose()?;
+        let denoiser_config = match unet || zimage {
             true => None,
             false => Some(crate::mmdit::DitConfig::from_file(part(
                 "transformer/config.json",
@@ -721,6 +757,7 @@ impl ImagePipeline {
         // it, and the patch size is not written down anywhere. It is whatever
         // squares the latent's channels up to the width the denoiser reads.
         let patch = match &denoiser_config {
+            None if zimage => zimage_config.as_ref().map_or(1, |config| config.patch),
             None => 1,
             Some(config) => {
                 let packed = config.in_channels / decoder_config.latent_channels.max(1);
@@ -762,6 +799,8 @@ impl ImagePipeline {
             solver: scheduler.as_ref().map_or(defaults.solver, solver_named),
             // klein is distilled to four steps.
             steps: match (unet, flux2) {
+                // Z-Image-Turbo is distilled to eight.
+                _ if zimage => 8,
                 (true, _) => 50,
                 (false, true) => 4,
                 (false, false) => defaults.steps,
@@ -888,7 +927,7 @@ impl ImagePipeline {
                         let tokenizer = Bpe::from_file(words.join("tokenizer.json"))?;
                         let mut encoder_config =
                             crate::text_encoder::TextEncoderConfig::from_file(&states_config)?;
-                        let chat = match flux2 {
+                        let chat = match flux2 || zimage {
                             false => None,
                             true => {
                                 let pad = read_json(&words.join("tokenizer_config.json"))
@@ -899,10 +938,13 @@ impl ImagePipeline {
                                     })
                                     .ok_or_else(|| {
                                         NetworkError::InvalidConfig(
-                                            "FLUX.2's tokenizer names no padding token".into(),
+                                            "the chat tokenizer names no padding token".into(),
                                         )
                                     })?;
-                                Some(ChatPrompt::flux2(pad))
+                                Some(match zimage {
+                                    true => ChatPrompt::z_image(pad),
+                                    false => ChatPrompt::flux2(pad),
+                                })
                             }
                         };
                         // Layers past the deepest one read are never run, so
@@ -944,6 +986,11 @@ impl ImagePipeline {
             Ok::<_, NetworkError>(file)
         };
         let denoiser: ImageDenoiser = match denoiser_config {
+            None if zimage => ImageDenoiser::ZImage(ZImage::read(
+                &mut denoiser_file("transformer")?,
+                zimage_config.expect("read with the flag"),
+                precision,
+            )?),
             Some(denoiser_config) => Dit::read_at(
                 &mut denoiser_file("transformer")?,
                 "",
@@ -1072,13 +1119,20 @@ impl ImagePipeline {
         }
         let sequence = matches!(self.encoder, PromptEncoder::Sequence { .. });
         let t5 = self.encoder.t5().filter(|t5| t5.config().gated);
-        if sequence || t5.is_some() || matches!(self.denoiser, ImageDenoiser::Transformer(_)) {
+        let transformer = matches!(
+            self.denoiser,
+            ImageDenoiser::Transformer(_) | ImageDenoiser::ZImage(_)
+        );
+        if sequence || t5.is_some() || transformer {
             let context = crate::gpu_transformer::GpuContext::new(device)?;
             if let Some(t5) = t5 {
                 t5.attach_device(&context)?;
             }
             if let ImageDenoiser::Transformer(dit) = &mut self.denoiser {
                 dit.attach_device(&context)?;
+            }
+            if let ImageDenoiser::ZImage(model) = &mut self.denoiser {
+                model.attach_device(&context)?;
             }
             // After the denoiser, and allowed to fail: a prompt encoder that
             // does not fit beside it (FLUX.2-klein's Qwen3 in BF16 on a 12 GB
@@ -1913,7 +1967,7 @@ mod tests {
     ) {
         let dit = match &reference.denoiser {
             ImageDenoiser::Transformer(denoiser) => denoiser.config().clone(),
-            ImageDenoiser::Unet(_) => unreachable!("the test pipeline is built with a transformer"),
+            _ => unreachable!("the test pipeline is built with a transformer"),
         };
         publish_parts(&dit, reference.decoder.config(), directory, clip, t5, None);
     }

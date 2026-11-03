@@ -433,6 +433,25 @@ extern "C" __global__ void softmax_rows(half_t*__restrict__ scores,
     s[i]=f2h(i<visible?__expf(h2f(s[i])-peak)*inv:0.f);
 }
 
+// `softmax_rows` for scores too large for FP16, which the FLUX.1 autoencoder's
+// middle attention produces: f32 scores in, FP16 probabilities out.
+extern "C" __global__ void softmax_wide(const float*__restrict__ scores,
+    half_t*__restrict__ out,int context){
+  __shared__ float red[THREADS];
+  const float*s=scores+(long long)blockIdx.x*context;
+  half_t*o=out+(long long)blockIdx.x*context;
+  float largest=__int_as_float(0xff800000),total=0.f;
+  for(int i=threadIdx.x;i<context;i+=THREADS){
+    float v=s[i];
+    if(v>largest){total*=__expf(largest-v);largest=v;}
+    total+=__expf(v-largest);
+  }
+  float peak=block_max(largest,red);
+  total*=__expf(largest-peak);
+  float inv=1.f/block_sum(total,red);
+  for(int i=threadIdx.x;i<context;i+=THREADS)o[i]=f2h(__expf(s[i]-peak)*inv);
+}
+
 // Half the projection is the value and half is its gate, which is the gated
 // feed-forward every one of these transformer blocks ends in.
 // The projection that feeds this is the widest tensor a transformer block
@@ -675,6 +694,7 @@ pub struct ImageGpu {
     layer_norm: CudaFunction,
     softmax_rows: CudaFunction,
     softmax_warp: CudaFunction,
+    softmax_wide: CudaFunction,
     gelu_gate: CudaFunction,
     upsample: CudaFunction,
     transpose: CudaFunction,
@@ -687,6 +707,11 @@ pub struct ImageGpu {
     silu_bwd: CudaFunction,
     upsample_bwd: CudaFunction,
     softmax_bwd: CudaFunction,
+    /// Keep attention scores in f32. Off by default, which keeps every
+    /// existing result bit for bit. A decoder turns it on for good the first
+    /// time it overflows FP16, which the FLUX.1 autoencoder (Z-Image) does in
+    /// its middle attention: its scores reach 2e7.
+    wide_scores: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ImageGpu {
@@ -723,6 +748,7 @@ impl ImageGpu {
             layer_norm: get("layer_norm")?,
             softmax_rows: get("softmax_rows")?,
             softmax_warp: get("softmax_warp")?,
+            softmax_wide: get("softmax_wide")?,
             gelu_gate: get("gelu_gate")?,
             upsample: get("upsample")?,
             transpose: get("transpose")?,
@@ -735,6 +761,7 @@ impl ImageGpu {
             silu_bwd: get("silu_bwd")?,
             upsample_bwd: get("upsample_bwd")?,
             softmax_bwd: get("softmax_bwd")?,
+            wide_scores: false.into(),
         }))
     }
 
@@ -1902,9 +1929,44 @@ impl ImageGpu {
         let chunk = (SCORE_BUDGET / (heads * context).max(1)).clamp(1, tokens);
         let mut scores = self.uninit(heads * chunk, context)?;
         let mut output = self.uninit(tokens, queries.cols)?;
+        let wide = !causal && self.wide_scores.load(std::sync::atomic::Ordering::Relaxed);
+        let mut wide_scores = match wide {
+            true => Some(
+                unsafe { self.context.stream.alloc::<f32>(heads * chunk * context) }.map_err(
+                    cuda_alloc_err("device allocation", heads * chunk * context * 4),
+                )?,
+            ),
+            false => None,
+        };
 
         for first in (0..tokens).step_by(chunk) {
             let rows = chunk.min(tokens - first);
+            if let Some(wide) = wide_scores.as_mut() {
+                let shape = (heads, head_dim, first, rows, context);
+                self.wide_score_gemm(queries, keys, wide, shape, scale)?;
+                let lines = heads * rows;
+                unsafe {
+                    self.context
+                        .stream
+                        .launch_builder(&self.softmax_wide)
+                        .arg(&*wide)
+                        .arg(&mut scores.data)
+                        .arg(&(context as i32))
+                        .launch(grid(lines))
+                }
+                .map_err(cuda_err("attention softmax kernel"))?;
+                self.merge(
+                    &scores,
+                    values,
+                    &mut output,
+                    heads,
+                    head_dim,
+                    first,
+                    rows,
+                    context,
+                )?;
+                continue;
+            }
             self.scores(
                 queries,
                 keys,
@@ -1989,12 +2051,53 @@ impl ImageGpu {
         context: usize,
         scale: f32,
     ) -> Result<(), NetworkError> {
+        let (out_pointer, _out) = scores.data.device_ptr_mut(&self.context.stream);
+        let shape = (heads, head_dim, first, rows, context);
+        self.score_gemm(queries, keys, out_pointer, false, shape, scale)
+    }
+
+    /// [`ImageGpu::scores`] into `f32`, summed in `f32`.
+    fn wide_score_gemm(
+        &self,
+        queries: View<'_>,
+        keys: View<'_>,
+        scores: &mut CudaSlice<f32>,
+        shape: (usize, usize, usize, usize, usize),
+        scale: f32,
+    ) -> Result<(), NetworkError> {
+        let (out_pointer, _out) = scores.device_ptr_mut(&self.context.stream);
+        self.score_gemm(queries, keys, out_pointer, true, shape, scale)
+    }
+
+    fn score_gemm(
+        &self,
+        queries: View<'_>,
+        keys: View<'_>,
+        out_pointer: u64,
+        wide: bool,
+        (heads, head_dim, first, rows, context): (usize, usize, usize, usize, usize),
+        scale: f32,
+    ) -> Result<(), NetworkError> {
         let query = queries.data.slice(queries.base + first * queries.lead..);
         let key = keys.data.slice(keys.base..);
         let (key_pointer, _key) = key.device_ptr(&self.context.stream);
         let (query_pointer, _query) = query.device_ptr(&self.context.stream);
-        let (out_pointer, _out) = scores.data.device_ptr_mut(&self.context.stream);
         let (scale, zero) = (f16::from_f32(scale), f16::ZERO);
+        let (wide_scale, wide_zero) = (scale.to_f32(), 0f32);
+        let (alpha, beta, out_type, compute) = match wide {
+            true => (
+                &wide_scale as *const f32 as *const std::ffi::c_void,
+                &wide_zero as *const f32 as *const std::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_32F,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            ),
+            false => (
+                &scale as *const f16 as *const std::ffi::c_void,
+                &zero as *const f16 as *const std::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16F,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+            ),
+        };
         unsafe {
             cublas::gemm_strided_batched_ex(
                 *self.context.blas.handle(),
@@ -2003,7 +2106,7 @@ impl ImageGpu {
                 context as i32,
                 rows as i32,
                 head_dim as i32,
-                &scale as *const f16 as *const std::ffi::c_void,
+                alpha,
                 key_pointer as *const std::ffi::c_void,
                 cublas_sys::cudaDataType_t::CUDA_R_16F,
                 keys.lead as i32,
@@ -2012,13 +2115,13 @@ impl ImageGpu {
                 cublas_sys::cudaDataType_t::CUDA_R_16F,
                 queries.lead as i32,
                 head_dim as i64,
-                &zero as *const f16 as *const std::ffi::c_void,
+                beta,
                 out_pointer as *mut std::ffi::c_void,
-                cublas_sys::cudaDataType_t::CUDA_R_16F,
+                out_type,
                 context as i32,
                 (rows * context) as i64,
                 heads as i32,
-                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+                compute,
                 cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
         }
@@ -3235,6 +3338,19 @@ impl DeviceVae {
     /// `latent` has already had the model's scale and shift undone by the host,
     /// which is one multiply per value and keeps that arithmetic in one place.
     pub fn decode(&self, latent: &FeatureMap) -> Result<FeatureMap, NetworkError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.decode_once(latent) {
+            // Retry once with f32 scores, and keep them for every later decode.
+            Err(NetworkError::Cuda(message))
+                if message.contains("overflowed") && !self.gpu.wide_scores.swap(true, Relaxed) =>
+            {
+                self.decode_once(latent)
+            }
+            result => result,
+        }
+    }
+
+    fn decode_once(&self, latent: &FeatureMap) -> Result<FeatureMap, NetworkError> {
         let gpu = &self.gpu;
         let mut hidden = Map {
             tensor: gpu.upload(latent.channels, latent.pixels(), &latent.data)?,
