@@ -15,9 +15,11 @@
 //! with those layers left on cuBLAS. A scale per 64 columns keeps an outlier
 //! from flattening the rest of its row.
 //!
-//! Opt-in: `RB_FLUX2_W8A8=1`, read once. Off, nothing here is compiled or
-//! loaded and every linear keeps the dequantize-then-cuBLAS path. It changes
-//! the numbers (activations lose to int8), so it is not the default.
+//! The default for FLUX.2 on compute capability 8.0+ (owner, 2026-11-03);
+//! `RB_FLUX2_W8A8=0`, read once, turns it off, and then nothing here is
+//! compiled or loaded and every linear keeps the dequantize-then-cuBLAS path.
+//! It changes the numbers (activations lose to int8): klein's parity test
+//! holds this path to its own gates, the off path to the strict ones.
 
 use crate::cuda_training::cuda_err;
 use crate::gpu_model::Gpu;
@@ -25,6 +27,7 @@ use crate::network::NetworkError;
 use cudarc::driver::{CudaFunction, CudaSlice, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // The GEMM: a block of eight warps owns a 128 x 128 tile of `y`, each warp
 // 64 x 32 (four m16 by four n8 mmas per step of 32 along k). A 64-wide slab
@@ -207,10 +210,19 @@ const BM: usize = 128;
 /// keeps its old path (the modulation GEMV has one row).
 const MIN_ROWS: usize = 64;
 
-/// Whether `RB_FLUX2_W8A8=1` asks for the W8A8 path. Read once.
+/// Whether the W8A8 path is wanted: yes unless `RB_FLUX2_W8A8=0`. Read once.
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RB_FLUX2_W8A8").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("RB_FLUX2_W8A8").as_deref() != Ok("0"))
+}
+
+/// Set once [`W8a8::load`] has loaded the kernels on some device, so a test
+/// can tell which path actually ran.
+static LOADED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn loaded() -> bool {
+    LOADED.load(Ordering::Relaxed)
 }
 
 /// The two kernels, loaded on one device.
@@ -247,10 +259,12 @@ impl W8a8 {
                 .load_function(name)
                 .map_err(cuda_err("W8A8 kernel lookup"))
         };
-        Ok(Some(Self {
+        let kernels = Self {
             gemm: get("gemm_w8a8")?,
             quantize: get("quantize_rows_i8")?,
-        }))
+        };
+        LOADED.store(true, Ordering::Relaxed);
+        Ok(Some(kernels))
     }
 
     /// `out = x . W^T + beta * out` for `rows` BF16 rows `x` and the int8

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- W8A8 is now the default for FLUX.2-klein on compute capability 8.0+
+  (owner, 2026-11-03); `RB_FLUX2_W8A8=0` turns it off. Other DiT layouts
+  (FLUX.1) keep the dequantize-then-cuBLAS path. `flux2_klein_matches_diffusers`
+  with `RB_FLUX2_W8A8=0` is unchanged (step-0 8.727e-3, final latent
+  3.313e-2, image 3.028e-2, strict gates); by default it runs W8A8 (1.114e-2,
+  4.935e-2, 4.154e-2) against W8A8's own gates 0.0125 / 0.055 / 0.046, the
+  measured numbers plus about 12 %.
 - W8A8 for FLUX.2-klein's block linears (RustingFrame P5), opt-in with
   `RB_FLUX2_W8A8=1` on compute capability 8.0+: `cuda_w8a8` quantizes BF16
   activations to int8 per token per 64 columns and multiplies them with the
