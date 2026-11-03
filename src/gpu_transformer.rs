@@ -109,6 +109,10 @@ pub struct GpuContext {
     /// The fused attention kernel, present only on Ampere and later. `None`
     /// leaves attention on the three-kernel cuBLAS path.
     pub(crate) flash: Option<crate::cuda_flash::FlashKernels>,
+    /// The sm_89+ FP8 GEMM (`cuda_fp8`), loaded only when
+    /// `RUSTING_BRAIN_FP8_MMA` is set on such a device; `None` keeps FP8
+    /// weights on the widen-then-cuBLAS path. UNVERIFIED on sm_89 / sm_120.
+    pub(crate) fp8_gemm: Option<cudarc::driver::CudaFunction>,
     /// RoPE tables, uploaded on first use and shared by every layer.
     pub(crate) rope: Mutex<Option<Arc<crate::gpu_model::DeviceRope>>>,
     /// Packed weights a [`Decoder`](crate::transformer::Decoder) lent for the
@@ -234,6 +238,9 @@ impl GpuContext {
             transfers: std::sync::atomic::AtomicUsize::new(0),
             model: crate::gpu_model::ModelKernels::load(&module)?,
             flash: crate::cuda_flash::flash_kernels(device, &context),
+            fp8_gemm: crate::cuda_fp8::enabled()
+                .then(|| crate::cuda_fp8::load(&context))
+                .flatten(),
             rope: Mutex::new(None),
             packs: Mutex::new(None),
             int8_decode: std::sync::atomic::AtomicBool::new(false),

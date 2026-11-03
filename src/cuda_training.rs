@@ -682,6 +682,28 @@ extern "C" __global__ void dequantize_fp8(const unsigned char*q,const float*scal
   size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)units*inner)return;
   store_act(out,i,e4m3_to_f32(q[i])*scales[i/inner],narrow);
 }
+// `quantized::f32_to_e4m3`, op for op: round to nearest even, saturate at 448,
+// NaN to 0x7f.
+__device__ __forceinline__ unsigned char f32_to_e4m3(float x){
+  if(isnan(x))return 0x7f;
+  unsigned sign=signbit(x)?0x80u:0u;float a=fabsf(x);
+  if(a>=448.f)return sign|0x7eu;
+  int octave=max((int)(__float_as_uint(a)>>23)-127,-6);
+  int steps=(int)rintf(a*__uint_as_float((unsigned)(130-octave)<<23));
+  return sign|min(((octave+7)<<3)+steps-8,0x7e);
+}
+// One block a row: the activations of the sm_89+ FP8 GEMM (`cuda_fp8.rs`) as
+// `Quantized::from_matrix_fp8` stores a weight, scale = absmax / 448 and a
+// zero row a zero scale. No FP8 instruction, so it runs (and is tested) on
+// sm_86 too.
+extern "C" __global__ void quantize_rows_e4m3(const void*x,int narrow,int inner,unsigned char*q,float*scales){
+  size_t base=(size_t)blockIdx.x*inner;float m=0.f;
+  for(int c=threadIdx.x;c<inner;c+=blockDim.x)m=fmaxf(m,fabsf(load_act(x,base+c,narrow)));
+  float scale=img_block_max(m)/448.f;
+  if(threadIdx.x==0)scales[blockIdx.x]=scale;
+  for(int c=threadIdx.x;c<inner;c+=blockDim.x)
+    q[base+c]=scale>0.f?f32_to_e4m3(load_act(x,base+c,narrow)/scale):0;
+}
 // The 4-bit layout of `quantized.rs`: rows padded to blocks of 64, byte j of a
 // block holding weight j low and weight j+32 high, one scale a block, and the
 // codebook's 16 levels in `levels`.

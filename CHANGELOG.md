@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- An FP8 GEMM for sm_89 and later (RustingFrame X3a), off by default:
+  `cuda_fp8` runs `y = x . W^T + beta * y` for an X1 FP8 weight with `x`
+  quantized to E4M3 per row on the fly (`quantize_rows_e4m3`, bit for bit the
+  host encoder), on `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`,
+  FP32 accumulation, both scales in the epilogue, FP32 output as the existing
+  linear path. It loads only on compute capability 8.9+ with
+  `RUSTING_BRAIN_FP8_MMA` set; every other device keeps the widen-then-cuBLAS
+  path. Host math: `Quantized::matmul_fp8_activations`. NVRTC 13.4 builds it
+  for compute_89 and compute_120 PTX and through ptxas to sm_89 SASS (56
+  registers) and sm_120 SASS (62 registers), no spills, 6144 B shared; sm_86
+  rejects the instruction, and the 3060 does not compile or load it.
+  On the 3060 the activation quantizer matches the host bit for bit, the lib
+  suite passes (704, the known detection failure, 32 ignored) and klein
+  parity is unchanged (step-0 8.727e-3, image 3.028e-2). Estimate of full
+  FP8 math on klein (test-only `RB_TEST_FP8_ACTIVATIONS`: activations through
+  E4M3 per row and back, then the BF16 path, device, lighthouse seed 0):
+  step-0 3.935e-2, final latent 2.083e-1, image 8.693e-2, against weight-only
+  FP8's 3.10e-2 / 1.617e-1 / 6.925e-2, so per-row FP8 math is further off
+  the image gate (0.034) than X1.
+  The kernel's results on sm_89 and sm_120 are UNVERIFIED: no such card has
+  run `gpu_model::tests::the_fp8_gemm_matches_the_host_reference_on_sm_89_or_skips`
+  (ignored, needs sm_89+).
 - Every NVRTC kernel now compiles for the device's own virtual architecture:
   the newest one the loaded NVRTC reports that is not above the oldest
   visible device (compute_86 on a 3060, compute_89 on an sm_89 card,
