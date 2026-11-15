@@ -2,7 +2,7 @@
 //!
 //! [`crate::gpu_model`] holds a whole decoder layer on the device, but the
 //! graph it drives is fixed — embedding, sixteen identical blocks, logits. The
-//! models in `2Dto3DPlan.md` need a different one: a flow transformer whose
+//! image-to-3D models need a different one: a flow transformer whose
 //! blocks alternate self-attention over latent tokens with cross-attention to
 //! a frozen image encoder's output, and a shape decoder whose queries are
 //! points in space. This module is the piece that graph does not already have.
@@ -32,7 +32,7 @@
 //! head. A profile of the shape VAE at batch 4 put the three-kernel path,
 //! softmax and per-head GEMMs together, at about 40% of the step.
 
-// Stage D of `2Dto3DPlan.md` is what calls this; until that block exists the
+// The flow transformer block is what calls this; until that block exists the
 // only caller is the parity test below, and a `cargo build` would otherwise
 // report the whole module as dead.
 #![allow(dead_code)]

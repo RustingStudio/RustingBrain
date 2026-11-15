@@ -687,7 +687,7 @@ every new field defaults when it is missing from the file.
 ### Documentation
 
 - The CUDA out-of-memory error explains fragmentation.
-- `roadmap.md` plans the next releases. The README scope now covers
+- The README scope now covers
   `Conv2d` and `TrainableConv2d` and lists the model types.
 - `Matrix::random` is documented as unseeded test filler.
 

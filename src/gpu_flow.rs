@@ -2,7 +2,7 @@
 //!
 //! [`crate::gpu_model`] holds a decoder layer on the device and
 //! [`crate::gpu_cross`] adds attention between two different token sets. This
-//! module is the third piece `2Dto3DPlan.md` asks for: the block the flow
+//! module is the third piece the image-to-3D models ask for: the block the flow
 //! transformer actually has — self-attention over the latent slots,
 //! cross-attention to the image tokens, a SwiGLU, each one wrapped in the
 //! adaptive normalization of [`crate::adaln`].

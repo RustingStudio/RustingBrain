@@ -61,7 +61,7 @@ card has roughly 4.5 GB of headroom at the largest shape measured.
 
 ## What this rules out
 
-The plan in `optimizePlan.md` gated two tasks on this measurement:
+The optimization plan gated two tasks on this measurement:
 
 - **Task 6, bf16 activation storage** — justified only below about 25% MFU,
   where the step is starved of bandwidth rather than arithmetic.
@@ -647,7 +647,7 @@ BPE, Adam 3e-4, seed 7:
 | 499 | 2.9449 | 3.1844 |
 | Held-out | 4.6321 | 4.9239 |
 
-The W1 column was taken on an earlier copy of the corpus (the roadmap and
+The W1 column was taken on an earlier copy of the corpus (the plan and
 baseline files have changed since), so it is a sanity bound, not a paired
 comparison. A same-corpus rerun of the previous commit ran out of memory
 because `strata` held 10.5 GB of the GPU.
@@ -806,8 +806,7 @@ four steps (77.5 ms of kernel time a step):
 | `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_..._nt` (grad of weight) | 5.06 | 26.5 TFLOP/s |
 | `ce_loss_grad_bf16` | 2.73 | ~288 GB/s |
 
-Each GEMM is 4096 x 512 x 32000 (134 GFLOP). Rejected for speed: see
-roadmap A6.
+Each GEMM is 4096 x 512 x 32000 (134 GFLOP). Rejected for speed.
 
 ## Device decode before a device KV cache (C2 step 1, 2026-10-07)
 
