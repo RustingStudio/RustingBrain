@@ -166,9 +166,14 @@ pub fn fourier_features(points: &Matrix, bands: usize) -> Result<Matrix, Network
 
     let width = 3 + 6 * bands;
     let mut features = Matrix::new(points.rows, width);
-    for row in 0..points.rows {
-        let point = points.row(row);
-        let out = features.row_mut(row);
+    // One training batch is a few hundred thousand points and this runs on the
+    // host every step, so the rows are spread over the cores.
+    use rayon::prelude::*;
+    let rows = features
+        .data
+        .par_chunks_mut(width)
+        .zip(points.data.par_chunks(3));
+    rows.with_min_len(1024).for_each(|(out, point)| {
         out[..3].copy_from_slice(point);
         for band in 0..bands {
             let frequency = (1u32 << band) as f32 * std::f32::consts::PI;
@@ -178,7 +183,7 @@ pub fn fourier_features(points: &Matrix, bands: usize) -> Result<Matrix, Network
                 out[3 + band * 6 + axis * 2 + 1] = cos;
             }
         }
-    }
+    });
     Ok(features)
 }
 
@@ -1376,7 +1381,12 @@ mod tests {
                     "query_in" => &mut model.query_in.weight.value.data[index],
                     "from_latent" => &mut model.from_latent.weight.value.data[index],
                     "decoder_block" => {
-                        &mut model.decoder_blocks[0].mlp.params_mut().remove(0).value.data[index]
+                        &mut model.decoder_blocks[0]
+                            .mlp
+                            .params_mut()
+                            .remove(0)
+                            .value
+                            .data[index]
                     }
                     _ => &mut model.head_bias.value.data[index],
                 };
@@ -1388,7 +1398,12 @@ mod tests {
                     "query_in" => &mut model.query_in.weight.value.data[index],
                     "from_latent" => &mut model.from_latent.weight.value.data[index],
                     "decoder_block" => {
-                        &mut model.decoder_blocks[0].mlp.params_mut().remove(0).value.data[index]
+                        &mut model.decoder_blocks[0]
+                            .mlp
+                            .params_mut()
+                            .remove(0)
+                            .value
+                            .data[index]
                     }
                     _ => &mut model.head_bias.value.data[index],
                 };
