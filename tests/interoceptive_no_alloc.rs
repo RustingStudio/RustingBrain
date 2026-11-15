@@ -1,4 +1,4 @@
-//! `docs/interoceptive_spec.md` §5.3: stepping the simulation and cycling the
+//! Stepping the simulation and cycling the
 //! replay buffer must not touch the heap. The Q-network's forward and backward
 //! passes are out of scope; they work on `Matrix` values and allocate by design.
 //!

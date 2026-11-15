@@ -29,8 +29,7 @@ TensorFlow except at 4×1024, where it is ahead. GEMMs are 60% of a step at
 These are single-GPU numbers on one architecture family. There is no
 multi-GPU, no distributed training, and no CPU-offload path; if your run needs
 those, use PyTorch. Per-architecture throughput for other shapes is in
-[docs/baseline.md](docs/baseline.md), and the optimization work behind the
-table is in [docs/optimize-plan.md](docs/optimize-plan.md).
+[docs/baseline.md](docs/baseline.md).
 
 ## What is in the box
 
