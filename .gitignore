@@ -13,3 +13,6 @@ flamegraph.svg
 lm.rbw
 lm.rbw.opt
 lm.vocab
+
+# Drafts of posts about the library
+.posts/

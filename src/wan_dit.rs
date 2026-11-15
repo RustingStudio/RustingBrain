@@ -1256,7 +1256,7 @@ pub(crate) mod tests {
             started.elapsed()
         );
         // The F32 rounding of thirty blocks, each about 1e-6 (block0), adds up;
-        // see docs/baseline.md.
+        // see docs/measurements.md.
         gate("output", relative(&stack(&output), &read("output").0), 5e-5);
         drop((head, step));
 

@@ -160,7 +160,7 @@
   the reference trajectory). Requests are checked (frames 4k+1, sides a
   multiple of 32). On an RTX 3060: a 256x256x5 clip in 6 steps takes 2.2 s,
   a 704x1280x17 step 4.5-5.4 s; umT5 stays on the host and the DiT is
-  dropped before a decode that does not fit beside it (`docs/baseline.md`,
+  dropped before a decode that does not fit beside it (`docs/measurements.md`,
   W4).
 - Wan 2.2's video transformer: `wan_dit::WanDit` runs one denoiser call of
   the TI2V-5B DiT (a timestep per frame, so the first frame of an
@@ -168,28 +168,28 @@
   `WanTransformer3DModel` in F32 (output relative L2 2.3e-5) and 3.3e-2 at
   Q8. `WanDit::attach_device` runs it on the GPU (int8 weights, BF16
   operands, FP32 residual): 4.4e-2 against diffusers, 704x1280x17 in
-  2.3-2.6 s a step and about 7.7 GB on an RTX 3060 (`docs/baseline.md`, W3).
+  2.3-2.6 s a step and about 7.7 GB on an RTX 3060 (`docs/measurements.md`, W3).
   A malformed checkpoint is refused with `InvalidConfig` before any upload.
 - Wan 2.2's video autoencoder: `wan_vae::WanVaeDecoder` decodes a latent
   (one map per latent frame) into RGB frames and `WanVaeEncoder` encodes a
   `1 + 4k`-frame clip, both matching diffusers' `AutoencoderKLWan` in F32
   (relative L2 under 1e-6). `WanVaeDecoder::attach_device` decodes on the GPU
   in FP16 (1.3e-3): 704x1280x17 in 9.5 s and 7.8 GB on an RTX 3060, untiled
-  (`docs/baseline.md`, W2).
+  (`docs/measurements.md`, W2).
 - umT5, Wan 2.2's prompt encoder, runs through `T5Encoder`: a checkpoint with
   a position table in every block is read that way (T5's single shared table
   is unchanged), on the host and the device. `T5Encoder::encode_real` gives
   the states Wan hands its denoiser: the real tokens only, zero rows after
   them. umT5-XXL at Q8 against transformers: token ids exact, prompt
   embeddings 0.0203 / 0.0245 on the host, 0.0204 / 0.0245 on an RTX 3060
-  (95 / 194 ms for 9 / 39 tokens; `docs/baseline.md`, W1).
+  (95 / 194 ms for 9 / 39 tokens; `docs/measurements.md`, W1).
 - `ImagePipeline::encoder_on_device` says whether `to_cuda` (or `try_cuda`)
   moved a sequence prompt encoder such as FLUX.2-klein's Qwen3. That upload
   may fail when VRAM is short and the encoder then stays on the host (prompt
   encode about 12 s instead of 0.7 s on an RTX 3060); before, nothing said so.
 - FLUX.2-klein-4B denoises faster on the device: 1024x1024 Q8 on an RTX 3060
   9.96 s to 6.61 s for 4 steps (2.49 to 1.65 s a step), parity against
-  diffusers unchanged (`docs/baseline.md`, P2). The per-head norm and
+  diffusers unchanged (`docs/measurements.md`, P2). The per-head norm and
   rotation runs one warp per head, flash attention streams K and V with
   `cp.async` (also faster for the LM shapes: 0.557 to 0.398 ms at 4x1024,
   head 64), and the MLP activation writes BF16 straight from the fused GEMM.
@@ -199,11 +199,11 @@
 - `ImagePipeline::to_cuda` (and `try_cuda`) moves a sequence prompt encoder
   such as FLUX.2-klein's Qwen3 to the device as well: 1024x1024 Q8 prompt
   encode 12.4 s to 0.7 s on an RTX 3060, embeddings 0.0249 against diffusers
-  (host Q8 0.0251), peak VRAM 6754 to 10402 MiB (`docs/baseline.md`, P1).
+  (host Q8 0.0251), peak VRAM 6754 to 10402 MiB (`docs/measurements.md`, P1).
   New: `TextEncoder::attach_device`, `on_device`, `detach_device` and the
   `cuda_text_encoder` module.
 - FLUX.2-klein loads and runs through `ImagePipeline`, checked stage by stage
-  against diffusers (`docs/baseline.md`, K14). New public items:
+  against diffusers (`docs/measurements.md`, K14). New public items:
   `ChatPrompt`, `ImagePipeline::sample_latent_from_noise`, `TextEncoder::forward_layers`,
   `VaeDecoder::patch_norm`. A diffusers-layout DiT loaded at Q8 no longer
   panics. Breaking for code that names these: `DynamicShift` gains
@@ -331,7 +331,7 @@ changes:
 - YOLO training throughput (K13g): the depthwise weight gradient reads channels coalesced, 1x1 stride-1 convolutions skip `im2col` and `col2im`, `detection_loss` runs each image on its own rayon task, several device buffers that a kernel overwrites whole skip their memset, and `examples/yolo_detect` trains in mixed precision (BF16 GEMMs, FP32 accumulate). SiLU runs inside the device batch norm kernels, and on a mixed-precision context a training convolution keeps bf16 columns and runs its three GEMMs and its `col2im` on bf16, four channels a thread. The batch norm's column sums come from one coalesced kernel instead of GEMVs, and its backward pass reads the incoming gradient through the SiLU instead of writing it out first. YOLO's convolutions no longer copy their input into their caches. The host detection loss reads anchors from the output maps in place, decodes them in parallel, and writes its gradients straight into the map buffers, and `TaskAlignedAssigner` picks each box's top candidates with a select instead of a full sort, with the boxes in parallel. `yolo_detect --warmup N` times the steady state. The device batch norm keeps its input for the backward pass instead of writing its normalized values out. YOLO's device backward pass accumulates gradients in place, a slice's straight into its channels. `yolo_detect --batch 4` at 1280 goes from 5.3 to 12.8 samples/s inside the warmup and runs at about 15.75 samples/s in the steady state.
 - `interoceptive::CausalTrunk`: a causal transformer over the observation window, one token per candle, chosen with `AgentConfig::causal: Some(CausalConfig { lookback, d_model, layers, heads })` (G8). `QNetwork::trunk` is now the `Trunk` enum and `AgentConfig` has a new `causal` field; code that builds `AgentConfig` with a struct literal and no `..AgentConfig::new(..)` needs `causal: None`.
 - `train_unet_lora` example: trains a LoRA on the attention projections of a Stable Diffusion 1.x UNet on the CUDA device and writes a diffusers PEFT file. New `UnetLora::new`, `UnetLora::write_peft` and `DeviceUnet::noise_step`. diffusers' `load_lora_adapter` loads the written file to within 8.5e-7 of `UnetLora::read_peft` (G10 c).
-- An ignored timing test, `cuda_image::lora::tests::an_sd15_step_at_512_is_timed`: one adapted forward and backward of Stable Diffusion 1.5's UNet at 512x512 on the device takes 191.0 ms on an RTX 3060 (65.1 forward, 125.9 backward; random weights of the 1.5 shapes), recorded in `docs/baseline.md` (G10 b-iii-c).
+- An ignored timing test, `cuda_image::lora::tests::an_sd15_step_at_512_is_timed`: one adapted forward and backward of Stable Diffusion 1.5's UNet at 512x512 on the device takes 191.0 ms on an RTX 3060 (65.1 forward, 125.9 backward; random weights of the 1.5 shapes), recorded in `docs/measurements.md` (G10 b-iii-c).
 - YOLO11 inference at 1280 under 15 ms, Gate 3 of the detection track (K13f). `Yolo11::fuse()` folds every batch norm into its convolution as ultralytics' `fuse()` does. On a `CudaDevice::with_mixed_precision` device, the fused 3x3 and strided convolutions build their `im2col` columns in bf16 and run bf16 GEMMs with an FP32 accumulator. `TrainableConv2d::infer_device(input, silu)` is a cache-free forward that adds the bias and SiLU in one kernel and reads a 1x1 convolution's input as its columns. `Yolo11::save_ultralytics(path)` writes an ultralytics state dict that `load_ultralytics` and ultralytics read back. `Validation::stages_ms` gives the time of each stage. On the 278 player val images (rect letterboxed, e.g. 1280x736), batch 1 on the 3060: upload 0.56 ms, forward 13.56 ms and download 0.47 ms, 14.6 ms for the model (37.7 ms unfused before), with mAP50 0.7390 (fp32: 0.7394). Decode on the host takes another 3.34 ms and NMS 0.02 ms. Other speedups: im2col reads and writes float4 with 32-bit indices, bias plus activation runs on float4, outputs written in full are left uninitialised, and a `Slice` node copies only its own channels.
 
   The API a consumer crate uses, with features `cuda,images`:
