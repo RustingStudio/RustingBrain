@@ -72,7 +72,7 @@ impl Codebook {
 }
 
 /// A `[rows, cols]` weight matrix as `i8` values with one `f32` scale per row
-/// (or per `group` columns of a row, see [`Quantized::from_matrix_grouped`]),
+/// (or per `group` columns of a row),
 /// or as 4-bit codebook indices with one `f32` scale per [`BLOCK`] of a row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Quantized {

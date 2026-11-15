@@ -745,6 +745,7 @@ impl Dit {
     }
 
     /// The reference images being edited from, if any.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn references(&self) -> Option<&References> {
         self.references.as_ref()
     }

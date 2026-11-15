@@ -1477,6 +1477,7 @@ mod tests {
 
     /// Frames 0, F/4, F/2, 3F/4 and F-1 of `clip`, each scaled to 640 wide,
     /// side by side in one PNG; no frame files.
+    #[cfg(all(feature = "cuda", feature = "images"))]
     fn save_tiles(clip: &[FeatureMap], path: &Path) {
         use std::io::Write;
         let (width, height, frames) = (clip[0].width, clip[0].height, clip.len());

@@ -1,6 +1,6 @@
 [package]
 name = "rusting_brain"
-version = "4.0.0"
+version = "5.0.0"
 edition = "2024"
 description = "A Rust deep-learning library for training and running transformer language models, dense and mixture-of-experts, on CPU or CUDA."
 readme = "README.md"
@@ -56,6 +56,10 @@ required-features = ["images"]
 
 [[example]]
 name = "text_to_image"
+required-features = ["images"]
+
+[[example]]
+name = "image_edit"
 required-features = ["images"]
 
 [[example]]

@@ -219,11 +219,13 @@ impl<T> Streams<T> {
     }
 
     /// Where the next layer's history is.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn position(&self) -> usize {
         self.cursor
     }
 
     /// Goes back to a [`Self::position`], to run another chunk through the layers after it.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn seek(&mut self, position: usize) {
         self.cursor = position;
     }
