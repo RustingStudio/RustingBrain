@@ -505,6 +505,7 @@ pub(crate) struct GpuDecoderCache {
     /// product against.
     latent: CudaSlice<f32>,
     from_latent: Projection,
+    blocks: Vec<GpuBlockCache>,
     features: CudaSlice<f32>,
     cross: CrossCache,
     decoder_norm: Normed,
@@ -555,7 +556,13 @@ pub(crate) fn decode_train_batch(
     let latent_device = gpu.upload(&latent.data)?;
     let from_latent = Projection::new(&gpu, &model.from_latent)?;
     let latent_rows = sequences * latents;
-    let kv = from_latent.forward(&gpu, &bytes(&latent_device), latent_rows)?;
+    let mut kv = from_latent.forward(&gpu, &bytes(&latent_device), latent_rows)?;
+    let mut blocks = Vec::with_capacity(model.decoder_blocks.len());
+    for block in &model.decoder_blocks {
+        let (next, cache) = block_forward(&gpu, block, kv, latents, sequences, width)?;
+        kv = next;
+        blocks.push(cache);
+    }
 
     let features = fourier_features(queries, config.frequencies)?;
     let rows = features.rows;
@@ -611,6 +618,7 @@ pub(crate) fn decode_train_batch(
         GpuDecoderCache {
             latent: latent_device,
             from_latent,
+            blocks,
             features,
             cross,
             decoder_norm,
@@ -665,7 +673,8 @@ pub(crate) fn decode_backward(
         model.head_bias.grad.data[0] += grad_distances.iter().sum::<f32>();
     }
 
-    let mut grad_norms = gpu.zeros(2 * width)?;
+    // The decoder norm, the head norm, then two per decoder block.
+    let mut grad_norms = gpu.zeros((2 + 2 * model.decoder_blocks.len()) * width)?;
     let grad_output = gpu.upload(grad_distances)?;
     let mut grad_normed = cache.head.backward(
         &gpu,
@@ -689,7 +698,7 @@ pub(crate) fn decode_backward(
         &gpu,
         &cache.head_norm,
         &grad_normed,
-        &mut grad_norms.slice_mut(width..),
+        &mut grad_norms.slice_mut(width..2 * width),
         None,
         rows,
         width,
@@ -736,6 +745,27 @@ pub(crate) fn decode_backward(
         rows,
     )?;
 
+    let mut grad_kv = grad_kv;
+    for (index, (block, block_cache)) in model
+        .decoder_blocks
+        .iter_mut()
+        .zip(&cache.blocks)
+        .enumerate()
+        .rev()
+    {
+        grad_kv = block_backward(
+            &gpu,
+            block,
+            block_cache,
+            &grad_kv,
+            &mut grad_norms,
+            (2 + 2 * index) * width,
+            latents,
+            cache.sequences,
+            width,
+        )?;
+    }
+
     let grad_latent = cache.from_latent.backward(
         &gpu,
         &mut model.from_latent,
@@ -747,7 +777,15 @@ pub(crate) fn decode_backward(
 
     let scales = gpu.download(&grad_norms)?;
     Gpu::accumulate_host_grad(&mut model.decoder_norm.weight, &scales[..width]);
-    Gpu::accumulate_host_grad(&mut model.head_norm.weight, &scales[width..]);
+    Gpu::accumulate_host_grad(&mut model.head_norm.weight, &scales[width..2 * width]);
+    for (index, block) in model.decoder_blocks.iter_mut().enumerate() {
+        let at = (2 + 2 * index) * width;
+        Gpu::accumulate_host_grad(&mut block.attention_norm.weight, &scales[at..at + width]);
+        Gpu::accumulate_host_grad(
+            &mut block.mlp_norm.weight,
+            &scales[at + width..at + 2 * width],
+        );
+    }
     Ok(grad_latent)
 }
 
@@ -803,6 +841,10 @@ fn device_params(model: &mut ShapeVae) -> Vec<&mut Param> {
     params.extend(model.decoder_mlp.params_mut());
     params.extend(model.head.params_mut());
     params.extend(model.color_head.params_mut());
+    for block in &mut model.decoder_blocks {
+        params.extend(block.attention.params_mut());
+        params.extend(block.mlp.params_mut());
+    }
     params
 }
 
@@ -839,6 +881,7 @@ mod tests {
             head_dim: 8,
             d_ff: 16,
             encoder_blocks: 2,
+            decoder_blocks: 2,
             frequencies: 2,
             eps: 1e-5,
             free_bits: 0.0,

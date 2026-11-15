@@ -65,6 +65,12 @@ pub struct ShapeVaeConfig {
     pub d_ff: usize,
     /// Self-attention blocks over the latents, after the surface is read.
     pub encoder_blocks: usize,
+    /// Self-attention blocks over the widened latent, before the query points
+    /// read it. This is where the decoder's capacity lives: with none, a query
+    /// sees each latent only through one cross-attention. Old checkpoints,
+    /// written before the field existed, load as zero.
+    #[serde(default)]
+    pub decoder_blocks: usize,
     /// Octaves of [`fourier_features`]. The highest frequency is `2^(n-1)`
     /// cycles per unit, so this is the cap on the detail the field can hold.
     pub frequencies: usize,
@@ -92,6 +98,7 @@ impl Default for ShapeVaeConfig {
             head_dim: 64,
             d_ff: 2048,
             encoder_blocks: 4,
+            decoder_blocks: 0,
             frequencies: 8,
             eps: 1e-5,
             free_bits: 0.0,
@@ -303,6 +310,8 @@ enum DecoderCached {
 
 struct HostDecoderCache {
     latent: Matrix,
+    /// Empty for a chunk decoded for its values alone.
+    blocks: Vec<BlockCache>,
     features: Matrix,
     cross: CrossAttentionCache,
     residual: Matrix,
@@ -328,6 +337,8 @@ pub struct ShapeVae {
 
     /// Decoder: the latent widened back out to `d_model` to be attended to.
     pub(crate) from_latent: Linear,
+    #[serde(default)]
+    pub(crate) decoder_blocks: Vec<Block>,
     pub(crate) query_in: Linear,
     pub(crate) read_latent: MultiHeadAttention,
     pub(crate) decoder_norm: RmsNorm,
@@ -362,6 +373,7 @@ impl PartialEq for ShapeVae {
             && self.encoder_norm == other.encoder_norm
             && self.to_moments == other.to_moments
             && self.from_latent == other.from_latent
+            && self.decoder_blocks == other.decoder_blocks
             && self.query_in == other.query_in
             && self.read_latent == other.read_latent
             && self.decoder_norm == other.decoder_norm
@@ -383,6 +395,9 @@ impl ShapeVae {
         for _ in 0..config.encoder_blocks {
             blocks.push(Block::new(&config, rng)?);
         }
+        // Drawn after everything else, so a model without decoder blocks
+        // initializes exactly as it did before they existed.
+        let mut decoder_blocks = Vec::with_capacity(config.decoder_blocks);
 
         Ok(Self {
             // The three normal channels ride alongside the encoded position.
@@ -418,6 +433,12 @@ impl ShapeVae {
             head: Linear::new(config.d_model, 1, rng),
             color_head: Linear::new(config.d_model, 3, rng),
             head_bias: Param::zeros(1, 1),
+            decoder_blocks: {
+                for _ in 0..config.decoder_blocks {
+                    decoder_blocks.push(Block::new(&config, rng)?);
+                }
+                decoder_blocks
+            },
             #[cfg(feature = "cuda")]
             device: None,
             config,
@@ -678,7 +699,7 @@ impl ShapeVae {
                 "a decode chunk holds at least one query point".into(),
             ));
         }
-        let kv = self.latent_keys(latent)?;
+        let kv = self.host_keys(latent)?;
 
         let mut distances = Vec::with_capacity(queries.rows);
         for start in (0..queries.rows).step_by(chunk) {
@@ -701,7 +722,7 @@ impl ShapeVae {
                 distances.extend(self.decode_train(latent, &slice)?.0);
                 continue;
             }
-            let (chunk_distances, _) = self.decode_chunk(latent, &kv, &slice)?;
+            let (chunk_distances, _) = self.decode_chunk(latent, &kv, Vec::new(), &slice)?;
             distances.extend(chunk_distances);
         }
         Ok(distances)
@@ -728,8 +749,8 @@ impl ShapeVae {
             ));
         }
 
-        let kv = self.latent_keys(latent)?;
-        self.decode_chunk(latent, &kv, queries)
+        let (kv, blocks) = self.latent_keys(latent)?;
+        self.decode_chunk(latent, &kv, blocks, queries)
     }
 
     /// Decodes a packed CUDA batch with equal query counts per shape.
@@ -783,7 +804,7 @@ impl ShapeVae {
                 "a decode chunk holds at least one query point".into(),
             ));
         }
-        let kv = self.latent_keys(latent)?;
+        let kv = self.host_keys(latent)?;
 
         let mut colors = Vec::with_capacity(points.rows);
         for start in (0..points.rows).step_by(chunk) {
@@ -794,10 +815,10 @@ impl ShapeVae {
             let (_, cache) = if self.device.is_some() {
                 self.decode_train(latent, &slice)?
             } else {
-                self.decode_chunk(latent, &kv, &slice)?
+                self.decode_chunk(latent, &kv, Vec::new(), &slice)?
             };
             #[cfg(not(feature = "cuda"))]
-            let (_, cache) = self.decode_chunk(latent, &kv, &slice)?;
+            let (_, cache) = self.decode_chunk(latent, &kv, Vec::new(), &slice)?;
             let decoded = self.colors(&cache)?;
             colors.extend(decoded.data.chunks_exact(3).map(|c| [c[0], c[1], c[2]]));
         }
@@ -877,6 +898,15 @@ impl ShapeVae {
         let grad_embedded = add(&grad_residual, &grad_embedded);
         self.query_in.backward(&cache.features, &grad_embedded);
 
+        if cache.blocks.len() != self.decoder_blocks.len() {
+            return Err(NetworkError::InvalidConfig(
+                "this cache was decoded for its values and cannot be trained through".into(),
+            ));
+        }
+        let mut grad_kv = grad_kv;
+        for (block, block_cache) in self.decoder_blocks.iter_mut().zip(&cache.blocks).rev() {
+            grad_kv = block.backward(block_cache, &grad_kv)?;
+        }
         Ok(self.from_latent.backward(&cache.latent, &grad_kv))
     }
 
@@ -973,6 +1003,11 @@ impl ShapeVae {
         params.extend(self.head.params_mut());
         params.extend(self.color_head.params_mut());
         params.push(&mut self.head_bias);
+        // Last, so the positional names of everything above are the ones an
+        // older checkpoint was written with.
+        for block in &mut self.decoder_blocks {
+            params.extend(block.params_mut());
+        }
         params
     }
 
@@ -1055,20 +1090,38 @@ impl ShapeVae {
     /// The latent widened to `d_model`, which is what a query attends to.
     ///
     /// Computed once per shape and shared by every chunk.
-    fn latent_keys(&self, latent: &Matrix) -> Result<Matrix, NetworkError> {
+    /// The keys for a decode that runs on the host. On a device the chunk
+    /// computes its own, so this skips the host pass and returns nothing.
+    fn host_keys(&self, latent: &Matrix) -> Result<Matrix, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if self.device.is_some() {
+            return Ok(Matrix::from_vec(0, 0, Vec::new()));
+        }
+        Ok(self.latent_keys(latent)?.0)
+    }
+
+    fn latent_keys(&self, latent: &Matrix) -> Result<(Matrix, Vec<BlockCache>), NetworkError> {
         if latent.rows != self.config.latents || latent.cols != self.config.latent_dim {
             return Err(NetworkError::InvalidConfig(format!(
                 "the latent is [{}, {}] and this model's is [{}, {}]",
                 latent.rows, latent.cols, self.config.latents, self.config.latent_dim
             )));
         }
-        Ok(self.from_latent.forward(latent))
+        let mut kv = self.from_latent.forward(latent);
+        let mut caches = Vec::with_capacity(self.decoder_blocks.len());
+        for block in &self.decoder_blocks {
+            let (next, cache) = block.forward_train(&kv)?;
+            kv = next;
+            caches.push(cache);
+        }
+        Ok((kv, caches))
     }
 
     fn decode_chunk(
         &self,
         latent: &Matrix,
         kv: &Matrix,
+        blocks: Vec<BlockCache>,
         queries: &Matrix,
     ) -> Result<(Vec<f32>, DecoderCache), NetworkError> {
         let features = fourier_features(queries, self.config.frequencies)?;
@@ -1092,6 +1145,7 @@ impl ShapeVae {
             DecoderCache {
                 inner: DecoderCached::Host(Box::new(HostDecoderCache {
                     latent: latent.clone(),
+                    blocks,
                     features,
                     cross,
                     residual,
@@ -1153,6 +1207,7 @@ mod tests {
             head_dim: 8,
             d_ff: 16,
             encoder_blocks: 1,
+            decoder_blocks: 1,
             frequencies: 2,
             eps: 1e-5,
             free_bits: 0.0,
@@ -1299,10 +1354,11 @@ mod tests {
 
         let epsilon = 1e-3;
         // One weight from each stage of the decoder, plus the bias.
-        let probes: [(&str, usize); 4] = [
+        let probes: [(&str, usize); 5] = [
             ("head", 3),
             ("query_in", 11),
             ("from_latent", 5),
+            ("decoder_block", 7),
             ("head_bias", 0),
         ];
         for (name, index) in probes {
@@ -1310,6 +1366,7 @@ mod tests {
                 "head" => model.head.weight.grad.data[index],
                 "query_in" => model.query_in.weight.grad.data[index],
                 "from_latent" => model.from_latent.weight.grad.data[index],
+                "decoder_block" => model.decoder_blocks[0].mlp.params_mut()[0].grad.data[index],
                 _ => model.head_bias.grad.data[index],
             };
 
@@ -1318,6 +1375,9 @@ mod tests {
                     "head" => &mut model.head.weight.value.data[index],
                     "query_in" => &mut model.query_in.weight.value.data[index],
                     "from_latent" => &mut model.from_latent.weight.value.data[index],
+                    "decoder_block" => {
+                        &mut model.decoder_blocks[0].mlp.params_mut().remove(0).value.data[index]
+                    }
                     _ => &mut model.head_bias.value.data[index],
                 };
                 let original = *slot;
@@ -1327,6 +1387,9 @@ mod tests {
                     "head" => &mut model.head.weight.value.data[index],
                     "query_in" => &mut model.query_in.weight.value.data[index],
                     "from_latent" => &mut model.from_latent.weight.value.data[index],
+                    "decoder_block" => {
+                        &mut model.decoder_blocks[0].mlp.params_mut().remove(0).value.data[index]
+                    }
                     _ => &mut model.head_bias.value.data[index],
                 };
                 *slot = original;
@@ -1694,6 +1757,7 @@ mod tests {
             head_dim: 16,
             d_ff: 96,
             encoder_blocks: 1,
+            decoder_blocks: 1,
             frequencies: 6,
             eps: 1e-5,
             free_bits: 0.0,
