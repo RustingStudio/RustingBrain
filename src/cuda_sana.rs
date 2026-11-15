@@ -1649,6 +1649,7 @@ mod tests {
         gate("device chained image", &image.data, &want_image, 3e-2);
     }
 
+    #[cfg(feature = "images")]
     #[test]
     #[ignore = "needs RB_SANA_REF, RB_SANA_CUDA=1 and a CUDA device"]
     fn sana_device_timing() {

@@ -54,7 +54,7 @@ jobs:
       # dependencies afresh, without Cargo.lock, and `metal` only builds on
       # macOS.
       - id: release
-        run: echo "tag=$(git describe --tags --abbrev=0)" >> "$GITHUB_OUTPUT"
+        run: echo "tag=$(git describe --tags --abbrev=0 --match "v*")" >> "$GITHUB_OUTPUT"
       - uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           baseline-rev: ${{ steps.release.outputs.tag }}
