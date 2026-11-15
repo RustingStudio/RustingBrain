@@ -220,12 +220,25 @@ impl Block {
         // of them has a position to rotate against.
         attention.set_causal(false);
         attention.set_rope_enabled(false);
+        let mut mlp = SwiGlu::new(config.d_model, config.d_ff, rng);
+
+        // Every block adds two branches onto the residual stream, so at full
+        // scale a deep stack starts with a stream many times the size of its
+        // input and trains slower the deeper it is. Shrinking the projection
+        // that writes each branch by `1 / sqrt(2 * depth)` keeps the stream
+        // the same size at any depth. Nothing is drawn, so the random stream
+        // is where it was.
+        let depth = (config.encoder_blocks + config.decoder_blocks).max(1);
+        let shrink = (2.0 * depth as f32).sqrt().recip();
+        for weight in [&mut attention.output.weight, &mut mlp.down.weight] {
+            weight.value.data.iter_mut().for_each(|value| *value *= shrink);
+        }
 
         Ok(Self {
             attention_norm: RmsNorm::new(config.d_model, config.eps),
             attention,
             mlp_norm: RmsNorm::new(config.d_model, config.eps),
-            mlp: SwiGlu::new(config.d_model, config.d_ff, rng),
+            mlp,
         })
     }
 
