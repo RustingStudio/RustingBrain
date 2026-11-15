@@ -1191,7 +1191,7 @@ mod tests {
         }
         let model = PathBuf::from(
             std::env::var("RB_WAN_MODEL")
-                .unwrap_or_else(|_| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+                .unwrap_or_else(|_| "/mnt/ollama/RustingFrameModels/Wan2.2-TI2V-5B".into()),
         );
         let mut pipeline = VideoPipeline::load(&model).unwrap();
         pipeline.encoder = None;
@@ -1256,10 +1256,10 @@ mod tests {
         }
         let model = PathBuf::from(
             std::env::var("RB_WAN_MODEL")
-                .unwrap_or_else(|_| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+                .unwrap_or_else(|_| "/mnt/ollama/RustingFrameModels/Wan2.2-TI2V-5B".into()),
         );
         let fast = PathBuf::from(std::env::var("RB_FASTWAN").unwrap_or_else(|_| {
-            "/home/vasylt/Code/ai/ml/models/FastWan2.2-TI2V-5B-FullAttn-Diffusers".into()
+            "/mnt/ollama/RustingFrameModels/FastWan2.2-TI2V-5B-FullAttn-Diffusers".into()
         }));
         let dir = PathBuf::from("/tmp/ws5");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1361,7 +1361,7 @@ mod tests {
         };
         let model = PathBuf::from(
             env("RB_WAN_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/Wan2.2-TI2V-5B".into()),
         );
         let frames: usize = env("RB_WS3_FRAMES").map_or(17, |v| v.parse().unwrap());
         let runs: usize = env("RB_WS3_RUNS").map_or(1, |v| v.parse().unwrap());
@@ -1529,7 +1529,7 @@ mod tests {
         let dir = PathBuf::from(dir);
         let model = PathBuf::from(
             env("RB_WAN_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/Wan2.2-TI2V-5B".into()),
         );
         let size = env("RB_WS9D_SIZE").unwrap_or_else(|| "352x640x121".into());
         let mut reference =
@@ -1644,7 +1644,7 @@ mod tests {
         let dir = PathBuf::from(env("RB_WAN_REF").expect("RB_WAN_REF"));
         let model = PathBuf::from(
             env("RB_WAN_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/Wan2.2-TI2V-5B".into()),
         );
         let cuda = env("RB_WAN_CUDA").as_deref() == Some("1");
         let meta = read_json(&dir.join("reference.json")).unwrap();
