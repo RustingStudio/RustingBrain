@@ -937,7 +937,7 @@ mod tests {
         let dir = std::path::PathBuf::from(env("RB_ZIMAGE_REF").expect("RB_ZIMAGE_REF"));
         let model = std::path::PathBuf::from(
             env("RB_ZIMAGE_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Z-Image-Turbo".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/Z-Image-Turbo".into()),
         );
         let settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())

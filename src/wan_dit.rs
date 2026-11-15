@@ -1167,7 +1167,7 @@ pub(crate) mod tests {
         let dir = std::path::PathBuf::from(env("RB_WAN_REF").expect("RB_WAN_REF"));
         let model = std::path::PathBuf::from(
             env("RB_WAN_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/Wan2.2-TI2V-5B".into()),
         )
         .join("transformer");
         let mut reference =

@@ -921,7 +921,7 @@ mod tests {
         }
         let dir = std::path::PathBuf::from(
             std::env::var("RB_WAN_MODEL")
-                .unwrap_or_else(|_| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+                .unwrap_or_else(|_| "/mnt/ollama/RustingFrameModels/Wan2.2-TI2V-5B".into()),
         );
         let config =
             crate::wan_dit::WanDitConfig::from_file(dir.join("transformer/config.json")).unwrap();
@@ -1006,7 +1006,7 @@ mod tests {
         };
         let model_dir = std::path::PathBuf::from(
             env("RB_WAN_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/Wan2.2-TI2V-5B".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/Wan2.2-TI2V-5B".into()),
         );
         let embeds = env("RB_WAN_EMBEDS").unwrap_or_else(|| {
             "/home/vasylt/Code/rusting/RustingFrame/tools/ref/wan/embeds.safetensors".into()

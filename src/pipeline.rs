@@ -3119,7 +3119,7 @@ mod tests {
         let dir = std::path::PathBuf::from(env("RB_FLUX2_REF").expect("RB_FLUX2_REF"));
         let model = std::path::PathBuf::from(
             env("RB_FLUX2_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/FLUX.2-klein-4B".into()),
         );
         let settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
@@ -3303,7 +3303,7 @@ mod tests {
         let dir = std::path::PathBuf::from(env("RB_FLUX2_REF").expect("RB_FLUX2_REF"));
         let model = std::path::PathBuf::from(
             env("RB_FLUX2_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/FLUX.2-klein-4B".into()),
         );
         let mut reference =
             crate::safetensors::SafeTensors::open(dir.join("flux2.safetensors")).unwrap();
@@ -3436,7 +3436,7 @@ mod tests {
             let dir = std::path::PathBuf::from(env("RB_FLUX2_REF").expect("RB_FLUX2_REF"));
             let model = std::path::PathBuf::from(
                 env("RB_FLUX2_MODEL")
-                    .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
+                    .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/FLUX.2-klein-4B".into()),
             );
             let settings: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
@@ -3514,7 +3514,7 @@ mod tests {
         let dir = std::path::PathBuf::from(env("RB_FLUX2_REF").expect("RB_FLUX2_REF"));
         let model = std::path::PathBuf::from(
             env("RB_FLUX2_MODEL")
-                .unwrap_or_else(|| "/home/vasylt/Code/ai/ml/models/FLUX.2-klein-4B".into()),
+                .unwrap_or_else(|| "/mnt/ollama/RustingFrameModels/FLUX.2-klein-4B".into()),
         );
         let mut reference =
             crate::safetensors::SafeTensors::open(dir.join("flux2.safetensors")).unwrap();
