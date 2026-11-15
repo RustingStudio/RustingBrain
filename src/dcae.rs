@@ -28,7 +28,11 @@ pub(crate) struct Conv3 {
 }
 
 impl Conv3 {
-    pub(crate) fn read(file: &mut ShardedSafeTensors, name: &str, bias: bool) -> Result<Self, NetworkError> {
+    pub(crate) fn read(
+        file: &mut ShardedSafeTensors,
+        name: &str,
+        bias: bool,
+    ) -> Result<Self, NetworkError> {
         let (values, shape) = file.tensor(&format!("{name}.weight"))?;
         let (outputs, inputs) = (shape[0], shape[1]);
         let mut weight = Matrix::new(outputs, 9 * inputs);
@@ -43,12 +47,22 @@ impl Conv3 {
             true => Some(file.tensor(&format!("{name}.bias"))?.0),
             false => None,
         };
-        Ok(Self { weight, bias, inputs })
+        Ok(Self {
+            weight,
+            bias,
+            inputs,
+        })
     }
 
     /// Convolves a `height x width` map. With `upsample`, the input is half
     /// that size and read through a 2x nearest upsampling.
-    pub(crate) fn forward(&self, input: &Matrix, height: usize, width: usize, upsample: bool) -> Matrix {
+    pub(crate) fn forward(
+        &self,
+        input: &Matrix,
+        height: usize,
+        width: usize,
+        upsample: bool,
+    ) -> Matrix {
         let (c, outputs) = (self.inputs, self.weight.rows);
         let source_width = if upsample { width / 2 } else { width };
         let source = |y: usize, x: usize| match upsample {
@@ -69,12 +83,16 @@ impl Conv3 {
                 .for_each(|(pixel, patch)| {
                     let (y, x) = (top + pixel / width, pixel % width);
                     for k in 0..9 {
-                        let (sy, sx) = (y as isize + k as isize / 3 - 1, x as isize + k as isize % 3 - 1);
+                        let (sy, sx) = (
+                            y as isize + k as isize / 3 - 1,
+                            x as isize + k as isize % 3 - 1,
+                        );
                         if sy < 0 || sx < 0 || sy >= height as isize || sx >= width as isize {
                             continue;
                         }
                         let row = source(sy as usize, sx as usize);
-                        patch[k * c..(k + 1) * c].copy_from_slice(&input.data[row * c..(row + 1) * c]);
+                        patch[k * c..(k + 1) * c]
+                            .copy_from_slice(&input.data[row * c..(row + 1) * c]);
                     }
                 });
             let mut product = Matrix::new(rows * width, outputs);
@@ -84,7 +102,8 @@ impl Conv3 {
                     row.iter_mut().zip(bias).for_each(|(v, b)| *v += b);
                 });
             }
-            out.data[top * width * outputs..][..rows * width * outputs].copy_from_slice(&product.data);
+            out.data[top * width * outputs..][..rows * width * outputs]
+                .copy_from_slice(&product.data);
         }
         out
     }
@@ -92,7 +111,14 @@ impl Conv3 {
 
 /// A `k x k` depthwise convolution, zero padded, over token-major input;
 /// `weight` is `[channels, k, k]`.
-pub(crate) fn depthwise(x: &Matrix, height: usize, width: usize, weight: &[f32], bias: Option<&[f32]>, k: usize) -> Matrix {
+pub(crate) fn depthwise(
+    x: &Matrix,
+    height: usize,
+    width: usize,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+) -> Matrix {
     let c = x.cols;
     let half = (k / 2) as isize;
     let mut out = Matrix::new(x.rows, c);
@@ -139,7 +165,11 @@ pub(crate) fn rms_affine(x: &mut Matrix, weight: &[f32], bias: &[f32]) {
 }
 
 fn add(target: &mut Matrix, other: &Matrix) {
-    target.data.par_iter_mut().zip(&other.data).for_each(|(a, b)| *a += b);
+    target
+        .data
+        .par_iter_mut()
+        .zip(&other.data)
+        .for_each(|(a, b)| *a += b);
 }
 
 pub(crate) struct Norm {
@@ -158,8 +188,15 @@ impl Norm {
 
 pub(crate) enum Block {
     /// `DCUpBlock2d`, interpolate mode, with its channel-repeat shortcut.
-    Up { conv: Conv3, repeats: usize },
-    Res { conv1: Conv3, conv2: Conv3, norm: Norm },
+    Up {
+        conv: Conv3,
+        repeats: usize,
+    },
+    Res {
+        conv1: Conv3,
+        conv2: Conv3,
+        norm: Norm,
+    },
     Vit(Box<Vit>),
 }
 
@@ -192,7 +229,11 @@ pub struct DcaeDecoder {
 impl DcaeDecoder {
     /// Reads the decoder half of `vae/diffusion_pytorch_model.safetensors`.
     pub fn load(model: impl AsRef<Path>) -> Result<Self, NetworkError> {
-        let mut file = ShardedSafeTensors::open(model.as_ref().join("vae/diffusion_pytorch_model.safetensors"))?;
+        let mut file = ShardedSafeTensors::open(
+            model
+                .as_ref()
+                .join("vae/diffusion_pytorch_model.safetensors"),
+        )?;
         let f = &mut file;
         let mut stages = Vec::new();
         for stage in (0..6).rev() {
@@ -218,8 +259,12 @@ impl DcaeDecoder {
                         query: linear(f, &name("attn.to_q"), false)?,
                         key: linear(f, &name("attn.to_k"), false)?,
                         value: linear(f, &name("attn.to_v"), false)?,
-                        multiscale_in: f.tensor(&name("attn.to_qkv_multiscale.0.proj_in.weight"))?.0,
-                        multiscale_out: f.tensor(&name("attn.to_qkv_multiscale.0.proj_out.weight"))?.0,
+                        multiscale_in: f
+                            .tensor(&name("attn.to_qkv_multiscale.0.proj_in.weight"))?
+                            .0,
+                        multiscale_out: f
+                            .tensor(&name("attn.to_qkv_multiscale.0.proj_out.weight"))?
+                            .0,
                         out: linear(f, &name("attn.to_out"), false)?,
                         attention_norm: Norm::read(f, &name("attn.norm_out"))?,
                         inverted: linear(f, &name("conv_out.conv_inverted"), true)?,
@@ -260,7 +305,11 @@ impl DcaeDecoder {
             )));
         }
         let (mut height, mut width) = (latent.height, latent.width);
-        let tokens = transpose(&Matrix::from_vec(latent.channels, height * width, latent.data.clone()));
+        let tokens = transpose(&Matrix::from_vec(
+            latent.channels,
+            height * width,
+            latent.data.clone(),
+        ));
         let mut hidden = self.conv_in.forward(&tokens, height, width, false);
         let repeats = hidden.cols / tokens.cols;
         hidden
@@ -282,14 +331,19 @@ impl DcaeDecoder {
                         let mut up = conv.forward(&hidden, height, width, true);
                         let source_channels = hidden.cols;
                         let channels = up.cols;
-                        up.data.par_chunks_mut(channels).enumerate().for_each(|(pixel, row)| {
-                            let (y, x) = (pixel / width, pixel % width);
-                            let sub = (y % 2) * 2 + x % 2;
-                            let source = &hidden.data[((y / 2) * source_width + x / 2) * source_channels..][..source_channels];
-                            for (c, v) in row.iter_mut().enumerate() {
-                                *v += source[(c * 4 + sub) / repeats];
-                            }
-                        });
+                        up.data
+                            .par_chunks_mut(channels)
+                            .enumerate()
+                            .for_each(|(pixel, row)| {
+                                let (y, x) = (pixel / width, pixel % width);
+                                let sub = (y % 2) * 2 + x % 2;
+                                let source = &hidden.data
+                                    [((y / 2) * source_width + x / 2) * source_channels..]
+                                    [..source_channels];
+                                for (c, v) in row.iter_mut().enumerate() {
+                                    *v += source[(c * 4 + sub) / repeats];
+                                }
+                            });
                         hidden = up;
                     }
                     Block::Res { conv1, conv2, norm } => {
@@ -321,11 +375,19 @@ pub(crate) fn channel_major(tokens: &Matrix, height: usize, width: usize) -> Fea
 }
 
 impl Vit {
-    fn forward(&self, hidden: &mut Matrix, height: usize, width: usize) -> Result<(), NetworkError> {
+    fn forward(
+        &self,
+        hidden: &mut Matrix,
+        height: usize,
+        width: usize,
+    ) -> Result<(), NetworkError> {
         let (n, c) = (hidden.rows, hidden.cols);
         // q | k | v, then their 5x5 + grouped 1x1 aggregate: 6C channels.
         let mut qkv = Matrix::new(n, 3 * c);
-        for (part, layer) in [&self.query, &self.key, &self.value].into_iter().enumerate() {
+        for (part, layer) in [&self.query, &self.key, &self.value]
+            .into_iter()
+            .enumerate()
+        {
             let projected = layer.forward(hidden)?;
             qkv.data
                 .par_chunks_mut(3 * c)
@@ -349,7 +411,11 @@ impl Vit {
         // first 32 are that group's queries, then keys, then values.
         let groups = 6 * c / (3 * HEAD_DIM);
         let width_out = groups * HEAD_DIM;
-        let mut split = [Matrix::new(n, width_out), Matrix::new(n, width_out), Matrix::new(n, width_out)];
+        let mut split = [
+            Matrix::new(n, width_out),
+            Matrix::new(n, width_out),
+            Matrix::new(n, width_out),
+        ];
         for (part, target) in split.iter_mut().enumerate() {
             target
                 .data
@@ -373,13 +439,24 @@ impl Vit {
         }
         let attended = linear_attention(&split[0], &split[1], &split[2], groups, HEAD_DIM);
         let mut out = self.out.forward(&attended)?;
-        rms_affine(&mut out, &self.attention_norm.weight, &self.attention_norm.bias);
+        rms_affine(
+            &mut out,
+            &self.attention_norm.weight,
+            &self.attention_norm.bias,
+        );
         add(hidden, &out);
 
         // GLUMBConv with a norm and a residual.
         let mut x = self.inverted.forward(hidden)?;
         x.data.par_iter_mut().for_each(|v| *v = silu(*v));
-        let x = depthwise(&x, height, width, &self.depth_weight, Some(&self.depth_bias), 3);
+        let x = depthwise(
+            &x,
+            height,
+            width,
+            &self.depth_weight,
+            Some(&self.depth_bias),
+            3,
+        );
         let half = x.cols / 2;
         let mut glu = Matrix::new(n, half);
         glu.data
@@ -409,7 +486,11 @@ mod tests {
         let mut weight = Matrix::new(1, 9);
         weight.data[4] = 1.0;
         weight.data[5] = 2.0;
-        let conv = Conv3 { weight, bias: Some(vec![0.5]), inputs: 1 };
+        let conv = Conv3 {
+            weight,
+            bias: Some(vec![0.5]),
+            inputs: 1,
+        };
         let input = Matrix::from_vec(4, 1, vec![1.0, 2.0, 3.0, 4.0]);
         let out = conv.forward(&input, 2, 2, false);
         assert_eq!(out.data, vec![5.5, 2.5, 11.5, 4.5]);
@@ -434,12 +515,13 @@ mod tests {
         };
         let mut stages = Vec::new();
         let start = std::time::Instant::now();
-        let image = decoder.decode_probed(&latent, |index, map| {
-            if index < 3 {
-                stages.push(map)
-            }
-        })
-        .unwrap();
+        let image = decoder
+            .decode_probed(&latent, |index, map| {
+                if index < 3 {
+                    stages.push(map)
+                }
+            })
+            .unwrap();
         println!("host dc-ae: {:.1} s", start.elapsed().as_secs_f32());
         for (index, map) in stages.iter().enumerate() {
             let name = format!("vae_up{}", 5 - index);

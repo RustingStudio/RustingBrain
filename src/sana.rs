@@ -153,11 +153,18 @@ fn embed(file: &mut ShardedSafeTensors, ids: &[u32]) -> Result<Matrix, NetworkEr
 }
 
 /// A Gemma norm gain with its `1 +` folded in.
-pub(crate) fn gemma_norm(file: &mut ShardedSafeTensors, name: &str) -> Result<Vec<f32>, NetworkError> {
+pub(crate) fn gemma_norm(
+    file: &mut ShardedSafeTensors,
+    name: &str,
+) -> Result<Vec<f32>, NetworkError> {
     Ok(file.tensor(name)?.0.into_iter().map(|w| 1.0 + w).collect())
 }
 
-pub(crate) fn linear(file: &mut ShardedSafeTensors, name: &str, bias: bool) -> Result<Dense, NetworkError> {
+pub(crate) fn linear(
+    file: &mut ShardedSafeTensors,
+    name: &str,
+    bias: bool,
+) -> Result<Dense, NetworkError> {
     let (values, shape) = file.tensor(&format!("{name}.weight"))?;
     let rows = shape[0];
     let cols = values.len() / rows;
@@ -200,7 +207,12 @@ impl GemmaLayer {
         })
     }
 
-    fn forward(&self, hidden: &mut Matrix, rotary: &crate::text_encoder::Rotary, mask: &[bool]) -> Result<(), NetworkError> {
+    fn forward(
+        &self,
+        hidden: &mut Matrix,
+        rotary: &crate::text_encoder::Rotary,
+        mask: &[bool],
+    ) -> Result<(), NetworkError> {
         use crate::text_encoder::rms_norm;
         let x = rms_norm(hidden, &self.input_norm, GEMMA_EPS);
         let mut query = self.query.forward(&x)?;
@@ -223,7 +235,11 @@ impl GemmaLayer {
             );
             set_columns(&mut attended, head * GEMMA_HEAD_DIM, &out);
         }
-        let out = rms_norm(&self.output.forward(&attended)?, &self.post_attention_norm, GEMMA_EPS);
+        let out = rms_norm(
+            &self.output.forward(&attended)?,
+            &self.post_attention_norm,
+            GEMMA_EPS,
+        );
         add(hidden, &out);
 
         let x = rms_norm(hidden, &self.pre_feedforward_norm, GEMMA_EPS);
@@ -233,7 +249,11 @@ impl GemmaLayer {
             .par_iter_mut()
             .zip(&up.data)
             .for_each(|(g, u)| *g = gelu(*g) * u);
-        let out = rms_norm(&self.down.forward(&gate)?, &self.post_feedforward_norm, GEMMA_EPS);
+        let out = rms_norm(
+            &self.down.forward(&gate)?,
+            &self.post_feedforward_norm,
+            GEMMA_EPS,
+        );
         add(hidden, &out);
         Ok(())
     }
@@ -381,7 +401,9 @@ impl SanaDit {
     /// Reads `transformer/diffusion_pytorch_model.safetensors`.
     pub fn load(model: impl AsRef<Path>) -> Result<Self, NetworkError> {
         let mut file = ShardedSafeTensors::open(
-            model.as_ref().join("transformer/diffusion_pytorch_model.safetensors"),
+            model
+                .as_ref()
+                .join("transformer/diffusion_pytorch_model.safetensors"),
         )?;
         let f = &mut file;
         let mut blocks = Vec::with_capacity(DIT_LAYERS);
@@ -444,7 +466,11 @@ impl SanaDit {
     }
 
     /// `(temb [6 * 1152], embedded [1152])` for a time and a guidance.
-    pub(crate) fn conditioning(&self, t: f32, guidance: f32) -> Result<(Vec<f32>, Vec<f32>), NetworkError> {
+    pub(crate) fn conditioning(
+        &self,
+        t: f32,
+        guidance: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>), NetworkError> {
         let embed = |layers: &[Dense; 2], value: f32| -> Result<Vec<f32>, NetworkError> {
             let mut x = layers[0].apply(&timestep_features(value))?;
             x.iter_mut().for_each(|v| *v = silu(*v));
@@ -511,8 +537,16 @@ impl SanaBlock {
         gated_add(hidden, &self.out.forward(&attended)?, part(2));
 
         // Cross-attention over the prompt, no gate.
-        let query = crate::text_encoder::rms_norm(&self.cross_query.forward(hidden)?, &self.cross_query_norm, QK_EPS);
-        let key = crate::text_encoder::rms_norm(&self.cross_key.forward(context)?, &self.cross_key_norm, QK_EPS);
+        let query = crate::text_encoder::rms_norm(
+            &self.cross_query.forward(hidden)?,
+            &self.cross_query_norm,
+            QK_EPS,
+        );
+        let key = crate::text_encoder::rms_norm(
+            &self.cross_key.forward(context)?,
+            &self.cross_key_norm,
+            QK_EPS,
+        );
         let value = self.cross_value.forward(context)?;
         let mut attended = Matrix::new(hidden.rows, DIT_DIM);
         for head in 0..CROSS_HEADS {
@@ -533,7 +567,14 @@ impl SanaBlock {
         let x = modulated_norm(hidden, part(3), part(4), NORM_EPS);
         let mut inverted = self.inverted.forward(&x)?;
         inverted.data.par_iter_mut().for_each(|v| *v = silu(*v));
-        let depth = crate::dcae::depthwise(&inverted, height, width, &self.depth_weight, Some(&self.depth_bias), 3);
+        let depth = crate::dcae::depthwise(
+            &inverted,
+            height,
+            width,
+            &self.depth_weight,
+            Some(&self.depth_bias),
+            3,
+        );
         let mut glu = Matrix::new(depth.rows, FF_HIDDEN);
         glu.data
             .par_chunks_mut(FF_HIDDEN)
@@ -550,18 +591,31 @@ impl SanaBlock {
     /// `SanaLinearAttnProcessor2_0`: RMS-normed, ReLU'd queries and keys,
     /// `out = (V K^T) q / (sum(K) q + 1e-15)` per head.
     fn linear_attention(&self, x: &Matrix) -> Result<Matrix, NetworkError> {
-        let mut query = crate::text_encoder::rms_norm(&self.query.forward(x)?, &self.query_norm, QK_EPS);
+        let mut query =
+            crate::text_encoder::rms_norm(&self.query.forward(x)?, &self.query_norm, QK_EPS);
         let mut key = crate::text_encoder::rms_norm(&self.key.forward(x)?, &self.key_norm, QK_EPS);
         let value = self.value.forward(x)?;
         query.data.par_iter_mut().for_each(|v| *v = v.max(0.0));
         key.data.par_iter_mut().for_each(|v| *v = v.max(0.0));
-        Ok(linear_attention(&query, &key, &value, DIT_HEADS, DIT_HEAD_DIM))
+        Ok(linear_attention(
+            &query,
+            &key,
+            &value,
+            DIT_HEADS,
+            DIT_HEAD_DIM,
+        ))
     }
 }
 
 /// Linear attention over token-major `[n, heads * d]` inputs, with the
 /// one-padded value row as the normalizer.
-pub(crate) fn linear_attention(query: &Matrix, key: &Matrix, value: &Matrix, heads: usize, d: usize) -> Matrix {
+pub(crate) fn linear_attention(
+    query: &Matrix,
+    key: &Matrix,
+    value: &Matrix,
+    heads: usize,
+    d: usize,
+) -> Matrix {
     let n = query.rows;
     let width = query.cols;
     let mut out = Matrix::new(n, heads * d);
@@ -598,7 +652,8 @@ pub(crate) fn linear_attention(query: &Matrix, key: &Matrix, value: &Matrix, hea
         .collect();
     for (head, values) in per_head.iter().enumerate() {
         for token in 0..n {
-            out.data[token * heads * d + head * d..][..d].copy_from_slice(&values[token * d..(token + 1) * d]);
+            out.data[token * heads * d + head * d..][..d]
+                .copy_from_slice(&values[token * d..(token + 1) * d]);
         }
     }
     out
@@ -644,7 +699,10 @@ pub fn sample(
         let scm = s.sin() / (s.cos() + s.sin());
         let norm = (scm * scm + (1.0 - scm) * (1.0 - scm)).sqrt();
         let mut input = latents.clone();
-        input.data.iter_mut().for_each(|v| *v = *v / SIGMA_DATA * norm);
+        input
+            .data
+            .iter_mut()
+            .for_each(|v| *v = *v / SIGMA_DATA * norm);
         let raw = denoise(&input, scm)?;
         let draw = noise(i);
         for at in 0..latents.data.len() {
@@ -698,14 +756,25 @@ impl SanaSprint {
             &start,
             steps,
             |x, t| self.dit.forward(x, h, w, &context, t, GUIDANCE),
-            |i| crate::diffusion::noise(LATENT_CHANNELS, h * w, seed.map(|s| s.wrapping_add(1 + i as u64))),
+            |i| {
+                crate::diffusion::noise(
+                    LATENT_CHANNELS,
+                    h * w,
+                    seed.map(|s| s.wrapping_add(1 + i as u64)),
+                )
+            },
         )?;
         self.decoder.decode(&latent_map(&latent, h, w))
     }
 }
 
 pub(crate) fn check_size(width: usize, height: usize, steps: usize) -> Result<(), NetworkError> {
-    if width == 0 || height == 0 || !width.is_multiple_of(DOWNSCALE) || !height.is_multiple_of(DOWNSCALE) || steps == 0 {
+    if width == 0
+        || height == 0
+        || !width.is_multiple_of(DOWNSCALE)
+        || !height.is_multiple_of(DOWNSCALE)
+        || steps == 0
+    {
         return Err(NetworkError::InvalidConfig(format!(
             "SANA-Sprint needs sizes that are positive multiples of 32 and at least one step, \
              not {width}x{height} in {steps}"
@@ -731,16 +800,22 @@ pub(crate) mod tests {
 
     pub(crate) fn relative(got: &[f32], want: &[f32]) -> f32 {
         assert_eq!(got.len(), want.len());
-        let (gap, norm) = got.iter().zip(want).fold((0.0f64, 0.0f64), |(g, n), (a, b)| {
-            (g + ((a - b) as f64).powi(2), n + (*b as f64).powi(2))
-        });
+        let (gap, norm) = got
+            .iter()
+            .zip(want)
+            .fold((0.0f64, 0.0f64), |(g, n), (a, b)| {
+                (g + ((a - b) as f64).powi(2), n + (*b as f64).powi(2))
+            });
         (gap / norm).sqrt() as f32
     }
 
     pub(crate) fn gate(name: &str, got: &[f32], want: &[f32], limit: f32) -> f32 {
         let error = relative(got, want);
         println!("{name}: relative L2 {error:.3e} (gate {limit:.0e})");
-        assert!(error <= limit, "{name} misses its gate: {error:.3e} > {limit:.0e}");
+        assert!(
+            error <= limit,
+            "{name} misses its gate: {error:.3e} > {limit:.0e}"
+        );
         error
     }
 
@@ -749,7 +824,8 @@ pub(crate) mod tests {
     pub(crate) fn reference() -> Option<(SafeTensors, PathBuf)> {
         let dir = PathBuf::from(std::env::var("RB_SANA_REF").ok()?);
         let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).ok()?).ok()?;
+            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).ok()?)
+                .ok()?;
         let model = PathBuf::from(json["model"].as_str()?);
         Some((SafeTensors::open(dir.join("sana.safetensors")).ok()?, model))
     }
@@ -793,18 +869,37 @@ pub(crate) mod tests {
         let encoder = GemmaEncoder::open(&model).unwrap();
         let prompt = "a lighthouse on a rocky coast in fog";
         let (ids, mask) = encoder.prompt_ids(prompt).unwrap();
-        let want: Vec<u32> = tensor(&mut reference, "input_ids").iter().map(|v| *v as u32).collect();
-        let want_mask: Vec<bool> = tensor(&mut reference, "attention_mask").iter().map(|v| *v != 0.0).collect();
+        let want: Vec<u32> = tensor(&mut reference, "input_ids")
+            .iter()
+            .map(|v| *v as u32)
+            .collect();
+        let want_mask: Vec<bool> = tensor(&mut reference, "attention_mask")
+            .iter()
+            .map(|v| *v != 0.0)
+            .collect();
         assert_eq!(ids, want, "token ids");
         assert_eq!(mask, want_mask, "attention mask");
         let start = std::time::Instant::now();
         let hidden = encoder.hidden(&ids, &mask).unwrap();
         println!("host gemma: {:.1} s", start.elapsed().as_secs_f32());
-        gate("gemma hidden", &hidden.data, &tensor(&mut reference, "gemma_hidden"), 1e-2);
+        gate(
+            "gemma hidden",
+            &hidden.data,
+            &tensor(&mut reference, "gemma_hidden"),
+            1e-2,
+        );
         let (embeds, selected) = select_prompt(&hidden, &mask);
-        let want_selected: Vec<bool> = tensor(&mut reference, "prompt_mask").iter().map(|v| *v != 0.0).collect();
+        let want_selected: Vec<bool> = tensor(&mut reference, "prompt_mask")
+            .iter()
+            .map(|v| *v != 0.0)
+            .collect();
         assert_eq!(selected, want_selected);
-        gate("prompt embeds", &embeds.data, &tensor(&mut reference, "prompt_embeds"), 1e-2);
+        gate(
+            "prompt embeds",
+            &embeds.data,
+            &tensor(&mut reference, "prompt_embeds"),
+            1e-2,
+        );
     }
 
     #[test]
@@ -814,22 +909,39 @@ pub(crate) mod tests {
             panic!("set RB_SANA_REF to the sana_refs.py output folder");
         };
         let dit = SanaDit::load(&model).unwrap();
-        let embeds = Matrix::from_vec(PROMPT_TOKENS, GEMMA_HIDDEN, tensor(&mut reference, "prompt_embeds"));
-        let mask: Vec<bool> = tensor(&mut reference, "prompt_mask").iter().map(|v| *v != 0.0).collect();
+        let embeds = Matrix::from_vec(
+            PROMPT_TOKENS,
+            GEMMA_HIDDEN,
+            tensor(&mut reference, "prompt_embeds"),
+        );
+        let mask: Vec<bool> = tensor(&mut reference, "prompt_mask")
+            .iter()
+            .map(|v| *v != 0.0)
+            .collect();
         let context = dit.context(&embeds, &mask).unwrap();
         let input = Matrix::from_vec(LATENT_CHANNELS, 1024, tensor(&mut reference, "step0_input"));
         let times = timesteps(2);
         let scm = times[0].sin() / (times[0].cos() + times[0].sin());
         let start = std::time::Instant::now();
-        let raw = dit.forward(&input, 32, 32, &context, scm, GUIDANCE).unwrap();
+        let raw = dit
+            .forward(&input, 32, 32, &context, scm, GUIDANCE)
+            .unwrap();
         println!("host dit step: {:.1} s", start.elapsed().as_secs_f32());
-        gate("dit step 0", &raw.data, &tensor(&mut reference, "step0_raw"), 1e-2);
+        gate(
+            "dit step 0",
+            &raw.data,
+            &tensor(&mut reference, "step0_raw"),
+            1e-2,
+        );
 
         let noise = |name: &str, reference: &mut SafeTensors| {
             Matrix::from_vec(LATENT_CHANNELS, 1024, tensor(reference, name))
         };
         let start_noise = noise("noise", &mut reference);
-        let draws = [noise("step0_noise", &mut reference), noise("step1_noise", &mut reference)];
+        let draws = [
+            noise("step0_noise", &mut reference),
+            noise("step1_noise", &mut reference),
+        ];
         let latent = sample(
             &start_noise,
             2,
@@ -837,6 +949,11 @@ pub(crate) mod tests {
             |i| draws[i].clone(),
         )
         .unwrap();
-        gate("final latent", &latent.data, &tensor(&mut reference, "final_latents"), 3e-2);
+        gate(
+            "final latent",
+            &latent.data,
+            &tensor(&mut reference, "final_latents"),
+            3e-2,
+        );
     }
 }

@@ -20,7 +20,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("usage: image_edit <model directory> <in.png> <prompt> <out.png>");
         std::process::exit(2);
     };
-    let env = |name: &str| std::env::var(name).ok().and_then(|value| value.parse::<usize>().ok());
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+    };
     let (size, runs) = (env("SIZE").unwrap_or(512), env("RUNS").unwrap_or(1));
 
     let mut pipeline = ImagePipeline::load_at(directory, Precision::Q8)?;

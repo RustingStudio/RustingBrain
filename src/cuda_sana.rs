@@ -21,12 +21,14 @@ use crate::matrix::Matrix;
 use crate::network::NetworkError;
 use crate::safetensors::ShardedSafeTensors;
 use crate::sana::{
-    CROSS_HEAD_DIM, CROSS_HEADS, DIT_DIM, DIT_HEAD_DIM, DIT_HEADS, DOWNSCALE, FF_HIDDEN,
-    GEMMA_EPS, GEMMA_HEAD_DIM, GEMMA_HEADS, GEMMA_HIDDEN, GEMMA_KV_HEADS, GEMMA_LAYERS,
-    GEMMA_SOFTCAP, GEMMA_THETA, GUIDANCE, GemmaEncoder, GemmaLayer, LATENT_CHANNELS, NORM_EPS,
-    QK_EPS, SanaDit, check_size, gemma_norm, latent_map, sample, select_prompt, transpose,
+    CROSS_HEAD_DIM, CROSS_HEADS, DIT_DIM, DIT_HEAD_DIM, DIT_HEADS, DOWNSCALE, FF_HIDDEN, GEMMA_EPS,
+    GEMMA_HEAD_DIM, GEMMA_HEADS, GEMMA_HIDDEN, GEMMA_KV_HEADS, GEMMA_LAYERS, GEMMA_SOFTCAP,
+    GEMMA_THETA, GUIDANCE, GemmaEncoder, GemmaLayer, LATENT_CHANNELS, NORM_EPS, QK_EPS, SanaDit,
+    check_size, gemma_norm, latent_map, sample, select_prompt, transpose,
 };
-use cudarc::driver::{CudaFunction, CudaSlice, CudaView, CudaViewMut, DevicePtrMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaSlice, CudaView, CudaViewMut, DevicePtrMut, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::Ptx;
 use half::bf16;
 use std::path::Path;
@@ -287,8 +289,15 @@ struct Vit {
 
 #[allow(clippy::large_enum_variant)] // a few dozen blocks, built once
 enum Stage {
-    Up { conv: Conv, repeats: usize },
-    Res { conv1: Conv, conv2: Conv, norm: Affine },
+    Up {
+        conv: Conv,
+        repeats: usize,
+    },
+    Res {
+        conv1: Conv,
+        conv2: Conv,
+        norm: Affine,
+    },
     Vit(Box<Vit>),
 }
 
@@ -385,7 +394,11 @@ impl DeviceSana {
             .context()
             .load_module(ptx()?.clone())
             .map_err(cuda_err("SANA module loading"))?;
-        let get = |name: &str| module.load_function(name).map_err(cuda_err("SANA kernel lookup"));
+        let get = |name: &str| {
+            module
+                .load_function(name)
+                .map_err(cuda_err("SANA kernel lookup"))
+        };
         let k = Kernels {
             rms: get("rms")?,
             rms_inplace: get("rms_inplace")?,
@@ -660,7 +673,14 @@ impl DeviceSana {
         Ok(out)
     }
 
-    fn bias_act(&self, x: &mut CudaSlice<f32>, bias: &CudaSlice<f32>, rows: usize, cols: usize, silu: bool) -> R<()> {
+    fn bias_act(
+        &self,
+        x: &mut CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        silu: bool,
+    ) -> R<()> {
         let n = rows * cols;
         unsafe {
             self.context
@@ -819,7 +839,15 @@ impl DeviceSana {
     /// A 3x3 convolution, padding 1, of a `height x width` map (read through
     /// a 2x nearest upsampling of half that size when `up`), after `act` on
     /// its input (0 none, 1 SiLU, 2 ReLU). Bias included.
-    fn conv(&self, conv: &Conv, x: &CudaSlice<f32>, height: usize, width: usize, up: bool, act: i32) -> R<CudaSlice<f32>> {
+    fn conv(
+        &self,
+        conv: &Conv,
+        x: &CudaSlice<f32>,
+        height: usize,
+        width: usize,
+        up: bool,
+        act: i32,
+    ) -> R<CudaSlice<f32>> {
         let gpu = self.gpu();
         let (c, o) = (conv.inputs, conv.outputs);
         let padded = ((height + 2) * (width + 2) + 2) * c;
@@ -916,7 +944,10 @@ impl DeviceSana {
     fn gemma_layers(&self, ids: &[u32], mask: &[bool], layers: usize) -> R<Matrix> {
         let gpu = self.gpu();
         let (len, d) = (ids.len(), GEMMA_HIDDEN);
-        let (q_width, kv_width) = (GEMMA_HEADS * GEMMA_HEAD_DIM, GEMMA_KV_HEADS * GEMMA_HEAD_DIM);
+        let (q_width, kv_width) = (
+            GEMMA_HEADS * GEMMA_HEAD_DIM,
+            GEMMA_KV_HEADS * GEMMA_HEAD_DIM,
+        );
         let qkv_width = q_width + 2 * kv_width;
         let group = GEMMA_HEADS / GEMMA_KV_HEADS;
         let stride = len.next_multiple_of(8);
@@ -927,7 +958,9 @@ impl DeviceSana {
             let source = self
                 .embed
                 .get(id as usize * d..(id as usize + 1) * d)
-                .ok_or_else(|| NetworkError::InvalidConfig(format!("token {id} is past Gemma's vocabulary")))?;
+                .ok_or_else(|| {
+                    NetworkError::InvalidConfig(format!("token {id} is past Gemma's vocabulary"))
+                })?;
             for (value, weight) in row.iter_mut().zip(source) {
                 *value = weight.to_f32() * normalizer;
             }
@@ -940,9 +973,27 @@ impl DeviceSana {
         let mut x = gpu.uninit(len * d)?;
         let mut out = gpu.uninit(len * d)?;
         for layer in &self.gemma[..layers] {
-            self.rms(&mut x.slice_mut(..), d, &hidden.slice(..), d, &layer.input_norm, None, len, d, GEMMA_EPS, false)?;
+            self.rms(
+                &mut x.slice_mut(..),
+                d,
+                &hidden.slice(..),
+                d,
+                &layer.input_norm,
+                None,
+                len,
+                d,
+                GEMMA_EPS,
+                false,
+            )?;
             let mut qkv = gpu.act(len * qkv_width, false)?;
-            self.mm(&layer.qkv, &x.slice(..), len, qkv.destination(), qkv_width, 0.0)?;
+            self.mm(
+                &layer.qkv,
+                &x.slice(..),
+                len,
+                qkv.destination(),
+                qkv_width,
+                0.0,
+            )?;
             for (heads, offset) in [(GEMMA_HEADS, 0), (GEMMA_KV_HEADS, q_width)] {
                 unsafe {
                     self.context
@@ -1015,19 +1066,63 @@ impl DeviceSana {
                 )?;
             }
             self.mm(&layer.output, &merged.slice(..), len, &mut out, d, 0.0)?;
-            self.rms(&mut hidden.slice_mut(..), d, &out.slice(..), d, &layer.post_attention_norm, None, len, d, GEMMA_EPS, true)?;
+            self.rms(
+                &mut hidden.slice_mut(..),
+                d,
+                &out.slice(..),
+                d,
+                &layer.post_attention_norm,
+                None,
+                len,
+                d,
+                GEMMA_EPS,
+                true,
+            )?;
 
-            self.rms(&mut x.slice_mut(..), d, &hidden.slice(..), d, &layer.pre_feedforward_norm, None, len, d, GEMMA_EPS, false)?;
+            self.rms(
+                &mut x.slice_mut(..),
+                d,
+                &hidden.slice(..),
+                d,
+                &layer.pre_feedforward_norm,
+                None,
+                len,
+                d,
+                GEMMA_EPS,
+                false,
+            )?;
             let gate_up = self.dense(&layer.gate_up, &x, len)?;
             let gated = self.glu(&gate_up, len, layer.down.inner, false)?;
             drop(gate_up);
             self.mm(&layer.down, &gated.slice(..), len, &mut out, d, 0.0)?;
-            self.rms(&mut hidden.slice_mut(..), d, &out.slice(..), d, &layer.post_feedforward_norm, None, len, d, GEMMA_EPS, true)?;
+            self.rms(
+                &mut hidden.slice_mut(..),
+                d,
+                &out.slice(..),
+                d,
+                &layer.post_feedforward_norm,
+                None,
+                len,
+                d,
+                GEMMA_EPS,
+                true,
+            )?;
         }
         if layers < self.gemma.len() {
             return Ok(Matrix::from_vec(len, d, gpu.download(&hidden)?));
         }
-        self.rms(&mut x.slice_mut(..), d, &hidden.slice(..), d, &self.gemma_norm, None, len, d, GEMMA_EPS, false)?;
+        self.rms(
+            &mut x.slice_mut(..),
+            d,
+            &hidden.slice(..),
+            d,
+            &self.gemma_norm,
+            None,
+            len,
+            d,
+            GEMMA_EPS,
+            false,
+        )?;
         Ok(Matrix::from_vec(len, d, gpu.download(&x)?))
     }
 
@@ -1044,7 +1139,14 @@ impl DeviceSana {
     /// One denoiser call, as [`SanaDit::forward`]: `latent` and the result
     /// are `[32, height * width]`, channel-major; `context` is
     /// [`SanaDit::context`]'s output.
-    pub fn dit_forward(&self, latent: &Matrix, height: usize, width: usize, context: &Matrix, t: f32) -> R<Matrix> {
+    pub fn dit_forward(
+        &self,
+        latent: &Matrix,
+        height: usize,
+        width: usize,
+        context: &Matrix,
+        t: f32,
+    ) -> R<Matrix> {
         let gpu = self.gpu();
         let (n, d, m) = (height * width, DIT_DIM, context.rows);
         let tokens = transpose(latent);
@@ -1065,18 +1167,59 @@ impl DeviceSana {
 
             let x = self.ln_mod(&hidden, &part(0), &part(1), n, d)?;
             let mut qkv = self.dense(&block.qkv, &x, n)?;
-            self.rms_inplace(&mut qkv.slice_mut(..), 3 * d, &block.query_norm, n, d, QK_EPS, true)?;
-            self.rms_inplace(&mut qkv.slice_mut(d..), 3 * d, &block.key_norm, n, d, QK_EPS, true)?;
-            let attended = self.linear_attention(&qkv, n, DIT_HEADS, DIT_HEAD_DIM, 3 * d, DIT_HEAD_DIM, [0, d, 2 * d], false)?;
+            self.rms_inplace(
+                &mut qkv.slice_mut(..),
+                3 * d,
+                &block.query_norm,
+                n,
+                d,
+                QK_EPS,
+                true,
+            )?;
+            self.rms_inplace(
+                &mut qkv.slice_mut(d..),
+                3 * d,
+                &block.key_norm,
+                n,
+                d,
+                QK_EPS,
+                true,
+            )?;
+            let attended = self.linear_attention(
+                &qkv,
+                n,
+                DIT_HEADS,
+                DIT_HEAD_DIM,
+                3 * d,
+                DIT_HEAD_DIM,
+                [0, d, 2 * d],
+                false,
+            )?;
             self.mm(&block.out, &attended.slice(..), n, &mut update, d, 0.0)?;
             self.gated_add(&mut hidden, &update, &block.out.b, Some(&part(2)), n, d)?;
 
             let mut query = self.dense(&block.cross_query, &hidden, n)?;
             self.bias_act(&mut query, &block.cross_query.b, n, d, false)?;
-            self.rms_inplace(&mut query.slice_mut(..), d, &block.cross_query_norm, n, d, QK_EPS, false)?;
+            self.rms_inplace(
+                &mut query.slice_mut(..),
+                d,
+                &block.cross_query_norm,
+                n,
+                d,
+                QK_EPS,
+                false,
+            )?;
             let mut kv = self.dense(&block.cross_kv, &prompt, m)?;
             self.bias_act(&mut kv, &block.cross_kv.b, m, 2 * d, false)?;
-            self.rms_inplace(&mut kv.slice_mut(..), 2 * d, &block.cross_key_norm, m, d, QK_EPS, false)?;
+            self.rms_inplace(
+                &mut kv.slice_mut(..),
+                2 * d,
+                &block.cross_key_norm,
+                m,
+                d,
+                QK_EPS,
+                false,
+            )?;
             let mut attended = gpu.uninit(n * d)?;
             let scale = (CROSS_HEAD_DIM as f32).powf(-0.5);
             unsafe {
@@ -1097,7 +1240,14 @@ impl DeviceSana {
                     .launch(cfg(n * CROSS_HEADS))
                     .map_err(cuda_err("SANA cross-attention"))?;
             }
-            self.mm(&block.cross_out, &attended.slice(..), n, &mut update, d, 0.0)?;
+            self.mm(
+                &block.cross_out,
+                &attended.slice(..),
+                n,
+                &mut update,
+                d,
+                0.0,
+            )?;
             self.gated_add(&mut hidden, &update, &block.cross_out.b, None, n, d)?;
 
             let x = self.ln_mod(&hidden, &part(3), &part(4), n, d)?;
@@ -1127,7 +1277,11 @@ impl DeviceSana {
         let x = self.ln_mod(&hidden, &shift.slice(..), &scale.slice(..), n, d)?;
         let mut out = self.dense(&self.proj_out, &x, n)?;
         self.bias_act(&mut out, &self.proj_out.b, n, LATENT_CHANNELS, false)?;
-        Ok(transpose(&Matrix::from_vec(n, LATENT_CHANNELS, gpu.download(&out)?)))
+        Ok(transpose(&Matrix::from_vec(
+            n,
+            LATENT_CHANNELS,
+            gpu.download(&out)?,
+        )))
     }
 
     fn vit(&self, v: &Vit, hidden: &mut CudaSlice<f32>, height: usize, width: usize) -> R<()> {
@@ -1164,11 +1318,31 @@ impl DeviceSana {
         drop(spread);
         let head = crate::dcae::HEAD_DIM;
         let heads = 6 * c / (3 * head);
-        let attended = self.linear_attention(&cat, n, heads, head, 6 * c, 3 * head, [0, head, 2 * head], true)?;
+        let attended = self.linear_attention(
+            &cat,
+            n,
+            heads,
+            head,
+            6 * c,
+            3 * head,
+            [0, head, 2 * head],
+            true,
+        )?;
         drop(cat);
         let mut update = gpu.uninit(n * c)?;
         self.mm(&v.out, &attended.slice(..), n, &mut update, c, 0.0)?;
-        self.rms(&mut hidden.slice_mut(..), c, &update.slice(..), c, &v.attention_norm.weight, Some(&v.attention_norm.bias), n, c, 1e-5, true)?;
+        self.rms(
+            &mut hidden.slice_mut(..),
+            c,
+            &update.slice(..),
+            c,
+            &v.attention_norm.weight,
+            Some(&v.attention_norm.bias),
+            n,
+            c,
+            1e-5,
+            true,
+        )?;
 
         let wide = v.inverted.units;
         let mut inverted = self.dense(&v.inverted, hidden, n)?;
@@ -1188,12 +1362,27 @@ impl DeviceSana {
         let gated = self.glu(&depth, n, wide / 2, true)?;
         drop(depth);
         self.mm(&v.point, &gated.slice(..), n, &mut update, c, 0.0)?;
-        self.rms(&mut hidden.slice_mut(..), c, &update.slice(..), c, &v.norm.weight, Some(&v.norm.bias), n, c, 1e-5, true)
+        self.rms(
+            &mut hidden.slice_mut(..),
+            c,
+            &update.slice(..),
+            c,
+            &v.norm.weight,
+            Some(&v.norm.bias),
+            n,
+            c,
+            1e-5,
+            true,
+        )
     }
 
     /// [`DcaeDecoder::decode`] on the device, handing each stage's output to
     /// `probe` (`up_blocks.5` first) when one is given.
-    pub fn decode(&self, latent: &FeatureMap, mut probe: Option<&mut dyn FnMut(usize, FeatureMap)>) -> R<FeatureMap> {
+    pub fn decode(
+        &self,
+        latent: &FeatureMap,
+        mut probe: Option<&mut dyn FnMut(usize, FeatureMap)>,
+    ) -> R<FeatureMap> {
         if latent.channels != LATENT_CHANNELS {
             return Err(NetworkError::InvalidConfig(format!(
                 "the DC-AE decodes 32 latent channels, not {}",
@@ -1202,11 +1391,22 @@ impl DeviceSana {
         }
         let gpu = self.gpu();
         let (mut height, mut width) = (latent.height, latent.width);
-        let tokens = transpose(&Matrix::from_vec(LATENT_CHANNELS, height * width, latent.data.clone()));
+        let tokens = transpose(&Matrix::from_vec(
+            LATENT_CHANNELS,
+            height * width,
+            latent.data.clone(),
+        ));
         let source = gpu.upload(&tokens.data)?;
         let mut hidden = self.conv(&self.conv_in, &source, height, width, false, 0)?;
         let channels = self.conv_in.outputs;
-        self.up_add(&mut hidden, &source, (height, width, channels), LATENT_CHANNELS, channels / LATENT_CHANNELS, false)?;
+        self.up_add(
+            &mut hidden,
+            &source,
+            (height, width, channels),
+            LATENT_CHANNELS,
+            channels / LATENT_CHANNELS,
+            false,
+        )?;
         let mut channels = channels;
         for (index, stage) in self.stages.iter().enumerate() {
             for block in stage {
@@ -1215,7 +1415,14 @@ impl DeviceSana {
                         height *= 2;
                         width *= 2;
                         let mut up = self.conv(conv, &hidden, height, width, true, 0)?;
-                        self.up_add(&mut up, &hidden, (height, width, conv.outputs), channels, *repeats, true)?;
+                        self.up_add(
+                            &mut up,
+                            &hidden,
+                            (height, width, conv.outputs),
+                            channels,
+                            *repeats,
+                            true,
+                        )?;
                         hidden = up;
                         channels = conv.outputs;
                     }
@@ -1224,7 +1431,18 @@ impl DeviceSana {
                         let y = self.conv(conv2, &x, height, width, false, 1)?;
                         drop(x);
                         let n = height * width;
-                        self.rms(&mut hidden.slice_mut(..), channels, &y.slice(..), channels, &norm.weight, Some(&norm.bias), n, channels, 1e-5, true)?;
+                        self.rms(
+                            &mut hidden.slice_mut(..),
+                            channels,
+                            &y.slice(..),
+                            channels,
+                            &norm.weight,
+                            Some(&norm.bias),
+                            n,
+                            channels,
+                            1e-5,
+                            true,
+                        )?;
                     }
                     Stage::Vit(v) => self.vit(v, &mut hidden, height, width)?,
                 }
@@ -1256,7 +1474,14 @@ impl DeviceSana {
 
     /// One image in `[-1, 1]`, `[3, height, width]`, as
     /// [`crate::sana::SanaSprint::generate`] makes it.
-    pub fn generate(&self, prompt: &str, width: usize, height: usize, steps: usize, seed: Option<u64>) -> R<FeatureMap> {
+    pub fn generate(
+        &self,
+        prompt: &str,
+        width: usize,
+        height: usize,
+        steps: usize,
+        seed: Option<u64>,
+    ) -> R<FeatureMap> {
         check_size(width, height, steps)?;
         let (_, _, context) = self.context(prompt)?;
         let (h, w) = (height / DOWNSCALE, width / DOWNSCALE);
@@ -1265,7 +1490,13 @@ impl DeviceSana {
             &start,
             steps,
             |x, t| self.dit_forward(x, h, w, &context, t),
-            |i| crate::diffusion::noise(LATENT_CHANNELS, h * w, seed.map(|s| s.wrapping_add(1 + i as u64))),
+            |i| {
+                crate::diffusion::noise(
+                    LATENT_CHANNELS,
+                    h * w,
+                    seed.map(|s| s.wrapping_add(1 + i as u64)),
+                )
+            },
         )?;
         self.decode(&latent_map(&latent, h, w), None)
     }
@@ -1284,7 +1515,8 @@ mod tests {
         let (reference, model) = reference()?;
         let dir = std::path::PathBuf::from(std::env::var("RB_SANA_REF").ok()?);
         let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).ok()?).ok()?;
+            serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).ok()?)
+                .ok()?;
         let prompt = json["prompt"].as_str()?.to_string();
         let context = GpuContext::new(0).expect("a CUDA device");
         let start = std::time::Instant::now();
@@ -1302,19 +1534,40 @@ mod tests {
         // Gemma, from the prompt.
         let (ids, mask) = sana.encoder.prompt_ids(&prompt).unwrap();
         let first = sana.gemma_layers(&ids, &mask, 1).unwrap();
-        gate("device gemma layer 0", &first.data, &tensor(&mut reference, "gemma_layer0"), 1e-2);
+        gate(
+            "device gemma layer 0",
+            &first.data,
+            &tensor(&mut reference, "gemma_layer0"),
+            1e-2,
+        );
         let hidden = sana.gemma_hidden(&ids, &mask).unwrap();
-        gate("device gemma hidden", &hidden.data, &tensor(&mut reference, "gemma_hidden"), 1e-2);
+        gate(
+            "device gemma hidden",
+            &hidden.data,
+            &tensor(&mut reference, "gemma_hidden"),
+            1e-2,
+        );
         let (embeds, own_mask) = select_prompt(&hidden, &mask);
-        gate("device prompt embeds", &embeds.data, &tensor(&mut reference, "prompt_embeds"), 1e-2);
+        gate(
+            "device prompt embeds",
+            &embeds.data,
+            &tensor(&mut reference, "prompt_embeds"),
+            1e-2,
+        );
         let own_context = sana.dit.context(&embeds, &own_mask).unwrap();
 
         // The DiT and the sampler, from the reference's embeds and noise.
         let want_embeds = tensor(&mut reference, "prompt_embeds");
-        let want_mask: Vec<bool> = tensor(&mut reference, "prompt_mask").iter().map(|v| *v != 0.0).collect();
+        let want_mask: Vec<bool> = tensor(&mut reference, "prompt_mask")
+            .iter()
+            .map(|v| *v != 0.0)
+            .collect();
         let context = sana
             .dit
-            .context(&Matrix::from_vec(want_mask.len(), GEMMA_HIDDEN, want_embeds), &want_mask)
+            .context(
+                &Matrix::from_vec(want_mask.len(), GEMMA_HIDDEN, want_embeds),
+                &want_mask,
+            )
             .unwrap();
         let grid = 32;
         let n = grid * grid;
@@ -1322,13 +1575,35 @@ mod tests {
         let s = MAX_TIME;
         let scm = s.sin() / (s.cos() + s.sin());
         let raw = sana.dit_forward(&input, grid, grid, &context, scm).unwrap();
-        gate("device dit step 0", &raw.data, &tensor(&mut reference, "step0_raw"), 1e-2);
+        gate(
+            "device dit step 0",
+            &raw.data,
+            &tensor(&mut reference, "step0_raw"),
+            1e-2,
+        );
         let start = Matrix::from_vec(LATENT_CHANNELS, n, tensor(&mut reference, "noise"));
         let draws: Vec<Matrix> = (0..timesteps(2).len() - 1)
-            .map(|i| Matrix::from_vec(LATENT_CHANNELS, n, tensor(&mut reference, &format!("step{i}_noise"))))
+            .map(|i| {
+                Matrix::from_vec(
+                    LATENT_CHANNELS,
+                    n,
+                    tensor(&mut reference, &format!("step{i}_noise")),
+                )
+            })
             .collect();
-        let latent = sample(&start, 2, |x, t| sana.dit_forward(x, grid, grid, &context, t), |i| draws[i].clone()).unwrap();
-        gate("device final latent", &latent.data, &tensor(&mut reference, "final_latents"), 3e-2);
+        let latent = sample(
+            &start,
+            2,
+            |x, t| sana.dit_forward(x, grid, grid, &context, t),
+            |i| draws[i].clone(),
+        )
+        .unwrap();
+        gate(
+            "device final latent",
+            &latent.data,
+            &tensor(&mut reference, "final_latents"),
+            3e-2,
+        );
 
         // The DC-AE, from the reference's latent.
         let vae_input = FeatureMap {
@@ -1346,14 +1621,30 @@ mod tests {
         let image = sana.decode(&vae_input, Some(&mut keep)).unwrap();
         for (index, map) in stages.iter().enumerate() {
             let name = format!("vae_up{}", 5 - index);
-            gate(&format!("device {name}"), &map.data, &tensor(&mut reference, &name), 1e-2);
+            gate(
+                &format!("device {name}"),
+                &map.data,
+                &tensor(&mut reference, &name),
+                1e-2,
+            );
         }
         let want_image = tensor(&mut reference, "image");
         gate("device image", &image.data, &want_image, 3e-2);
 
         // Chained: own embeds, own latent, own image, the reference's noise.
-        let latent = sample(&start, 2, |x, t| sana.dit_forward(x, grid, grid, &own_context, t), |i| draws[i].clone()).unwrap();
-        gate("device chained final latent", &latent.data, &tensor(&mut reference, "final_latents"), 3e-2);
+        let latent = sample(
+            &start,
+            2,
+            |x, t| sana.dit_forward(x, grid, grid, &own_context, t),
+            |i| draws[i].clone(),
+        )
+        .unwrap();
+        gate(
+            "device chained final latent",
+            &latent.data,
+            &tensor(&mut reference, "final_latents"),
+            3e-2,
+        );
         let image = sana.decode(&latent_map(&latent, grid, grid), None).unwrap();
         gate("device chained image", &image.data, &want_image, 3e-2);
     }
@@ -1374,22 +1665,53 @@ mod tests {
         println!("first job: {warm:.3} s");
         let times: Vec<f32> = (0..3).map(|_| run(&prompt).0).collect();
         let mean = times.iter().sum::<f32>() / times.len() as f32;
-        let spread = times.iter().cloned().fold(f32::MIN, f32::max) - times.iter().cloned().fold(f32::MAX, f32::min);
+        let spread = times.iter().cloned().fold(f32::MIN, f32::max)
+            - times.iter().cloned().fold(f32::MAX, f32::min);
         println!("warm 1024^2 2-step jobs: {times:?} s, mean {mean:.3} s, spread {spread:.3} s");
 
         if let Ok(dir) = std::env::var("RB_SANA_SHOWCASE") {
             std::fs::create_dir_all(&dir).unwrap();
             let prompts = [
-                ("01_portrait", "Close-up portrait of an elderly fisherman with a weathered face and grey beard, soft window light, 85mm photo"),
-                ("02_city_night", "A rainy neon-lit street in Tokyo at night, reflections on wet asphalt, people with umbrellas, cinematic"),
-                ("03_food", "A bowl of ramen with a soft boiled egg, chashu pork and spring onions on a wooden table, food photography"),
-                ("04_text_sign", "A vintage wooden shop sign that says OPEN DAILY in painted white letters, brick wall background"),
-                ("05_fox_snow", "A red fox walking through fresh snow in a pine forest at golden hour, wildlife photo, shallow depth of field"),
-                ("06_product", "A studio product photo of a matte black wireless headphone on a white background, soft shadows"),
-                ("07_anime", "Anime style illustration of a girl with a red scarf standing on a hill under a starry sky"),
-                ("08_hands", "Two hands holding a steaming cup of coffee, close-up, natural light, detailed fingers"),
-                ("09_architecture", "A modern glass house on a cliff above the ocean at sunset, architectural photography"),
-                ("10_group", "Three friends laughing at a cafe table outdoors, candid street photo, summer afternoon"),
+                (
+                    "01_portrait",
+                    "Close-up portrait of an elderly fisherman with a weathered face and grey beard, soft window light, 85mm photo",
+                ),
+                (
+                    "02_city_night",
+                    "A rainy neon-lit street in Tokyo at night, reflections on wet asphalt, people with umbrellas, cinematic",
+                ),
+                (
+                    "03_food",
+                    "A bowl of ramen with a soft boiled egg, chashu pork and spring onions on a wooden table, food photography",
+                ),
+                (
+                    "04_text_sign",
+                    "A vintage wooden shop sign that says OPEN DAILY in painted white letters, brick wall background",
+                ),
+                (
+                    "05_fox_snow",
+                    "A red fox walking through fresh snow in a pine forest at golden hour, wildlife photo, shallow depth of field",
+                ),
+                (
+                    "06_product",
+                    "A studio product photo of a matte black wireless headphone on a white background, soft shadows",
+                ),
+                (
+                    "07_anime",
+                    "Anime style illustration of a girl with a red scarf standing on a hill under a starry sky",
+                ),
+                (
+                    "08_hands",
+                    "Two hands holding a steaming cup of coffee, close-up, natural light, detailed fingers",
+                ),
+                (
+                    "09_architecture",
+                    "A modern glass house on a cliff above the ocean at sunset, architectural photography",
+                ),
+                (
+                    "10_group",
+                    "Three friends laughing at a cafe table outdoors, candid street photo, summer afternoon",
+                ),
             ];
             for (name, prompt) in prompts {
                 let (seconds, image) = run(prompt);

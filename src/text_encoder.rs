@@ -274,7 +274,11 @@ impl TextEncoder {
         let width = self.config.d_model;
         let mut output = Matrix::new(ids.len(), layers.len() * width);
         self.run(ids, real, deepest, |done, hidden| {
-            for (slot, _) in layers.iter().enumerate().filter(|(_, layer)| **layer == done) {
+            for (slot, _) in layers
+                .iter()
+                .enumerate()
+                .filter(|(_, layer)| **layer == done)
+            {
                 for token in 0..hidden.rows {
                     output.row_mut(token)[slot * width..(slot + 1) * width]
                         .copy_from_slice(hidden.row(token));

@@ -81,8 +81,8 @@ impl VaeConfig {
             .map_err(|error| NetworkError::InvalidDataset(format!("vae config.json: {error}")))?;
 
         let default = Self::default();
-        let flux2 = json.get("_class_name").and_then(|name| name.as_str())
-            == Some("AutoencoderKLFlux2");
+        let flux2 =
+            json.get("_class_name").and_then(|name| name.as_str()) == Some("AutoencoderKLFlux2");
         let number = |name: &str, fallback: usize| -> usize {
             json.get(name)
                 .and_then(|value| value.as_u64())
@@ -1181,9 +1181,15 @@ pub(crate) mod tests {
         let packed = config.latent_channels * 4;
         tensors.insert(
             "bn.running_mean".into(),
-            (vec![packed], (0..packed).map(|index| index as f32).collect()),
+            (
+                vec![packed],
+                (0..packed).map(|index| index as f32).collect(),
+            ),
         );
-        tensors.insert("bn.running_var".into(), (vec![packed], vec![3.9999; packed]));
+        tensors.insert(
+            "bn.running_var".into(),
+            (vec![packed], vec![3.9999; packed]),
+        );
         crate::safetensors::write_checkpoint(&path, &tensors);
         let decoder = VaeDecoder::load(&path, "decoder.", config).unwrap();
         let (mean, std) = decoder.patch_norm().unwrap();
@@ -1386,21 +1392,21 @@ pub(crate) mod tests {
     }
 }
 
-    #[cfg(feature = "images")]
-    #[test]
-    fn from_image_bytes_round_trips_and_resizes() {
-        let mut image = FeatureMap::new(3, 5, 7);
-        for (index, value) in image.data.iter_mut().enumerate() {
-            *value = (index % 13) as f32 / 6.0 - 1.0;
-        }
-        let png = png_bytes(&image).unwrap();
-        let same = from_image_bytes(&png, 7, 5).unwrap();
-        assert_eq!(to_rgb8(&same), to_rgb8(&image));
-        let resized = from_image_bytes(&png, 16, 9).unwrap();
-        assert_eq!(
-            (resized.channels, resized.width, resized.height),
-            (3, 16, 9)
-        );
-        assert!(from_image_bytes(&png, 0, 9).is_err());
-        assert!(from_image_bytes(b"nope", 4, 4).is_err());
+#[cfg(feature = "images")]
+#[test]
+fn from_image_bytes_round_trips_and_resizes() {
+    let mut image = FeatureMap::new(3, 5, 7);
+    for (index, value) in image.data.iter_mut().enumerate() {
+        *value = (index % 13) as f32 / 6.0 - 1.0;
     }
+    let png = png_bytes(&image).unwrap();
+    let same = from_image_bytes(&png, 7, 5).unwrap();
+    assert_eq!(to_rgb8(&same), to_rgb8(&image));
+    let resized = from_image_bytes(&png, 16, 9).unwrap();
+    assert_eq!(
+        (resized.channels, resized.width, resized.height),
+        (3, 16, 9)
+    );
+    assert!(from_image_bytes(&png, 0, 9).is_err());
+    assert!(from_image_bytes(b"nope", 4, 4).is_err());
+}

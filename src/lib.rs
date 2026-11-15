@@ -138,8 +138,8 @@ pub mod recurrent;
 pub mod rng;
 pub mod rope;
 pub mod safetensors;
-pub mod sana;
 pub mod sampling;
+pub mod sana;
 pub mod serialization;
 pub mod shape_vae;
 pub mod shards;
@@ -170,17 +170,17 @@ pub mod cuda_image;
 #[cfg(feature = "cuda")]
 pub mod cuda_mmdit;
 #[cfg(feature = "cuda")]
-pub mod cuda_t5;
-#[cfg(feature = "cuda")]
-pub mod cuda_wan_dit;
-#[cfg(feature = "cuda")]
 pub mod cuda_sana;
 #[cfg(feature = "cuda")]
-pub(crate) mod cuda_w8a8;
+pub mod cuda_t5;
 #[cfg(feature = "cuda")]
 pub mod cuda_text_encoder;
 #[cfg(feature = "cuda")]
 pub mod cuda_training;
+#[cfg(feature = "cuda")]
+pub(crate) mod cuda_w8a8;
+#[cfg(feature = "cuda")]
+pub mod cuda_wan_dit;
 #[cfg(feature = "cuda")]
 pub(crate) mod gpu_cross;
 #[cfg(feature = "cuda")]
@@ -306,9 +306,9 @@ pub use transformer::{
 pub use transformer_block::{FeedForward, TransformerBlock};
 pub use unet::{Control, ControlNet, Unet, UnetConfig};
 pub use vae::{VaeConfig, VaeDecoder, VaeEncoder, to_rgb8};
+pub use video_pipeline::{UniPc, Video, VideoConfig, VideoPipeline, VideoRequest};
 pub use vision::{VisionTransformer, VitConfig};
 #[cfg(feature = "images")]
 pub use vit_encoder::read_image;
 pub use vit_encoder::{CLIP_MEAN, CLIP_STD, VitEncoder, VitEncoderConfig, composite_rgba};
-pub use video_pipeline::{UniPc, Video, VideoConfig, VideoPipeline, VideoRequest};
 pub use wan_dit::{WanBlock, WanDit, WanDitConfig};
