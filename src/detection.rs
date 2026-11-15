@@ -164,7 +164,7 @@ impl DetectionImage {
         let mut rgb = vec![0u8; width * height * 3];
         for (row, &(y, wy)) in rgb.chunks_exact_mut(width * 3).zip(&ys) {
             let y1 = (y + 1).min(self.height - 1);
-            for (pixel, &(x, wx)) in row.chunks_exact_mut(3).zip(&xs) {
+            for (pixel, &(x, wx)) in row.as_chunks_mut::<3>().0.iter_mut().zip(&xs) {
                 let x1 = (x + 1).min(self.width - 1);
                 for (c, value) in pixel.iter_mut().enumerate() {
                     let at = |yy: usize, xx: usize| self.rgb[(yy * self.width + xx) * 3 + c] as f32;
@@ -305,7 +305,7 @@ impl DetectionImage {
     /// ultralytics' `RandomHSV` given its draws: hue, saturation and value
     /// multiplied by `gains` in OpenCV's 8-bit HSV (hue in `0..180`, wrapping).
     pub fn hsv(&mut self, gains: [f32; 3]) {
-        for pixel in self.rgb.chunks_exact_mut(3) {
+        for pixel in self.rgb.as_chunks_mut::<3>().0 {
             let [r, g, b] = [pixel[0], pixel[1], pixel[2]].map(f32::from);
             let max = r.max(g).max(b);
             let delta = max - r.min(g).min(b);
@@ -347,7 +347,10 @@ impl DetectionImage {
     pub fn flip_horizontal(&mut self) {
         for row in self.rgb.chunks_exact_mut(self.width * 3) {
             row.reverse();
-            row.chunks_exact_mut(3).for_each(|pixel| pixel.reverse());
+            row.as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .for_each(|pixel| pixel.reverse());
         }
         let w = self.width as f32;
         for b in &mut self.boxes {

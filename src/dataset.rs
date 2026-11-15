@@ -766,19 +766,27 @@ fn read_npy(path: &Path) -> Result<Vec<Vec<f32>>, NetworkError> {
     let data = &bytes[start + header_length..];
     let values: Vec<f32> = match descr.as_str() {
         "<f4" | "=f4" | "|f4" => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
             .collect(),
         "<f8" | "=f8" => data
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|v| f64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]) as f32)
             .collect(),
         "<i4" | "=i4" => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|v| i32::from_le_bytes([v[0], v[1], v[2], v[3]]) as f32)
             .collect(),
         "<i8" | "=i8" => data
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|v| i64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]) as f32)
             .collect(),
         "|u1" | "u1" => data.iter().map(|&value| f32::from(value)).collect(),
@@ -833,7 +841,9 @@ fn read_idx(path: &Path, scale: bool) -> Result<Vec<Vec<f32>>, NetworkError> {
     }
 
     let shape: Vec<usize> = bytes[4..header]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as usize)
         .collect();
     // A corrupt shape can overflow; the file can never hold that many values.
@@ -857,19 +867,27 @@ fn read_idx(path: &Path, scale: bool) -> Result<Vec<Vec<f32>>, NetworkError> {
         0x08 => data.iter().map(|&value| f32::from(value)).collect(),
         0x09 => data.iter().map(|&value| f32::from(value as i8)).collect(),
         0x0b => data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|v| f32::from(i16::from_be_bytes([v[0], v[1]])))
             .collect(),
         0x0c => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|v| i32::from_be_bytes([v[0], v[1], v[2], v[3]]) as f32)
             .collect(),
         0x0d => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|v| f32::from_be_bytes([v[0], v[1], v[2], v[3]]))
             .collect(),
         0x0e => data
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|v| f64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]) as f32)
             .collect(),
         other => return Err(invalid(format!("type code {other:#04x}"))),

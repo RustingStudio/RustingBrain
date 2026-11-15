@@ -259,7 +259,9 @@ impl TokenFile {
         self.file.seek(SeekFrom::Start(offset * 4))?;
         self.file.read_exact(&mut window)?;
         Ok(window
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|id| u32::from_le_bytes([id[0], id[1], id[2], id[3]]))
             .collect())
     }
@@ -316,7 +318,9 @@ impl TokenFile {
             self.file.read_exact(&mut window)?;
             windows.push(
                 window
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|id| u32::from_le_bytes([id[0], id[1], id[2], id[3]]))
                     .collect::<Vec<u32>>(),
             );
@@ -536,7 +540,7 @@ mod tests {
         assert_eq!(batch.batch(), 4);
         assert_eq!(batch.seq_len(), 16);
         assert!(!batch.is_padded());
-        for window in batch.ids().chunks_exact(16) {
+        for window in batch.ids().as_chunks::<16>().0 {
             assert!(window.windows(2).all(|pair| pair[1] == pair[0] + 1));
             assert!(window[15] < 1_000);
         }
@@ -609,7 +613,9 @@ mod tests {
         TokenFile::write_jsonl(&bin, &jsonl, "text", Some(0), tokenize).unwrap();
         let expected: Vec<u32> = std::fs::read(&bin)
             .unwrap()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|id| u32::from_le_bytes([id[0], id[1], id[2], id[3]]))
             .collect();
         assert_eq!(expected.len(), 10, "four bytes and a separator, twice");
@@ -716,7 +722,7 @@ mod tests {
         let (mut low, mut total) = (0, 0);
         for step in 0..200 {
             let batch = mix.batch(step, 8, 16).unwrap();
-            for window in batch.ids().chunks_exact(16) {
+            for window in batch.ids().as_chunks::<16>().0 {
                 // A window never straddles two sources.
                 assert_eq!(window[0] < 1_000, window[15] < 1_000);
                 assert!(window.windows(2).all(|pair| pair[1] == pair[0] + 1));

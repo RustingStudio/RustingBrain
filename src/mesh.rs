@@ -1320,7 +1320,7 @@ fn emit_tetrahedron(
     };
 
     let mut faces = Vec::with_capacity(2);
-    for triangle in table.chunks_exact(3) {
+    for triangle in table.as_chunks::<3>().0 {
         if triangle[0] == usize::MAX {
             break;
         }
