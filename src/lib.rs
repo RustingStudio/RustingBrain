@@ -92,7 +92,7 @@
 //!
 //! # Where to read next
 //!
-//! - `tutorials/` — a sixteen-chapter course, from what a neural network is to
+//! - `tutorials/` — an eighteen-chapter course, from what a neural network is to
 //!   training a language model end to end.
 //! - `docs/baseline.md` — measured throughput per architecture on an RTX 3060.
 //! - `IMPORT_MODELS.md` — running ONNX models exported from TensorFlow or

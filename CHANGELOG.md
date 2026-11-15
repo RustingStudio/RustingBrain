@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 5.0.0
+
+A major version: the image pipeline's public types gained fields and variants.
+Code written for 4.0.0 needs these changes:
+
+- `DynamicShift::empirical` and `VaeConfig::batch_norm_eps` are new fields.
+  Name them in a struct literal, or start from the type's default.
+- `DynamicShift::shift` takes the step count as a second argument.
+- `PromptEncoder::Sequence` has a new `chat` field. Add `..` to a pattern that
+  matches it.
+- `Precision::Fp8` and `ImageDenoiser::ZImage` are new variants. Add an arm to
+  an exhaustive `match`.
 
 - Z-Image-Turbo text-to-image (RustingFrame Z1). `zimage::ZImage` is the
   single-stream DiT: noise and caption refiners, 3D RoPE 32/48/48, qk norm.
