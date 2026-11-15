@@ -5,6 +5,12 @@ on:
     branches: [main, master]
   pull_request:
 
+# .cargo/config.toml builds for the host CPU. Runners differ, and a cached
+# proc macro built on a newer one dies with SIGILL on an older one, so CI
+# builds for the baseline instead.
+env:
+  RUSTFLAGS: -C target-cpu=x86-64
+
 jobs:
   rust:
     runs-on: ubuntu-latest
