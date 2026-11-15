@@ -243,7 +243,9 @@ impl Ema {
             let mut bytes = vec![0u8; length];
             reader.read_exact(&mut bytes)?;
             let data = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect();
             shadow.push(Matrix::from_vec(rows, cols, data));

@@ -700,9 +700,9 @@ mod tests {
         // mask and mean pooling it could only do for itself.
         let mut image = Matrix::from_vec(1, 64, (0..64).map(|value| value as f32 / 64.0).collect());
         let before = model.forward(&image).unwrap();
-        for index in 0..64 {
+        for (index, value) in image.data.iter_mut().enumerate() {
             if index / 8 >= 4 && index % 8 >= 4 {
-                image.data[index] = 1.0;
+                *value = 1.0;
             }
         }
         let after = model.forward(&image).unwrap();

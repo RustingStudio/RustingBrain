@@ -182,7 +182,7 @@ impl Glb {
         };
         let positions = self.floats(position as usize, 3)?;
         let base = mesh.positions.len() as u32;
-        for corner in positions.chunks_exact(3) {
+        for corner in positions.as_chunks::<3>().0 {
             mesh.positions.push(transform_point(
                 transform,
                 [corner[0], corner[1], corner[2]],
@@ -190,7 +190,7 @@ impl Glb {
         }
 
         if let Some(normal) = primitive["attributes"]["NORMAL"].as_u64() {
-            for corner in self.floats(normal as usize, 3)?.chunks_exact(3) {
+            for corner in self.floats(normal as usize, 3)?.as_chunks::<3>().0 {
                 mesh.normals.push(transform_normal(
                     transform,
                     [corner[0], corner[1], corner[2]],
@@ -198,7 +198,7 @@ impl Glb {
             }
         }
         if let Some(uv) = primitive["attributes"]["TEXCOORD_0"].as_u64() {
-            for corner in self.floats(uv as usize, 2)?.chunks_exact(2) {
+            for corner in self.floats(uv as usize, 2)?.as_chunks::<2>().0 {
                 mesh.uvs.push([corner[0], corner[1]]);
             }
         }
@@ -212,7 +212,7 @@ impl Glb {
         match primitive["indices"].as_u64() {
             Some(indices) => {
                 let indices = self.integers(indices as usize)?;
-                for face in indices.chunks_exact(3) {
+                for face in indices.as_chunks::<3>().0 {
                     mesh.indices
                         .push([base + face[0], base + face[1], base + face[2]]);
                 }

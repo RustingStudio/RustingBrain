@@ -825,7 +825,14 @@ impl ShapeVae {
             #[cfg(not(feature = "cuda"))]
             let (_, cache) = self.decode_chunk(latent, &kv, Vec::new(), &slice)?;
             let decoded = self.colors(&cache)?;
-            colors.extend(decoded.data.chunks_exact(3).map(|c| [c[0], c[1], c[2]]));
+            colors.extend(
+                decoded
+                    .data
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|c| [c[0], c[1], c[2]]),
+            );
         }
         Ok(colors)
     }
@@ -1076,7 +1083,9 @@ impl ShapeVae {
             3,
             surface
                 .data
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .flat_map(|point| point[..3].iter().copied())
                 .collect(),
         );

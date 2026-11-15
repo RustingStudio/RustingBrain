@@ -1106,7 +1106,9 @@ impl Network {
         debug_assert_eq!(inputs.len(), INFERENCE_TILE);
         let mut width = self.input_size;
         for (column, value) in scratch.current[..width * INFERENCE_TILE]
-            .chunks_exact_mut(INFERENCE_TILE)
+            .as_chunks_mut::<INFERENCE_TILE>()
+            .0
+            .iter_mut()
             .enumerate()
         {
             for (sample, slot) in value.iter_mut().enumerate() {
@@ -1119,10 +1121,15 @@ impl Network {
             let source = &scratch.current[..width * INFERENCE_TILE];
             let destination = &mut scratch.next[..units * INFERENCE_TILE];
 
-            for (row, out) in destination.chunks_exact_mut(INFERENCE_TILE).enumerate() {
+            for (row, out) in destination
+                .as_chunks_mut::<INFERENCE_TILE>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
                 let mut accumulator = [layer.biases.data[row]; INFERENCE_TILE];
                 let weights = &layer.weights.data[row * layer.weights.cols..][..width];
-                for (weight, values) in weights.iter().zip(source.chunks_exact(INFERENCE_TILE)) {
+                for (weight, values) in weights.iter().zip(source.as_chunks::<INFERENCE_TILE>().0) {
                     for (slot, value) in accumulator.iter_mut().zip(values) {
                         *slot += weight * value;
                     }
@@ -1167,11 +1174,11 @@ impl Network {
         scratch: &mut TiledInferenceScratch,
     ) -> Vec<Vec<f32>> {
         let mut outputs = Vec::with_capacity(inputs.len());
-        let mut tiles = inputs.chunks_exact(INFERENCE_TILE);
-        for tile in &mut tiles {
+        let (tiles, remainder) = inputs.as_chunks::<INFERENCE_TILE>();
+        for tile in tiles {
             self.forward_inference_tile(tile, scratch, &mut outputs);
         }
-        for input in tiles.remainder() {
+        for input in remainder {
             outputs.push(self.forward_inference(input, &mut scratch.single).to_vec());
         }
         outputs

@@ -27,7 +27,12 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut lanes = [0.0f32; 8];
     let tail = a.len() - a.len() % 8;
-    for (x, y) in a[..tail].chunks_exact(8).zip(b[..tail].chunks_exact(8)) {
+    for (x, y) in a[..tail]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(b[..tail].as_chunks::<8>().0)
+    {
         for lane in 0..8 {
             lanes[lane] += x[lane] * y[lane];
         }

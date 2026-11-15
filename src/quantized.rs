@@ -459,8 +459,10 @@ fn dot_lanes<const LANES: usize>(activations: &[f32], weights: &[i8]) -> f32 {
     let tail = activations.len() - activations.len() % LANES;
 
     for (x, y) in activations[..tail]
-        .chunks_exact(LANES)
-        .zip(weights[..tail].chunks_exact(LANES))
+        .as_chunks::<LANES>()
+        .0
+        .iter()
+        .zip(weights[..tail].as_chunks::<LANES>().0)
     {
         let mut widened = [0.0f32; LANES];
         for lane in 0..LANES {
@@ -504,8 +506,10 @@ fn dot_fp8(activations: &[f32], weights: &[u8]) -> f32 {
     let mut lanes = [0.0f32; LANES];
     let tail = activations.len() - activations.len() % LANES;
     for (x, w) in activations[..tail]
-        .chunks_exact(LANES)
-        .zip(weights[..tail].chunks_exact(LANES))
+        .as_chunks::<LANES>()
+        .0
+        .iter()
+        .zip(weights[..tail].as_chunks::<LANES>().0)
     {
         for lane in 0..LANES {
             lanes[lane] += x[lane] * table[usize::from(w[lane])];
@@ -540,7 +544,7 @@ fn dot4_lanes<const LANES: usize>(
     let mut total = 0.0f32;
     for ((x, bytes), scale) in activations
         .chunks(BLOCK)
-        .zip(packed.chunks_exact(BLOCK / 2))
+        .zip(packed.as_chunks::<{ BLOCK / 2 }>().0)
         .zip(scales)
     {
         let mut widened = [0.0f32; BLOCK];
@@ -552,8 +556,10 @@ fn dot4_lanes<const LANES: usize>(
         let mut lanes = [0.0f32; LANES];
         let tail = x.len() - x.len() % LANES;
         for (x, w) in x[..tail]
-            .chunks_exact(LANES)
-            .zip(widened[..tail].chunks_exact(LANES))
+            .as_chunks::<LANES>()
+            .0
+            .iter()
+            .zip(widened[..tail].as_chunks::<LANES>().0)
         {
             for lane in 0..LANES {
                 lanes[lane] += x[lane] * w[lane];

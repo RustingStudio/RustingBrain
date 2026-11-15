@@ -479,7 +479,7 @@ pub fn composite_rgba(
         });
     }
     let mut map = FeatureMap::new(3, size, size);
-    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+    for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
         let alpha = pixel[3];
         for channel in 0..3 {
             let composited = pixel[channel] * alpha + background[channel] * (1.0 - alpha);

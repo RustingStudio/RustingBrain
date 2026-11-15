@@ -126,7 +126,13 @@ impl Trainer {
                 / cfg.epsilon_decay_steps.max(1) as f32)
                 .min(1.0);
             let epsilon = cfg.epsilon_start + (cfg.epsilon_end - cfg.epsilon_start) * progress;
-            for (row, body) in body_matrix.data.chunks_exact_mut(4).zip(&bodies) {
+            for (row, body) in body_matrix
+                .data
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(&bodies)
+            {
                 row.copy_from_slice(&body.to_array());
             }
             let q = self.agent.q_values(&obs, &body_matrix);

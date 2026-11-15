@@ -45,7 +45,9 @@ pub fn ticks_from_flat(flat: &[f32]) -> Vec<MarketTick> {
         0,
         "flat buffer is not whole candles"
     );
-    flat.chunks_exact(TICK_FEATURES)
+    flat.as_chunks::<TICK_FEATURES>()
+        .0
+        .iter()
         .map(|c| MarketTick {
             open: c[0],
             high: c[1],
@@ -457,7 +459,12 @@ impl MarketEnvironment {
         let window = &self.ticks[self.t + 1 - lookback..=self.t];
         let close = window[lookback - 1].close;
         let mean_volume = window.iter().map(|c| c.volume).sum::<f32>() / lookback as f32;
-        for (slot, c) in obs.chunks_exact_mut(TICK_FEATURES).zip(window) {
+        for (slot, c) in obs
+            .as_chunks_mut::<TICK_FEATURES>()
+            .0
+            .iter_mut()
+            .zip(window)
+        {
             slot[0] = (c.open / close - 1.0) * 100.0;
             slot[1] = (c.high / close - 1.0) * 100.0;
             slot[2] = (c.low / close - 1.0) * 100.0;

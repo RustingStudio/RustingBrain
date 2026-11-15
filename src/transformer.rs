@@ -1664,7 +1664,7 @@ impl TransformerLm {
             }
             let mut bytes = vec![0u8; rows * cols * 4];
             reader.read_exact(&mut bytes)?;
-            for (slot, chunk) in param.value.data.iter_mut().zip(bytes.chunks_exact(4)) {
+            for (slot, chunk) in param.value.data.iter_mut().zip(bytes.as_chunks::<4>().0) {
                 *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             }
         }
@@ -2355,7 +2355,7 @@ impl TransformerLm {
             let mut moments = [Matrix::new(rows, cols), Matrix::new(rows, cols)];
             for matrix in &mut moments {
                 reader.read_exact(&mut bytes)?;
-                for (slot, chunk) in matrix.data.iter_mut().zip(bytes.chunks_exact(4)) {
+                for (slot, chunk) in matrix.data.iter_mut().zip(bytes.as_chunks::<4>().0) {
                     *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
             }
@@ -2562,7 +2562,7 @@ impl TransformerLm {
                 Precision::F32 => {
                     let mut bytes = vec![0u8; rows * cols * 4];
                     reader.read_exact(&mut bytes)?;
-                    for (slot, chunk) in param.value.data.iter_mut().zip(bytes.chunks_exact(4)) {
+                    for (slot, chunk) in param.value.data.iter_mut().zip(bytes.as_chunks::<4>().0) {
                         *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     }
                 }
