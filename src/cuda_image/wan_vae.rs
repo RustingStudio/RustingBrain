@@ -11,8 +11,8 @@
 //! `DeviceConv` removes it if it ever shows in a profile.
 
 use super::*;
-use std::sync::atomic::Ordering;
 use crate::wan_vae::{CausalConv3d, Streams, WanAttention, WanResnet, WanVaeDecoder, unpatchify};
+use std::sync::atomic::Ordering;
 
 const WAN_KERNELS: &str = r#"
 typedef unsigned short half_t;
@@ -431,7 +431,8 @@ impl DeviceWanDecoder {
         let count = hidden.len();
         for (index, frame) in hidden.into_iter().enumerate() {
             // Only the clip's very last frame feeds no later output.
-            k.ending.store(ending && index + 1 == count, Ordering::Relaxed);
+            k.ending
+                .store(ending && index + 1 == count, Ordering::Relaxed);
             streams.seek(mark);
             let mut frame = vec![frame];
             for block in &self.up_blocks[tail..] {
@@ -480,7 +481,12 @@ impl WanKernels {
         targets: Option<Vec<Map>>,
     ) -> Result<Vec<Map>, NetworkError> {
         let newest = conv.taps.len() - 1;
-        if newest > 0 && conv.taps.iter().all(|tap| tap.kernel > 1 && tap.stride == 1) {
+        if newest > 0
+            && conv
+                .taps
+                .iter()
+                .all(|tap| tap.kernel > 1 && tap.stride == 1)
+        {
             return self.causal_fan(conv, history, chunk, targets);
         }
         let (stream, past) = extend(history, chunk);
@@ -526,7 +532,11 @@ impl WanKernels {
                 }
             };
             // The last frame of the clip feeds no later output.
-            let reach = if ending { newest.min(count - 1 - index) } else { newest };
+            let reach = if ending {
+                newest.min(count - 1 - index)
+            } else {
+                newest
+            };
             let have = partial.len();
             for back in have..reach {
                 let out = &conv.taps[newest - 1 - back];

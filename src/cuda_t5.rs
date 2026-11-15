@@ -92,7 +92,10 @@ impl DeviceT5 {
             })
             .collect::<Result<_, NetworkError>>()?;
         Ok(Self {
-            narrow: !encoder.blocks.iter().any(|block| block.query.is_quantized()),
+            narrow: !encoder
+                .blocks
+                .iter()
+                .any(|block| block.query.is_quantized()),
             final_norm: gpu.upload(&encoder.final_norm)?,
             context: context.clone(),
             blocks,

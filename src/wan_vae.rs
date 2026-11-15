@@ -1249,7 +1249,10 @@ pub(crate) mod tests {
                     video[0].width
                 );
                 let peak = crate::cuda_training::reserved_high_water(0).unwrap();
-                eprintln!("wan vae device decode {size} run {run}: peak {} MiB", peak >> 20);
+                eprintln!(
+                    "wan vae device decode {size} run {run}: peak {} MiB",
+                    peak >> 20
+                );
                 if let (0, Some(path)) = (run, env("RB_WAN_DUMP")) {
                     let bytes: Vec<u8> = video
                         .iter()
