@@ -21,24 +21,10 @@ start changing things.
 Almost every problem announces itself in the loss curve, and the shape tells
 you which problem it is.
 
-```
-loss                                   loss
- │╲                                     │╲
- │ ╲___________  healthy                │ ╲____  training
- │                                       │  ╲
- └──────────── epoch                     │   ╲___
-                                         │ ___/     validation
-loss                                     └──────────── epoch
- │──────────── flat: not learning              overfitting
- │
- └──────────── epoch                    loss
-                                         │╲  ╱╲    ╱╲
-loss                                     │ ╲╱  ╲  ╱  ╲   unstable:
- │╲                                      │      ╲╱        rate too high
- │ ╲___
- │     ╳  NaN                            └──────────── epoch
- └──────────── epoch
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="figures/loss_shapes_dark.svg">
+  <img src="figures/loss_shapes_light.svg" alt="Loss curve shapes: healthy, flat, NaN, overfitting, unstable">
+</picture>
 
 So: print it. Every time, in every run.
 

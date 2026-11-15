@@ -160,25 +160,10 @@ attention.
 
 Eight of these, in a row:
 
-```
-input ──┬─────────────────────────────┐
-        ↓                             │
-    RMSNorm                           │
-        ↓                             │
-    attention (RoPE + causal mask)    │
-        ↓                             ↓
-        └───────────── + ─────────────┘   residual
-                       ↓
-                 ──────┬──────────────┐
-                       ↓              │
-                   RMSNorm            │
-                       ↓              │
-                   SwiGLU             │
-                       ↓              ↓
-                       └────── + ─────┘   residual
-                              ↓
-                           output
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="figures/transformer_block_dark.svg">
+  <img src="figures/transformer_block_light.svg" alt="A transformer block: RMSNorm, attention, residual, RMSNorm, SwiGLU, residual">
+</picture>
 
 **RMSNorm** rescales each vector to a consistent magnitude so the next layer
 sees inputs in a predictable range. It is LayerNorm without the mean

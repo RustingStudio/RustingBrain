@@ -14,13 +14,10 @@ GPU.
 A mixture-of-experts layer breaks that link. It holds many feed-forward
 networks and runs two of them per token.
 
-```
-dense:   token → [        one big FFN        ] → output
-
-MoE:     token → router → expert 3 ─┐
-                       → expert 7 ─┴─ weighted sum → output
-                          (experts 1,2,4,5,6,8 idle)
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="figures/experts_dark.svg">
+  <img src="figures/experts_light.svg" alt="A dense layer runs one big network; a mixture of experts routes each token to two of eight">
+</picture>
 
 Same latency per token, several times the parameters.
 
@@ -58,11 +55,12 @@ The router is one bias-free `d_model → num_experts` projection. For each token
 it produces one score per expert, softmax turns those into probabilities, and
 the top `k` win.
 
-```
-token vector ──→ router ──→ [0.02, 0.61, 0.05, 0.28, 0.01, 0.01, 0.01, 0.01]
-                                     ↑            ↑
-                                 expert 1     expert 3       (top-2)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="figures/router_dark.svg">
+  <img src="figures/router_light.svg" alt="Router probabilities for eight experts; experts 1 and 3 win">
+</picture>
 
+```
 output = 0.69 × expert_1(token) + 0.31 × expert_3(token)
 ```
 
