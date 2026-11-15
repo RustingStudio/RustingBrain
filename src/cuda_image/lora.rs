@@ -891,7 +891,7 @@ mod tests {
 
     /// G10 b-iii-c: one adapted forward and backward of Stable Diffusion
     /// 1.5's UNet at 512x512 (a 64x64 latent, 77 prompt tokens), timed for
-    /// `docs/baseline.md`. The weights are random: the step's cost is its
+    /// `docs/measurements.md`. The weights are random: the step's cost is its
     /// shapes, and the 1.5 checkpoint is not on this machine.
     ///
     /// ```bash

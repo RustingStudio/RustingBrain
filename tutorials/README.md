@@ -1,7 +1,8 @@
 # The RustingBrain Course
 
-Eighteen chapters, from what a neural network is to training a mixture-of-experts
-language model on a GPU and generating images with a published diffusion model. No prior machine-learning knowledge assumed. Rust
+Eighteen chapters, from what a neural network is to training a
+mixture-of-experts language model on a GPU and generating images with a
+published diffusion model. No prior machine-learning knowledge assumed. Rust
 assumed at the level of "I can read a `for` loop".
 
 Every chapter has runnable code in [`code/`](code/) and ends with exercises.
@@ -94,10 +95,9 @@ to fifty times slower, and chapter 13.8 is a list of people who forgot.
 
 ## What is not here
 
-Training a convolutional network, encoder-decoder models, reinforcement
-learning, multi-GPU and distributed training. The library runs convolutions
-(chapter 18 is built on them) but no chapter trains one yet; the rest are not
-implemented, so they are not taught here.
+Training a convolutional network, reinforcement learning, encoder-decoder
+models, multi-GPU and distributed training. The library has the first two, but
+no chapter teaches them yet; the rest are not implemented.
 
 The reference documentation is the source. Every public type carries the
 reasoning behind it, which is the part that does not fit in a tutorial.
