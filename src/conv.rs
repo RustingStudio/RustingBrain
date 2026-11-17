@@ -3647,6 +3647,198 @@ pub fn max_pool_same_backward_device(
     Ok(grad.with_data(out))
 }
 
+/// FiLM on the device: `x * (1 + scale) + shift`, one scale and one shift per
+/// sample and channel. `params` is `[batch, 2 * channels]`, every scale before
+/// every shift, and small enough that uploading it is not a crossing worth
+/// avoiding.
+#[cfg(feature = "cuda")]
+pub fn film_device(
+    input: &DeviceImageBatch,
+    params: &Matrix,
+) -> Result<DeviceImageBatch, NetworkError> {
+    film_launch(input, params, true)
+}
+
+/// The way back through [`film_device`]: `dL/dinput`, and `dL/dparams` on the
+/// host in the layout `params` has. `input` is what the forward pass read.
+#[cfg(feature = "cuda")]
+pub fn film_backward_device(
+    input: &DeviceImageBatch,
+    params: &Matrix,
+    grad: &DeviceImageBatch,
+) -> Result<(DeviceImageBatch, Matrix), NetworkError> {
+    let context = &grad.context;
+    let blocks = grad.batch * grad.channels;
+    let mut sums = context.uninit(2 * blocks)?;
+    let [pixels, channels] = [grad.pixels(), grad.channels].map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.film_bwd)
+            .arg(&mut sums)
+            .arg(&grad.data)
+            .arg(&input.data)
+            .arg(&pixels)
+            .arg(&channels)
+            .launch(group_blocks(blocks))
+            .map_err(crate::cuda_training::cuda_err("FiLM backward kernel"))?;
+    }
+    let mut grad_params = Matrix::new(grad.batch, 2 * grad.channels);
+    context.download(&sums, &mut grad_params)?;
+    Ok((film_launch(grad, params, false)?, grad_params))
+}
+
+#[cfg(feature = "cuda")]
+fn film_launch(
+    input: &DeviceImageBatch,
+    params: &Matrix,
+    shift: bool,
+) -> Result<DeviceImageBatch, NetworkError> {
+    if (params.rows, params.cols) != (input.batch, 2 * input.channels) {
+        return Err(NetworkError::InvalidConfig(format!(
+            "FiLM over {} samples of {} channels wants {} x {} parameters, not {} x {}",
+            input.batch,
+            input.channels,
+            input.batch,
+            2 * input.channels,
+            params.rows,
+            params.cols
+        )));
+    }
+    let context = &input.context;
+    let params = context.upload(params)?;
+    let total = input.data.len();
+    let mut out = context.uninit(total)?;
+    let [n, pixels, channels, shift] =
+        [total, input.pixels(), input.channels, usize::from(shift)].map(|v| v as i32);
+    unsafe {
+        context
+            .stream
+            .launch_builder(&context.image.film)
+            .arg(&mut out)
+            .arg(&input.data)
+            .arg(&params)
+            .arg(&n)
+            .arg(&pixels)
+            .arg(&channels)
+            .arg(&shift)
+            .launch(crate::cuda_training::cfg(total))
+            .map_err(crate::cuda_training::cuda_err("FiLM kernel"))?;
+    }
+    Ok(input.with_data(out))
+}
+
+/// Reorders the rows of a batch from `[o, first, second]` to
+/// `[o, second, first]`, which is what turns "every pixel of a view" into
+/// "every view of a pixel" for attention across views. The result keeps the
+/// input's dimensions: it is the same values in another row order, and
+/// calling this again with the two lengths exchanged puts them back.
+#[cfg(feature = "cuda")]
+pub fn swap_row_axes_device(
+    input: &DeviceImageBatch,
+    first: usize,
+    second: usize,
+) -> Result<DeviceImageBatch, NetworkError> {
+    let rows = input.batch * input.pixels();
+    if first * second == 0 || !rows.is_multiple_of(first * second) {
+        return Err(NetworkError::InvalidConfig(format!(
+            "{rows} rows do not divide into {first} x {second} blocks"
+        )));
+    }
+    let out = image_launch(
+        input,
+        input.data.len(),
+        "row reorder kernel",
+        |context| &context.image.swap_axes,
+        &[first, second, input.channels],
+    )?;
+    Ok(input.with_data(out))
+}
+
+/// What [`cross_attention_backward_device`] needs from the forward pass.
+#[cfg(feature = "cuda")]
+pub struct DeviceCrossAttentionCache {
+    inner: crate::gpu_cross::CrossCache,
+    /// The keys' batch, height, width and channels, for their gradient.
+    keys: [usize; 4],
+}
+
+/// [`MultiHeadAttention::forward_train_cross`](crate::attention::MultiHeadAttention::forward_train_cross)
+/// over batches already on the device: every `q_len` rows of `queries` attend
+/// to the matching `kv_len` rows of `keys`. The attention's four projections
+/// must be on the same device. The result has the queries' shape.
+#[cfg(feature = "cuda")]
+pub fn cross_attention_device(
+    attention: &crate::attention::MultiHeadAttention,
+    queries: &DeviceImageBatch,
+    keys: &DeviceImageBatch,
+    q_len: usize,
+    kv_len: usize,
+) -> Result<(DeviceImageBatch, DeviceCrossAttentionCache), NetworkError> {
+    let (q_rows, kv_rows) = (queries.batch * queries.pixels(), keys.batch * keys.pixels());
+    if q_len == 0 || !q_rows.is_multiple_of(q_len) || kv_rows != q_rows / q_len * kv_len {
+        return Err(NetworkError::InvalidConfig(format!(
+            "{q_rows} queries in sequences of {q_len} do not pair with {kv_rows} keys in sequences of {kv_len}"
+        )));
+    }
+    if queries.channels != attention.d_model() || keys.channels != attention.kv_features() {
+        return Err(NetworkError::InvalidConfig(format!(
+            "this attention reads {}-wide queries and {}-wide keys, not {} and {}",
+            attention.d_model(),
+            attention.kv_features(),
+            queries.channels,
+            keys.channels
+        )));
+    }
+    let gpu = crate::gpu_model::Gpu {
+        context: &queries.context,
+    };
+    let shape = crate::gpu_cross::CrossShape {
+        q_len,
+        kv_len,
+        sequences: q_rows / q_len,
+    };
+    let (out, inner) = crate::gpu_cross::forward(
+        &gpu,
+        attention,
+        &queries.data.slice(..),
+        &keys.data.slice(..),
+        shape,
+    )?;
+    Ok((
+        queries.with_data(out),
+        DeviceCrossAttentionCache {
+            inner,
+            keys: [keys.batch, keys.height, keys.width, keys.channels],
+        },
+    ))
+}
+
+/// Accumulates the four projections' gradients on the device and returns
+/// `(dL/dqueries, dL/dkeys)`.
+#[cfg(feature = "cuda")]
+pub fn cross_attention_backward_device(
+    attention: &mut crate::attention::MultiHeadAttention,
+    cache: &DeviceCrossAttentionCache,
+    grad: &DeviceImageBatch,
+) -> Result<(DeviceImageBatch, DeviceImageBatch), NetworkError> {
+    let gpu = crate::gpu_model::Gpu {
+        context: &grad.context,
+    };
+    let (queries, keys) = crate::gpu_cross::backward(&gpu, attention, &cache.inner, &grad.data)?;
+    let [batch, height, width, channels] = cache.keys;
+    Ok((
+        grad.with_data(queries),
+        DeviceImageBatch {
+            batch,
+            height,
+            width,
+            channels,
+            ..grad.with_data(keys)
+        },
+    ))
+}
+
 /// One thread per output element of a kernel taking `(out, in, total, dims...)`.
 #[cfg(feature = "cuda")]
 fn image_launch(
@@ -4216,6 +4408,117 @@ mod tests {
             );
             close(&device_side.bias.grad.data, &host_side.bias.grad.data, what);
         }
+    }
+
+    /// FiLM, the row reorder and cross-attention over device batches, forward
+    /// and backward, against the same arithmetic on the host.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_film_reorder_and_cross_attention_match_the_host() {
+        let Some(device) = cuda_or_skip() else {
+            return;
+        };
+        let close = |name: &str, actual: &[f32], expected: &[f32]| {
+            assert_eq!(actual.len(), expected.len(), "{name}");
+            for (index, (a, b)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-4 * b.abs().max(1.0),
+                    "{name}[{index}]: {a} vs {b}"
+                );
+            }
+        };
+        let (batch, pixels, channels) = (6, 12, 8);
+        let input = noise(batch, 3, 4, channels, 1);
+        let grad = noise(batch, 3, 4, channels, 2);
+        let params = noise(1, 1, batch, 2 * channels, 3).tokens;
+        let (on_card, on_card_grad) = (
+            device.upload(&input).unwrap(),
+            device.upload(&grad).unwrap(),
+        );
+
+        let mut expected = input.clone();
+        let mut expected_grad = grad.clone();
+        let mut expected_params = Matrix::new(batch, 2 * channels);
+        for row in 0..batch * pixels {
+            let p = params.row(row / pixels);
+            for c in 0..channels {
+                expected.tokens.row_mut(row)[c] =
+                    input.tokens.row(row)[c] * (1.0 + p[c]) + p[channels + c];
+                expected_grad.tokens.row_mut(row)[c] = grad.tokens.row(row)[c] * (1.0 + p[c]);
+                expected_params.row_mut(row / pixels)[c] +=
+                    grad.tokens.row(row)[c] * input.tokens.row(row)[c];
+                expected_params.row_mut(row / pixels)[channels + c] += grad.tokens.row(row)[c];
+            }
+        }
+        let modulated = film_device(&on_card, &params).unwrap().download().unwrap();
+        close("film", &modulated.tokens.data, &expected.tokens.data);
+        let (back, grad_params) = film_backward_device(&on_card, &params, &on_card_grad).unwrap();
+        close(
+            "film input gradient",
+            &back.download().unwrap().tokens.data,
+            &expected_grad.tokens.data,
+        );
+        close(
+            "film parameter gradient",
+            &grad_params.data,
+            &expected_params.data,
+        );
+
+        // Two objects of three views: [object, view, pixel] to [object, pixel, view].
+        let swapped = swap_row_axes_device(&on_card, 3, pixels).unwrap();
+        let host = swapped.download().unwrap();
+        for (object, view, pixel) in [(0, 0, 0), (0, 2, 5), (1, 1, 11)] {
+            assert_eq!(
+                host.tokens.row((object * pixels + pixel) * 3 + view),
+                input.tokens.row((object * 3 + view) * pixels + pixel)
+            );
+        }
+        let restored = swap_row_axes_device(&swapped, pixels, 3).unwrap();
+        assert_eq!(restored.download().unwrap().tokens.data, input.tokens.data);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let rope = crate::rope::Rope::new(4, 1, 10000.0).unwrap();
+        let mut attention =
+            crate::attention::MultiHeadAttention::cross(channels, 6, 2, 2, 4, rope, &mut rng)
+                .unwrap();
+        let keys = noise(batch, 1, 5, 6, 4);
+        let (expected, cache) = attention
+            .forward_train_cross(&input.tokens, &keys.tokens, pixels, 5)
+            .unwrap();
+        let (expected_queries, expected_keys) =
+            attention.backward_cross(&cache, &grad.tokens).unwrap();
+        let mut resident = attention.clone();
+        for linear in [
+            &mut resident.query,
+            &mut resident.key,
+            &mut resident.value,
+            &mut resident.output,
+        ] {
+            linear.weight.zero_grad();
+            linear.to_cuda_on(&device).unwrap();
+        }
+        let on_card_keys = device.upload(&keys).unwrap();
+        let (attended, cache) =
+            cross_attention_device(&resident, &on_card, &on_card_keys, pixels, 5).unwrap();
+        close(
+            "attention",
+            &attended.download().unwrap().tokens.data,
+            &expected.data,
+        );
+        let (grad_queries, grad_keys) =
+            cross_attention_backward_device(&mut resident, &cache, &on_card_grad).unwrap();
+        close(
+            "query gradient",
+            &grad_queries.download().unwrap().tokens.data,
+            &expected_queries.data,
+        );
+        let grad_keys = grad_keys.download().unwrap();
+        assert_eq!(
+            (grad_keys.batch, grad_keys.width, grad_keys.channels()),
+            (batch, 5, 6)
+        );
+        close("key gradient", &grad_keys.tokens.data, &expected_keys.data);
+        assert!(cross_attention_device(&resident, &on_card, &on_card_keys, pixels, 4).is_err());
     }
 
     /// Group norm then SiLU on the device, forward and back, against the host

@@ -350,6 +350,29 @@ extern "C" __global__ void copy_channels(float*dst,const float*src,int rows,int 
   int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*width)return;
   long long r=i/width;int c=i%width;float v=src[r*sC+soff+c];float*d=dst+r*dC+doff+c;*d=add?*d+v:v;
 }
+// FiLM over `[batch * pixels, C]`: `p` is `[batch, 2 * C]`, a scale offset
+// and a shift per sample and channel. `shift` 0 leaves the shift out, which
+// is the gradient's way back through the same modulation.
+extern "C" __global__ void film(float*y,const float*x,const float*p,int total,int pixels,int C,int shift){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C;const float*ps=p+(long long)(i/C/pixels)*2*C;
+  y[i]=x[i]*(1.f+ps[c])+(shift?ps[C+c]:0.f);
+}
+// One block per (sample, channel): the gradient of `p`, the sum over pixels of
+// g * x for the scale and of g for the shift.
+extern "C" __global__ void film_bwd(float*out,const float*g,const float*x,int n,int C){
+  int b=blockIdx.x/C,c=blockIdx.x%C;long long base=(long long)b*n*C+c;
+  float a=0.f,z=0.f;
+  for(int p=threadIdx.x;p<n;p+=blockDim.x){float d=g[base+(long long)p*C];a+=d*x[base+(long long)p*C];z+=d;}
+  a=img_block_sum(a);z=img_block_sum(z);
+  if(threadIdx.x==0){out[(long long)b*2*C+c]=a;out[(long long)b*2*C+C+c]=z;}
+}
+// Rows `[o, A, B]` reordered to `[o, B, A]`, each row C wide.
+extern "C" __global__ void swap_axes(float*y,const float*x,int total,int A,int B,int C){
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=total)return;
+  int c=i%C,r=i/C,a=r%A,q=r/A,b=q%B,o=q/B;
+  y[i]=x[(((long long)o*A+a)*B+b)*C+c];
+}
 // Stride-one max pool padded to keep the size; `arg` is the winner's place in
 // the window, the first maximum on a tie as on the host.
 extern "C" __global__ void maxpool_same(float*y,int*arg,const float*x,int total,int H,int W,int C,int k){

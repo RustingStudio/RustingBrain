@@ -68,6 +68,9 @@ pub(crate) struct ImageTrainKernels {
     pub(crate) dw_fwd: CudaFunction,
     pub(crate) dw_bwd_input: CudaFunction,
     pub(crate) dw_bwd_weight: CudaFunction,
+    pub(crate) film: CudaFunction,
+    pub(crate) film_bwd: CudaFunction,
+    pub(crate) swap_axes: CudaFunction,
 }
 
 /// One device, its stream, cuBLAS handle and the kernels the transformer uses.
@@ -234,6 +237,9 @@ impl GpuContext {
                 dw_fwd: get("dw_fwd")?,
                 dw_bwd_input: get("dw_bwd_input")?,
                 dw_bwd_weight: get("dw_bwd_weight")?,
+                film: get("film")?,
+                film_bwd: get("film_bwd")?,
+                swap_axes: get("swap_axes")?,
             },
             transfers: std::sync::atomic::AtomicUsize::new(0),
             model: crate::gpu_model::ModelKernels::load(&module)?,
