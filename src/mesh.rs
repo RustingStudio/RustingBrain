@@ -1872,8 +1872,15 @@ struct Collapse {
 impl Ord for Collapse {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Reversed, because `BinaryHeap` is a max-heap and the cheapest
-        // collapse is the one to take.
-        other.key.cmp(&self.key)
+        // collapse is the one to take. Equally cheap collapses go by their
+        // vertices: the edges are queued in a hash map's order, which differs
+        // from run to run, and the heap must not hand that order on.
+        (other.key, other.from, other.into, other.stamps).cmp(&(
+            self.key,
+            self.from,
+            self.into,
+            self.stamps,
+        ))
     }
 }
 impl PartialOrd for Collapse {
@@ -1883,7 +1890,7 @@ impl PartialOrd for Collapse {
 }
 impl PartialEq for Collapse {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
 impl Eq for Collapse {}
@@ -2403,6 +2410,24 @@ mod simplify_tests {
         for point in &mesh.positions {
             let distance = (length(*point) - 0.8).abs();
             assert!(distance < 0.01, "{point:?} sits {distance} off the surface");
+        }
+    }
+
+    /// Two maps in one process hash with different keys, so this is the same
+    /// difference two runs of a program see.
+    #[test]
+    fn the_same_mesh_simplifies_to_the_same_mesh_every_time() {
+        // A flat sheet is all ties: every interior collapse costs nothing.
+        for mesh in [sphere(24), grid(12)] {
+            let target = mesh.indices.len() / 5;
+            let mut first = mesh.clone();
+            first.simplify(target);
+            for _ in 0..4 {
+                let mut again = mesh.clone();
+                again.simplify(target);
+                assert_eq!(again.indices, first.indices);
+                assert_eq!(again.positions, first.positions);
+            }
         }
     }
 
