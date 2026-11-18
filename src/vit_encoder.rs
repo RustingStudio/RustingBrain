@@ -507,19 +507,27 @@ pub fn read_image<P: AsRef<std::path::Path>>(
     let path = path.as_ref();
     let decoded = image::open(path)
         .map_err(|error| NetworkError::InvalidDataset(format!("{}: {error}", path.display())))?;
+    // A render of a 3D asset is usually cut out, and the tower has three input
+    // channels, so the alpha is composited rather than fed. It is composited
+    // before the resize: resizing straight alpha first mixes the colour hidden
+    // under transparent pixels into the outline, which no opaque picture has.
+    let decoded = match decoded.color().has_alpha() {
+        true => {
+            let mut flat = decoded.to_rgba8();
+            for pixel in flat.pixels_mut() {
+                let alpha = f32::from(pixel[3]) / 255.0;
+                for channel in 0..3 {
+                    let over = f32::from(pixel[channel]) * alpha;
+                    pixel[channel] = (over + 255.0 * background * (1.0 - alpha)).round() as u8;
+                }
+                pixel[3] = 255;
+            }
+            image::DynamicImage::ImageRgba8(flat)
+        }
+        false => decoded,
+    };
     let side = size as u32;
     let decoded = decoded.resize_exact(side, side, image::imageops::FilterType::CatmullRom);
-
-    // A render of a 3D asset is usually cut out, and the tower has three input
-    // channels, so the alpha is composited rather than fed.
-    if decoded.color().has_alpha() {
-        let rgba: Vec<f32> = decoded
-            .to_rgba8()
-            .iter()
-            .map(|&value| f32::from(value) / 255.0)
-            .collect();
-        return composite_rgba(&rgba, size, [background; 3]);
-    }
 
     let mut map = FeatureMap::new(3, size, size);
     for (index, pixel) in decoded.to_rgb8().pixels().enumerate() {
@@ -959,5 +967,32 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "images"))]
+mod alpha_tests {
+    use super::read_image;
+
+    /// What lies under a transparent pixel must not reach the tower.
+    #[test]
+    fn a_cut_out_reads_as_the_same_picture_flattened_onto_white() {
+        let folder = std::env::temp_dir().join(format!("rusting-alpha-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let cut = image::RgbaImage::from_fn(64, 64, |x, y| match (16..48).contains(&x) && y > 20 {
+            true => image::Rgba([200, 40, 90, 255]),
+            false => image::Rgba([0, 0, 0, 0]),
+        });
+        let flat = image::RgbImage::from_fn(64, 64, |x, y| match cut.get_pixel(x, y)[3] {
+            255 => image::Rgb([200, 40, 90]),
+            _ => image::Rgb([255, 255, 255]),
+        });
+        cut.save(folder.join("cut.png")).unwrap();
+        flat.save(folder.join("flat.png")).unwrap();
+        let cut = read_image(folder.join("cut.png"), 24, 1.0).unwrap();
+        let flat = read_image(folder.join("flat.png"), 24, 1.0).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        let worst = cut.data.iter().zip(&flat.data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(worst < 0.05, "the two readings differ by {worst}");
     }
 }
