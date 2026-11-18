@@ -574,8 +574,23 @@ impl FlowTransformer {
         dropout: f32,
         rng: &mut R,
     ) -> Result<f32, NetworkError> {
+        self.train_step_shifted(clean, tokens, dropout, 1.0, rng)
+    }
+
+    /// [`train_step`](Self::train_step) with the timesteps bent towards the
+    /// noisy end by `shift` (see [`sample_timesteps`]; 1.0 leaves them alone).
+    /// The noisy end is where the sample's overall shape is decided, and so
+    /// where the model has the most use for its condition.
+    pub fn train_step_shifted<R: Rng>(
+        &mut self,
+        clean: &Matrix,
+        tokens: &Matrix,
+        dropout: f32,
+        shift: f32,
+        rng: &mut R,
+    ) -> Result<f32, NetworkError> {
         let sequences = self.check(clean, tokens, &[])?;
-        let times = sample_timesteps(sequences, 1.0, rng);
+        let times = sample_timesteps(sequences, shift, rng);
 
         let mut noise = Matrix::new(clean.rows, clean.cols);
         for value in &mut noise.data {
