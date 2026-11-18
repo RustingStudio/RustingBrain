@@ -231,7 +231,11 @@ impl Block {
         let depth = (config.encoder_blocks + config.decoder_blocks).max(1);
         let shrink = (2.0 * depth as f32).sqrt().recip();
         for weight in [&mut attention.output.weight, &mut mlp.down.weight] {
-            weight.value.data.iter_mut().for_each(|value| *value *= shrink);
+            weight
+                .value
+                .data
+                .iter_mut()
+                .for_each(|value| *value *= shrink);
         }
 
         Ok(Self {

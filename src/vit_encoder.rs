@@ -992,7 +992,12 @@ mod alpha_tests {
         let cut = read_image(folder.join("cut.png"), 24, 1.0).unwrap();
         let flat = read_image(folder.join("flat.png"), 24, 1.0).unwrap();
         std::fs::remove_dir_all(&folder).unwrap();
-        let worst = cut.data.iter().zip(&flat.data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let worst = cut
+            .data
+            .iter()
+            .zip(&flat.data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
         assert!(worst < 0.05, "the two readings differ by {worst}");
     }
 }
