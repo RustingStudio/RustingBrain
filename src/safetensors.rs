@@ -17,9 +17,11 @@
 
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
+use crate::quantized::Quantized;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
 /// The element types a `.safetensors` header can name.
@@ -554,10 +556,257 @@ pub struct ShardedSafeTensors {
     map: BTreeMap<String, String>,
     shards: BTreeMap<String, SafeTensors>,
     /// What [`ShardedSafeTensors::add_lora`] adds to a weight as it is read.
-    deltas: BTreeMap<String, Vec<f32>>,
+    deltas: BTreeMap<String, Vec<LoraDelta>>,
+    /// What [`ShardedSafeTensors::open`] was given, which names the cache.
+    path: PathBuf,
+    /// Set by [`ShardedSafeTensors::cache_q8`].
+    q8: Option<Q8Cache>,
+}
+
+/// Int8 weights a load has already rounded, kept beside the checkpoint so
+/// that the next load reads one byte a weight instead of reading four and
+/// rounding them again.
+///
+/// The file is the checkpoint's fingerprint and then one record per weight in
+/// the order the load asked for them, which is the same every time: a key,
+/// the shape, the int8 values and the scales. A record that is not the one
+/// asked for means the file is stale: it is deleted, this load rounds its own
+/// weights, and the next one writes the file again.
+#[derive(Debug)]
+enum Q8Cache {
+    Read(Q8Reader),
+    Write(Q8Writer),
+}
+
+/// A cache being read. One core filling fresh memory is slower than the disk
+/// is, so there is a handle a core and each reads its own stretch of a block.
+#[derive(Debug)]
+struct Q8Reader {
+    files: Vec<File>,
+    /// Where the next block starts.
+    at: u64,
+    /// The file's length, which no block in it can exceed.
+    limit: u64,
+    path: PathBuf,
+}
+
+/// A cache being written under a temporary name. It takes its real name when
+/// dropped, synced first so that a crash cannot leave a file that only looks
+/// whole.
+#[derive(Debug)]
+struct Q8Writer {
+    file: BufWriter<File>,
+    part: PathBuf,
+    path: PathBuf,
+    /// A record went in and none failed.
+    good: bool,
+}
+
+impl Drop for Q8Writer {
+    fn drop(&mut self) {
+        let whole = self.good
+            && self
+                .file
+                .flush()
+                .and_then(|()| self.file.stream_position())
+                // A part file left by a load that was killed may be longer.
+                .and_then(|end| self.file.get_ref().set_len(end))
+                .and_then(|()| self.file.get_ref().sync_all())
+                .is_ok();
+        let _ = match whole {
+            true => std::fs::rename(&self.part, &self.path),
+            false => std::fs::remove_file(&self.part),
+        };
+    }
+}
+
+fn write_block(file: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
+    file.write_all(&(bytes.len() as u64).to_le_bytes())?;
+    file.write_all(bytes)
+}
+
+/// The next block [`write_block`] wrote, refused past the file's length so
+/// that a damaged length is an error rather than an allocation.
+fn read_block(reader: &mut Q8Reader) -> std::io::Result<Vec<u8>> {
+    let read = |file: &mut File, at: u64, bytes: &mut [u8]| {
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(bytes)
+    };
+    let mut len = [0u8; 8];
+    read(&mut reader.files[0], reader.at, &mut len)?;
+    let len = u64::from_le_bytes(len);
+    if len > reader.limit {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let start = reader.at + 8;
+    let mut bytes = vec![0u8; len as usize];
+    // No more stretches than handles, and none too short to be worth a core.
+    let stretch = bytes.len().div_ceil(reader.files.len()).max(1 << 20);
+    bytes
+        .par_chunks_mut(stretch)
+        .zip(&mut reader.files)
+        .enumerate()
+        .try_for_each(|(index, (bytes, file))| {
+            read(file, start + (index * stretch) as u64, bytes)
+        })?;
+    reader.at = start + len;
+    Ok(bytes)
+}
+
+fn write_q8(file: &mut impl Write, key: &str, quantized: &Quantized) -> std::io::Result<()> {
+    let (data, scales, group) = quantized
+        .int8()
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    let (rows, cols) = quantized.shape();
+    let shape = [rows, cols, group].map(|size| (size as u64).to_le_bytes());
+    write_block(file, key.as_bytes())?;
+    write_block(file, shape.as_flattened())?;
+    write_block(file, &data.iter().map(|&q| q as u8).collect::<Vec<_>>())?;
+    let scales: Vec<u8> = scales.iter().flat_map(|scale| scale.to_le_bytes()).collect();
+    write_block(file, &scales)
+}
+
+/// The next record, or `None` if it is not `key`'s or not whole.
+fn read_q8(reader: &mut Q8Reader, key: &str) -> Option<Quantized> {
+    if read_block(reader).ok()? != key.as_bytes() {
+        return None;
+    }
+    let shape = read_block(reader).ok()?;
+    let mut shape = shape
+        .chunks_exact(8)
+        .map(|size| u64::from_le_bytes(size.try_into().expect("eight bytes")) as usize);
+    let (rows, cols, group) = (shape.next()?, shape.next()?, shape.next()?);
+    let data = read_block(reader).ok()?;
+    let scales = read_block(reader).ok()?;
+    Quantized::from_int8(
+        rows,
+        cols,
+        group,
+        data.into_iter().map(|q| q as i8).collect(),
+        scales
+            .chunks_exact(4)
+            .map(|scale| f32::from_le_bytes(scale.try_into().expect("four bytes")))
+            .collect(),
+    )
+}
+
+/// One LoRA's share of a weight, `factor * up[row..] @ down`, multiplied out
+/// only as the weight is read: held whole, the adapters of a 7B transformer's
+/// attention alone are 8 GB.
+#[derive(Clone, Debug)]
+struct LoraDelta {
+    up: std::sync::Arc<Matrix>,
+    down: std::sync::Arc<Matrix>,
+    factor: f32,
+    /// The first of `up`'s rows that are this weight's.
+    row: usize,
 }
 
 impl ShardedSafeTensors {
+    /// Keeps the int8 weights [`ShardedSafeTensors::quantized`] makes in a
+    /// file beside the checkpoint, the opened path with `.q8` after it, and
+    /// reads them from it when it is there (see [`Q8Cache`]). The file is one
+    /// byte per cached weight. A directory that cannot be written leaves the
+    /// load as slow as it was, and `RB_Q8_CACHE=0` asks for that.
+    pub(crate) fn cache_q8(&mut self) {
+        if std::env::var_os("RB_Q8_CACHE").is_some_and(|value| value == "0") {
+            return;
+        }
+        let beside = |suffix: &str| {
+            let mut name = self.path.clone().into_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        let (path, part) = (beside(".q8"), beside(".q8.part"));
+        // The format, and what the checkpoint was when the cache was made.
+        let mut print = String::from("rusting-brain q8 cache 1\n");
+        for shard in self.map.values().collect::<std::collections::BTreeSet<_>>() {
+            let (len, modified) = std::fs::metadata(self.directory.join(shard))
+                .map_or((0, None), |meta| (meta.len(), meta.modified().ok()));
+            let modified = modified
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos());
+            print.push_str(&format!("{shard} {len} {modified}\n"));
+        }
+
+        let files: std::io::Result<Vec<File>> = (0..rayon::current_num_threads())
+            .map(|_| File::open(&path))
+            .collect();
+        if let Ok(files) = files {
+            let limit = files[0].metadata().map_or(0, |meta| meta.len());
+            let (at, path) = (0, path.clone());
+            let mut reader = Q8Reader { files, at, limit, path };
+            if read_block(&mut reader).is_ok_and(|head| head == print.as_bytes()) {
+                self.q8 = Some(Q8Cache::Read(reader));
+                return;
+            }
+        }
+        // A load with a LoRA reads the cache for the weights the LoRA leaves
+        // alone, and writes none: it would hold the merged weights.
+        if !self.deltas.is_empty() {
+            return;
+        }
+        // ponytail: not truncated, so two loads writing the same records at
+        // once write the same bytes and neither sees a hole. Two loads with
+        // different `RB_Q8_GROUP` at once still interleave; lock the file
+        // (`File::try_lock`) once `rust-version` reaches 1.89.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&part);
+        if let Ok(file) = file {
+            let mut writer = Q8Writer {
+                file: BufWriter::with_capacity(1 << 20, file),
+                part,
+                path,
+                good: false,
+            };
+            if write_block(&mut writer.file, print.as_bytes()).is_ok() {
+                self.q8 = Some(Q8Cache::Write(writer));
+            }
+        }
+    }
+
+    /// The weight `build` reads and rounds, from the cache when
+    /// [`ShardedSafeTensors::cache_q8`] found it there under `key`, and added
+    /// to the cache when it is being written. A LoRA changes what `build`
+    /// reads for the weights it adapts, so a load with one writes no cache
+    /// and reads it only for the others: `key` has to hold the names of the
+    /// weights `build` reads for that to be told.
+    pub(crate) fn quantized(
+        &mut self,
+        key: &str,
+        build: impl FnOnce(&mut Self) -> Result<Quantized, NetworkError>,
+    ) -> Result<Quantized, NetworkError> {
+        let adapted = self
+            .deltas
+            .keys()
+            .any(|name| key.contains(name.trim_end_matches(".weight")));
+        if !self.deltas.is_empty() && !matches!(self.q8, Some(Q8Cache::Read(_))) {
+            return build(self);
+        }
+        if let Some(Q8Cache::Read(reader)) = &mut self.q8 {
+            match read_q8(reader, key) {
+                // Read past, so the next record is the next weight's.
+                Some(_) if adapted => return build(self),
+                Some(quantized) => return Ok(quantized),
+                None => {
+                    let _ = std::fs::remove_file(&reader.path);
+                    self.q8 = None;
+                }
+            }
+        }
+        let quantized = build(self)?;
+        if let Some(Q8Cache::Write(writer)) = &mut self.q8 {
+            writer.good = write_q8(&mut writer.file, key, &quantized).is_ok();
+            if !writer.good {
+                self.q8 = None;
+            }
+        }
+        Ok(quantized)
+    }
+
     /// Opens the index at `path`, or a single-file model if `path` is a
     /// `.safetensors` file, so a caller does not have to know which it has.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, NetworkError> {
@@ -586,6 +835,8 @@ impl ShardedSafeTensors {
                 map,
                 shards: BTreeMap::from([(name, shard)]),
                 deltas: BTreeMap::new(),
+                path: path.to_path_buf(),
+                q8: None,
             });
         }
 
@@ -619,6 +870,8 @@ impl ShardedSafeTensors {
             map,
             shards: BTreeMap::new(),
             deltas: BTreeMap::new(),
+            path: path.to_path_buf(),
+            q8: None,
         })
     }
 
@@ -630,9 +883,10 @@ impl ShardedSafeTensors {
     /// Merges a LoRA file into the weights it adapts, as they are read from
     /// now on, and says how many weights it changes.
     ///
-    /// Both published spellings are read: PEFT and diffusers' `lora_A` and
-    /// `lora_B`, and kohya's `lora_down`, `lora_up` and `alpha`, which name the
-    /// weight with underscores for dots. Each adapted weight gains
+    /// The published spellings are read: PEFT and diffusers' `lora_A` and
+    /// `lora_B`, kohya's `lora_down`, `lora_up` and `alpha`, which name the
+    /// weight with underscores for dots, and the `lora.down` and `lora.up` of
+    /// lightx2v's distillation files. Each adapted weight gains
     /// `scale * alpha / rank * up @ down`, with `alpha` the rank where the file
     /// has none.
     ///
@@ -696,22 +950,27 @@ impl ShardedSafeTensors {
         let names: Vec<String> = file.names().map(str::to_string).collect();
         let mut changed = 0;
         for name in &names {
-            let (stem, up_name) = match name.strip_suffix(".lora_A.weight") {
-                Some(stem) => (stem, format!("{stem}.lora_B.weight")),
-                None => match name.strip_suffix(".lora_down.weight") {
-                    Some(stem) => (stem, format!("{stem}.lora_up.weight")),
-                    None if name.ends_with(".lora_B.weight")
-                        || name.ends_with(".lora_up.weight")
-                        || name.ends_with(".alpha") =>
-                    {
-                        continue;
-                    }
-                    None => {
-                        return Err(NetworkError::InvalidDataset(format!(
-                            "{name} is not part of a LoRA pair; other adapter kinds are not read"
-                        )));
-                    }
-                },
+            const SPELLINGS: [(&str, &str); 3] = [
+                (".lora_A.weight", ".lora_B.weight"),
+                (".lora_down.weight", ".lora_up.weight"),
+                (".lora.down.weight", ".lora.up.weight"),
+            ];
+            let pair = SPELLINGS.iter().find_map(|(down, up)| {
+                let stem = name.strip_suffix(down)?;
+                Some((stem, format!("{stem}{up}")))
+            });
+            let (stem, up_name) = match pair {
+                Some(pair) => pair,
+                None if name.ends_with(".alpha")
+                    || SPELLINGS.iter().any(|(_, up)| name.ends_with(up)) =>
+                {
+                    continue;
+                }
+                None => {
+                    return Err(NetworkError::InvalidDataset(format!(
+                        "{name} is not part of a LoRA pair; other adapter kinds are not read"
+                    )));
+                }
             };
             // Peel off prefixes until what is left names a weight here, or a
             // prefix says it belongs elsewhere.
@@ -777,20 +1036,22 @@ impl ShardedSafeTensors {
                      make its {base_len} weights"
                 )));
             }
-            let up = Matrix::from_vec(outputs, rank, up);
-            let down = Matrix::from_vec(rank, inputs, down);
-            let mut product = Matrix::new(outputs, inputs);
-            up.dot(&down, &mut product);
+            let up = std::sync::Arc::new(Matrix::from_vec(outputs, rank, up));
+            let down = std::sync::Arc::new(Matrix::from_vec(rank, inputs, down));
             let factor = scale * alpha / rank as f32;
-            let mut values = product.data.iter();
+            let mut row = 0;
             for (stem, size) in target.iter().zip(sizes) {
-                let delta = self
-                    .deltas
+                let delta = LoraDelta {
+                    up: up.clone(),
+                    down: down.clone(),
+                    factor,
+                    row,
+                };
+                self.deltas
                     .entry(format!("{stem}.weight"))
-                    .or_insert_with(|| vec![0.0; size]);
-                for (delta, value) in delta.iter_mut().zip(values.by_ref().take(size)) {
-                    *delta += factor * value;
-                }
+                    .or_default()
+                    .push(delta);
+                row += size / inputs;
             }
             changed += 1;
         }
@@ -825,11 +1086,15 @@ impl ShardedSafeTensors {
             .get_mut(&file)
             .expect("the shard was just opened")
             .tensor(name)?;
-        if let Some(delta) = self.deltas.get(name) {
-            values
-                .iter_mut()
-                .zip(delta)
-                .for_each(|(value, delta)| *value += delta);
+        for delta in self.deltas.get(name).into_iter().flatten() {
+            let (rank, inputs) = (delta.down.rows, delta.down.cols);
+            let rows = values.len() / inputs;
+            let up = delta.up.data[delta.row * rank..][..rows * rank].to_vec();
+            let mut product = Matrix::new(rows, inputs);
+            Matrix::from_vec(rows, rank, up).dot(&delta.down, &mut product);
+            for (value, add) in values.iter_mut().zip(&product.data) {
+                *value += delta.factor * add;
+            }
         }
         Ok((values, shape))
     }
@@ -1337,6 +1602,55 @@ mod writer_tests {
         let matrix = file.matrix("first").unwrap();
         assert_eq!((matrix.rows, matrix.cols), (2, 3));
         assert_eq!(matrix.data, flat);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_q8_cache_hands_back_what_was_rounded() {
+        let path = scratch("q8");
+        let flat = [1.0f32, -2.0, 3.5, 4.0, 5.0, -6.25];
+        let stored = [("w.weight", &[2, 3][..], &flat[..])];
+        write(&path, &stored, &BTreeMap::new()).unwrap();
+        let cache = PathBuf::from(format!("{}.q8", path.display()));
+        let round = |file: &mut ShardedSafeTensors| -> Result<Quantized, NetworkError> {
+            Ok(Quantized::from_matrix_grouped(&file.matrix("w.weight")?, 2))
+        };
+
+        let mut file = ShardedSafeTensors::open(&path).unwrap();
+        file.cache_q8();
+        let fresh = file.quantized("w by 2", round).unwrap();
+        drop(file);
+        assert!(cache.exists(), "the first load writes the cache");
+
+        let mut file = ShardedSafeTensors::open(&path).unwrap();
+        file.cache_q8();
+        let cached = file.quantized("w by 2", |_| panic!("not from the cache"));
+        assert_eq!(cached.unwrap(), fresh);
+        drop(file);
+
+        // A LoRA load rounds the weights it adapts afresh, and leaves the
+        // cache as it found it.
+        let lora = scratch("q8-lora");
+        let pair = [
+            ("w.lora.down.weight", &[1, 3][..], &[1.0f32, 0.0, 0.0][..]),
+            ("w.lora.up.weight", &[2, 1][..], &[1.0f32, 1.0][..]),
+        ];
+        write(&lora, &pair, &BTreeMap::new()).unwrap();
+        let mut file = ShardedSafeTensors::open(&path).unwrap();
+        assert_eq!(file.add_lora(&lora, &[""], 1.0).unwrap(), 1);
+        file.cache_q8();
+        assert_eq!(file.matrix("w.weight").unwrap().data[..4], [2.0, -2.0, 3.5, 5.0]);
+        assert_ne!(file.quantized("w by 2", round).unwrap(), fresh);
+        drop(file);
+        assert!(cache.exists(), "a LoRA load keeps the cache");
+        std::fs::remove_file(&lora).ok();
+
+        // Another key is another weight: the stale file goes, and the answer
+        // is rounded from the checkpoint.
+        let mut file = ShardedSafeTensors::open(&path).unwrap();
+        file.cache_q8();
+        assert_eq!(file.quantized("w by 3", round).unwrap(), fresh);
+        assert!(!cache.exists(), "a stale cache is deleted");
         std::fs::remove_file(&path).ok();
     }
 

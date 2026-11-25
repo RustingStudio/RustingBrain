@@ -19,7 +19,7 @@ use crate::gpu_model::{Act, FlashShape, Gpu};
 use crate::gpu_transformer::GpuContext;
 use crate::matrix::Matrix;
 use crate::network::NetworkError;
-use crate::text_encoder::{Rotary, TextEncoder};
+use crate::text_encoder::TextEncoder;
 use cudarc::driver::{CudaFunction, CudaSlice, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use std::sync::{Arc, OnceLock};
@@ -193,6 +193,18 @@ impl DeviceTextEncoder {
             .map_err(cuda_err("text encoder kernel lookup"))?;
         let pack = |parts: &[&crate::conv::Dense]| -> Result<Act, NetworkError> {
             let inner = parts[0].in_dim();
+            // Int8 parts with a scale a row go up stacked as they are: no
+            // widened copy on the host, and none on the device, where one
+            // beside a denoiser is what a 12 GB card ran out of room for.
+            let int8: Option<Vec<_>> = parts
+                .iter()
+                .map(|part| part.int8().filter(|&(.., group)| group == inner))
+                .collect();
+            if let Some(int8) = int8 {
+                let q: Vec<i8> = int8.iter().flat_map(|&(q, ..)| q).copied().collect();
+                let scales: Vec<f32> = int8.iter().flat_map(|&(_, s, _)| s).copied().collect();
+                return gpu.int8(&q, &scales, q.len() / inner, inner, inner);
+            }
             let mut values = Vec::new();
             for part in parts {
                 values.extend_from_slice(&part.weight_f32().data);
@@ -259,7 +271,7 @@ impl DeviceTextEncoder {
         let narrow = self.narrow;
 
         let mut hidden = gpu.upload(&encoder.embed(ids)?.data)?;
-        let rotary = Rotary::new(tokens, head_dim, config.rope_theta);
+        let rotary = encoder.rotary(tokens, real);
         let (cos, sin) = (gpu.upload(&rotary.cos)?, gpu.upload(&rotary.sin)?);
         let shape = FlashShape {
             rows: tokens,

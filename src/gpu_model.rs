@@ -1678,6 +1678,36 @@ impl Gpu<'_> {
         Ok(act)
     }
 
+    /// Host int8 rows and their scales on the device as they are: the weight
+    /// [`Gpu::quantized`] and [`Gpu::quantized_grouped`] make of the widened
+    /// copy, without widening it. `group` is the columns one scale covers,
+    /// `cols` or more for a scale per row (see `Quantized::int8`).
+    pub(crate) fn int8(
+        &self,
+        q: &[i8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group: usize,
+    ) -> Result<Act, NetworkError> {
+        debug_assert_eq!(q.len(), rows * cols);
+        // SAFETY: `i8` and `u8` have the same size and alignment, and every
+        // bit pattern is valid for both.
+        let bytes = unsafe { std::slice::from_raw_parts(q.as_ptr().cast::<u8>(), q.len()) };
+        Ok(Act {
+            bytes: self
+                .context
+                .stream
+                .clone_htod(bytes)
+                .map_err(cuda_alloc_err("host to device copy", bytes.len()))?,
+            narrow: false,
+            len: rows * cols,
+            scales: Some(self.upload(scales)?),
+            group: if group < cols { group } else { 0 },
+            fp8: false,
+        })
+    }
+
     /// Host FP8 E4M3 rows and their row scales on the device as they are, one
     /// byte a weight (see `Quantized::from_matrix_fp8`).
     pub(crate) fn fp8(

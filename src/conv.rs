@@ -169,6 +169,23 @@ impl Dense {
         })
     }
 
+    /// A layer around a weight that is already one byte per value, as
+    /// [`Dense::quantize`] would have left it.
+    pub(crate) fn from_quantized(
+        quantized: crate::quantized::Quantized,
+        bias: Option<Vec<f32>>,
+    ) -> Result<Self, NetworkError> {
+        let (rows, cols) = quantized.shape();
+        let weight = Matrix {
+            rows,
+            cols,
+            data: Vec::new(),
+        };
+        let mut layer = Self::new(weight, bias)?;
+        layer.quantized = Some(quantized);
+        Ok(layer)
+    }
+
     /// Output width.
     pub fn out_dim(&self) -> usize {
         self.weight.rows
@@ -234,6 +251,13 @@ impl Dense {
             Some(quantized) => std::borrow::Cow::Owned(quantized.dequantize()),
             None => std::borrow::Cow::Borrowed(&self.weight),
         }
+    }
+
+    /// The int8 values, the scales and the columns one scale covers, if the
+    /// weight is stored as int8 (see `Quantized::int8`).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn int8(&self) -> Option<(&[i8], &[f32], usize)> {
+        self.quantized.as_ref().and_then(|q| q.int8())
     }
 
     /// The int8 values and row scales, if the weight is stored as int8.

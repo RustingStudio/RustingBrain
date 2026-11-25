@@ -102,7 +102,9 @@ impl WanVaeConfig {
                 .map(|value| value.as_bool())
                 .collect::<Option<Vec<bool>>>()
                 .ok_or_else(|| missing("temperal_downsample"))?,
-            patch_size: number("patch_size")?,
+            // Qwen-Image 2.1's autoencoder is this one unpatched, and says so
+            // with a null.
+            patch_size: number("patch_size").unwrap_or(1),
             in_channels: number("in_channels")?,
             out_channels: number("out_channels")?,
             latents_mean: floats("latents_mean")?,
@@ -917,7 +919,12 @@ fn read_conv3d(
     stride: usize,
     padding: usize,
 ) -> Result<CausalConv3d, NetworkError> {
-    let (values, shape) = file.tensor(&format!("{name}.weight"))?;
+    let (values, mut shape) = file.tensor(&format!("{name}.weight"))?;
+    // An image autoencoder of this design (Qwen-Image 2.1's) stores the same
+    // layers with no time axis: one tap.
+    if shape.len() == 4 {
+        shape.insert(2, 1);
+    }
     if shape.len() != 5 || shape[3] != shape[4] {
         return Err(NetworkError::InvalidConfig(format!(
             "{name}.weight is {shape:?}, not a 3D convolution with a square kernel"

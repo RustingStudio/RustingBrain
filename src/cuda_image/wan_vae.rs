@@ -489,6 +489,12 @@ impl WanKernels {
         {
             return self.causal_fan(conv, history, chunk, targets);
         }
+        // One tap reads no earlier frame, so there is nothing to keep: held
+        // anyway, every such layer's input would outlive the decode, and at
+        // full size that is what runs a card out of memory.
+        if newest == 0 {
+            return self.causal_over(conv, &chunk, 0, targets);
+        }
         let (stream, past) = extend(history, chunk);
         let outputs = self.causal_over(conv, &stream, past, targets)?;
         retire(history, stream);

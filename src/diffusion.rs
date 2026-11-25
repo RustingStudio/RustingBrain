@@ -61,7 +61,10 @@ pub enum Scheduler {
     /// where the large-scale structure of the image is decided: 1.0 is an even
     /// spacing, and published models ship values between 1.0 and 3.0, rising
     /// with resolution.
-    FlowMatch { shift: f32 },
+    ///
+    /// A `terminal` above zero stretches the levels so the last one before
+    /// the clean end lands on it, as Qwen-Image's `shift_terminal` asks.
+    FlowMatch { shift: f32, terminal: f32 },
     /// DDIM over the scaled-linear beta schedule of the Stable Diffusion 1.x
     /// and XL line, where the model predicts the noise.
     Ddim {
@@ -74,7 +77,10 @@ pub enum Scheduler {
 impl Scheduler {
     /// Flow matching at the shift a model's own configuration names.
     pub fn flow_match(shift: f32) -> Self {
-        Self::FlowMatch { shift }
+        Self::FlowMatch {
+            shift,
+            terminal: 0.0,
+        }
     }
 
     /// The betas Stable Diffusion 1.x, 2.x and XL were all trained with.
@@ -99,14 +105,12 @@ impl Scheduler {
         }
 
         Ok(match *self {
-            Self::FlowMatch { shift } => (0..=steps)
-                .map(|step| {
-                    let level = 1.0 - step as f32 / steps as f32;
-                    // The shift pushes levels towards one, so more of the run
-                    // is spent where the image's structure is still being set.
-                    shift * level / (1.0 + (shift - 1.0) * level)
-                })
-                .collect(),
+            Self::FlowMatch { .. } => {
+                let levels: Vec<f32> = (0..steps)
+                    .map(|step| 1.0 - step as f32 / steps as f32)
+                    .collect();
+                return self.sigmas_from(&levels);
+            }
             Self::Ddim {
                 beta_start,
                 beta_end,
@@ -126,6 +130,33 @@ impl Scheduler {
                 sigmas
             }
         })
+    }
+
+    /// [`Scheduler::sigmas`] over levels the caller names, noisiest first and
+    /// before the shift, as a distilled checkpoint's `sample_sigmas` are. The
+    /// clean end is added. Only flow matching takes them.
+    pub fn sigmas_from(&self, levels: &[f32]) -> Result<Vec<f32>, NetworkError> {
+        let Self::FlowMatch { shift, terminal } = *self else {
+            return Err(NetworkError::InvalidConfig(
+                "only a flow-matching schedule takes its levels from the checkpoint".into(),
+            ));
+        };
+        // The shift pushes levels towards one, so more of the run is spent
+        // where the image's structure is still being set.
+        let mut sigmas: Vec<f32> = levels
+            .iter()
+            .map(|level| shift * level / (1.0 + (shift - 1.0) * level))
+            .collect();
+        if terminal > 0.0
+            && let Some(&last) = sigmas.last()
+        {
+            let scale = (1.0 - last) / (1.0 - terminal);
+            for sigma in &mut sigmas {
+                *sigma = 1.0 - (1.0 - *sigma) / scale;
+            }
+        }
+        sigmas.push(0.0);
+        Ok(sigmas)
     }
 
     /// The noise range of [`Scheduler::sigmas`] for a DDIM schedule, spaced
@@ -790,6 +821,33 @@ mod tests {
                 .collect();
             Ok(Matrix::from_vec(latents.rows, latents.cols, data))
         }
+    }
+
+    #[test]
+    fn a_terminal_stretches_the_levels_to_end_on_it() {
+        let scheduler = Scheduler::FlowMatch {
+            shift: 2.0,
+            terminal: 0.02,
+        };
+        let sigmas = scheduler.sigmas(40).unwrap();
+        assert_eq!(sigmas.len(), 41);
+        assert!((sigmas[0] - 1.0).abs() < 1e-6);
+        assert!((sigmas[39] - 0.02).abs() < 1e-6);
+        assert_eq!(sigmas[40], 0.0);
+        assert!(sigmas.windows(2).all(|pair| pair[0] > pair[1]));
+        assert_eq!(
+            Scheduler::flow_match(2.0).sigmas(4).unwrap()[3],
+            2.0 * 0.25 / 1.25
+        );
+        // Named levels take the same shift and stretch as spaced ones.
+        assert_eq!(
+            scheduler.sigmas_from(&[1.0, 0.75, 0.5, 0.25]).unwrap(),
+            scheduler.sigmas(4).unwrap()
+        );
+        assert_eq!(
+            Scheduler::flow_match(1.0).sigmas_from(&[1.0, 0.9, 0.4]).unwrap(),
+            [1.0, 0.9, 0.4, 0.0]
+        );
     }
 
     #[test]

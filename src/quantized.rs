@@ -147,20 +147,26 @@ impl Quantized {
     pub(crate) fn from_matrix_grouped(value: &Matrix, group: usize) -> Self {
         let cols = value.cols.max(1);
         let group = group.clamp(1, cols);
-        let mut data = Vec::with_capacity(value.data.len());
-        let mut scales = Vec::with_capacity(value.rows * cols.div_ceil(group));
+        let groups = cols.div_ceil(group);
+        let mut data = vec![0i8; value.data.len()];
+        let mut scales = vec![0.0f32; value.data.len() / cols * groups];
 
-        for chunk in value.data.chunks(cols).flat_map(|row| row.chunks(group)) {
-            let absmax = chunk.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
-            let scale = absmax / 127.0;
-            scales.push(scale);
-            let inverse = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-            data.extend(
-                chunk
-                    .iter()
-                    .map(|v| (v * inverse).round().clamp(-127.0, 127.0) as i8),
-            );
-        }
+        // Rows are independent, and a model's worth of them is billions of
+        // weights, so they are rounded on every core.
+        data.par_chunks_mut(cols)
+            .zip(scales.par_chunks_mut(groups))
+            .zip(value.data.par_chunks(cols))
+            .for_each(|((data, scales), row)| {
+                let chunks = data.chunks_mut(group).zip(row.chunks(group));
+                for ((data, chunk), scale) in chunks.zip(scales) {
+                    let absmax = chunk.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+                    *scale = absmax / 127.0;
+                    let inverse = if *scale > 0.0 { 1.0 / *scale } else { 0.0 };
+                    for (slot, v) in data.iter_mut().zip(chunk) {
+                        *slot = (v * inverse).round().clamp(-127.0, 127.0) as i8;
+                    }
+                }
+            });
 
         Self {
             rows: value.rows,
@@ -403,6 +409,40 @@ impl Quantized {
             Values::Fp8(data) => data.len(),
         };
         values + self.scales.len() * 4
+    }
+
+    pub(crate) fn shape(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+
+    /// The int8 values, row-major, the scales, and the columns one scale
+    /// covers (`cols` for a scale per row); `None` unless the weight is int8.
+    pub(crate) fn int8(&self) -> Option<(&[i8], &[f32], usize)> {
+        match &self.values {
+            Values::Int8(data) => Some((data, &self.scales, self.group)),
+            _ => None,
+        }
+    }
+
+    /// The weight [`Quantized::int8`] took apart, or `None` if the parts do
+    /// not fit each other, as a damaged cache's would not.
+    pub(crate) fn from_int8(
+        rows: usize,
+        cols: usize,
+        group: usize,
+        data: Vec<i8>,
+        scales: Vec<f32>,
+    ) -> Option<Self> {
+        let fits = (1..=cols).contains(&group)
+            && rows.checked_mul(cols) == Some(data.len())
+            && rows.checked_mul(cols.div_ceil(group)) == Some(scales.len());
+        fits.then_some(Self {
+            rows,
+            cols,
+            values: Values::Int8(data),
+            scales,
+            group,
+        })
     }
 
     /// The int8 values, row-major, and one scale per row, for an upload, or

@@ -27,6 +27,7 @@ use crate::conv::Dense;
 use crate::matrix::Matrix;
 use crate::mmdit::attention_over;
 use crate::network::NetworkError;
+use crate::quantized::Quantized;
 use crate::safetensors::ShardedSafeTensors;
 use crate::tokenizer::Bpe;
 use crate::transformer::Precision;
@@ -114,6 +115,9 @@ pub struct TextEncoder {
     embeddings: Matrix,
     pub(crate) layers: Vec<Layer>,
     final_norm: Vec<f32>,
+    /// Where the padding rows of a prompt sit for RoPE, if not at their own
+    /// index. FLUX 3 trained with them all at position 1.
+    pub pad_position: Option<usize>,
     #[cfg(feature = "cuda")]
     device: Option<crate::cuda_text_encoder::DeviceTextEncoder>,
 }
@@ -122,6 +126,20 @@ impl TextEncoder {
     /// The configuration this encoder was built for.
     pub fn config(&self) -> &TextEncoderConfig {
         &self.config
+    }
+
+    /// The RoPE tables for `tokens` rows of which the first `real` are not
+    /// padding.
+    pub(crate) fn rotary(&self, tokens: usize, real: usize) -> Rotary {
+        let mut rotary = Rotary::new(tokens, self.config.head_dim, self.config.rope_theta);
+        if let Some(position) = self.pad_position.filter(|position| *position < real) {
+            let half = self.config.head_dim / 2;
+            for row in real..tokens {
+                rotary.cos.copy_within(position * half..(position + 1) * half, row * half);
+                rotary.sin.copy_within(position * half..(position + 1) * half, row * half);
+            }
+        }
+        rotary
     }
 
     /// Reads an encoder out of a checkpoint.
@@ -200,6 +218,7 @@ impl TextEncoder {
             config,
             embeddings,
             layers,
+            pad_position: None,
             #[cfg(feature = "cuda")]
             device: None,
         })
@@ -218,6 +237,25 @@ impl TextEncoder {
             context, self,
         )?);
         Ok(())
+    }
+
+    /// The bytes [`TextEncoder::attach_device`] puts on the device: one a
+    /// weight where a layer is int8, two (BF16) where it is not.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let dense = |layer: &Layer| {
+            [
+                &layer.query,
+                &layer.key,
+                &layer.value,
+                &layer.output,
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+            ]
+            .map(|dense| dense.out_dim() * dense.in_dim() * (2 - dense.is_quantized() as usize))
+        };
+        self.layers.iter().flat_map(dense).sum()
     }
 
     /// Whether [`TextEncoder::attach_device`] moved this encoder.
@@ -240,7 +278,7 @@ impl TextEncoder {
             let hidden = device.forward_layers(self, ids, ids.len(), &[self.layers.len()])?;
             return Ok(rms_norm(&hidden, &self.final_norm, self.config.eps));
         }
-        let hidden = self.run(ids, ids.len(), self.layers.len(), |_, _| {})?;
+        let hidden = self.run(ids, ids.len(), self.layers.len(), None, |_, _| {})?;
         Ok(rms_norm(&hidden, &self.final_norm, self.config.eps))
     }
 
@@ -273,7 +311,7 @@ impl TextEncoder {
         }
         let width = self.config.d_model;
         let mut output = Matrix::new(ids.len(), layers.len() * width);
-        self.run(ids, real, deepest, |done, hidden| {
+        self.run(ids, real, deepest, None, |done, hidden| {
             for (slot, _) in layers
                 .iter()
                 .enumerate()
@@ -288,6 +326,33 @@ impl TextEncoder {
         Ok(output)
     }
 
+    /// The states after the last layer, with no final norm, of a prompt that
+    /// holds a picture: `ids` with `visual` standing in for its image tokens.
+    ///
+    /// ponytail: host only. Qwen-Image 2.1 keeps its encoder off the card,
+    /// which the denoiser fills; teach `cuda_text_encoder` the three-axis
+    /// positions and the deepstack sums if an edit model's encoder ever fits.
+    pub fn forward_visual(&self, ids: &[u32], visual: &Visual) -> Result<Matrix, NetworkError> {
+        #[cfg(feature = "cuda")]
+        if self.device.is_some() {
+            return Err(NetworkError::InvalidConfig(
+                "a prompt with a picture in it is only read on the host".into(),
+            ));
+        }
+        let rows = visual.rows.len();
+        if visual.embeddings.rows != rows
+            || visual.embeddings.cols != self.config.d_model
+            || visual.rows.iter().any(|row| *row >= ids.len())
+            || visual.deepstack.iter().any(|deep| deep.rows != rows)
+            || visual.positions.len() > ids.len()
+        {
+            return Err(NetworkError::InvalidConfig(
+                "the picture's rows do not fit the prompt they are spliced into".into(),
+            ));
+        }
+        self.run(ids, ids.len(), self.layers.len(), Some(visual), |_, _| {})
+    }
+
     /// The first `depth` layers over `ids`, of which the first `real` are
     /// attended to. `after` sees the hidden states after every layer, counted
     /// from one.
@@ -296,16 +361,26 @@ impl TextEncoder {
         ids: &[u32],
         real: usize,
         depth: usize,
+        visual: Option<&Visual>,
         mut after: impl FnMut(usize, &Matrix),
     ) -> Result<Matrix, NetworkError> {
         let mut hidden = self.embed(ids)?;
+        let scatter = |hidden: &mut Matrix, rows: &[usize], source: &Matrix, add: bool| {
+            for (from, row) in rows.iter().enumerate() {
+                for (value, source) in hidden.row_mut(*row).iter_mut().zip(source.row(from)) {
+                    *value = source + if add { *value } else { 0.0 };
+                }
+            }
+        };
+        if let Some(visual) = visual {
+            scatter(&mut hidden, &visual.rows, &visual.embeddings, false);
+        }
 
-        let (heads, kv_heads, head_dim) = (
-            self.config.num_heads,
-            self.config.kv_heads,
-            self.config.head_dim,
-        );
-        let rotary = Rotary::new(ids.len(), head_dim, self.config.rope_theta);
+        let (heads, kv_heads) = (self.config.num_heads, self.config.kv_heads);
+        let rotary = match visual {
+            Some(visual) => visual.rotary(ids.len(), self.config.head_dim, self.config.rope_theta),
+            None => self.rotary(ids.len(), real),
+        };
 
         for (index, layer) in self.layers[..depth].iter().enumerate() {
             let normed = rms_norm(&hidden, &layer.input_norm, self.config.eps);
@@ -346,6 +421,9 @@ impl TextEncoder {
             let projected = layer.down.forward(&gate)?;
             for (value, delta) in hidden.data.iter_mut().zip(&projected.data) {
                 *value += delta;
+            }
+            if let Some(deep) = visual.and_then(|visual| Some((visual, visual.deepstack.get(index)?))) {
+                scatter(&mut hidden, &deep.0.rows, deep.1, true);
             }
             after(index + 1, &hidden);
         }
@@ -393,7 +471,97 @@ impl TextEncoder {
 pub(crate) struct Rotary {
     pub(crate) cos: Vec<f32>,
     pub(crate) sin: Vec<f32>,
-    half: usize,
+    pub(crate) half: usize,
+}
+
+/// A picture spliced into a prompt, the way Qwen3-VL reads one: rows from
+/// [`crate::qwen_vision::QwenVision`] in place of the embeddings of the
+/// prompt's image tokens.
+pub struct Visual {
+    /// The rows of the prompt that hold an image token, ascending.
+    pub rows: Vec<usize>,
+    /// What those rows hold in place of an embedding, `[rows.len(), d_model]`.
+    pub embeddings: Matrix,
+    /// Added to those rows after the first layers, one matrix a layer.
+    pub deepstack: Vec<Matrix>,
+    /// Where each leading token sits in time, height and width. Text sits at
+    /// one position on all three; a picture's tokens share a time and spread
+    /// over the other two. The tokens past the end of this follow one apart
+    /// from `next`.
+    pub positions: Vec<[usize; 3]>,
+    pub next: usize,
+}
+
+impl Visual {
+    /// A prompt with no picture in it yet, for a model `d_model` wide.
+    pub fn new(d_model: usize) -> Self {
+        Self {
+            rows: Vec::new(),
+            embeddings: Matrix::new(0, d_model),
+            deepstack: Vec::new(),
+            positions: Vec::new(),
+            next: 0,
+        }
+    }
+
+    /// `count` tokens of text come next.
+    pub fn text(&mut self, count: usize) {
+        self.positions.extend((self.next..self.next + count).map(|at| [at; 3]));
+        self.next += count;
+    }
+
+    /// A picture comes next: `rows * columns` image tokens in reading order,
+    /// with what [`crate::qwen_vision::QwenVision::forward`] made of it.
+    pub fn picture(&mut self, rows: usize, columns: usize, seen: (Matrix, Vec<Matrix>)) {
+        for row in 0..rows {
+            for column in 0..columns {
+                self.rows.push(self.positions.len());
+                self.positions.push([self.next, self.next + row, self.next + column]);
+            }
+        }
+        // A picture is as long in time as its longer side.
+        self.next += rows.max(columns);
+        let (embeddings, deepstack) = seen;
+        let append = |all: &mut Matrix, more: Matrix| {
+            all.data.extend(more.data);
+            all.rows += more.rows;
+        };
+        append(&mut self.embeddings, embeddings);
+        for (index, deep) in deepstack.into_iter().enumerate() {
+            match self.deepstack.get_mut(index) {
+                Some(all) => append(all, deep),
+                None => self.deepstack.push(deep),
+            }
+        }
+    }
+
+    /// The rotary table of a prompt of `tokens` rows.
+    ///
+    /// ponytail: Qwen3-VL's interleaving for `mrope_section` `[24, 20, 20]`,
+    /// the only layout this has met: of the first 60 pairs every third turns
+    /// with the height and the one after with the width, and the rest turn
+    /// with the time. Read `rope_scaling.mrope_section` if another turns up.
+    fn rotary(&self, tokens: usize, head_dim: usize, theta: f32) -> Rotary {
+        let mut rotary = Rotary::new(tokens, head_dim, theta);
+        let half = rotary.half;
+        for token in 0..tokens {
+            let position = match self.positions.get(token) {
+                Some(position) => *position,
+                None => [self.next + token - self.positions.len(); 3],
+            };
+            for index in 0..half {
+                let axis = match index % 3 {
+                    1 | 2 if index < 60 => index % 3,
+                    _ => 0,
+                };
+                let frequency = theta.powf(-2.0 * index as f32 / head_dim as f32);
+                let angle = position[axis] as f32 * frequency;
+                rotary.cos[token * half + index] = angle.cos();
+                rotary.sin[token * half + index] = angle.sin();
+            }
+        }
+        rotary
+    }
 }
 
 impl Rotary {
@@ -467,23 +635,28 @@ fn dense(
     name: &str,
     precision: Precision,
 ) -> Result<Dense, NetworkError> {
-    let (values, shape) = file.tensor(&format!("{name}.weight"))?;
-    if shape.len() != 2 {
-        return Err(NetworkError::InvalidConfig(format!(
-            "{name}.weight is {shape:?}, which is not a linear layer"
-        )));
-    }
+    let weight = |file: &mut ShardedSafeTensors| -> Result<Matrix, NetworkError> {
+        let (values, shape) = file.tensor(&format!("{name}.weight"))?;
+        if shape.len() != 2 {
+            return Err(NetworkError::InvalidConfig(format!(
+                "{name}.weight is {shape:?}, which is not a linear layer"
+            )));
+        }
+        Ok(Matrix::from_vec(shape[0], shape[1], values))
+    };
     // Qwen2 carries attention biases and Qwen3 does not, so the bias is read
     // if it is there rather than required.
     let bias = file
         .tensor(&format!("{name}.bias"))
         .ok()
         .map(|(bias, _)| bias);
-    let mut layer = Dense::new(Matrix::from_vec(shape[0], shape[1], values), bias)?;
-    if precision == Precision::Q8 {
-        layer.quantize();
+    if precision != Precision::Q8 {
+        return Dense::new(weight(file)?, bias);
     }
-    Ok(layer)
+    let quantized = file.quantized(&format!("{name}.weight"), |file| {
+        Ok(Quantized::from_matrix(&weight(file)?))
+    })?;
+    Dense::from_quantized(quantized, bias)
 }
 
 fn vector(file: &mut ShardedSafeTensors, name: &str) -> Result<Vec<f32>, NetworkError> {

@@ -34,9 +34,11 @@ use crate::conv::{FeatureMap, pixel_shuffle, pixel_unshuffle};
 use crate::diffusion::{
     Denoiser, Inpaint, SamplingConfig, Scheduler, Solver, noise, sample, sample_from,
 };
+use crate::flux3::Flux3;
 use crate::matrix::Matrix;
 use crate::mmdit::{Conditioning, Dit};
 use crate::network::NetworkError;
+use crate::qwen_image21::QwenImage21;
 use crate::t5::T5Encoder;
 use crate::text_encoder::TextEncoder;
 use crate::tokenizer::{Bpe, Unigram};
@@ -61,6 +63,13 @@ pub struct PipelineConfig {
     /// How the schedule bends towards the noisy end. Published models raise it
     /// with resolution.
     pub shift: f32,
+    /// The level the last step starts from, when the scheduler stretches its
+    /// levels to end on one (`shift_terminal`). Zero for no stretch.
+    pub shift_terminal: f32,
+    /// The levels a distilled checkpoint was tuned to step through, before
+    /// the shift: `sample_sigmas` in its `model_index.json`. A run of as many
+    /// steps takes them, and any other count is spaced evenly.
+    pub sample_sigmas: Vec<f32>,
     /// The models that record `use_dynamic_shifting` raise the shift with the
     /// image's size instead of holding it fixed, and this is how far.
     pub dynamic_shift: Option<DynamicShift>,
@@ -85,6 +94,8 @@ impl Default for PipelineConfig {
             guidance: 1.0,
             embedded_guidance: 3.5,
             shift: 3.0,
+            shift_terminal: 0.0,
+            sample_sigmas: Vec::new(),
             dynamic_shift: None,
             patch: 2,
             latent_channels: 16,
@@ -155,14 +166,103 @@ pub struct ImagePipeline {
     /// its own tokenizer. Models that pool their own states leave this empty.
     pub pooled: Option<PooledEncoder>,
     pub denoiser: ImageDenoiser,
-    pub decoder: VaeDecoder,
+    pub decoder: ImageDecoder,
     /// The encoder half of the autoencoder, which only image-to-image needs.
     ///
     /// [`ImagePipeline::load`] attaches one when the checkpoint's VAE file
     /// holds it, which nearly all of them do. Text-to-image never touches it,
     /// so a file without one still loads.
     pub image_encoder: Option<VaeEncoder>,
+    /// Set on Qwen-Image 2.1, which reads a picture to edit its own way.
+    pub qwen_edit: Option<QwenEdit>,
     pub config: PipelineConfig,
+}
+
+/// What a Qwen-Image 2.1 edit reads its pictures with: Qwen3-VL's vision
+/// tower, which puts a picture into the prompt, and the autoencoder's
+/// encoder, which puts it into the denoiser's rows. Neither is loaded before
+/// the first picture, so text-to-image never pays for them.
+pub struct QwenEdit {
+    encoder_weights: std::path::PathBuf,
+    vae_weights: std::path::PathBuf,
+    vae: crate::wan_vae::WanVaeConfig,
+    precision: Precision,
+    readers: Option<(
+        crate::qwen_vision::QwenVision,
+        crate::wan_vae::WanVaeEncoder,
+    )>,
+    /// While pictures are set: the prompt's tokens up to the last picture's,
+    /// and the pictures spliced into them.
+    prompt: Option<(Vec<u32>, crate::text_encoder::Visual)>,
+}
+
+/// The half of an autoencoder that turns a latent into a picture.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum ImageDecoder {
+    /// The KL autoencoder of the Stable Diffusion and FLUX lines.
+    Kl(VaeDecoder),
+    /// Wan 2.2's autoencoder over a single frame, which is Qwen-Image 2.1's.
+    /// `config` says of it what the pipeline asks of any decoder.
+    Wan {
+        decoder: crate::wan_vae::WanVaeDecoder,
+        config: crate::vae::VaeConfig,
+    },
+}
+
+impl From<VaeDecoder> for ImageDecoder {
+    fn from(decoder: VaeDecoder) -> Self {
+        Self::Kl(decoder)
+    }
+}
+
+impl ImageDecoder {
+    pub fn config(&self) -> &crate::vae::VaeConfig {
+        match self {
+            Self::Kl(decoder) => decoder.config(),
+            Self::Wan { config, .. } => config,
+        }
+    }
+
+    /// See [`VaeDecoder::patch_norm`].
+    pub fn patch_norm(&self) -> Option<(&[f32], &[f32])> {
+        match self {
+            Self::Kl(decoder) => decoder.patch_norm(),
+            Self::Wan { .. } => None,
+        }
+    }
+
+    /// The image in `[-1, 1]` for a latent as the denoiser left it.
+    pub fn decode(&self, latent: &FeatureMap) -> Result<FeatureMap, NetworkError> {
+        match self {
+            Self::Kl(decoder) => decoder.decode(latent),
+            Self::Wan { decoder, .. } => {
+                let mut frames = vec![latent.clone()];
+                decoder.config.denormalize(&mut frames);
+                let mut image = decoder.decode(&frames)?.swap_remove(0);
+                // ponytail: Qwen-Image 2.1 decodes RGBA and the alpha plane is
+                // dropped, since nothing downstream writes one; carry it
+                // through `FeatureMap` and the PNG writer if transparent
+                // output is wanted.
+                image.channels = image.channels.min(3);
+                image
+                    .data
+                    .truncate(image.channels * image.height * image.width);
+                Ok(image)
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn attach_device(
+        &mut self,
+        gpu: std::sync::Arc<crate::cuda_image::ImageGpu>,
+    ) -> Result<(), NetworkError> {
+        match self {
+            Self::Kl(decoder) => decoder.attach_device(gpu),
+            Self::Wan { decoder, .. } => decoder.attach_device(&gpu),
+        }
+    }
 }
 
 /// The model at the middle of a pipeline.
@@ -181,6 +281,10 @@ pub enum ImageDenoiser {
     Unet(Unet),
     /// Z-Image's single-stream transformer.
     ZImage(ZImage),
+    /// FLUX 3's flow-map transformer.
+    Flux3(Flux3),
+    /// Qwen-Image 2.1's block-causal transformer.
+    QwenImage21(QwenImage21),
 }
 
 impl From<Dit> for ImageDenoiser {
@@ -204,6 +308,8 @@ impl ImageDenoiser {
             Self::Transformer(denoiser) => denoiser.config().in_channels,
             Self::Unet(denoiser) => denoiser.config().out_channels,
             Self::ZImage(denoiser) => denoiser.config().token_width(),
+            Self::Flux3(denoiser) => denoiser.config().in_channels,
+            Self::QwenImage21(denoiser) => denoiser.config().in_channels,
         }
     }
 
@@ -213,6 +319,8 @@ impl ImageDenoiser {
             Self::Transformer(denoiser) => denoiser.config().text_dim,
             Self::Unet(denoiser) => denoiser.config().cross_dim,
             Self::ZImage(denoiser) => denoiser.config().caption_dim,
+            Self::Flux3(denoiser) => denoiser.config().text_dim,
+            Self::QwenImage21(denoiser) => denoiser.config().text_dim,
         }
     }
 
@@ -221,7 +329,7 @@ impl ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.pooled_dim(),
             Self::Unet(denoiser) => denoiser.pooled_dim(),
-            Self::ZImage(_) => None,
+            Self::ZImage(_) | Self::Flux3(_) | Self::QwenImage21(_) => None,
         }
     }
 
@@ -231,6 +339,8 @@ impl ImageDenoiser {
             Self::Transformer(denoiser) => denoiser.set_conditioning(conditioning),
             Self::Unet(denoiser) => denoiser.set_conditioning(conditioning),
             Self::ZImage(denoiser) => denoiser.set_conditioning(conditioning),
+            Self::Flux3(denoiser) => denoiser.set_conditioning(conditioning),
+            Self::QwenImage21(denoiser) => denoiser.set_conditioning(conditioning),
         }
     }
 
@@ -239,8 +349,12 @@ impl ImageDenoiser {
         match self {
             Self::Transformer(denoiser) => denoiser.set_unconditional(conditioning),
             Self::Unet(denoiser) => denoiser.set_unconditional(conditioning),
-            // Z-Image-Turbo is distilled to run without guidance.
-            Self::ZImage(_) => {}
+            // Z-Image-Turbo and FLUX 3 Klein are distilled to run without
+            // guidance.
+            // ponytail: Qwen-Image 2.1 ships with its true CFG at 1.0, off,
+            // so there is no second pass; add the unconditional text cache
+            // to `qwen_image21` if negative prompts are wanted.
+            Self::ZImage(_) | Self::Flux3(_) | Self::QwenImage21(_) => {}
         }
     }
 }
@@ -251,6 +365,8 @@ impl Denoiser for ImageDenoiser {
             Self::Transformer(denoiser) => denoiser.denoise(latents, sigma),
             Self::Unet(denoiser) => denoiser.denoise(latents, sigma),
             Self::ZImage(denoiser) => denoiser.denoise(latents, sigma),
+            Self::Flux3(denoiser) => denoiser.denoise(latents, sigma),
+            Self::QwenImage21(denoiser) => denoiser.denoise(latents, sigma),
         }
     }
 
@@ -263,6 +379,8 @@ impl Denoiser for ImageDenoiser {
             Self::Transformer(denoiser) => denoiser.denoise_unconditional(latents, sigma),
             Self::Unet(denoiser) => denoiser.denoise_unconditional(latents, sigma),
             Self::ZImage(denoiser) => denoiser.denoise_unconditional(latents, sigma),
+            Self::Flux3(denoiser) => denoiser.denoise_unconditional(latents, sigma),
+            Self::QwenImage21(denoiser) => denoiser.denoise_unconditional(latents, sigma),
         }
     }
 }
@@ -349,6 +467,12 @@ pub struct ChatPrompt {
     pub layers: Vec<usize>,
     /// Whether only the real tokens are encoded, with no padding.
     pub trim: bool,
+    /// The real tokens' states are padded to a multiple of this many rows
+    /// with the state of a padding token. Zero for no such padding.
+    pub multiple: usize,
+    /// How many leading rows of the states are dropped: a system turn the
+    /// encoder reads and the denoiser does not.
+    pub drop_rows: usize,
 }
 
 impl ChatPrompt {
@@ -362,6 +486,8 @@ impl ChatPrompt {
             pad,
             layers: vec![9, 18, 27],
             trim: false,
+            multiple: 0,
+            drop_rows: 0,
         }
     }
 
@@ -375,6 +501,36 @@ impl ChatPrompt {
             pad,
             layers: vec![35],
             trim: true,
+            multiple: 0,
+            drop_rows: 0,
+        }
+    }
+
+    /// `QwenImage21Pipeline`'s for text-to-image: a fixed system turn before
+    /// the user's, whose rows are dropped, and the state after the last
+    /// layer. `tokenizer` counts the system turn.
+    pub fn qwen_image(pad: u32, tokenizer: &Bpe) -> Result<Self, NetworkError> {
+        let system =
+            "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
+        let drop_rows = tokenizer.encode(system)?.len();
+        Ok(Self {
+            prefix: format!("{system}<|im_start|>user\n"),
+            length: 512 + drop_rows,
+            layers: vec![36],
+            drop_rows,
+            ..Self::z_image(pad)
+        })
+    }
+
+    /// FLUX 3's: Z-Image's turn, up to 8192 tokens, the states after every
+    /// fourth layer up to 32, padded to a multiple of 80 rows. The denoiser
+    /// attends to the padding, so its count is part of the recipe.
+    pub fn flux3(pad: u32) -> Self {
+        Self {
+            length: 8192,
+            layers: (1..=8).map(|index| index * 4).collect(),
+            multiple: 80,
+            ..Self::z_image(pad)
         }
     }
 
@@ -472,8 +628,26 @@ impl PromptEncoder {
                 encoder,
                 chat: Some(chat),
             } => {
-                let (ids, real) = chat.tokenize(tokenizer, prompt)?;
-                Ok((encoder.forward_layers(&ids, real, &chat.layers)?, None))
+                let (mut ids, real) = chat.tokenize(tokenizer, prompt)?;
+                let rows = match chat.multiple {
+                    0 => ids.len(),
+                    multiple => real.div_ceil(multiple) * multiple,
+                };
+                // Every padding row comes out the same: the same token at the
+                // same position, reading the same real keys. So one is run
+                // and repeated.
+                if rows > ids.len() {
+                    ids.push(chat.pad);
+                }
+                let mut states = encoder.forward_layers(&ids, real, &chat.layers)?;
+                while states.rows < rows {
+                    states.data.extend_from_within((states.rows - 1) * states.cols..);
+                    states.rows += 1;
+                }
+                let dropped = chat.drop_rows.min(states.rows);
+                states.data.drain(..dropped * states.cols);
+                states.rows -= dropped;
+                Ok((states, None))
             }
             Self::Sequence {
                 tokenizer, encoder, ..
@@ -585,10 +759,10 @@ impl ImagePipeline {
     pub fn new(
         encoder: PromptEncoder,
         denoiser: impl Into<ImageDenoiser>,
-        decoder: VaeDecoder,
+        decoder: impl Into<ImageDecoder>,
         config: PipelineConfig,
     ) -> Result<Self, NetworkError> {
-        let denoiser = denoiser.into();
+        let (denoiser, decoder) = (denoiser.into(), decoder.into());
         let packed = config.latent_channels * config.patch * config.patch;
         if denoiser.in_channels() != packed {
             return Err(NetworkError::InvalidConfig(format!(
@@ -626,6 +800,7 @@ impl ImagePipeline {
             denoiser,
             decoder,
             image_encoder: None,
+            qwen_edit: None,
             config,
         })
     }
@@ -702,20 +877,46 @@ impl ImagePipeline {
             other => other,
         };
 
-        let decoder_config = crate::vae::VaeConfig::from_file(part("vae/config.json"))?;
         let scheduler = read_json(&part("scheduler/scheduler_config.json"));
         // FLUX.2 is told apart by its pipeline's name: its prompt, schedule
         // and latent all differ from FLUX.1's in ways no part's own
         // configuration records.
-        let pipeline_name = read_json(&part("model_index.json")).and_then(|json| {
+        // A modular pipeline (FLUX 3) writes its index under another name.
+        let index = read_json(&part("model_index.json"))
+            .or_else(|| read_json(&part("modular_model_index.json")));
+        let pipeline_name = index.as_ref().and_then(|json| {
             json.get("_class_name")
                 .and_then(|name| name.as_str())
                 .map(str::to_owned)
         });
+        let sample_sigmas: Vec<f32> = index
+            .as_ref()
+            .and_then(|json| json.get("sample_sigmas")?.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|sigma| Some(sigma.as_f64()? as f32))
+            .collect();
         let flux2 = pipeline_name
             .as_ref()
             .is_some_and(|name| name.starts_with("Flux2"));
         let zimage = pipeline_name.as_deref() == Some("ZImagePipeline");
+        let flux3 = pipeline_name
+            .as_ref()
+            .is_some_and(|name| name.starts_with("Flux3"));
+        let qwen21 = pipeline_name.as_deref() == Some("QwenImage21Pipeline");
+        // Qwen-Image 2.1 decodes through Wan 2.2's autoencoder, 16x a side.
+        let wan_config = qwen21
+            .then(|| crate::wan_vae::WanVaeConfig::from_file(part("vae/config.json")))
+            .transpose()?;
+        let decoder_config = match &wan_config {
+            Some(wan) => crate::vae::VaeConfig {
+                latent_channels: wan.z_dim,
+                // Read only for their count: a doubling per rung past one.
+                block_out_channels: vec![0; wan.dim_mult.len()],
+                ..Default::default()
+            },
+            None => crate::vae::VaeConfig::from_file(part("vae/config.json"))?,
+        };
         // Which denoiser a model has is which directory it published it in.
         let unet = part("unet/config.json").exists();
 
@@ -747,7 +948,15 @@ impl ImagePipeline {
         let zimage_config = zimage
             .then(|| crate::zimage::ZImageConfig::from_file(part("transformer/config.json")))
             .transpose()?;
-        let denoiser_config = match unet || zimage {
+        let flux3_config = flux3
+            .then(|| crate::flux3::Flux3Config::from_file(part("transformer/config.json")))
+            .transpose()?;
+        let qwen21_config = qwen21
+            .then(|| {
+                crate::qwen_image21::QwenImage21Config::from_file(part("transformer/config.json"))
+            })
+            .transpose()?;
+        let denoiser_config = match unet || zimage || flux3 || qwen21 {
             true => None,
             false => Some(crate::mmdit::DitConfig::from_file(part(
                 "transformer/config.json",
@@ -758,6 +967,8 @@ impl ImagePipeline {
         // squares the latent's channels up to the width the denoiser reads.
         let patch = match &denoiser_config {
             None if zimage => zimage_config.as_ref().map_or(1, |config| config.patch),
+            // FLUX.2's latent: 2x2 patches of 32 channels.
+            None if flux3 => 2,
             None => 1,
             Some(config) => {
                 let packed = config.in_channels / decoder_config.latent_channels.max(1);
@@ -782,7 +993,13 @@ impl ImagePipeline {
             shift: scheduler
                 .as_ref()
                 .and_then(|scheduler| number(scheduler, "shift"))
-                .unwrap_or(defaults.shift),
+                // FLUX 3 publishes no scheduler; its pipeline fixes the shift.
+                .unwrap_or(if flux3 { 6.93 } else { defaults.shift }),
+            shift_terminal: scheduler
+                .as_ref()
+                .and_then(|scheduler| number(scheduler, "shift_terminal"))
+                .unwrap_or(0.0),
+            sample_sigmas: sample_sigmas.clone(),
             dynamic_shift: scheduler
                 .as_ref()
                 .and_then(dynamic_shift)
@@ -799,8 +1016,14 @@ impl ImagePipeline {
             solver: scheduler.as_ref().map_or(defaults.solver, solver_named),
             // klein is distilled to four steps.
             steps: match (unet, flux2) {
+                // A checkpoint that names its levels runs that many steps.
+                _ if !sample_sigmas.is_empty() => sample_sigmas.len(),
                 // Z-Image-Turbo is distilled to eight.
                 _ if zimage => 8,
+                // FLUX 3 Klein to sixteen.
+                _ if flux3 => 16,
+                // Qwen-Image 2.1 is not distilled; its pipeline's default.
+                _ if qwen21 => 40,
                 (true, _) => 50,
                 (false, true) => 4,
                 (false, false) => defaults.steps,
@@ -901,6 +1124,10 @@ impl ImagePipeline {
                     crate::safetensors::ShardedSafeTensors::open(weights(&part(states))?)?;
                 let words = match two {
                     true => part("tokenizer_2"),
+                    // Qwen-Image 2.1 keeps it in its processor's.
+                    false if qwen21 => part("processor"),
+                    // FLUX 3 keeps the tokenizer beside the encoder.
+                    false if !part("tokenizer").exists() => part(states),
                     false => part("tokenizer"),
                 };
                 let encoder = match t5 {
@@ -917,17 +1144,19 @@ impl ImagePipeline {
                         // A language model's own file writes its layers under
                         // `model.`; a repacked one writes them bare. The file
                         // says which.
-                        let prefix = match encoder_file
-                            .names()
-                            .any(|name| name.starts_with("model.layers."))
-                        {
-                            true => "model.",
-                            false => "",
-                        };
+                        // A vision-language model (FLUX 3's Qwen3-VL)
+                        // writes its language half one level further down.
+                        let prefix = ["model.language_model.", "model.", ""]
+                            .into_iter()
+                            .find(|prefix| {
+                                let layers = format!("{prefix}layers.");
+                                encoder_file.names().any(|name| name.starts_with(&layers))
+                            })
+                            .unwrap_or("");
                         let tokenizer = Bpe::from_file(words.join("tokenizer.json"))?;
                         let mut encoder_config =
                             crate::text_encoder::TextEncoderConfig::from_file(&states_config)?;
-                        let chat = match flux2 || zimage {
+                        let chat = match flux2 || zimage || flux3 || qwen21 {
                             false => None,
                             true => {
                                 let pad = read_json(&words.join("tokenizer_config.json"))
@@ -941,9 +1170,11 @@ impl ImagePipeline {
                                             "the chat tokenizer names no padding token".into(),
                                         )
                                     })?;
-                                Some(match zimage {
-                                    true => ChatPrompt::z_image(pad),
-                                    false => ChatPrompt::flux2(pad),
+                                Some(match (zimage, flux3) {
+                                    _ if qwen21 => ChatPrompt::qwen_image(pad, &tokenizer)?,
+                                    (true, _) => ChatPrompt::z_image(pad),
+                                    (_, true) => ChatPrompt::flux3(pad),
+                                    _ => ChatPrompt::flux2(pad),
                                 })
                             }
                         };
@@ -954,14 +1185,23 @@ impl ImagePipeline {
                         {
                             encoder_config.layers = encoder_config.layers.min(*deepest);
                         }
+                        // ponytail: Qwen-Image 2.1's encoder is quantized
+                        // again on every load, about 7 GB of cache the disk
+                        // this was built on had no room for beside the
+                        // transformer's; add `qwen21` here when there is.
+                        if zimage || flux3 {
+                            encoder_file.cache_q8();
+                        }
+                        let mut encoder = TextEncoder::read_at(
+                            &mut encoder_file,
+                            prefix,
+                            encoder_config,
+                            precision,
+                        )?;
+                        encoder.pad_position = flux3.then_some(1);
                         PromptEncoder::Sequence {
                             tokenizer,
-                            encoder: TextEncoder::read_at(
-                                &mut encoder_file,
-                                prefix,
-                                encoder_config,
-                                precision,
-                            )?,
+                            encoder,
                             chat,
                         }
                     }
@@ -986,11 +1226,35 @@ impl ImagePipeline {
             Ok::<_, NetworkError>(file)
         };
         let denoiser: ImageDenoiser = match denoiser_config {
-            None if zimage => ImageDenoiser::ZImage(ZImage::read(
-                &mut denoiser_file("transformer")?,
-                zimage_config.expect("read with the flag"),
-                precision,
-            )?),
+            None if zimage => {
+                // The slow part of a load is rounding 6 billion weights to
+                // int8, so they are kept on disk for the next one.
+                let mut file = denoiser_file("transformer")?;
+                file.cache_q8();
+                ImageDenoiser::ZImage(ZImage::read(
+                    &mut file,
+                    zimage_config.expect("read with the flag"),
+                    precision,
+                )?)
+            }
+            None if flux3 => {
+                let mut file = denoiser_file("transformer")?;
+                file.cache_q8();
+                ImageDenoiser::Flux3(Flux3::read(
+                    &mut file,
+                    flux3_config.expect("read with the flag"),
+                    precision,
+                )?)
+            }
+            None if qwen21 => {
+                let mut file = denoiser_file("transformer")?;
+                file.cache_q8();
+                ImageDenoiser::QwenImage21(QwenImage21::read(
+                    &mut file,
+                    qwen21_config.expect("read with the flag"),
+                    precision,
+                )?)
+            }
             Some(denoiser_config) => Dit::read_at(
                 &mut denoiser_file("transformer")?,
                 "",
@@ -1019,13 +1283,36 @@ impl ImagePipeline {
 
         // One file holds both halves of the autoencoder. Text-to-image needs
         // only the decoder, so a file without an encoder still loads.
-        let mut vae = crate::safetensors::ShardedSafeTensors::open(weights(&part("vae"))?)?;
-        let decoder = VaeDecoder::read(&mut vae, "decoder.", decoder_config.clone())?;
-        let image_encoder = VaeEncoder::read(&mut vae, "encoder.", decoder_config).ok();
-        drop(vae);
+        let (decoder, image_encoder) = match wan_config.clone() {
+            Some(wan) => {
+                let decoder = crate::wan_vae::WanVaeDecoder::load(weights(&part("vae"))?, wan)?;
+                let decoder = ImageDecoder::Wan {
+                    decoder,
+                    config: decoder_config,
+                };
+                (decoder, None)
+            }
+            None => {
+                let mut vae =
+                    crate::safetensors::ShardedSafeTensors::open(weights(&part("vae"))?)?;
+                let decoder = VaeDecoder::read(&mut vae, "decoder.", decoder_config.clone())?;
+                let image_encoder = VaeEncoder::read(&mut vae, "encoder.", decoder_config).ok();
+                (decoder.into(), image_encoder)
+            }
+        };
 
         let mut pipeline = Self::new(encoder, denoiser, decoder, config)?;
         pipeline.image_encoder = image_encoder;
+        if let Some(vae) = wan_config {
+            pipeline.qwen_edit = Some(QwenEdit {
+                encoder_weights: weights(&part(states))?,
+                vae_weights: weights(&part("vae"))?,
+                vae,
+                precision,
+                readers: None,
+                prompt: None,
+            });
+        }
 
         // A model whose second encoder is not a CLIP tower pools through the
         // first one, which is.
@@ -1121,7 +1408,10 @@ impl ImagePipeline {
         let t5 = self.encoder.t5().filter(|t5| t5.config().gated);
         let transformer = matches!(
             self.denoiser,
-            ImageDenoiser::Transformer(_) | ImageDenoiser::ZImage(_)
+            ImageDenoiser::Transformer(_)
+                | ImageDenoiser::ZImage(_)
+                | ImageDenoiser::Flux3(_)
+                | ImageDenoiser::QwenImage21(_)
         );
         if sequence || t5.is_some() || transformer {
             let context = crate::gpu_transformer::GpuContext::new(device)?;
@@ -1134,11 +1424,33 @@ impl ImagePipeline {
             if let ImageDenoiser::ZImage(model) = &mut self.denoiser {
                 model.attach_device(&context)?;
             }
+            if let ImageDenoiser::Flux3(model) = &mut self.denoiser {
+                model.attach_device(&context)?;
+            }
+            if let ImageDenoiser::QwenImage21(model) = &mut self.denoiser {
+                model.attach_device(&context)?;
+            }
             // After the denoiser, and allowed to fail: a prompt encoder that
             // does not fit beside it (FLUX.2-klein's Qwen3 in BF16 on a 12 GB
             // card) or has no device path stays on the host, where it worked.
+            // Fitting is not enough: Z-Image's Qwen3 in int8 fits a 12 GB
+            // card beside the denoiser and leaves it too little to render
+            // 1024x1024 with, so the encoder goes up only if the denoiser
+            // keeps a reserve.
+            // ponytail: one reserve for every model and image size, 2 GiB
+            // (a 1024x1024 Z-Image render was measured at 1.4 GiB)
+            // unless `RB_ENCODER_RESERVE_MB` says otherwise; ask the denoiser
+            // what its largest image needs if this ever guesses wrong.
             if let PromptEncoder::Sequence { encoder, .. } = &mut self.encoder {
-                encoder.attach_device(&context).ok();
+                let reserve = std::env::var("RB_ENCODER_RESERVE_MB")
+                    .ok()
+                    .and_then(|megabytes| megabytes.parse().ok())
+                    .unwrap_or(2048usize)
+                    << 20;
+                let free = cudarc::driver::result::mem_get_info().map_or(0, |(free, _)| free);
+                if free >= encoder.device_bytes() + reserve {
+                    encoder.attach_device(&context).ok();
+                }
             }
         }
         Ok(())
@@ -1211,7 +1523,10 @@ impl ImagePipeline {
         height: usize,
     ) -> Result<Conditioning, NetworkError> {
         let (columns, rows) = self.patch_grid(width, height)?;
-        let (text, own) = self.encoder.encode(prompt)?;
+        let (text, own) = match self.qwen_prompt(prompt)? {
+            Some(text) => (text, None),
+            None => self.encoder.encode(prompt)?,
+        };
         let pooled = match &self.pooled {
             Some(part) => part.encoder.encode(&part.tokenizer, prompt)?.1,
             // A denoiser that wants no pooled vector is handed none, which is
@@ -1291,7 +1606,12 @@ impl ImagePipeline {
         let scheduler = self.scheduler(patches);
         // A run starts at the noisiest level the schedule holds, which is one
         // for flow matching and far above it for DDIM.
-        let first = scheduler.sigmas(self.config.steps)?[0];
+        let sigmas = self.sigmas(&scheduler)?;
+        let first = sigmas[0];
+        // FLUX 3 is told the level each step jumps to.
+        if let ImageDenoiser::Flux3(model) = &mut self.denoiser {
+            model.set_schedule(sigmas);
+        }
         start.data.iter_mut().for_each(|value| *value *= first);
 
         let settings = SamplingConfig {
@@ -1300,7 +1620,21 @@ impl ImagePipeline {
             guidance: self.config.guidance,
             seed,
         };
-        sample(&mut self.denoiser, scheduler, start, &settings, on_step)
+        let latent = sample(&mut self.denoiser, scheduler, start, &settings, on_step);
+        // What an edit keeps on the device does not fit beside the decode.
+        if let ImageDenoiser::QwenImage21(model) = &mut self.denoiser {
+            model.release();
+        }
+        latent
+    }
+
+    /// The levels a run of `config.steps` steps passes through: the
+    /// checkpoint's own where it names that many, evenly spaced otherwise.
+    fn sigmas(&self, scheduler: &Scheduler) -> Result<Vec<f32>, NetworkError> {
+        match self.config.sample_sigmas.len() == self.config.steps {
+            true => scheduler.sigmas_from(&self.config.sample_sigmas),
+            false => scheduler.sigmas(self.config.steps),
+        }
     }
 
     /// The schedule this pipeline runs on, at the shift its latent size asks
@@ -1313,10 +1647,13 @@ impl ImagePipeline {
                 beta_end,
                 train_steps,
             },
-            None => Scheduler::flow_match(match self.config.dynamic_shift {
-                Some(dynamic) => dynamic.shift(patches, self.config.steps),
-                None => self.config.shift,
-            }),
+            None => Scheduler::FlowMatch {
+                shift: match self.config.dynamic_shift {
+                    Some(dynamic) => dynamic.shift(patches, self.config.steps),
+                    None => self.config.shift,
+                },
+                terminal: self.config.shift_terminal,
+            },
         }
     }
 
@@ -1401,7 +1738,10 @@ impl ImagePipeline {
         }
 
         let scheduler = self.scheduler(patches);
-        let sigmas = scheduler.sigmas(self.config.steps)?;
+        let sigmas = self.sigmas(&scheduler)?;
+        if let ImageDenoiser::Flux3(model) = &mut self.denoiser {
+            model.set_schedule(sigmas.clone());
+        }
         // Full strength starts at the top of the schedule, none of it starts
         // at the bottom, where there is no work left to do.
         let first = ((1.0 - strength.clamp(0.0, 1.0)) * self.config.steps as f32).round() as usize;
@@ -1489,6 +1829,119 @@ impl ImagePipeline {
         self.decode(&latent, columns, rows)
     }
 
+    /// [`ImagePipeline::set_references`] for Qwen-Image 2.1. Each picture goes
+    /// through the vision tower into the prompt, in diffusers' template
+    /// (`<image1>`, ` <image2>`, ...), and through the autoencoder into the
+    /// denoiser's rows.
+    fn set_qwen_references(&mut self, images: &[FeatureMap]) -> Result<(), NetworkError> {
+        let (
+            ImageDenoiser::QwenImage21(model),
+            Some(edit),
+            PromptEncoder::Sequence {
+                tokenizer,
+                encoder,
+                chat: Some(chat),
+            },
+        ) = (&mut self.denoiser, &mut self.qwen_edit, &self.encoder)
+        else {
+            return Err(NetworkError::InvalidConfig(
+                "this pipeline was not loaded as Qwen-Image 2.1, so it cannot read a reference"
+                    .into(),
+            ));
+        };
+        edit.prompt = None;
+        model.set_references(Vec::new());
+        if images.is_empty() {
+            return Ok(());
+        }
+        if edit.readers.is_none() {
+            let mut file = crate::safetensors::ShardedSafeTensors::open(&edit.encoder_weights)?;
+            edit.readers = Some((
+                crate::qwen_vision::QwenVision::read(&mut file, "model.visual.", edit.precision)?,
+                crate::wan_vae::WanVaeEncoder::load(&edit.vae_weights, edit.vae.clone())?,
+            ));
+        }
+        let (tower, vae) = edit.readers.as_ref().expect("read above");
+        let pad = tokenizer.token_id("<|image_pad|>").ok_or_else(|| {
+            NetworkError::InvalidConfig("the tokenizer has no image token".into())
+        })?;
+        let mut ids = Vec::new();
+        let mut visual = crate::text_encoder::Visual::new(encoder.config().d_model);
+        let mut references = Vec::new();
+        for (index, image) in images.iter().enumerate() {
+            if image.channels != 3
+                || image.width == 0
+                || image.height == 0
+                || !image.width.is_multiple_of(32)
+                || !image.height.is_multiple_of(32)
+            {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "a reference is RGB with sides in multiples of 32, not {} channels at {}x{}",
+                    image.channels, image.width, image.height
+                )));
+            }
+            let words = match index {
+                0 => format!("{}<image1><|vision_start|>", chat.prefix),
+                _ => format!("<|vision_end|> <image{}><|vision_start|>", index + 1),
+            };
+            let words = tokenizer.encode(&words)?;
+            visual.text(words.len());
+            ids.extend(words);
+            // The denoiser is handed the text without the system turn and
+            // without the image tokens, which the latent cells stand in for.
+            let at = ids.len() - chat.drop_rows - visual.rows.len();
+            visual.picture(image.height / 32, image.width / 32, tower.forward(image)?);
+            ids.resize(chat.drop_rows + at + visual.rows.len(), pad);
+
+            // ponytail: every picture is opaque. diffusers reads an alpha
+            // channel here and shows the tower the picture over white; take
+            // four channels when a caller has a transparent one.
+            let mut frame = FeatureMap::new(4, image.height, image.width);
+            frame.data[..image.data.len()].copy_from_slice(&image.data);
+            frame.data[image.data.len()..].fill(1.0);
+            let latent = vae.encode(&[frame])?.remove(0);
+            references.push(crate::qwen_image21::Reference {
+                at,
+                latents: latent.to_tokens(),
+                height: latent.height,
+                width: latent.width,
+            });
+        }
+        model.set_references(references);
+        edit.prompt = Some((ids, visual));
+        Ok(())
+    }
+
+    /// The prompt states of a Qwen-Image 2.1 edit: `None` while no reference
+    /// is set, when the prompt is read as any other.
+    fn qwen_prompt(&self, prompt: &str) -> Result<Option<Matrix>, NetworkError> {
+        let (
+            Some(QwenEdit {
+                prompt: Some((ids, visual)),
+                ..
+            }),
+            PromptEncoder::Sequence {
+                tokenizer,
+                encoder,
+                chat: Some(chat),
+            },
+        ) = (&self.qwen_edit, &self.encoder)
+        else {
+            return Ok(None);
+        };
+        // diffusers reads an empty prompt as one space.
+        let prompt = if prompt.is_empty() { " " } else { prompt };
+        let mut ids = ids.clone();
+        ids.extend(tokenizer.encode(&format!("<|vision_end|>{prompt}{}", chat.suffix))?);
+        let states = encoder.forward_visual(&ids, visual)?;
+        let mut text = Matrix::new(0, states.cols);
+        for row in (chat.drop_rows..states.rows).filter(|row| !visual.rows.contains(row)) {
+            text.data.extend_from_slice(states.row(row));
+            text.rows += 1;
+        }
+        Ok(Some(text))
+    }
+
     /// Hands a FLUX.2 denoiser reference images to edit from, or takes them
     /// away when `images` is empty.
     ///
@@ -1500,7 +1953,14 @@ impl ImagePipeline {
     /// and rides through every denoiser step as extra tokens at its own
     /// position in time. The image itself can be any size, not the
     /// references'. Needs [`ImagePipeline::image_encoder`].
+    ///
+    /// Qwen-Image 2.1 reads a reference its own way, and its prompt with it:
+    /// call [`ImagePipeline::condition`] after this, not before. Its sides are
+    /// multiples of 32 (diffusers resizes it to about a megapixel).
     pub fn set_references(&mut self, images: &[FeatureMap]) -> Result<(), NetworkError> {
+        if matches!(self.denoiser, ImageDenoiser::QwenImage21(_)) {
+            return self.set_qwen_references(images);
+        }
         let ImageDenoiser::Transformer(dit) = &mut self.denoiser else {
             return Err(NetworkError::InvalidConfig(
                 "only a transformer denoiser takes reference images".into(),
@@ -1891,6 +2351,8 @@ mod tests {
             guidance: 1.0,
             embedded_guidance: 3.5,
             shift: 3.0,
+            shift_terminal: 0.0,
+            sample_sigmas: Vec::new(),
             dynamic_shift: None,
             patch: 2,
             latent_channels: 4,

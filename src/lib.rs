@@ -116,6 +116,7 @@ pub mod ema;
 pub mod embedding;
 pub mod ffn;
 pub mod flow_transformer;
+pub mod flux3;
 #[cfg(test)]
 mod fuzz;
 pub mod gguf;
@@ -134,6 +135,8 @@ pub mod optimizers;
 pub mod param;
 pub mod pipeline;
 pub mod quantized;
+pub mod qwen_image21;
+pub mod qwen_vision;
 pub mod recurrent;
 pub mod rng;
 pub mod rope;

@@ -18,6 +18,7 @@ use crate::diffusion::Denoiser;
 use crate::matrix::Matrix;
 use crate::mmdit::Conditioning;
 use crate::network::NetworkError;
+use crate::quantized::Quantized;
 use crate::safetensors::ShardedSafeTensors;
 use crate::transformer::Precision;
 use rayon::prelude::*;
@@ -135,7 +136,7 @@ impl std::fmt::Debug for ZImage {
     }
 }
 
-fn linear(file: &mut ShardedSafeTensors, name: &str) -> Result<Dense, NetworkError> {
+pub(crate) fn linear(file: &mut ShardedSafeTensors, name: &str) -> Result<Dense, NetworkError> {
     let bias = file
         .tensor(&format!("{name}.bias"))
         .ok()
@@ -144,28 +145,35 @@ fn linear(file: &mut ShardedSafeTensors, name: &str) -> Result<Dense, NetworkErr
 }
 
 /// Several bias-free linears over the same input as one, rows stacked.
-fn stacked(
+pub(crate) fn stacked(
     file: &mut ShardedSafeTensors,
     names: &[String],
     precision: Precision,
 ) -> Result<Dense, NetworkError> {
-    let mut data = Vec::new();
-    let (mut rows, mut cols) = (0, 0);
-    for name in names {
-        let part = file.matrix(&format!("{name}.weight"))?;
-        rows += part.rows;
-        cols = part.cols;
-        data.extend_from_slice(&part.data);
-    }
-    let mut layer = Dense::new(Matrix::from_vec(rows, cols, data), None)?;
-    if precision != Precision::F32 {
-        // FP8 is not wired for this model; it takes Q8 like everything else.
-        match crate::mmdit::q8_group() {
-            0 => layer.quantize(),
-            group => layer.quantize_grouped(group),
+    let read = |file: &mut ShardedSafeTensors| -> Result<Matrix, NetworkError> {
+        let mut data = Vec::new();
+        let (mut rows, mut cols) = (0, 0);
+        for name in names {
+            let part = file.matrix(&format!("{name}.weight"))?;
+            rows += part.rows;
+            cols = part.cols;
+            data.extend_from_slice(&part.data);
         }
+        Ok(Matrix::from_vec(rows, cols, data))
+    };
+    if precision == Precision::F32 {
+        return Dense::new(read(file)?, None);
     }
-    Ok(layer)
+    // FP8 is not wired for this model; it takes Q8 like everything else.
+    let group = crate::mmdit::q8_group();
+    let quantized = file.quantized(&format!("{names:?} by {group}"), |file| {
+        let weight = read(file)?;
+        Ok(match group {
+            0 => Quantized::from_matrix(&weight),
+            group => Quantized::from_matrix_grouped(&weight, group),
+        })
+    })?;
+    Dense::from_quantized(quantized, None)
 }
 
 impl ZImage {
@@ -434,7 +442,7 @@ impl Denoiser for ZImage {
 }
 
 #[cfg(feature = "cuda")]
-mod device {
+pub(crate) mod device {
     use super::{Block, SEQ_MULTIPLE, ZImage, ZImageConfig};
     use crate::conv::Dense;
     use crate::cuda_flash::compile_ptx;
@@ -446,7 +454,7 @@ mod device {
     use cudarc::driver::{CudaFunction, CudaSlice, CudaView, LaunchConfig, PushKernelArg};
     use std::sync::Arc;
 
-    const KERNELS: &str = r#"
+    pub(crate) const KERNELS: &str = r#"
 #define ROW_THREADS 256
 __device__ __forceinline__ float row_sum(float v,float*red){
   int tid=threadIdx.x;red[tid]=v;__syncthreads();
@@ -495,10 +503,50 @@ extern "C" __global__ void head_norm_rope(float*x,const float*scale,const float*
 }
 "#;
 
-    struct Linear {
+    pub(crate) struct Linear {
         weight: Act,
-        units: usize,
+        pub(crate) units: usize,
         inner: usize,
+    }
+
+    impl Linear {
+        /// The host weight is already int8, so its bytes and scales go up as
+        /// they are: a quarter of the PCIe bytes of the widened copy, and no
+        /// pass over it on either side.
+        pub(crate) fn upload(gpu: &Gpu<'_>, layer: &Dense) -> Result<Self, NetworkError> {
+            let (units, inner) = (layer.out_dim(), layer.in_dim());
+            let weight = match layer.int8() {
+                Some((q, scales, group)) => gpu.int8(q, scales, units, inner, group)?,
+                None => {
+                    let wide = gpu.upload(&layer.weight_f32().data)?;
+                    gpu.narrowed(&wide.slice(..), units * inner, true)?
+                }
+            };
+            Ok(Self {
+                weight,
+                units,
+                inner,
+            })
+        }
+
+        pub(crate) fn project(
+            &self,
+            gpu: &Gpu<'_>,
+            x: &Act,
+            rows: usize,
+            out: &mut CudaSlice<f32>,
+        ) -> Result<(), NetworkError> {
+            gpu.project(
+                &self.weight,
+                self.units,
+                self.inner,
+                &x.all(),
+                true,
+                &mut out.slice_mut(..),
+                rows,
+                0.0,
+            )
+        }
     }
 
     struct DeviceBlock {
@@ -533,7 +581,7 @@ extern "C" __global__ void head_norm_rope(float*x,const float*scale,const float*
         eps: f32,
     }
 
-    fn rows_config(rows: usize) -> LaunchConfig {
+    pub(crate) fn rows_config(rows: usize) -> LaunchConfig {
         LaunchConfig {
             grid_dim: (rows.clamp(1, 1024) as u32, 1, 1),
             block_dim: (256, 1, 1),
@@ -575,24 +623,7 @@ extern "C" __global__ void head_norm_rope(float*x,const float*scale,const float*
                     .load_function(name)
                     .map_err(cuda_err("Z-Image kernel lookup"))
             };
-            // The host weight is already on its int8 grid, so quantizing the
-            // widened copy again lands on the same values and scales.
-            let linear = |layer: &Dense| -> Result<Linear, NetworkError> {
-                let (units, inner) = (layer.out_dim(), layer.in_dim());
-                let wide = gpu.upload(&layer.weight_f32().data)?;
-                let weight = match (layer.is_quantized(), layer.int8_group()) {
-                    (true, Some(group)) => {
-                        gpu.quantized_grouped(&wide.slice(..), units, inner, group)?
-                    }
-                    (true, None) => gpu.quantized(&wide.slice(..), units, inner)?,
-                    (false, _) => gpu.narrowed(&wide.slice(..), units * inner, true)?,
-                };
-                Ok(Linear {
-                    weight,
-                    units,
-                    inner,
-                })
-            };
+            let linear = |layer: &Dense| Linear::upload(&gpu, layer);
             let blocks = blocks
                 .iter()
                 .map(|block| {
@@ -831,16 +862,7 @@ extern "C" __global__ void head_norm_rope(float*x,const float*scale,const float*
             rows: usize,
             out: &mut CudaSlice<f32>,
         ) -> Result<(), NetworkError> {
-            gpu.project(
-                &linear.weight,
-                linear.units,
-                linear.inner,
-                &x.all(),
-                true,
-                &mut out.slice_mut(..),
-                rows,
-                0.0,
-            )
+            linear.project(gpu, x, rows, out)
         }
 
         fn rms_scale(
